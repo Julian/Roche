@@ -17,8 +17,8 @@ pub enum ByteRangeParse {
     Unsatisfiable,
 }
 
-const MEDIA_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'sameorigin'; base-uri 'none'; form-action 'none'";
-const PDF_MEDIA_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; object-src 'self' blob:; frame-src 'self' blob:; img-src 'self' data: blob:; style-src 'unsafe-inline'; frame-ancestors 'sameorigin'; base-uri 'none'; form-action 'none'";
+const MEDIA_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'";
+const PDF_MEDIA_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; object-src 'self' blob:; frame-src 'self' blob:; img-src 'self' data: blob:; style-src 'unsafe-inline'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'";
 
 #[must_use]
 const fn media_csp_for_content_type(content_type: &str) -> &'static str {

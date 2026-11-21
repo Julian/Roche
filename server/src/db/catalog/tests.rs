@@ -1164,7 +1164,7 @@ async fn test_load_collection_preview_thumbnails_honors_dynamic_creator_filter()
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn test_wave_2a_internal_schemes_batch_caps_diary_crud_and_fts_search() {
+async fn test_internal_schemes_batch_caps_diary_crud_and_fts_search() {
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let catalog = db.catalog();
 

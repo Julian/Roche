@@ -12,8 +12,9 @@ use axum::{
 use chrono::Datelike as _;
 
 use super::{
-    DiaryFilterQuery, QuickLogForm, WantCompleteForm, load_existing_reader_item_ids,
-    parse_consumption_status, parse_optional_year, render_kind_options,
+    DiaryDeleteForm, DiaryEditForm, DiaryFilterQuery, QueuePageQuery, QuickLogForm,
+    WantCompleteForm, WantRemoveForm, load_existing_reader_item_ids, parse_consumption_status,
+    parse_diary_date_input, parse_optional_year, render_kind_options,
 };
 use crate::{
     db::{
@@ -24,13 +25,15 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _, esc, parse_csv_list,
-            parse_form_bool, rank_collection_href, redirect_with_flash, render_inline_csrf_form,
-            render_page, urlencode,
+            NavSection, PageShell, WebError, WithWebCsrf as _, consumption_status_label, esc,
+            parse_csv_list, parse_form_bool, rank_collection_href, redirect_with_flash,
+            render_inline_csrf_form, render_page, safe_local_redirect, urlencode,
         },
         links::{load_artist_id_by_lower_name, render_creator_links, sanitize_non_local_href},
     },
 };
+
+const DIARY_PAGE_SIZE: usize = 200;
 
 struct DiaryStats {
     total_all_years: usize,
@@ -80,12 +83,26 @@ pub(in crate::web) async fn diary_get(
         _ => None,
     };
     let catalog = service.catalog();
-    let (filtered_res, year_counts_res) = tokio::join!(
-        catalog.list_diary(q.year, status_filter, 500),
-        catalog.list_diary_year_counts(status_filter),
-    );
-    let entries = filtered_res.web_err(&session)?;
-    let sql_year_counts = year_counts_res.web_err(&session)?;
+    let sql_year_counts = catalog.list_diary_year_counts(status_filter).await.web_err(&session)?;
+    let total_all_years: usize = sql_year_counts
+        .iter()
+        .map(|(_, c)| usize::try_from(*c).unwrap_or(0))
+        .fold(0usize, usize::saturating_add);
+    let total_for_filter: usize = q.year.map_or(total_all_years, |yr| {
+        sql_year_counts
+            .iter()
+            .find(|(y, _)| *y == yr)
+            .map_or(0, |(_, c)| usize::try_from(*c).unwrap_or(0))
+    });
+
+    let total_pages = total_for_filter.max(1).div_ceil(DIARY_PAGE_SIZE);
+    let page_num = q.page.unwrap_or(1).clamp(1, total_pages);
+    let offset = (page_num - 1) * DIARY_PAGE_SIZE;
+
+    let entries = catalog
+        .list_diary_page(q.year, status_filter, DIARY_PAGE_SIZE, offset)
+        .await
+        .web_err(&session)?;
     let stats = DiaryStats::from_sql_years_and_entries(&sql_year_counts, &entries, q.year);
 
     let diary_creators: Vec<String> =
@@ -94,18 +111,10 @@ pub(in crate::web) async fn diary_get(
         load_artist_id_by_lower_name(&service, &diary_creators),
         load_diary_entry_tiers(&service, &entries),
     );
-
-    let mut months: Vec<(String, Vec<&ConsumptionLogView>)> = Vec::new();
-    for item in &entries {
-        let month_label = item.ts.format("%B %Y").to_string();
-        if let Some((last_label, bucket)) = months.last_mut()
-            && *last_label == month_label
-        {
-            bucket.push(item);
-        } else {
-            months.push((month_label, vec![item]));
-        }
-    }
+    let months = group_diary_by_month(&entries);
+    let active_status = status_filter.map_or("", ConsumptionStatus::as_str);
+    let current_href =
+        build_diary_href_page(q.year, active_status, (page_num > 1).then_some(page_num));
 
     let mut body = String::with_capacity(12_288);
     body.push_str(
@@ -116,14 +125,40 @@ pub(in crate::web) async fn diary_get(
         "<div class=\"list-detail-head\">\n\
            <div class=\"list-detail-title-group\">\n\
              <h2>Diary</h2>\n\
-             <span class=\"list-count-badge\">{}</span>\n\
+             <span class=\"list-count-badge\">{total_for_filter}</span>\n\
            </div>\n\
          </div>",
-        entries.len(),
     );
 
     render_diary_toolbar(&mut body, q.year, status_filter);
-    render_diary_months(&mut body, &months, &artist_links, &diary_tiers);
+    if total_pages > 1 {
+        render_diary_pager(
+            &mut body,
+            q.year,
+            active_status,
+            page_num,
+            total_pages,
+            "Diary pagination (top)",
+        );
+    }
+    render_diary_months(
+        &mut body,
+        &months,
+        &artist_links,
+        &diary_tiers,
+        &session.csrf_token,
+        &current_href,
+    );
+    if total_pages > 1 {
+        render_diary_pager(
+            &mut body,
+            q.year,
+            active_status,
+            page_num,
+            total_pages,
+            "Diary pagination (bottom)",
+        );
+    }
     body.push_str("</section>\n");
 
     render_diary_rail(&mut body, &stats, q.year, status_filter, &session.csrf_token);
@@ -136,9 +171,25 @@ pub(in crate::web) async fn diary_get(
         flash: &q.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
+        search_query: None,
         body_html: &body,
     })
     .into_response())
+}
+
+fn group_diary_by_month(entries: &[ConsumptionLogView]) -> Vec<(String, Vec<&ConsumptionLogView>)> {
+    let mut months: Vec<(String, Vec<&ConsumptionLogView>)> = Vec::new();
+    for item in entries {
+        let month_label = item.ts.format("%B %Y").to_string();
+        if let Some((last_label, bucket)) = months.last_mut()
+            && *last_label == month_label
+        {
+            bucket.push(item);
+        } else {
+            months.push((month_label, vec![item]));
+        }
+    }
+    months
 }
 
 async fn load_diary_entry_tiers(
@@ -154,6 +205,10 @@ async fn load_diary_entry_tiers(
 }
 
 fn build_diary_href(year: Option<i32>, status: &str) -> String {
+    build_diary_href_page(year, status, None)
+}
+
+fn build_diary_href_page(year: Option<i32>, status: &str, page: Option<usize>) -> String {
     let mut params = Vec::new();
     if let Some(yr) = year {
         params.push(format!("year={yr}"));
@@ -161,7 +216,48 @@ fn build_diary_href(year: Option<i32>, status: &str) -> String {
     if !status.is_empty() {
         params.push(format!("status={status}"));
     }
+    if let Some(p) = page.filter(|&p| p > 1) {
+        params.push(format!("page={p}"));
+    }
     if params.is_empty() { "/diary".to_owned() } else { format!("/diary?{}", params.join("&")) }
+}
+
+fn render_diary_pager(
+    out: &mut String,
+    year: Option<i32>,
+    status: &str,
+    page_num: usize,
+    total_pages: usize,
+    aria_label: &str,
+) {
+    let _ = write!(out, "<nav class=\"pager\" aria-label=\"{}\">", esc(aria_label));
+    if page_num > 1 {
+        let href = build_diary_href_page(year, status, Some(page_num - 1));
+        let _ = write!(
+            out,
+            "<a href=\"{}\"><span aria-hidden=\"true\">&larr;</span> Prev</a>",
+            esc(&href),
+        );
+    }
+    for p in 1..=total_pages {
+        if p == page_num {
+            let _ = write!(out, "<span class=\"current\" aria-current=\"page\">{p}</span>");
+        } else if p == 1 || p == total_pages || p.abs_diff(page_num) <= 2 {
+            let href = build_diary_href_page(year, status, Some(p));
+            let _ = write!(out, "<a href=\"{}\">{p}</a>", esc(&href));
+        } else if p.abs_diff(page_num) == 3 {
+            out.push_str("<span aria-hidden=\"true\">&hellip;</span>");
+        }
+    }
+    if page_num < total_pages {
+        let href = build_diary_href_page(year, status, Some(page_num + 1));
+        let _ = write!(
+            out,
+            "<a href=\"{}\">Next <span aria-hidden=\"true\">&rarr;</span></a>",
+            esc(&href),
+        );
+    }
+    out.push_str("</nav>\n");
 }
 
 fn render_diary_toolbar(
@@ -175,7 +271,7 @@ fn render_diary_toolbar(
            <div class=\"diary-toolbar-pills\" role=\"group\" aria-label=\"Filter by status\">\n",
     );
     for (slug, label) in
-        [("", "All"), ("consumed", "Consumed"), ("started", "Started"), ("abandoned", "Abandoned")]
+        [("", "All"), ("consumed", "Finished"), ("started", "Started"), ("abandoned", "Skipped")]
     {
         let is_cur = active_status == slug;
         let attrs = if is_cur {
@@ -198,6 +294,8 @@ fn render_diary_months(
     months: &[(String, Vec<&ConsumptionLogView>)],
     artist_links: &HashMap<String, String>,
     diary_tiers: &HashMap<String, char>,
+    csrf: &str,
+    return_to: &str,
 ) {
     if months.is_empty() {
         out.push_str("<p class=\"empty\">No diary entries match this filter.</p>\n");
@@ -216,11 +314,17 @@ fn render_diary_months(
             rows.len(),
         );
         for row in rows {
-            render_diary_page_row(out, row, artist_links, diary_tiers);
+            render_diary_page_row(out, row, artist_links, diary_tiers, csrf, return_to);
         }
         out.push_str("</section>\n");
     }
-    out.push_str("</div>\n");
+    out.push_str(
+        "</div>\n\
+         <div id=\"roche-diary-empty\" class=\"filter-empty-state\" hidden>\n\
+           <p>No diary entries match your search on this page.</p>\n\
+           <button type=\"button\" class=\"btn btn-small js-diary-clear\">Clear filter</button>\n\
+         </div>\n",
+    );
 }
 
 fn render_diary_page_row(
@@ -228,12 +332,19 @@ fn render_diary_page_row(
     row: &ConsumptionLogView,
     artist_links: &HashMap<String, String>,
     diary_tiers: &HashMap<String, char>,
+    csrf: &str,
+    return_to: &str,
 ) {
     let entry_href = format!("/entries/{}", urlencode(&row.entry.id));
     let creators_str = row.entry.creators.join(" ");
     let note_str = row.notes.as_deref().map_or("", str::trim);
     let search_blob =
         format!("{} {creators_str} {} {note_str}", row.entry.title, row.entry.kind.display_label());
+    let log_id_enc = urlencode(&row.id);
+    let date_iso = row.ts.format("%Y-%m-%d").to_string();
+    let sel_finished = if row.status == ConsumptionStatus::Consumed { " selected" } else { "" };
+    let sel_started = if row.status == ConsumptionStatus::Started { " selected" } else { "" };
+    let sel_skipped = if row.status == ConsumptionStatus::Abandoned { " selected" } else { "" };
 
     let _ = write!(
         out,
@@ -282,14 +393,43 @@ fn render_diary_page_row(
     if let Some(t) = tier {
         let _ = write!(out, "<span class=\"tier-pill tier-{t}\" title=\"Tier {t}\">{t}</span>");
     } else if row.status != ConsumptionStatus::Consumed {
-        let st_lbl = match row.status {
-            ConsumptionStatus::Started => "Started",
-            ConsumptionStatus::Abandoned => "Abandoned",
-            ConsumptionStatus::Consumed => "",
-        };
-        let _ = write!(out, "<span class=\"badge\">{st_lbl}</span>");
+        let _ =
+            write!(out, "<span class=\"badge\">{}</span>", consumption_status_label(row.status));
     }
-    out.push_str("</div>\n</div>\n");
+    let _ = write!(
+        out,
+        "<div class=\"diary-row-actions\">\
+           <details class=\"diary-edit-details\">\
+             <summary class=\"link-btn\" aria-label=\"Edit diary entry for {title}\">Edit</summary>\
+             <form method=\"post\" action=\"/web/diary/{log_id_enc}/edit\" class=\"diary-edit-form\">\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
+               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\
+               <div class=\"diary-edit-row\">\
+                 <select name=\"status\" aria-label=\"Diary status\">\
+                   <option value=\"consumed\"{sel_finished}>Finished</option>\
+                   <option value=\"started\"{sel_started}>Started</option>\
+                   <option value=\"abandoned\"{sel_skipped}>Skipped</option>\
+                 </select>\
+                 <input type=\"date\" name=\"date\" value=\"{date_iso}\" aria-label=\"Diary date\">\
+               </div>\
+               <textarea name=\"notes\" class=\"textarea-compact\" placeholder=\"Note…\" aria-label=\"Diary note\">{note_esc}</textarea>\
+               <button type=\"submit\" class=\"btn btn-primary btn-small\">Save</button>\
+             </form>\
+           </details>",
+        title = esc(&row.entry.title),
+        csrf = esc(csrf),
+        ret = esc(return_to),
+        note_esc = esc(note_str),
+    );
+    render_inline_csrf_form(
+        out,
+        &format!("/web/diary/{log_id_enc}/delete"),
+        csrf,
+        &[("return_to", return_to)],
+        Some("Delete this diary entry?"),
+        "<button type=\"submit\" class=\"link-btn link-btn-danger\" aria-label=\"Delete diary entry\">&times;</button>",
+    );
+    out.push_str("</div></div>\n</div>\n");
 }
 
 fn render_diary_rail(
@@ -383,7 +523,7 @@ fn render_diary_rail(
 pub(in crate::web) async fn queue_get(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
-    Query(flash): Query<FlashQuery>,
+    Query(q): Query<QueuePageQuery>,
 ) -> Result<Response, WebError> {
     let all_cols = service.catalog().list_collections(true, false).await.web_err(&session)?;
 
@@ -398,6 +538,16 @@ pub(in crate::web) async fn queue_get(
             ranked_queues.insert(wc.title.clone(), view);
         }
     }
+
+    let undo_banner = if let Some(eid) =
+        q.undo_entry.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && let Some(q_slug) = q.undo_queue.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && let Ok(Some(detail)) = service.catalog().get_entry_detail(eid).await
+    {
+        Some((detail.entry.id, detail.entry.title, q_slug.to_owned()))
+    } else {
+        None
+    };
 
     let queue_creators: Vec<String> = ranked_queues
         .values()
@@ -425,6 +575,22 @@ pub(in crate::web) async fn queue_get(
          </div>",
     );
 
+    if let Some((undo_id, undo_title, undo_queue)) = &undo_banner {
+        let toggle_action = format!("/web/entries/{}/queue-toggle", urlencode(undo_id));
+        body.push_str("<div class=\"undo-banner\" role=\"status\"><span>Removed <strong>");
+        let _ = write!(body, "{}", esc(undo_title));
+        body.push_str("</strong> from Queue.</span>");
+        render_inline_csrf_form(
+            &mut body,
+            &toggle_action,
+            &session.csrf_token,
+            &[("in_queue", "true"), ("queue_slug", undo_queue.as_str()), ("return_to", "/queue")],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small\">Undo</button>",
+        );
+        body.push_str("</div>\n");
+    }
+
     if ranked_queues.is_empty() {
         body.push_str(
             "<p class=\"empty\">Your queues are empty. Save a URL or add a movie, book, album, paper, or game using the Quick Save or Add to Queue panel.</p>\n",
@@ -448,9 +614,10 @@ pub(in crate::web) async fn queue_get(
         title: "Queue",
         active: NavSection::Queue,
         csrf_token: &session.csrf_token,
-        flash: &flash,
+        flash: &q.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
+        search_query: None,
         body_html: &body,
     })
     .into_response())
@@ -485,7 +652,7 @@ fn render_queue_rail(out: &mut String, csrf: &str) {
                  <div class=\"field\"><label for=\"ql-ident\">URL / Spotify / IMDb / ISBN</label>\n\
                    <input id=\"ql-ident\" name=\"identifier\" type=\"text\" placeholder=\"Optional link or ID\"></div>\n\
                  <div class=\"field\"><label for=\"ql-action\">Action</label>\n\
-                   <select id=\"ql-action\" name=\"action\">\n\
+                   <select id=\"ql-action\" name=\"action\" class=\"js-log-status-select\">\n\
                      <option value=\"want\">Add to Queue</option>\n\
                      <option value=\"consumed\">Log Finished</option>\n\
                      <option value=\"started\">Log Started</option>\n\
@@ -494,7 +661,7 @@ fn render_queue_rail(out: &mut String, csrf: &str) {
                  <div class=\"field\"><label for=\"ql-notes\">Notes (optional)</label>\n\
                    <textarea id=\"ql-notes\" name=\"notes\" class=\"textarea-compact\" placeholder=\"Optional notes…\"></textarea></div>\n\
                  <div class=\"field field-check\">\n\
-                   <input id=\"ql-rank\" name=\"rank_after\" type=\"checkbox\" value=\"1\" checked>\n\
+                   <input id=\"ql-rank\" name=\"rank_after\" type=\"checkbox\" value=\"1\" checked class=\"js-log-rank-check\">\n\
                    <label for=\"ql-rank\">Rank immediately when applicable</label></div>\n\
                  <button type=\"submit\" class=\"btn btn-primary btn-small\">Save</button>\n\
                </form>\n\
@@ -536,8 +703,11 @@ fn render_want_queue_section(
     for (idx, row) in qview.rows.iter().enumerate() {
         let id_enc = urlencode(&row.entry.id);
         let is_reader = reader_item_ids.contains(&row.entry.id);
-        let title_href =
-            if is_reader { format!("/reader/{id_enc}") } else { format!("/entries/{id_enc}") };
+        let title_href = if is_reader {
+            format!("/reader/{id_enc}?return_to=%2Fqueue")
+        } else {
+            format!("/entries/{id_enc}")
+        };
         let host = row
             .entry
             .url
@@ -577,7 +747,7 @@ fn render_want_queue_section(
         if is_reader {
             let _ = write!(
                 out,
-                "<a class=\"btn btn-small btn-ghost\" href=\"/reader/{}\">Read</a>",
+                "<a class=\"btn btn-small btn-ghost\" href=\"/reader/{}?return_to=%2Fqueue\">Read</a>",
                 esc(&id_enc),
             );
         }
@@ -597,7 +767,7 @@ fn render_want_queue_section(
             csrf,
             &[("rank_after", "1")],
             None,
-            "<button type=\"submit\" class=\"btn btn-small btn-primary\" title=\"Mark finished and rank\">Rank</button>",
+            "<button type=\"submit\" class=\"btn btn-small btn-primary\" title=\"Mark finished and rank\">Finish &amp; Rank</button>",
         );
         out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>");
         let remove_btn = format!(
@@ -610,14 +780,43 @@ fn render_want_queue_section(
     out.push_str("</ol>\n</section>\n");
 }
 
+pub(in crate::web) async fn post_diary_edit(
+    State(service): State<Arc<RocheService>>,
+    Extension(session): Extension<WebSession>,
+    Path(id): Path<String>,
+    Form(form): Form<DiaryEditForm>,
+) -> Result<Response, WebError> {
+    let dest = safe_local_redirect(form.return_to.as_deref(), "/diary");
+    let status = form.status.as_deref().map(parse_consumption_status);
+    let ts = parse_diary_date_input(form.date.as_deref());
+    let notes: Option<Option<&str>> = form.notes.as_deref().map(|raw| {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    });
+    service.catalog().update_consumption_log(&id, status, notes, ts).await.web_err(&session)?;
+    Ok(redirect_with_flash(&dest, "notice", "Updated diary entry"))
+}
+
+pub(in crate::web) async fn post_diary_delete(
+    State(service): State<Arc<RocheService>>,
+    Extension(session): Extension<WebSession>,
+    Path(id): Path<String>,
+    Form(form): Form<DiaryDeleteForm>,
+) -> Result<Response, WebError> {
+    let dest = safe_local_redirect(form.return_to.as_deref(), "/diary");
+    let _ = service.catalog().delete_consumption_log(&id).await.web_err(&session)?;
+    Ok(redirect_with_flash(&dest, "notice", "Deleted diary entry"))
+}
+
 pub(in crate::web) async fn post_quick_log(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Form(form): Form<QuickLogForm>,
 ) -> Result<Response, WebError> {
+    let err_dest = safe_local_redirect(form.return_to.as_deref(), "/queue");
     let kind = match EntryKind::parse_flexible(&form.kind) {
         Ok(k) => k,
-        Err(e) => return Ok(redirect_with_flash("/queue", "err", &e.to_string())),
+        Err(e) => return Ok(redirect_with_flash(&err_dest, "err", &e.to_string())),
     };
     let creators = parse_csv_list(form.creators.as_deref());
     let release_year = parse_optional_year(form.release_year.as_deref());
@@ -648,8 +847,9 @@ pub(in crate::web) async fn post_quick_log(
                 "Added to Queue",
             ))
         } else {
+            let dest = safe_local_redirect(form.return_to.as_deref(), "/queue");
             Ok(redirect_with_flash(
-                "/queue",
+                &dest,
                 "notice",
                 &format!("Added '{}' to {}", entry.title, queue.title),
             ))
@@ -672,8 +872,9 @@ pub(in crate::web) async fn post_quick_log(
                 "Logged to Diary",
             ))
         } else {
+            let dest = safe_local_redirect(form.return_to.as_deref(), "/diary");
             Ok(redirect_with_flash(
-                "/diary",
+                &dest,
                 "notice",
                 &format!("Logged '{}' to Diary", logged.entry.title),
             ))
@@ -713,7 +914,18 @@ pub(in crate::web) async fn post_want_remove(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path((queue, entry_id)): Path<(String, String)>,
+    Form(form): Form<WantRemoveForm>,
 ) -> Result<Response, WebError> {
     let removed = service.catalog().unwant_entry(&queue, &entry_id).await.web_err(&session)?;
-    Ok(redirect_with_flash("/queue", "notice", &format!("Removed '{}' from queue", removed.title)))
+    let dest = safe_local_redirect(form.return_to.as_deref(), "/queue");
+    let final_dest = if dest == "/queue" {
+        format!("/queue?undo_entry={}&undo_queue={}", urlencode(&entry_id), urlencode(&queue))
+    } else {
+        dest
+    };
+    Ok(redirect_with_flash(
+        &final_dest,
+        "notice",
+        &format!("Removed '{}' from queue", removed.title),
+    ))
 }

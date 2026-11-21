@@ -976,7 +976,7 @@ async fn test_web_csp_and_sanitized_reader_image_privacy_attributes() {
         .unwrap_or("");
     assert!(csp.contains("default-src 'self'"));
     assert!(csp.contains("script-src 'self'"));
-    assert!(csp.contains("frame-ancestors 'sameorigin'"));
+    assert!(csp.contains("frame-ancestors 'self'"));
 
     let html =
         String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
@@ -1487,7 +1487,7 @@ async fn test_want_to_read_readonly_inbox_starred_list_and_homepage_feed_discove
     let home_html = resp_html(get_authed(&app, "/", &cookie).await).await;
     assert!(home_html.contains("Queue (1)"));
     assert!(home_html.contains("LSM Compaction"));
-    assert!(home_html.contains("Feed Inbox (0)"));
+    assert!(home_html.contains("Feed Inbox (<span class=\"js-unread-count\">0</span>)"));
 
     let inbox_html = resp_html(get_authed(&app, "/inbox", &cookie).await).await;
     assert!(!inbox_html.contains("Save URL to Inbox"));
@@ -1971,9 +1971,9 @@ async fn test_web_filters_labels_and_destructive_confirmations() {
 
     let inbox_html = read_body_html(get_authed(&app, "/inbox", &cookie).await).await;
     assert!(inbox_html.contains(">PDF</span>"));
-    assert!(inbox_html.contains("aria-label=\"Search inbox\""));
+    assert!(inbox_html.contains("aria-label=\"Filter stream\""));
     assert!(inbox_html.contains("aria-pressed=\"false\""));
-    assert!(inbox_html.contains("data-confirm=\"Archive all unread items in your inbox?\""));
+    assert!(inbox_html.contains("data-confirm=\"Archive all "));
 
     let filtered_inbox = read_body_html(
         get_authed(&app, &format!("/inbox?feed={}&kind=article", feed.id), &cookie).await,
@@ -1987,11 +1987,11 @@ async fn test_web_filters_labels_and_destructive_confirmations() {
     assert!(feeds_html.contains(">YouTube</span>"));
     assert!(feeds_html.contains("data-confirm=\"Delete this feed subscription?"));
 
-    // 5. Entry page merge confirmation and accessible labels
+    // 5. Entry page 2-step merge preview flow and accessible labels
     let entry_html =
         read_body_html(get_authed(&app, &format!("/entries/{}", catalog_only.id), &cookie).await)
             .await;
-    assert!(entry_html.contains("data-confirm=\"Merge this duplicate"));
+    assert!(entry_html.contains("Preview Merge"));
     assert!(entry_html.contains("aria-label=\"Canonical entry UUID, URL, or exact title\""));
 }
 
@@ -2552,7 +2552,7 @@ async fn test_round2_web_ux_panels_pills_and_roche_js_guards() {
     let diary_consumed_html =
         read_body_html(get_authed(&app, "/diary?status=consumed", &cookie).await).await;
     assert!(diary_consumed_html.contains(
-        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/diary?status=consumed\">Consumed</a>"
+        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/diary?status=consumed\">Finished</a>"
     ));
     assert!(diary_consumed_html.contains("<a class=\"pill\" href=\"/diary\">All</a>"));
 }
@@ -2603,7 +2603,8 @@ async fn test_round2_web_security_reader_origin_and_rank_redirect() {
         read_body_html(get_authed(&app, &format!("/reader/{}", local_item.id), &cookie).await)
             .await;
     assert!(!local_reader_html.contains("Original &#8599;"));
-    assert!(local_reader_html.contains("class=\"inline-form js-reader-archive-form\""));
+    assert!(!local_reader_html.contains("class=\"inline-form js-reader-archive-form\""));
+    assert!(local_reader_html.contains("Remove from Queue"));
 
     let pub_item_url = Url::parse("https://example.org/public-essay").unwrap();
     let (pub_item, _) = db
@@ -2961,7 +2962,7 @@ async fn test_album_tracklist_enrichment_and_artist_discography_render() {
 }
 
 #[tokio::test]
-async fn test_wave_1c_web_auth_theme_and_flash_regressions() {
+async fn test_web_auth_theme_and_flash_regressions() {
     let (_db, app) = setup_web_app(Config::default()).await;
 
     // qw_4: redirect_with_flash strips stale duplicate notice/err query params
@@ -3035,7 +3036,7 @@ async fn test_wave_1c_web_auth_theme_and_flash_regressions() {
 }
 
 #[tokio::test]
-async fn test_wave_1c_web_inbox_and_reader_regressions() {
+async fn test_web_inbox_and_reader_regressions() {
     use crate::domain::ReadAtPatch;
 
     let (db, app) = setup_web_app(Config::default()).await;
@@ -3142,4 +3143,393 @@ async fn test_wave_1c_web_inbox_and_reader_regressions() {
     let finished_reader =
         read_body_html(get_authed(&app, &format!("/reader/{}", pdf_item.id), &cookie).await).await;
     assert!(finished_reader.contains("data-confirm="));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_web_search_diary_entry_feeds_rank_and_reader_flows() {
+    use crate::domain::{CollectionRole, ReadAtPatch};
+
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    // 1. Seed feed + items (in-progress article, unread podcast, cached PDF, uncached video)
+    let feed_url = Url::parse("https://flows.example.com/feed.xml").unwrap();
+    let feed =
+        db.feeds().create(FeedType::Rss, &feed_url, Some("Flow Dispatch"), None).await.unwrap();
+
+    let prog_url = Url::parse("https://flows.example.com/in-progress").unwrap();
+    let in_prog = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Halfway Essay on Typography",
+            url: &prog_url,
+            author: Some("Alice"),
+            published_at: Some(chrono::Utc::now()),
+            summary: Some("Progress summary"),
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    db.items().update(&in_prog.id, None, None, Some(0.45), ReadAtPatch::Unchanged).await.unwrap();
+
+    let pod_url = Url::parse("https://flows.example.com/pod-1").unwrap();
+    let fresh_pod = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Typography Podcast Ep 1",
+            url: &pod_url,
+            author: Some("Host"),
+            published_at: Some(chrono::Utc::now()),
+            summary: Some("Show notes"),
+            content_type: ContentType::Audio,
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
+         VALUES (?, ?, 'audio', ?, NULL, NULL, ?, ?)",
+    )
+    .bind("enc-pod-1")
+    .bind(&fresh_pod.id)
+    .bind("https://cdn.example.com/ep1.mp3")
+    .bind(3_900i64)
+    .bind(chrono::Utc::now())
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let pdf_url = Url::parse("https://flows.example.com/paper.pdf").unwrap();
+    let cached_pdf = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Cached Research PDF",
+            url: &pdf_url,
+            author: None,
+            published_at: Some(chrono::Utc::now()),
+            summary: None,
+            content_type: ContentType::Pdf,
+        })
+        .await
+        .unwrap();
+    let pdf_media = db
+        .media()
+        .create(&cached_pdf.id, crate::db::MediaType::Pdf, "pdfs/flow.pdf", Some(4096), None)
+        .await
+        .unwrap();
+
+    let vid_url = Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
+    let uncached_vid = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Typography Talk Video",
+            url: &vid_url,
+            author: Some("Speaker"),
+            published_at: Some(chrono::Utc::now()),
+            summary: None,
+            content_type: ContentType::Video,
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE entries SET thumbnail_url = ? WHERE id = ?")
+        .bind("https://img.example.com/thumb.jpg")
+        .bind(&uncached_vid.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // 2. Home Continue Reading filters to in-progress (0.03..0.98) and deduplicates from Feed Inbox
+    let home_html = read_body_html(get_authed(&app, "/", &cookie).await).await;
+    assert!(home_html.contains("Continue Reading"));
+    assert!(home_html.contains("continue-progress"));
+    assert!(home_html.contains("Halfway Essay on Typography"));
+    assert_eq!(
+        home_html.matches(&format!("/reader/{}", in_prog.id)).count(),
+        1,
+        "in-progress item in Continue Reading must be deduplicated out of Feed Inbox"
+    );
+    assert!(home_html.contains("1h 05m"));
+    assert!(home_html.contains("roche-quick-log-dialog"));
+    assert!(home_html.contains("roche-shortcuts-dialog"));
+
+    // 3. Reader upgrades: return_to back link, podcast duration (not "1 min read"), PDF iframe, uncached video hero
+    let pod_reader = read_body_html(
+        get_authed(&app, &format!("/reader/{}?return_to=%2F", fresh_pod.id), &cookie).await,
+    )
+    .await;
+    assert!(pod_reader.contains("href=\"/\""));
+    assert!(pod_reader.contains("1h 05m"));
+    assert!(!pod_reader.contains("1 min read"));
+    assert!(pod_reader.contains("reader-mobile-tools"));
+
+    let pdf_reader =
+        read_body_html(get_authed(&app, &format!("/reader/{}", cached_pdf.id), &cookie).await)
+            .await;
+    assert!(pdf_reader.contains("reader-pdf-frame"));
+    assert!(pdf_reader.contains(&format!("/web/media/{}", pdf_media.id)));
+    assert!(!pdf_reader.contains("No extracted article text"));
+
+    let vid_reader =
+        read_body_html(get_authed(&app, &format!("/reader/{}", uncached_vid.id), &cookie).await)
+            .await;
+    assert!(vid_reader.contains("reader-video-hero"));
+    assert!(vid_reader.contains("Watch Original"));
+
+    // 4. Feeds inline edit preserves filter return_to
+    let edit_feed_resp = post_form(
+        &app,
+        &format!("/web/feeds/{}/edit", feed.id),
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("title", "Flow Renamed"),
+            ("poll_interval", "120"),
+            ("return_to", "/feeds?status=active&q=Flow"),
+        ],
+    )
+    .await;
+    assert_eq!(edit_feed_resp.status(), StatusCode::SEE_OTHER);
+    let edit_loc = edit_feed_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    assert!(edit_loc.starts_with("/feeds?status=active&q=Flow&notice="));
+    let updated_feed = db.feeds().get(&feed.id).await.unwrap().unwrap();
+    assert_eq!(updated_feed.title.as_deref(), Some("Flow Renamed"));
+    assert_eq!(updated_feed.poll_interval, 120);
+
+    // 5. Catalog book, manual list auto-open & Auto-match existing across kinds (no Movie duplicate!) + Undo banner
+    let dune = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Dune Typography".to_owned(),
+            creators: vec!["Frank Herbert".to_owned()],
+            release_year: Some(1965),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let other_book = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Dune Typography Duplicate".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let third_book = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Grid Systems".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let manual = db
+        .catalog()
+        .create_manual_collection("Favorites", Some("favorites"), CollectionRole::List, None, None)
+        .await
+        .unwrap();
+
+    let empty_list_html = read_body_html(get_authed(&app, "/lists/favorites", &cookie).await).await;
+    assert!(empty_list_html.contains("open data-default-open"));
+    assert!(empty_list_html.contains("Auto &mdash; match existing work"));
+
+    let add_existing_resp = post_form(
+        &app,
+        "/web/lists/favorites/add",
+        &cookie,
+        &[("_csrf", &csrf), ("title_or_id", "Dune Typography"), ("kind", "")],
+    )
+    .await;
+    assert_eq!(add_existing_resp.status(), StatusCode::SEE_OTHER);
+    let add_loc = add_existing_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    assert!(add_loc.contains("Linked+existing+Book"));
+
+    let rem_resp = post_form(
+        &app,
+        &format!("/web/lists/favorites/remove/{}", dune.id),
+        &cookie,
+        &[("_csrf", &csrf), ("return_to", "/lists/favorites")],
+    )
+    .await;
+    assert_eq!(rem_resp.status(), StatusCode::SEE_OTHER);
+    let rem_loc = rem_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    assert!(rem_loc.contains(&format!("undo_remove={}", dune.id)));
+    let undo_list_html = read_body_html(get_authed(&app, rem_loc, &cookie).await).await;
+    assert!(undo_list_html.contains("undo-banner"));
+    assert!(undo_list_html.contains(">Undo</button>"));
+
+    // 6. Entry Queue toggle, Enrich JSON endpoint, and 2-step Merge Preview + Confirm
+    let q_add = post_form(
+        &app,
+        &format!("/web/entries/{}/queue-toggle", dune.id),
+        &cookie,
+        &[("_csrf", &csrf), ("in_queue", "true"), ("return_to", &format!("/entries/{}", dune.id))],
+    )
+    .await;
+    assert_eq!(q_add.status(), StatusCode::SEE_OTHER);
+    let entry_queued_html =
+        read_body_html(get_authed(&app, &format!("/entries/{}", dune.id), &cookie).await).await;
+    assert!(entry_queued_html.contains("In Queue"));
+
+    let enrich_resp =
+        post_form(&app, &format!("/web/entries/{}/enrich", dune.id), &cookie, &[("_csrf", &csrf)])
+            .await;
+    assert_eq!(enrich_resp.status(), StatusCode::OK);
+    let enrich_body = read_body_html(enrich_resp).await;
+    assert!(enrich_body.contains("\"enriched\""));
+
+    let preview_html = read_body_html(
+        get_authed(&app, &format!("/entries/{}?merge_preview={}", other_book.id, dune.id), &cookie)
+            .await,
+    )
+    .await;
+    assert!(preview_html.contains("merge-preview-card"));
+    assert!(preview_html.contains("Confirm Merge"));
+    let merge_resp = post_form(
+        &app,
+        &format!("/web/entries/{}/merge", other_book.id),
+        &cookie,
+        &[("_csrf", &csrf), ("canonical_id", &dune.id)],
+    )
+    .await;
+    assert_eq!(merge_resp.status(), StatusCode::SEE_OTHER);
+    assert!(
+        merge_resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with(&format!("/entries/{}", dune.id))
+    );
+
+    // 7. Diary quick-log return_to, unified labels, inline edit & delete, plus Global Search (/search)
+    let log_resp = post_form(
+        &app,
+        "/web/log",
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("title", "Dune Typography"),
+            ("kind", "book"),
+            ("action", "started"),
+            ("notes", "Initial read"),
+            ("return_to", "/lists"),
+        ],
+    )
+    .await;
+    assert_eq!(log_resp.status(), StatusCode::SEE_OTHER);
+    assert!(
+        log_resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("/lists?notice=")
+    );
+
+    let diary_logs = db.catalog().list_diary(None, None, 10).await.unwrap();
+    assert_eq!(diary_logs.len(), 1);
+    let log_id = diary_logs[0].id.clone();
+
+    let edit_log_resp = post_form(
+        &app,
+        &format!("/web/diary/{log_id}/edit"),
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("status", "abandoned"),
+            ("date", "2024-06-15"),
+            ("notes", "Updated typography note"),
+            ("return_to", "/diary"),
+        ],
+    )
+    .await;
+    assert_eq!(edit_log_resp.status(), StatusCode::SEE_OTHER);
+    let diary_html = read_body_html(get_authed(&app, "/diary", &cookie).await).await;
+    assert!(diary_html.contains(">Finished</a>"));
+    assert!(diary_html.contains(">Skipped</a>"));
+    assert!(diary_html.contains("Updated typography note"));
+
+    // Global Search returns hits across Catalog, Lists, Queue, Inbox, and Diary
+    let search_html = read_body_html(get_authed(&app, "/search?q=Typography", &cookie).await).await;
+    assert!(search_html.contains("id=\"search-catalog\""));
+    assert!(search_html.contains("id=\"search-inbox\""));
+    assert!(search_html.contains("id=\"search-diary\""));
+    assert!(search_html.contains("value=\"Typography\""));
+
+    let del_log_resp = post_form(
+        &app,
+        &format!("/web/diary/{log_id}/delete"),
+        &cookie,
+        &[("_csrf", &csrf), ("return_to", "/diary")],
+    )
+    .await;
+    assert_eq!(del_log_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(db.catalog().list_diary(None, None, 10).await.unwrap().len(), 0);
+
+    // 8. Rank: boundary arrows disabled, non-round-burning Skip, Undo comparison, 5-round Keep Refining
+    db.catalog().add_collection_entry(&manual.id, &dune.id, None).await.unwrap();
+    db.catalog().add_collection_entry(&manual.id, &third_book.id, None).await.unwrap();
+    let rank_html = read_body_html(
+        get_authed(&app, &format!("/rank/favorites?focus={}&round=0", dune.id), &cookie).await,
+    )
+    .await;
+    assert!(rank_html.contains("Round 1 of 5"));
+    assert!(rank_html.contains("js-card-up\" disabled"));
+    assert!(rank_html.contains("js-card-down\" disabled"));
+    // Skip preserves focus and round=0 while incrementing skip=1
+    assert!(rank_html.contains("name=\"skip\" value=\"1\""));
+    assert!(rank_html.contains("name=\"round\" value=\"0\""));
+    assert!(!rank_html.contains("name=\"random\" value=\"1\""));
+
+    let ord_json = serde_json::json!([[dune.id], [third_book.id]]).to_string();
+    let rank_post = post_form(
+        &app,
+        "/rank/favorites",
+        &cookie,
+        &[("_csrf", &csrf), ("focus", &dune.id), ("round", "0"), ("ordering_json", &ord_json)],
+    )
+    .await;
+    assert_eq!(rank_post.status(), StatusCode::SEE_OTHER);
+    let next_loc = rank_post.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
+    assert!(next_loc.contains("round=1"));
+    assert!(next_loc.contains("undo_comp="));
+
+    let r1_html = read_body_html(get_authed(&app, &next_loc, &cookie).await).await;
+    assert!(r1_html.contains("Provisional:"));
+    assert!(r1_html.contains("Done Placing"));
+    assert!(r1_html.contains("Comparison saved."));
+
+    // Undo deletes the comparison cleanly
+    let undo_comp_id = next_loc.split("undo_comp=").nth(1).unwrap().split('&').next().unwrap();
+    let undo_resp = post_form(
+        &app,
+        &format!("/web/comparisons/{undo_comp_id}/undo"),
+        &cookie,
+        &[("_csrf", &csrf), ("return_to", &format!("/rank/favorites?focus={}&round=0", dune.id))],
+    )
+    .await;
+    assert_eq!(undo_resp.status(), StatusCode::SEE_OTHER);
+    let view_after_undo = crate::service::CatalogService::new(&db)
+        .get_ranked_collection(&manual.id, false)
+        .await
+        .unwrap();
+    assert_eq!(view_after_undo.comparison_count, 0);
+
+    // Settled after 5 rounds exposes Keep Refining
+    let settled_html = read_body_html(
+        get_authed(&app, &format!("/rank/favorites?focus={}&round=5", dune.id), &cookie).await,
+    )
+    .await;
+    assert!(settled_html.contains("Placement Settled"));
+    assert!(settled_html.contains("Keep Refining"));
+    assert!(settled_html.contains("max_rounds=10"));
 }

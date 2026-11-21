@@ -7,7 +7,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use super::{CreateFeedForm, FeedToggleForm, ImportOpmlForm, ItemReturnForm};
+use super::{
+    CreateFeedForm, EditFeedForm, FeedToggleForm, FeedsQuery, ImportOpmlForm, ItemReturnForm,
+};
 use crate::{
     db::Feed,
     domain::FeedType,
@@ -16,10 +18,10 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, REFRESH_SVG, WebError, WithWebCsrf as _, esc,
-            parse_form_bool, redirect_see_other, redirect_with_flash,
-            render_feed_favicon_with_class, render_inline_csrf_form, render_page,
-            safe_local_redirect, urlencode,
+            NavSection, PageShell, REFRESH_SVG, WebError, WithWebCsrf as _, esc, parse_form_bool,
+            redirect_see_other, redirect_with_flash, render_feed_favicon_with_class,
+            render_inline_csrf_form_with_class, render_page, safe_local_redirect,
+            safe_web_error_message, urlencode,
         },
     },
 };
@@ -110,12 +112,42 @@ fn display_feed_host(feed: &Feed) -> &str {
     host.strip_prefix("www.").unwrap_or(host)
 }
 
+fn build_feeds_return_url(status: &str, kind: &str, q: &str) -> String {
+    let mut parts = Vec::new();
+    if !status.is_empty() && status != "all" {
+        parts.push(format!("status={}", urlencode(status)));
+    }
+    if !kind.is_empty() && kind != "all" {
+        parts.push(format!("kind={}", urlencode(kind)));
+    }
+    if !q.is_empty() {
+        parts.push(format!("q={}", urlencode(q)));
+    }
+    if parts.is_empty() { "/feeds".to_owned() } else { format!("/feeds?{}", parts.join("&")) }
+}
+
 pub(in crate::web) async fn feeds_get(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
-    Query(flash): Query<FlashQuery>,
+    Query(query): Query<FeedsQuery>,
 ) -> Result<Response, WebError> {
     let feeds = service.feeds().list().await.web_err(&session)?;
+
+    let initial_status = match query.status.as_deref().map(str::trim) {
+        Some("active") => "active",
+        Some("errors") => "errors",
+        Some("paused") => "paused",
+        _ => "all",
+    };
+    let initial_kind = match query.kind.as_deref().map(str::trim) {
+        Some("rss") => "rss",
+        Some("podcast") => "podcast",
+        Some("youtube") => "youtube",
+        Some("arxiv") => "arxiv",
+        _ => "all",
+    };
+    let initial_q = query.q.as_deref().map_or("", str::trim);
+    let return_url = build_feeds_return_url(initial_status, initial_kind, initial_q);
 
     let stats = FeedStats::from_feeds(&feeds);
     let mut sorted: Vec<&Feed> = feeds.iter().collect();
@@ -138,13 +170,14 @@ pub(in crate::web) async fn feeds_get(
     body.push_str(
         "<div class=\"feeds-grid\">\n<section class=\"feeds-main\" aria-label=\"Subscribed feeds\">\n",
     );
+    render_feeds_mobile_subscribe(&mut body, &session.csrf_token);
     if sorted.is_empty() {
         body.push_str(
             "<p class=\"empty\">No feeds subscribed yet. Paste a site homepage, feed URL, or YouTube channel in the Subscribe panel to get started.</p>\n",
         );
     } else {
-        render_feeds_toolbar(&mut body, &stats);
-        render_feeds_list(&mut body, &sorted, &session.csrf_token);
+        render_feeds_toolbar(&mut body, &stats, initial_status, initial_kind, initial_q);
+        render_feeds_list(&mut body, &sorted, &return_url, &session.csrf_token);
     }
     body.push_str("</section>\n");
     render_feeds_rail(&mut body, &stats, &session.csrf_token);
@@ -154,42 +187,72 @@ pub(in crate::web) async fn feeds_get(
         title: "Feeds",
         active: NavSection::Feeds,
         csrf_token: &session.csrf_token,
-        flash: &flash,
+        flash: &query.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
+        search_query: None,
         body_html: &body,
     })
     .into_response())
 }
 
-fn render_feeds_toolbar(out: &mut String, stats: &FeedStats) {
+fn render_feeds_mobile_subscribe(out: &mut String, csrf: &str) {
+    let _ = write!(
+        out,
+        "<details class=\"editorial-panel feeds-mobile-subscribe\">\n\
+           <summary>+ Subscribe to Feed</summary>\n\
+           <form method=\"post\" action=\"/web/feeds/create\" class=\"rail-form mt-sm\">\n\
+             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+             <div class=\"field\">\n\
+               <label for=\"m-feed-url\">Site, Feed URL, or YouTube Channel</label>\n\
+               <input id=\"m-feed-url\" name=\"url\" type=\"text\" required placeholder=\"https://danluu.com or feed.xml\">\n\
+             </div>\n\
+             <div class=\"field\">\n\
+               <label for=\"m-feed-title\">Custom Title (optional)</label>\n\
+               <input id=\"m-feed-title\" name=\"title\" type=\"text\" placeholder=\"Auto-detected from feed\">\n\
+             </div>\n\
+             <button type=\"submit\" class=\"btn btn-primary btn-small\">Subscribe</button>\n\
+           </form>\n\
+         </details>\n",
+        csrf = esc(csrf),
+    );
+}
+
+fn render_feeds_toolbar(
+    out: &mut String,
+    stats: &FeedStats,
+    initial_status: &str,
+    initial_kind: &str,
+    initial_q: &str,
+) {
+    let pill = |status: &str, label: &str, count: usize, extra_cls: &str| -> String {
+        let active = initial_status == status;
+        let cls = if active {
+            format!("pill {extra_cls} is-active js-feeds-pill")
+        } else {
+            format!("pill {extra_cls} js-feeds-pill")
+        };
+        let pressed = if active { "true" } else { "false" };
+        format!(
+            "<button type=\"button\" class=\"{}\" data-status=\"{status}\" aria-pressed=\"{pressed}\">{label} ({count})</button>",
+            cls.trim(),
+        )
+    };
     let _ = writeln!(
         out,
-        "<div class=\"feeds-toolbar\">\n\
+        "<div class=\"feeds-toolbar\" data-initial-status=\"{initial_status}\">\n\
            <div class=\"feeds-toolbar-pills\" role=\"group\" aria-label=\"Filter by status\">\n\
-             <button type=\"button\" class=\"pill is-active js-feeds-pill\" data-status=\"all\" aria-pressed=\"true\">All ({})</button>",
-        stats.total,
+             {}",
+        pill("all", "All", stats.total, ""),
     );
     if stats.paused > 0 {
-        let _ = writeln!(
-            out,
-            "<button type=\"button\" class=\"pill js-feeds-pill\" data-status=\"active\" aria-pressed=\"false\">Active ({})</button>",
-            stats.active,
-        );
+        let _ = writeln!(out, "{}", pill("active", "Active", stats.active, ""));
     }
     if stats.failing > 0 {
-        let _ = writeln!(
-            out,
-            "<button type=\"button\" class=\"pill pill-warn js-feeds-pill\" data-status=\"errors\" aria-pressed=\"false\">Errors ({})</button>",
-            stats.failing,
-        );
+        let _ = writeln!(out, "{}", pill("errors", "Errors", stats.failing, "pill-warn"));
     }
     if stats.paused > 0 {
-        let _ = writeln!(
-            out,
-            "<button type=\"button\" class=\"pill js-feeds-pill\" data-status=\"paused\" aria-pressed=\"false\">Paused ({})</button>",
-            stats.paused,
-        );
+        let _ = writeln!(out, "{}", pill("paused", "Paused", stats.paused, ""));
     }
     out.push_str(
         "</div>\n\
@@ -204,35 +267,45 @@ fn render_feeds_toolbar(out: &mut String, stats: &FeedStats) {
         ("arxiv", "arXiv", stats.arxiv),
     ] {
         if count > 0 {
-            let _ = write!(out, "<option value=\"{val}\">{label} ({count})</option>");
+            let sel = if initial_kind == val { " selected" } else { "" };
+            let _ = write!(out, "<option value=\"{val}\"{sel}>{label} ({count})</option>");
         }
     }
-    out.push_str(
+    let _ = write!(
+        out,
         "</select>\n\
-           <input type=\"search\" id=\"roche-feeds-search\" class=\"feeds-filter-input\" placeholder=\"Filter feeds…\" aria-label=\"Filter subscribed feeds\">\n\
+           <input type=\"search\" id=\"roche-feeds-search\" class=\"feeds-filter-input\" value=\"{}\" placeholder=\"Filter feeds…\" aria-label=\"Filter subscribed feeds\">\n\
          </div>\n\
        </div>\n",
+        esc(initial_q),
     );
 }
 
-fn render_feeds_list(out: &mut String, feeds: &[&Feed], csrf: &str) {
+fn render_feeds_list(out: &mut String, feeds: &[&Feed], return_url: &str, csrf: &str) {
     out.push_str("<ul class=\"inbox-list\" id=\"roche-feeds-list\">\n");
     for f in feeds {
-        render_feed_row(out, f, csrf);
+        render_feed_row(out, f, return_url, csrf);
     }
-    out.push_str("</ul>\n");
+    out.push_str(
+        "</ul>\n\
+         <div id=\"roche-feeds-empty\" class=\"filter-empty-state\" hidden>\n\
+           <p class=\"empty\">No subscribed feeds match this filter.</p>\n\
+           <button type=\"button\" class=\"btn btn-small btn-ghost js-feeds-clear\">Clear filters</button>\n\
+         </div>\n",
+    );
 }
 
-fn render_feed_row(out: &mut String, f: &Feed, csrf: &str) {
+fn render_feed_row(out: &mut String, f: &Feed, return_url: &str, csrf: &str) {
     let title = display_feed_title(f);
     let host = display_feed_host(f);
     let kind_key = feed_kind_key(f.feed_type);
     let paused = !f.is_active;
-    let active_err = if paused {
+    let full_err = if paused {
         None
     } else {
-        f.last_error.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(clean_feed_error)
+        f.last_error.as_deref().map(str::trim).filter(|s| !s.is_empty())
     };
+    let active_err = full_err.map(clean_feed_error);
     let row_cls = if paused { "inbox-row feed-row is-paused" } else { "inbox-row feed-row" };
     let search_blob = format!("{title} {host} {kind_key}");
 
@@ -246,10 +319,11 @@ fn render_feed_row(out: &mut String, f: &Feed, csrf: &str) {
     render_feed_favicon_with_class(out, Some(f.url.as_str()), title, "feed-favicon-lg");
 
     let id_enc = urlencode(&f.id);
+    let feed_inbox_status = if f.unread_count > 0 { "unread" } else { "all" };
     let _ = write!(
         out,
         "<div class=\"inbox-main\">\n\
-           <div class=\"inbox-title\"><a href=\"/inbox?status=all&amp;feed={id}\">{title}</a></div>\n\
+           <div class=\"inbox-title\"><a href=\"/inbox?status={feed_inbox_status}&amp;feed={id}\">{title}</a></div>\n\
            <div class=\"item-byline\">",
         id = esc(&id_enc),
         title = esc(title),
@@ -283,18 +357,87 @@ fn render_feed_row(out: &mut String, f: &Feed, csrf: &str) {
     if let Some(err_txt) = active_err {
         let _ = writeln!(out, "<p class=\"feed-row-error\">&#9888; {}</p>", esc(&err_txt));
     }
-    out.push_str("</div>\n<div class=\"inbox-controls inbox-controls-subtle\">\n");
+    render_feed_row_details(out, f, title, &id_enc, full_err, return_url, csrf);
+    out.push_str("</div>\n");
+    render_feed_row_controls(out, f, title, &id_enc, return_url, csrf);
+    out.push_str("</li>\n");
+}
 
+fn render_feed_row_details(
+    out: &mut String,
+    f: &Feed,
+    title: &str,
+    id_enc: &str,
+    full_err: Option<&str>,
+    return_url: &str,
+    csrf: &str,
+) {
+    let _ = write!(
+        out,
+        "<details class=\"feed-row-details\">\n\
+           <summary>Details &amp; Edit</summary>\n\
+           <div class=\"feed-row-details-body\">\n\
+             <div class=\"feed-url-bar\">\n\
+               <input type=\"text\" readonly value=\"{url}\" class=\"feed-url-code\" aria-label=\"Feed URL for {title}\">\n\
+               <button type=\"button\" class=\"btn btn-small btn-ghost js-copy-text\" data-copy-text=\"{url}\">Copy URL</button>\n\
+             </div>",
+        url = esc(f.url.as_str()),
+        title = esc(title),
+    );
+    if let Some(raw_err) = full_err {
+        let _ = writeln!(
+            out,
+            "<p class=\"feed-error-full\"><strong>Last error:</strong> {}</p>",
+            esc(raw_err),
+        );
+    }
+    let _ = write!(
+        out,
+        "<form method=\"post\" action=\"/web/feeds/{id_enc}/edit\" class=\"feed-edit-form js-feeds-preserve-form\">\n\
+           <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+           <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
+           <div class=\"feed-edit-grid\">\n\
+             <div class=\"field\">\n\
+               <label for=\"fe-title-{id_enc}\">Title</label>\n\
+               <input id=\"fe-title-{id_enc}\" name=\"title\" type=\"text\" value=\"{title}\" required>\n\
+             </div>\n\
+             <div class=\"field\">\n\
+               <label for=\"fe-interval-{id_enc}\">Poll every (min)</label>\n\
+               <input id=\"fe-interval-{id_enc}\" name=\"poll_interval\" type=\"number\" min=\"5\" max=\"10080\" value=\"{interval}\">\n\
+             </div>\n\
+             <button type=\"submit\" class=\"btn btn-primary btn-small\">Save</button>\n\
+           </div>\n\
+         </form>\n\
+         </div>\n\
+         </details>\n",
+        id_enc = esc(id_enc),
+        csrf = esc(csrf),
+        ret = esc(return_url),
+        title = esc(title),
+        interval = f.poll_interval,
+    );
+}
+
+fn render_feed_row_controls(
+    out: &mut String,
+    f: &Feed,
+    title: &str,
+    id_enc: &str,
+    return_url: &str,
+    csrf: &str,
+) {
+    out.push_str("<div class=\"inbox-controls inbox-controls-subtle\">\n");
     if f.is_active {
         let refresh_btn = format!(
             "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Refresh {t}\" aria-label=\"Refresh {t}\">{REFRESH_SVG}</button>",
             t = esc(title),
         );
-        render_inline_csrf_form(
+        render_inline_csrf_form_with_class(
             out,
             &format!("/web/feeds/{id_enc}/refresh"),
             csrf,
-            &[],
+            Some("js-feeds-preserve-form"),
+            &[("return_to", return_url)],
             None,
             &refresh_btn,
         );
@@ -304,24 +447,26 @@ fn render_feed_row(out: &mut String, f: &Feed, csrf: &str) {
     let toggle_btn = format!(
         "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-quiet\">{toggle_label}</button>"
     );
-    render_inline_csrf_form(
+    render_inline_csrf_form_with_class(
         out,
         &format!("/web/feeds/{id_enc}/toggle-active"),
         csrf,
-        &[("active", next_active)],
+        Some("js-feeds-preserve-form"),
+        &[("active", next_active), ("return_to", return_url)],
         None,
         &toggle_btn,
     );
     out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>");
-    render_inline_csrf_form(
+    render_inline_csrf_form_with_class(
         out,
         &format!("/web/feeds/{id_enc}/delete"),
         csrf,
-        &[],
+        Some("js-feeds-preserve-form"),
+        &[("return_to", return_url)],
         Some("Delete this feed subscription? Your diary and rankings will be preserved."),
         "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-danger-quiet\">Delete</button>",
     );
-    out.push_str("\n</div>\n</li>\n");
+    out.push_str("\n</div>\n");
 }
 
 fn render_feeds_rail(out: &mut String, stats: &FeedStats, csrf: &str) {
@@ -356,9 +501,9 @@ fn render_feeds_rail(out: &mut String, stats: &FeedStats, csrf: &str) {
            <section class=\"rail-block rail-card\">\n\
              <div class=\"section-head\"><h2>Feed Health</h2></div>\n\
              <div class=\"rail-stats\">\n\
-               <div><span class=\"rail-stat-num\">{active}</span><span class=\"rail-stat-label\">Active</span></div>\n\
-               <div><span class=\"rail-stat-num\">{paused}</span><span class=\"rail-stat-label\">Paused</span></div>\n\
-               <div><span class=\"rail-stat-num{warn_cls}\">{failing}</span><span class=\"rail-stat-label\">Failing</span></div>\n\
+               <button type=\"button\" class=\"rail-stat-btn js-feeds-stat-btn\" data-status=\"active\"><span class=\"rail-stat-num\">{active}</span><span class=\"rail-stat-label\">Active</span></button>\n\
+               <button type=\"button\" class=\"rail-stat-btn js-feeds-stat-btn\" data-status=\"paused\"><span class=\"rail-stat-num\">{paused}</span><span class=\"rail-stat-label\">Paused</span></button>\n\
+               <button type=\"button\" class=\"rail-stat-btn js-feeds-stat-btn\" data-status=\"errors\"><span class=\"rail-stat-num{warn_cls}\">{failing}</span><span class=\"rail-stat-label\">Failing</span></button>\n\
              </div>\n\
            </section>\n\
            <section class=\"rail-block rail-card\">\n\
@@ -457,13 +602,42 @@ pub(in crate::web) async fn post_feed_refresh(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
+    Form(form): Form<ItemReturnForm>,
 ) -> Result<Response, WebError> {
     let _ = service.feeds().get(&id).await.web_err(&session)?;
     let service_bg = Arc::clone(&service);
     service.spawn_background(async move {
         let _ = service_bg.feeds().refresh(&id).await;
     });
-    Ok(redirect_with_flash("/feeds", "notice", "Refreshing feed in background…"))
+    let dest = safe_local_redirect(form.return_to.as_deref(), "/feeds");
+    Ok(redirect_with_flash(&dest, "notice", "Refreshing feed in background…"))
+}
+
+pub(in crate::web) async fn post_feed_edit(
+    State(service): State<Arc<RocheService>>,
+    Path(id): Path<String>,
+    Form(form): Form<EditFeedForm>,
+) -> Response {
+    let dest = safe_local_redirect(form.return_to.as_deref(), "/feeds");
+    let clean_title = form.title.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let parsed_interval =
+        match form.poll_interval.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => match raw.parse::<i64>() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    return redirect_with_flash(
+                        &dest,
+                        "err",
+                        "Poll interval must be a number of minutes",
+                    );
+                }
+            },
+            None => None,
+        };
+    if let Err(err) = service.feeds().update(&id, clean_title, parsed_interval, None).await {
+        return redirect_with_flash(&dest, "err", &safe_web_error_message(&err));
+    }
+    redirect_with_flash(&dest, "notice", "Updated feed settings")
 }
 
 pub(in crate::web) async fn post_feed_refresh_all(
@@ -506,17 +680,20 @@ pub(in crate::web) async fn post_feed_toggle_active(
     } else {
         let _ = service.feeds().archive(&id).await.web_err(&session)?;
     }
-    Ok(redirect_see_other("/feeds"))
+    let dest = safe_local_redirect(form.return_to.as_deref(), "/feeds");
+    Ok(redirect_see_other(&dest))
 }
 
 pub(in crate::web) async fn post_feed_delete(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
+    Form(form): Form<ItemReturnForm>,
 ) -> Result<Response, WebError> {
     service.feeds().delete(&id).await.web_err(&session)?;
+    let dest = safe_local_redirect(form.return_to.as_deref(), "/feeds");
     Ok(redirect_with_flash(
-        "/feeds",
+        &dest,
         "notice",
         "Removed feed subscription (diary & rankings preserved)",
     ))

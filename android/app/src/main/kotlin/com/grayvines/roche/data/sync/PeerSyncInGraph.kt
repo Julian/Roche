@@ -7,7 +7,9 @@ import com.grayvines.roche.core.HlcTimestamp
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_GENERATOR
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_COMPARISON
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_CONSUMPTION_LOG
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_ENTRY
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_ITEM
 import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
@@ -149,6 +151,7 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
     )
     mergeIncomingComparisonsInDao(
         dao = dao,
+        cache = cache,
         incoming = response.comparisons,
         redirects = redirects,
         serverNode = serverNode,
@@ -531,6 +534,7 @@ private suspend fun prunePromotedWantMemberships(
 @Suppress("LongParameterList")
 private suspend fun mergeIncomingComparisonsInDao(
     dao: RocheDao,
+    cache: GraphEdgesBatchCache,
     incoming: List<SyncComparisonDto>,
     redirects: Map<String, String>,
     serverNode: String,
@@ -538,33 +542,83 @@ private suspend fun mergeIncomingComparisonsInDao(
     nowMs: Long,
 ) {
     if (incoming.isEmpty()) return
-    val toInsert = ArrayList<ComparisonEntity>()
-    for (comp in incoming) {
-        val canonicalOrdering = canonicalizeIncomingOrdering(comp.ordering, redirects)
-        if (EpRankingEngine.validateOrdering(canonicalOrdering).isFailure) continue
-        val rawScope = comp.scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }
-        val scope = rawScope?.let { followMergedInMap(it, redirects) }?.takeIf { it.isNotEmpty() }
-        val tsMillis = parseIsoInstant(comp.ts)?.toEpochMilli() ?: 0L
-        val wasRewritten = canonicalOrdering != comp.ordering || scope != rawScope
-        val id =
-            comp.id.trim().takeIf { it.isNotEmpty() && !wasRewritten }
-                ?: deterministicComparisonId(scope, tsMillis, canonicalOrdering)
-        val compHlc = resolveOrSynthesizeHlc(comp.hlc, comp.ts, nowIso, serverNode, nowMs)
-        toInsert.add(
-            ComparisonEntity(
-                id = id,
-                ts = comp.ts.ifBlank { nowIso },
-                scopeCollectionId = scope,
-                orderingJson = canonicalOrderingJson(canonicalOrdering),
-                createdAt = comp.createdAt ?: nowIso,
-                hlc = compHlc,
-                isLocalDirty = false,
-            )
+    val compTombstones = cache.tombstonesFor(TOMBSTONE_ENTITY_COMPARISON)
+    val toInsert = incoming.mapNotNull { comp ->
+        resolveIncomingComparisonDto(
+            dao = dao,
+            cache = cache,
+            compTombstones = compTombstones,
+            comp = comp,
+            redirects = redirects,
+            serverNode = serverNode,
+            nowIso = nowIso,
+            nowMs = nowMs,
         )
     }
     if (toInsert.isNotEmpty()) {
         dao.insertComparisonsIgnore(toInsert)
     }
+}
+
+@Suppress("LongParameterList")
+private suspend fun resolveIncomingComparisonDto(
+    dao: RocheDao,
+    cache: GraphEdgesBatchCache,
+    compTombstones: Map<String, TombstoneEntity>,
+    comp: SyncComparisonDto,
+    redirects: Map<String, String>,
+    serverNode: String,
+    nowIso: String,
+    nowMs: Long,
+): ComparisonEntity? {
+    val canonicalOrdering = canonicalizeIncomingOrdering(comp.ordering, redirects)
+    if (EpRankingEngine.validateOrdering(canonicalOrdering).isFailure) return null
+    val rawScope = comp.scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }
+    val scope = rawScope?.let { followMergedInMap(it, redirects) }?.takeIf { it.isNotEmpty() }
+    val tsMillis = parseIsoInstant(comp.ts)?.toEpochMilli() ?: 0L
+    val wasRewritten = canonicalOrdering != comp.ordering || scope != rawScope
+    val rawId = comp.id.trim()
+    val id =
+        rawId.takeIf { it.isNotEmpty() && !wasRewritten }
+            ?: deterministicComparisonId(scope, tsMillis, canonicalOrdering)
+    val compHlc = resolveOrSynthesizeHlc(comp.hlc, comp.ts, nowIso, serverNode, nowMs)
+    if (isComparisonTombstoned(dao, cache, compTombstones, id, rawId, wasRewritten, compHlc)) {
+        return null
+    }
+    return ComparisonEntity(
+        id = id,
+        ts = comp.ts.ifBlank { nowIso },
+        scopeCollectionId = scope,
+        orderingJson = canonicalOrderingJson(canonicalOrdering),
+        createdAt = comp.createdAt ?: nowIso,
+        hlc = compHlc,
+        isLocalDirty = false,
+    )
+}
+
+@Suppress("LongParameterList")
+private suspend fun isComparisonTombstoned(
+    dao: RocheDao,
+    cache: GraphEdgesBatchCache,
+    compTombstones: Map<String, TombstoneEntity>,
+    canonicalId: String,
+    rawId: String,
+    wasRewritten: Boolean,
+    compHlc: String,
+): Boolean {
+    val idsToCheck =
+        if (wasRewritten && rawId.isNotEmpty() && rawId != canonicalId) {
+            listOf(canonicalId, rawId)
+        } else {
+            listOf(canonicalId)
+        }
+    for (checkId in idsToCheck) {
+        val tomb = compTombstones[checkId] ?: continue
+        if (compareHlc(tomb.hlc, compHlc) >= 0) return true
+        dao.deleteTombstone(TOMBSTONE_ENTITY_COMPARISON, checkId)
+        cache.removeTombstone(TOMBSTONE_ENTITY_COMPARISON, checkId)
+    }
+    return false
 }
 
 private fun canonicalizeIncomingOrdering(
@@ -611,6 +665,7 @@ private suspend fun mergeIncomingGeneratorsInDao(
         val merged =
             reconcileSingleGeneratorInDao(
                 dao = dao,
+                cache = cache,
                 catalogStore = catalogStore,
                 colId = colId,
                 localGen = localByColId[colId],
@@ -675,6 +730,7 @@ private fun indexEligibleRemoteGenerators(
 @Suppress("LongParameterList")
 private suspend fun reconcileSingleGeneratorInDao(
     dao: RocheDao,
+    cache: GraphEdgesBatchCache,
     catalogStore: CatalogStore?,
     colId: String,
     localGen: CollectionGeneratorEntity?,
@@ -702,7 +758,10 @@ private suspend fun reconcileSingleGeneratorInDao(
         base = base.copy(currentEntryId = activeId)
     }
     if (allowLocalAutoAdvance) {
-        if (!activeId.isNullOrBlank() && !isDrawnEntryStillEligible(dao, colId, activeId)) {
+        if (
+            !activeId.isNullOrBlank() &&
+                isDrawConfirmedIneligible(dao, cache, colId, activeId, base.hlc)
+        ) {
             val hlc = nextLocalHlc(dao, localPeerId)
             base =
                 base.copy(
@@ -731,15 +790,31 @@ private suspend fun reconcileSingleGeneratorInDao(
     return base
 }
 
-private suspend fun isDrawnEntryStillEligible(
+/**
+ * Returns `true` only when positive local state confirms that [entryId] can no longer be the active
+ * draw for [colId] (terminal consumption log, merge redirect, or explicit entry/membership
+ * tombstone). A missing local `entries` or `collection_entries` row without a matching tombstone
+ * indicates a local cache gap rather than a deletion and must never trigger a dirty redraw that
+ * overwrites a peer's authoritative draw.
+ */
+private suspend fun isDrawConfirmedIneligible(
     dao: RocheDao,
+    cache: GraphEdgesBatchCache,
     colId: String,
     entryId: String,
+    baseHlc: String,
 ): Boolean {
-    val entry = dao.getEntryById(entryId) ?: return false
-    val isLive = entry.mergedIntoId.isNullOrBlank()
+    if (dao.countTerminalLogsForEntry(entryId) > 0) return true
+    val entry = dao.getEntryById(entryId)
+    if (entry != null && !entry.mergedIntoId.isNullOrBlank()) return true
+    val entryTomb = cache.tombstonesFor(TOMBSTONE_ENTITY_ENTRY)[entryId]
+    if (entry == null && entryTomb != null && compareHlc(entryTomb.hlc, baseHlc) >= 0) {
+        return true
+    }
+    val membershipKey = collectionEntryNaturalKey(colId, entryId)
+    val memTomb = cache.tombstonesFor(TOMBSTONE_ENTITY_COLLECTION_ENTRY)[membershipKey]
     val inPool = dao.getCollectionEntry(colId, entryId) != null
-    return isLive && inPool && dao.countTerminalLogsForEntry(entryId) == 0
+    return !inPool && memTomb != null && compareHlc(memTomb.hlc, baseHlc) >= 0
 }
 
 @Suppress("LongParameterList")

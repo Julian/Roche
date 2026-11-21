@@ -16,9 +16,10 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            ARCHIVE_BOX_SVG, FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _,
-            content_type_badge_class, content_type_label, esc, parse_csv_list, redirect_see_other,
-            redirect_with_flash, render_feed_favicon, render_inline_csrf_form, render_page,
+            ARCHIVE_BOX_SVG, FlashQuery, NavSection, PageShell, RESTORE_BOX_SVG, WebError,
+            WithWebCsrf as _, content_type_badge_class, content_type_label, esc,
+            format_audio_duration, parse_csv_list, redirect_see_other, redirect_with_flash,
+            render_feed_favicon, render_inline_csrf_form, render_page, render_triage_form,
             safe_local_redirect, urlencode,
         },
         links::sanitize_non_local_href,
@@ -120,6 +121,7 @@ pub(in crate::web) async fn inbox_get(
         flash: &q.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
+        search_query: None,
         body_html: &body,
     })
     .into_response())
@@ -143,7 +145,7 @@ fn render_inbox_body(
     body.push_str("<div class=\"inbox-layout\">\n");
     render_inbox_sidebar(&mut body, nav_ctx, feeds, total_unread);
     body.push_str("<section class=\"inbox-stream\" aria-label=\"Feed stream\">\n");
-    render_inbox_mobile_pills(&mut body, nav_ctx);
+    render_inbox_mobile_pills(&mut body, nav_ctx, feeds);
     render_inbox_toolbar(
         &mut body,
         csrf,
@@ -350,10 +352,14 @@ fn render_inbox_sidebar(
             esc(label),
         );
     }
-    out.push_str("</ul>\n</div>\n</div>\n");
+    out.push_str(
+        "</ul>\n\
+         <p class=\"sidebar-empty\" id=\"roche-sidebar-feeds-empty\" hidden>No matching feeds.</p>\n\
+         </div>\n</div>\n",
+    );
 }
 
-fn render_inbox_mobile_pills(out: &mut String, p: &InboxNavParams<'_>) {
+fn render_inbox_mobile_pills(out: &mut String, p: &InboxNavParams<'_>, feeds: &[Feed]) {
     out.push_str("<div class=\"inbox-mobile-filters pill-bar\">\n");
     for (slug, label) in [("unread", "Unread"), ("all", "All"), ("archived", "Archived")] {
         let attrs = if p.status == slug {
@@ -380,6 +386,40 @@ fn render_inbox_mobile_pills(out: &mut String, p: &InboxNavParams<'_>) {
         let next_kind = if is_cur { None } else { Some(k_slug) };
         let href = build_inbox_href(&InboxNavParams { kind: next_kind, page: 1, ..*p });
         let _ = writeln!(out, "<a {attrs} href=\"{}\">{label}</a>", esc(&href));
+    }
+    if !feeds.is_empty() {
+        let all_feeds_href = build_inbox_href(&InboxNavParams { feed: None, page: 1, ..*p });
+        let _ = writeln!(
+            out,
+            "<select class=\"inbox-mobile-feed-select js-mobile-feed-select\" aria-label=\"Switch feed\">\n\
+               <option value=\"{}\"{}>All Feeds</option>",
+            esc(&all_feeds_href),
+            if p.feed.is_none() { " selected" } else { "" },
+        );
+        for feed in feeds {
+            let label =
+                feed.title.as_deref().filter(|s| !s.is_empty()).unwrap_or(feed.url.as_str());
+            let next_status = if feed.unread_count > 0 { "unread" } else { "all" };
+            let feed_href = build_inbox_href(&InboxNavParams {
+                status: next_status,
+                feed: Some(feed.id.as_str()),
+                page: 1,
+                ..*p
+            });
+            let sel = if p.feed == Some(feed.id.as_str()) { " selected" } else { "" };
+            let count_part = if feed.unread_count > 0 {
+                format!(" ({})", feed.unread_count)
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                out,
+                "<option value=\"{}\"{sel}>{}{count_part}</option>",
+                esc(&feed_href),
+                esc(label),
+            );
+        }
+        out.push_str("</select>\n");
     }
     out.push_str("</div>\n");
 }
@@ -445,7 +485,7 @@ fn render_inbox_toolbar(
     }
     out.push_str("</div>\n<div class=\"inbox-toolbar-actions\">\n");
     render_inbox_inline_search(out, p);
-    render_inbox_batch_controls(out, csrf, p, items, return_to);
+    render_inbox_batch_controls(out, csrf, p, items, selected_feed_unread, return_to);
     out.push_str("</div>\n</div>\n");
 }
 
@@ -467,10 +507,21 @@ fn render_inbox_inline_search(out: &mut String, p: &InboxNavParams<'_>) {
     }
     let _ = write!(
         out,
-        "<input type=\"search\" name=\"q\" aria-label=\"Search inbox\" value=\"{}\" placeholder=\"Filter stream…\">\n\
-         </form>\n",
+        "<input type=\"search\" id=\"roche-inbox-search\" name=\"q\" aria-label=\"Filter stream\" value=\"{}\" placeholder=\"Filter stream…\">\n\
+         <button type=\"submit\" class=\"btn btn-small btn-ghost\">Filter</button>",
         esc(p.q.unwrap_or("")),
     );
+    if let Some(cur_q) = p.q {
+        let clear_href = build_inbox_href(&InboxNavParams { q: None, page: 1, ..*p });
+        let _ = write!(
+            out,
+            "<a class=\"btn btn-small btn-ghost\" href=\"{}\" aria-label=\"Clear stream filter\" title=\"Clear stream filter\">&times;</a>\
+             <a class=\"btn btn-small btn-ghost btn-quiet\" href=\"/search?q={}\">Search all &rarr;</a>",
+            esc(&clear_href),
+            esc(&urlencode(cur_q)),
+        );
+    }
+    out.push_str("</form>\n");
 }
 
 fn render_inbox_active_filters(
@@ -537,6 +588,7 @@ fn render_inbox_batch_controls(
     csrf: &str,
     p: &InboxNavParams<'_>,
     items: &[Item],
+    selected_feed_unread: Option<i64>,
     return_to: &str,
 ) {
     let has_narrowing = p.kind.is_some() || p.tag.is_some() || p.q.is_some();
@@ -556,17 +608,25 @@ fn render_inbox_batch_controls(
             "/web/items/archive-batch",
             csrf,
             &[("ids", &joined), ("return_to", return_to)],
-            None,
+            Some(&format!("Archive {} shown unread item(s)?", unread_ids.len())),
             &btn,
         );
     } else if let Some(fid) = p.feed {
+        let count = selected_feed_unread
+            .and_then(|c| usize::try_from(c).ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(unread_ids.len());
+        let confirm = format!("Archive all {count} unread item(s) in this feed?");
+        let btn = format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Feed Unread ({count})</button>"
+        );
         render_inline_csrf_form(
             out,
             "/web/items/archive-batch",
             csrf,
             &[("feed_id", fid), ("return_to", return_to)],
-            None,
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Feed Unread</button>",
+            Some(&confirm),
+            &btn,
         );
     } else {
         render_inline_csrf_form(
@@ -676,20 +736,28 @@ fn render_single_inbox_row(
     return_to: &str,
     tag_id_by_lower_name: &HashMap<String, String>,
 ) {
-    let row_cls =
-        if item.status == ItemStatus::Archived { "inbox-row is-archived" } else { "inbox-row" };
-    let id_enc = urlencode(&item.id);
-    let (star_glyph, star_pressed, star_cls) = if item.is_favorite {
-        ("&#9733;", "true", "btn btn-small btn-ghost inbox-star-btn is-starred")
+    let row_cls = if item.status == ItemStatus::Archived {
+        "inbox-row js-triage-row js-kbd-row is-archived"
     } else {
-        ("&#9734;", "false", "btn btn-small btn-ghost inbox-star-btn")
+        "inbox-row js-triage-row js-kbd-row"
+    };
+    let id_enc = urlencode(&item.id);
+    let reader_href = format!("/reader/{id_enc}?return_to={}", urlencode(return_to));
+    let (star_glyph, star_pressed, star_cls, star_action_word) = if item.is_favorite {
+        ("&#9733;", "true", "btn btn-small btn-ghost inbox-star-btn is-starred", "Unstar")
+    } else {
+        ("&#9734;", "false", "btn btn-small btn-ghost inbox-star-btn", "Star")
     };
     let star_btn = format!(
-        "<button type=\"submit\" class=\"{star_cls}\" title=\"Toggle Star\" aria-label=\"Star {}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
-        esc(&item.title),
+        "<button type=\"submit\" class=\"{star_cls}\" title=\"Toggle Star\" data-title=\"{title}\" aria-label=\"{star_action_word} {title}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
+        title = esc(&item.title),
     );
 
-    let _ = write!(out, "<li class=\"{row_cls}\">\n<div class=\"inbox-star-col\">");
+    let _ = write!(
+        out,
+        "<li class=\"{row_cls}\" data-item-id=\"{}\">\n<div class=\"inbox-star-col\">",
+        esc(&item.id)
+    );
     render_inline_csrf_form(
         out,
         &format!("/web/items/{id_enc}/star"),
@@ -703,9 +771,10 @@ fn render_single_inbox_row(
     if let Some(thumb) = item.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
         let _ = writeln!(
             out,
-            "<a class=\"inbox-thumb-link\" href=\"/reader/{id_enc}\" tabindex=\"-1\" aria-hidden=\"true\">\
+            "<a class=\"inbox-thumb-link\" href=\"{}\" tabindex=\"-1\" aria-hidden=\"true\">\
                <img class=\"inbox-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">\
              </a>",
+            esc(&reader_href),
             esc(thumb),
         );
     }
@@ -713,10 +782,28 @@ fn render_single_inbox_row(
     let _ = write!(
         out,
         "<div class=\"inbox-main\">\n\
-           <div class=\"inbox-title\"><a href=\"/reader/{id_enc}\">{}</a></div>\
-           <div class=\"item-byline\">",
+           <div class=\"inbox-title\"><a class=\"js-kbd-open\" href=\"{}\">{}</a></div>",
+        esc(&reader_href),
         esc(&item.title),
     );
+    render_inbox_row_byline(out, item, tag_id_by_lower_name);
+    if let Some(sum) = item.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let excerpt = clean_plain_excerpt(sum);
+        if !excerpt.is_empty() {
+            let _ = writeln!(out, "<p class=\"item-excerpt-clamped\">{}</p>", esc(&excerpt));
+        }
+    }
+    out.push_str("</div>\n");
+    render_inbox_row_controls(out, item, &id_enc, csrf, return_to);
+    out.push_str("</li>\n");
+}
+
+fn render_inbox_row_byline(
+    out: &mut String,
+    item: &Item,
+    tag_id_by_lower_name: &HashMap<String, String>,
+) {
+    out.push_str("<div class=\"item-byline\">");
     if item.content_type != ContentType::Article {
         let _ = write!(
             out,
@@ -730,7 +817,7 @@ fn render_single_inbox_row(
         if let Some(fid) = item.feed_id.as_deref() {
             let _ = write!(
                 out,
-                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=all&amp;feed={}\">",
+                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=unread&amp;feed={}\">",
                 esc(&urlencode(fid)),
             );
             render_feed_favicon(out, icon_url, ft, true);
@@ -739,6 +826,26 @@ fn render_single_inbox_row(
             out.push_str("<span class=\"byline-item byline-feed\">");
             render_feed_favicon(out, icon_url, ft, true);
             let _ = write!(out, "<span>{}</span></span>", esc(ft));
+        }
+    }
+    if item.content_type == ContentType::Audio
+        && let Some(dur) = item.duration.filter(|&d| d > 0)
+    {
+        if item.read_progress >= 0.03 && item.read_progress < 0.98 {
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let rem = ((dur as f64) * (1.0 - item.read_progress.clamp(0.0, 1.0))).round() as i64;
+            let _ = write!(
+                out,
+                "<span class=\"byline-item\">{} &middot; {} left</span>",
+                esc(&format_audio_duration(dur)),
+                esc(&format_audio_duration(rem.max(1))),
+            );
+        } else {
+            let _ = write!(
+                out,
+                "<span class=\"byline-item\">{}</span>",
+                esc(&format_audio_duration(dur)),
+            );
         }
     }
     if let Some(dt) = item.published_at {
@@ -758,15 +865,6 @@ fn render_single_inbox_row(
         }
     }
     out.push_str("</div>\n");
-    if let Some(sum) = item.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let excerpt = clean_plain_excerpt(sum);
-        if !excerpt.is_empty() {
-            let _ = writeln!(out, "<p class=\"item-excerpt-clamped\">{}</p>", esc(&excerpt));
-        }
-    }
-    out.push_str("</div>\n");
-    render_inbox_row_controls(out, item, &id_enc, csrf, return_to);
-    out.push_str("</li>\n");
 }
 
 fn render_inbox_row_controls(
@@ -779,18 +877,37 @@ fn render_inbox_row_controls(
     out.push_str("<div class=\"inbox-controls inbox-controls-subtle\">\n");
     render_audio_play_button(out, item);
 
-    let queue_btn = format!(
-        "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-quiet\" title=\"Add to Queue\" aria-label=\"Add {} to Queue\">+ Queue</button>",
-        esc(&item.title),
-    );
-    render_inline_csrf_form(
-        out,
-        &format!("/web/entries/{id_enc}/list-add"),
-        csrf,
-        &[("list_slug_or_id", WANT_TO_READ_COLLECTION_ID), ("return_to", return_to)],
-        None,
-        &queue_btn,
-    );
+    if item.in_want_to_read {
+        let queue_btn = format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-quiet is-in-queue\" title=\"Remove from Queue\" aria-label=\"Remove {} from Queue\">&#10003; In Queue</button>",
+            esc(&item.title),
+        );
+        render_triage_form(
+            out,
+            &format!("/web/want/read/remove/{id_enc}"),
+            csrf,
+            &[("return_to", return_to)],
+            "unqueue",
+            &item.title,
+            &format!("/web/entries/{id_enc}/list-add"),
+            &queue_btn,
+        );
+    } else {
+        let queue_btn = format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-quiet\" title=\"Add to Queue\" aria-label=\"Add {} to Queue\">+ Queue</button>",
+            esc(&item.title),
+        );
+        render_triage_form(
+            out,
+            &format!("/web/entries/{id_enc}/list-add"),
+            csrf,
+            &[("list_slug_or_id", WANT_TO_READ_COLLECTION_ID), ("return_to", return_to)],
+            "queue",
+            &item.title,
+            &format!("/web/want/read/remove/{id_enc}"),
+            &queue_btn,
+        );
+    }
     out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>");
 
     if item.status == ItemStatus::Unread {
@@ -798,22 +915,30 @@ fn render_inbox_row_controls(
             "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Archive (mark read)\" aria-label=\"Archive {}\">{ARCHIVE_BOX_SVG}</button>",
             esc(&item.title),
         );
-        render_inline_csrf_form(
+        render_triage_form(
             out,
             &format!("/web/items/{id_enc}/archive"),
             csrf,
             &[("return_to", return_to)],
-            None,
+            "archive",
+            &item.title,
+            &format!("/web/items/{id_enc}/unarchive"),
             &arch_btn,
         );
     } else {
-        render_inline_csrf_form(
+        let restore_btn = format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\" title=\"Restore to Unread\" aria-label=\"Restore {}\">{RESTORE_BOX_SVG} Restore</button>",
+            esc(&item.title),
+        );
+        render_triage_form(
             out,
             &format!("/web/items/{id_enc}/unarchive"),
             csrf,
             &[("return_to", return_to)],
-            None,
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Restore</button>",
+            "unarchive",
+            &item.title,
+            &format!("/web/items/{id_enc}/archive"),
+            &restore_btn,
         );
     }
     out.push_str("\n</div>\n");
@@ -859,12 +984,12 @@ pub(in crate::web) async fn post_item_save(
     let saved =
         service.items().save(&parsed_url, form.title.as_deref(), &tags).await.web_err(&session)?;
     if let Some(ret) = form.return_to.as_deref().filter(|s| !s.trim().is_empty()) {
-        Ok(redirect_with_flash(ret, "notice", "Added to Want to Read"))
+        Ok(redirect_with_flash(ret, "notice", "Added to Queue"))
     } else {
         Ok(redirect_with_flash(
             &format!("/reader/{}", urlencode(&saved.item.id)),
             "notice",
-            "Added to Want to Read",
+            "Added to Queue",
         ))
     }
 }

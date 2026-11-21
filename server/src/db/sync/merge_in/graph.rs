@@ -674,6 +674,17 @@ impl SyncRepo<'_> {
                 ctx.now,
                 ctx.peer_id,
             );
+            if Self::is_comparison_tombstoned_in_tx(
+                tx,
+                &comp_id,
+                comp.id.trim(),
+                was_rewritten,
+                &comp_hlc,
+            )
+            .await?
+            {
+                continue;
+            }
 
             let safe_comp_ts = clamp_incoming_upper_timestamp(comp.ts, ctx.now);
             let safe_comp_created =
@@ -702,6 +713,35 @@ impl SyncRepo<'_> {
             }
         }
         Ok(())
+    }
+
+    async fn is_comparison_tombstoned_in_tx(
+        tx: &mut SqliteConnection,
+        canonical_id: &str,
+        raw_id: &str,
+        was_rewritten: bool,
+        comp_hlc: &str,
+    ) -> Result<bool> {
+        if Self::check_and_clear_tombstone_in_tx(
+            tx,
+            ActivityEntityType::Comparison,
+            canonical_id,
+            comp_hlc,
+        )
+        .await?
+        {
+            return Ok(true);
+        }
+        if was_rewritten && !raw_id.is_empty() && raw_id != canonical_id {
+            return Ok(Self::check_and_clear_tombstone_in_tx(
+                tx,
+                ActivityEntityType::Comparison,
+                raw_id,
+                comp_hlc,
+            )
+            .await?);
+        }
+        Ok(false)
     }
 
     pub(super) async fn merge_incoming_generators_in_tx(

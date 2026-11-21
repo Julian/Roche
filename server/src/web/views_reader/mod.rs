@@ -10,7 +10,7 @@ use super::html::{FlashQuery, de_opt_from_str, esc, urlencode};
 use crate::{db::Item, domain::ContentType};
 
 pub(super) use feeds::{
-    export_opml_get, feeds_get, post_feed_create, post_feed_delete, post_feed_opml,
+    export_opml_get, feeds_get, post_feed_create, post_feed_delete, post_feed_edit, post_feed_opml,
     post_feed_refresh, post_feed_refresh_all, post_feed_toggle_active, refresh_status_get,
 };
 pub(super) use inbox::{
@@ -21,6 +21,23 @@ pub(super) use reader::{
     item_audio_get, post_item_finish, post_item_progress, post_item_tag_add, post_item_tag_remove,
     post_item_unfinish, reader_get, web_media_get,
 };
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ReaderQuery {
+    #[serde(default)]
+    pub return_to: Option<String>,
+    #[serde(flatten)]
+    pub flash: FlashQuery,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct FeedsQuery {
+    pub status: Option<String>,
+    pub kind: Option<String>,
+    pub q: Option<String>,
+    #[serde(flatten)]
+    pub flash: FlashQuery,
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct InboxQuery {
@@ -101,6 +118,18 @@ pub(super) struct ImportOpmlForm {
 #[derive(Debug, Deserialize)]
 pub(super) struct FeedToggleForm {
     pub active: String,
+    #[serde(default)]
+    pub return_to: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct EditFeedForm {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub poll_interval: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 pub(super) fn render_audio_play_button(out: &mut String, item: &Item) {
@@ -115,7 +144,7 @@ pub(super) fn render_audio_play_button(out: &mut String, item: &Item) {
          data-item-id=\"{}\" data-title=\"{}\" data-feed=\"{}\" \
          data-src=\"/web/items/{}/audio\" data-progress=\"{:.4}\" data-duration=\"{dur}\" \
          aria-label=\"Play {}\" aria-pressed=\"false\">\
-         <span aria-hidden=\"true\">&#9654;</span> Play</button>",
+         <span class=\"js-play-glyph\" aria-hidden=\"true\">&#9654;</span> <span class=\"js-play-label\">Play</span></button>",
         esc(&item.id),
         esc(&item.title),
         esc(feed_label),

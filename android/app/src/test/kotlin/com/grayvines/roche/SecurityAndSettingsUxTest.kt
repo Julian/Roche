@@ -49,7 +49,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 
-class Wave1BSecurityAndUxTest {
+class SecurityAndSettingsUxTest {
 
     @Test
     fun `H1 blocks authority parser differentials and returns canonical reconstructed URL`() {

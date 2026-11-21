@@ -449,11 +449,6 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     await expect(page.locator('main#roche-main h2')).toContainText('Accessibility Audit List');
     await assertAccessible(page, `${createdListPath} (empty manual list)`);
 
-    const addSummary = page.locator('details.editorial-panel > summary', {
-      hasText: 'Add Work to List',
-    });
-    await expect(addSummary).toBeVisible();
-    await addSummary.click();
     const addTitleInput = page.locator('#add-title');
     await expect(addTitleInput).toBeVisible();
     await addTitleInput.fill('A Pattern Language');
@@ -467,16 +462,19 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     // 3. Interactive rank board: axe audit + keyboard focus preservation + tie toggle Label-in-Name
     await gotoAndAssertOk(page, baseUrl, '/rank/design-classics', '/rank/design-classics');
     await expect(page.locator('.js-rank-card').first()).toBeVisible();
+    await expect(page.locator('.js-rank-card').first().locator('.js-card-up')).toBeDisabled();
+    await expect(page.locator('.js-rank-card').last().locator('.js-card-down')).toBeDisabled();
     await assertAccessible(page, '/rank/design-classics (initial)');
 
-    // Focus card #2's Move Up button, activate it, and verify focus stays on the button (not lost to body!)
+    // Focus card #2's Move Up button, activate it, and verify focus stays inside the card (transfers cleanly when Move Up disables at top)
     const secondCardUpBtn = page.locator('.js-rank-card').nth(1).locator('.js-card-up');
     await secondCardUpBtn.focus();
     await secondCardUpBtn.click();
-    const activeIsStillButton = await page.evaluate(() =>
-      document.activeElement?.classList.contains('js-card-up') ?? false
-    );
-    expect(activeIsStillButton, 'Focus was lost after reordering rank card').toBe(true);
+    const activeIsStillMoveButton = await page.evaluate(() => {
+      const el = document.activeElement;
+      return Boolean(el && (el.classList.contains('js-card-up') || el.classList.contains('js-card-down')));
+    });
+    expect(activeIsStillMoveButton, 'Focus was lost after reordering rank card').toBe(true);
 
     // Toggle Tie on card #2 and re-run axe to verify Untie state passes Label-in-Name & ARIA checks
     const secondCardTieBtn = page.locator('.js-rank-card').nth(1).locator('.js-card-tie');
@@ -484,5 +482,25 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     await expect(secondCardTieBtn).toHaveAttribute('aria-pressed', 'true');
     await expect(secondCardTieBtn).toHaveText('Untie');
     await assertAccessible(page, '/rank/design-classics (after move & tie)');
+
+    // 4. Global search (/search), masthead + Log modal, unified Diary status labels
+    await gotoAndAssertOk(page, baseUrl, '/search?q=Design', '/search');
+    await expect(page.locator('#roche-global-search')).toHaveValue('Design');
+    await assertAccessible(page, '/search?q=Design');
+
+    await page.locator('#roche-quick-log-btn').click();
+    const qlDialog = page.locator('#roche-quick-log-dialog');
+    await expect(qlDialog).toBeVisible();
+    await assertAccessible(page, 'Quick Log modal (Media tab)');
+    await page.locator('#roche-ql-tab-url').click();
+    await expect(page.locator('#qlm-url')).toBeVisible();
+    await assertAccessible(page, 'Quick Log modal (Save URL tab)');
+    await qlDialog.locator('.js-modal-close').first().click();
+    await expect(qlDialog).not.toBeVisible();
+
+    await gotoAndAssertOk(page, baseUrl, '/diary', '/diary');
+    await expect(page.locator('.diary-toolbar-pills')).toContainText('Finished');
+    await expect(page.locator('.diary-toolbar-pills')).toContainText('Skipped');
+    await assertAccessible(page, '/diary (unified status labels)');
   });
 });

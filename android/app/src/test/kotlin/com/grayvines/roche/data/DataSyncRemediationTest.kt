@@ -9,6 +9,7 @@ import com.grayvines.roche.core.MAX_CLOCK_DRIFT_MS
 import com.grayvines.roche.core.MAX_HLC_COUNTER
 import com.grayvines.roche.core.MAX_HLC_WALL_MS
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_GENERATOR
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_COMPARISON
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.deterministicItemId
@@ -17,6 +18,7 @@ import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.SyncCollectionGeneratorDto
+import com.grayvines.roche.data.catalog.SyncComparisonDto
 import com.grayvines.roche.data.catalog.SyncConsumptionLogDto
 import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
 import com.grayvines.roche.data.feeds.sanitizeFeedHtml
@@ -515,6 +517,84 @@ class DataSyncRemediationTest {
     }
 
     @Test
+    fun `remote generator draw is preserved when drawn entry or membership is absent locally without tombstone`() =
+        runTest {
+            val dao = database.dao()
+            val catalog = CatalogStore(dao = dao, localPeerIdProvider = { "android-peer-1" })
+            catalog.ensureSystemSeeded()
+            val nowIso = "2026-11-21T10:00:07.479Z"
+            val initialHlc = HlcTimestamp.create(1_795_100_023_564L, 0, "android-peer-1").encode()
+            val serverGenHlc = HlcTimestamp.create(1_795_255_207_479L, 0, "server").encode()
+            val (listId, albumA, albumB) = seedAlbumsGeneratorFixture(catalog, nowIso, initialHlc)
+
+            dao.deleteCollectionEntry(listId, albumB)
+            reconcileRemoteGeneratorDraw(
+                dao = dao,
+                catalog = catalog,
+                listId = listId,
+                entryId = albumB,
+                drawnAt = nowIso,
+                syncTs = "2026-11-21T12:42:39.816Z",
+                hlc = serverGenHlc,
+            )
+            val afterMissingMembership = dao.getCollectionGenerator(listId)!!
+            assertEquals(albumB, afterMissingMembership.currentEntryId)
+            assertEquals(serverGenHlc, afterMissingMembership.hlc)
+            assertFalse(afterMissingMembership.isLocalDirty)
+
+            val serverGenHlc2 = HlcTimestamp.create(1_795_255_300_000L, 0, "server").encode()
+            val unknownRemoteAlbumId = "album-not-cached-locally"
+            reconcileRemoteGeneratorDraw(
+                dao = dao,
+                catalog = catalog,
+                listId = listId,
+                entryId = unknownRemoteAlbumId,
+                drawnAt = nowIso,
+                syncTs = "2026-11-21T12:45:00.000Z",
+                hlc = serverGenHlc2,
+            )
+            val afterMissingEntry = dao.getCollectionGenerator(listId)!!
+            assertEquals(unknownRemoteAlbumId, afterMissingEntry.currentEntryId)
+            assertEquals(serverGenHlc2, afterMissingEntry.hlc)
+            assertFalse(afterMissingEntry.isLocalDirty)
+            assertEquals(albumA, dao.getEntryById(albumA)?.id)
+        }
+
+    private suspend fun reconcileRemoteGeneratorDraw(
+        dao: com.grayvines.roche.data.local.RocheDao,
+        catalog: CatalogStore,
+        listId: String,
+        entryId: String,
+        drawnAt: String,
+        syncTs: String,
+        hlc: String,
+    ) {
+        reconcilePeerSyncResponse(
+            dao = dao,
+            response =
+                com.grayvines.roche.data.remote.PeerSyncResponseDto(
+                    serverPeerId = "server",
+                    serverHlc = hlc,
+                    syncTimestamp = syncTs,
+                    hasMore = false,
+                    collectionGenerators =
+                        listOf(
+                            SyncCollectionGeneratorDto(
+                                collectionId = listId,
+                                enabled = true,
+                                currentEntryId = entryId,
+                                drawnAt = drawnAt,
+                                updatedAt = drawnAt,
+                                hlc = hlc,
+                            )
+                        ),
+                ),
+            localPeerId = "android-peer-1",
+            catalogStore = catalog,
+        )
+    }
+
+    @Test
     internal fun `rolled back transaction calling nextLocalHlc does not permanently advance FLAG_LOCAL_HLC`() =
         runTest {
             val dao = database.dao()
@@ -539,6 +619,71 @@ class DataSyncRemediationTest {
             assertEquals(baseMs, parsedNext.wallMs)
             assertEquals(1, parsedNext.counter)
             assertEquals(nextAfterRollback, dao.getLocalSyncFlag(FLAG_LOCAL_HLC))
+        }
+
+    @Test
+    fun `incoming comparison tombstone deletes local comparison and blocks stale resurrection`() =
+        runTest {
+            val dao = database.dao()
+            val catalog = CatalogStore(dao)
+            val nowIso = "2026-11-20T12:00:00Z"
+            val olderHlc = HlcTimestamp.create(1_700_000_000_000L, 0, "server").encode()
+            val newerTombHlc = HlcTimestamp.create(1_800_000_000_000L, 0, "server").encode()
+            val aId =
+                catalog.upsertEntry(
+                    UpsertCatalogEntryInput(kind = EntryKind.MOVIE, title = "Film A")
+                )
+            val bId =
+                catalog.upsertEntry(
+                    UpsertCatalogEntryInput(kind = EntryKind.MOVIE, title = "Film B")
+                )
+            val compId = "comp-test-1"
+            dao.insertComparisonIgnore(
+                ComparisonEntity(
+                    id = compId,
+                    ts = nowIso,
+                    scopeCollectionId = null,
+                    orderingJson = """[["$aId"],["$bId"]]""",
+                    createdAt = nowIso,
+                    hlc = olderHlc,
+                    isLocalDirty = false,
+                )
+            )
+            assertNotNull(dao.getComparisonById(compId))
+
+            reconcilePeerSyncResponse(
+                dao = dao,
+                response =
+                    PeerSyncResponseDto(
+                        serverPeerId = "server",
+                        syncTimestamp = nowIso,
+                        tombstones =
+                            listOf(
+                                SyncTombstoneDto(
+                                    TOMBSTONE_ENTITY_COMPARISON,
+                                    compId,
+                                    nowIso,
+                                    newerTombHlc,
+                                )
+                            ),
+                        comparisons =
+                            listOf(
+                                SyncComparisonDto(
+                                    id = compId,
+                                    ts = nowIso,
+                                    scopeCollectionId = null,
+                                    ordering = listOf(listOf(aId), listOf(bId)),
+                                    createdAt = nowIso,
+                                    hlc = olderHlc,
+                                )
+                            ),
+                    ),
+                localPeerId = "android-peer-1",
+                catalogStore = catalog,
+            )
+
+            assertNull(dao.getComparisonById(compId))
+            assertNotNull(dao.getTombstone(TOMBSTONE_ENTITY_COMPARISON, compId))
         }
 }
 

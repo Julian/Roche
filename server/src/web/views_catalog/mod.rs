@@ -14,10 +14,12 @@ use crate::{
 };
 
 pub(super) use diary_queue::{
-    diary_get, post_quick_log, post_want_complete, post_want_remove, queue_get,
+    diary_get, post_diary_delete, post_diary_edit, post_quick_log, post_want_complete,
+    post_want_remove, queue_get,
 };
 pub(super) use entry::{
-    entry_detail_get, post_artist_add_album, post_entry_list_add, post_entry_log, post_entry_merge,
+    entry_detail_get, post_artist_add_album, post_entry_enrich, post_entry_list_add,
+    post_entry_log, post_entry_merge, post_entry_queue_toggle,
 };
 pub(super) use lists::{
     list_detail_get, lists_get, post_list_add_entry, post_list_create, post_list_remove_entry,
@@ -35,6 +37,9 @@ pub(super) struct ListsOverviewQuery {
 pub(super) struct ListPageQuery {
     #[serde(default, deserialize_with = "de_opt_from_str")]
     pub page: Option<usize>,
+    pub tier: Option<String>,
+    pub q: Option<String>,
+    pub undo_remove: Option<String>,
     #[serde(flatten)]
     pub flash: FlashQuery,
 }
@@ -44,6 +49,23 @@ pub(super) struct DiaryFilterQuery {
     #[serde(default, deserialize_with = "de_opt_from_str")]
     pub year: Option<i32>,
     pub status: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_from_str")]
+    pub page: Option<usize>,
+    #[serde(flatten)]
+    pub flash: FlashQuery,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct EntryDetailQuery {
+    pub merge_preview: Option<String>,
+    #[serde(flatten)]
+    pub flash: FlashQuery,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct QueuePageQuery {
+    pub undo_entry: Option<String>,
+    pub undo_queue: Option<String>,
     #[serde(flatten)]
     pub flash: FlashQuery,
 }
@@ -64,6 +86,14 @@ pub(super) struct AddListEntryForm {
     pub creators: Option<String>,
     #[serde(default)]
     pub release_year: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ListRemoveForm {
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,8 +113,38 @@ pub(super) struct EntryAddToListForm {
 }
 
 #[derive(Debug, Deserialize)]
+pub(super) struct EntryQueueToggleForm {
+    pub in_queue: String,
+    #[serde(default)]
+    pub queue_slug: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub(super) struct EntryMergeForm {
-    pub canonical_query: String,
+    #[serde(default)]
+    pub canonical_id: Option<String>,
+    #[serde(default)]
+    pub canonical_query: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct DiaryEditForm {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub date: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct DiaryDeleteForm {
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +173,8 @@ pub(super) struct QuickLogForm {
     pub notes: Option<String>,
     #[serde(default)]
     pub rank_after: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -121,21 +183,28 @@ pub(super) struct WantCompleteForm {
     pub rank_after: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct WantRemoveForm {
+    #[serde(default)]
+    pub return_to: Option<String>,
+}
+
+const LOGGABLE_KINDS: [EntryKind; 10] = [
+    EntryKind::Movie,
+    EntryKind::Album,
+    EntryKind::Book,
+    EntryKind::Tv,
+    EntryKind::Game,
+    EntryKind::Song,
+    EntryKind::Article,
+    EntryKind::Paper,
+    EntryKind::Video,
+    EntryKind::PodcastEpisode,
+];
+
 pub(super) fn render_kind_options(selected: EntryKind) -> String {
-    const LOGGABLE: [EntryKind; 10] = [
-        EntryKind::Movie,
-        EntryKind::Album,
-        EntryKind::Book,
-        EntryKind::Tv,
-        EntryKind::Game,
-        EntryKind::Song,
-        EntryKind::Article,
-        EntryKind::Paper,
-        EntryKind::Video,
-        EntryKind::PodcastEpisode,
-    ];
     let mut out = String::with_capacity(512);
-    for k in LOGGABLE {
+    for k in LOGGABLE_KINDS {
         let sel = if k == selected { " selected" } else { "" };
         let _ = write!(
             out,
@@ -143,6 +212,15 @@ pub(super) fn render_kind_options(selected: EntryKind) -> String {
             k.as_str(),
             esc(k.display_label())
         );
+    }
+    out
+}
+
+pub(super) fn render_optional_kind_options() -> String {
+    let mut out = String::with_capacity(576);
+    out.push_str("<option value=\"\" selected>Auto &mdash; match existing work</option>");
+    for k in LOGGABLE_KINDS {
+        let _ = write!(out, "<option value=\"{}\">{}</option>", k.as_str(), esc(k.display_label()));
     }
     out
 }
@@ -181,6 +259,12 @@ pub(super) fn render_search_kind_options(selected: Option<EntryKind>) -> String 
 
 pub(super) fn parse_optional_year(raw: Option<&str>) -> Option<i32> {
     raw.map(str::trim).filter(|s| !s.is_empty()).and_then(|s| s.parse::<i32>().ok())
+}
+
+pub(super) fn parse_diary_date_input(raw: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let trimmed = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    let date = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").ok()?;
+    date.and_hms_opt(12, 0, 0).map(|dt| dt.and_utc())
 }
 
 pub(super) fn parse_consumption_status(raw: &str) -> ConsumptionStatus {

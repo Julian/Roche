@@ -188,6 +188,11 @@ impl ItemRepo<'_> {
                 qb.push(" AND ce_fav.entry_id IS NULL");
             }
         }
+        if filter.in_progress_only == Some(true) {
+            qb.push(
+                " AND COALESCE(es.progress, 0.0) >= 0.03 AND COALESCE(es.progress, 0.0) < 0.98",
+            );
+        }
         Self::append_updated_after_where_clause(
             &mut qb,
             filter.updated_after,
@@ -201,6 +206,10 @@ impl ItemRepo<'_> {
             fts_query.is_some() && matches!(filter.sort, None | Some(ItemSortField::Relevance));
         if filter.sort_updated_asc {
             qb.push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at) ASC, i.id ASC");
+        } else if filter.in_progress_only == Some(true) && filter.sort.is_none() {
+            qb.push(
+                " ORDER BY COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', es.interaction_updated_at), strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at)) DESC, i.id DESC",
+            );
         } else if sort_by_relevance {
             let rank_dir = match filter.order.unwrap_or_default() {
                 SortOrder::Desc => "ASC",

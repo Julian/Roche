@@ -3820,7 +3820,7 @@ async fn test_graph_tombstones_resolve_remapped_ids_in_same_sync_batch() {
 }
 
 #[tokio::test]
-async fn test_wave_2a_hlc_sanitization_timestamp_clamping_and_recorded_at_pruning() {
+async fn test_hlc_sanitization_timestamp_clamping_and_recorded_at_pruning() {
     // 1. HlcTimestamp::parse rejects invalid node_id characters and >64-char node IDs
     let valid = HlcTimestamp::new(1_700_000_000_000, 3, "peer-alpha_01").encode();
     assert!(HlcTimestamp::parse(&valid).is_some());
@@ -3913,7 +3913,7 @@ async fn test_wave_2a_hlc_sanitization_timestamp_clamping_and_recorded_at_prunin
 }
 
 #[tokio::test]
-async fn test_wave_2a_protected_collections_history_tombstone_and_peer_pruning() {
+async fn test_protected_collections_history_tombstone_and_peer_pruning() {
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let now = Utc::now();
     let movie = db
@@ -4025,7 +4025,7 @@ async fn test_wave_2a_protected_collections_history_tombstone_and_peer_pruning()
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn test_wave_2a_audit_fixes_sync_hlc_monotonicity_reserved_schemes_and_page_budget() {
+async fn test_sync_hlc_monotonicity_reserved_schemes_and_page_budget() {
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let now = Utc::now();
 
@@ -4317,4 +4317,163 @@ async fn test_wave_2a_audit_fixes_sync_hlc_monotonicity_reserved_schemes_and_pag
         }
     }
     assert!(tight_page.has_more, "tight budget must paginate via cutoff shrinking");
+}
+
+#[tokio::test]
+async fn test_incremental_generator_delta_bundles_drawn_entry_and_membership() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let now = Utc::now();
+
+    let list = db
+        .catalog()
+        .create_manual_collection(
+            "1001 Albums",
+            Some("1001_albums"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let album1 = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "Devotional Songs".to_owned(),
+            creators: vec!["Nusrat Fateh Ali Khan".to_owned()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let album2 = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "Remain in Light".to_owned(),
+            creators: vec!["Talking Heads".to_owned()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    db.catalog().add_collection_entry(&list.id, &album1.id, None).await.unwrap();
+    db.catalog().add_collection_entry(&list.id, &album2.id, None).await.unwrap();
+    db.catalog()
+        .update_collection_generator(&list.id, Some(true), Some(&album1.id), Some(now))
+        .await
+        .unwrap();
+
+    // Record cursor AFTER both albums and memberships were synced.
+    let cursor_before_finish: i64 =
+        sqlx::query_scalar("SELECT current_seq FROM sync_clock WHERE id = 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+    // Finishing album1 advances the generator to album2 without modifying album2 or its membership.
+    let (_, next_gen) =
+        db.catalog().finish_active_generator_entry(&list.id, Some("Loved it")).await.unwrap();
+    assert_eq!(next_gen.current_entry.as_ref().map(|e| e.id.as_str()), Some(album2.id.as_str()));
+
+    let (resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-peer".to_owned(),
+            since_seq: cursor_before_finish,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        resp.collection_generators.iter().any(|g| {
+            g.collection_id == list.id && g.current_entry_id.as_deref() == Some(album2.id.as_str())
+        }),
+        "incremental sync must emit the updated generator draw"
+    );
+    assert!(
+        resp.entries.iter().any(|e| e.id == album2.id),
+        "incremental sync must bundle the drawn entry even when its sync_seq <= since_seq"
+    );
+    assert!(
+        resp.collection_entries
+            .iter()
+            .any(|ce| ce.collection_id == list.id && ce.entry_id == album2.id),
+        "incremental sync must bundle the drawn entry's collection membership"
+    );
+}
+
+#[tokio::test]
+async fn test_comparison_tombstone_sync_deletes_and_blocks_stale_resurrection() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let now = Utc::now();
+
+    let a = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Comparison Alpha".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let b = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Comparison Beta".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let comp = db
+        .catalog()
+        .append_comparison(None, &[vec![a.id.clone()], vec![b.id.clone()]], None)
+        .await
+        .unwrap();
+    let deleted = db.catalog().delete_comparison(&comp.id).await.unwrap();
+    assert!(deleted);
+
+    let (resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-peer".to_owned(),
+            since_seq: 0,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        resp.tombstones
+            .iter()
+            .any(|t| t.entity_type == ActivityEntityType::Comparison && t.natural_key == comp.id),
+        "deleted comparison must emit a comparison sync tombstone"
+    );
+
+    // A stale incoming comparison from another peer must not resurrect the deleted row.
+    let stale_hlc =
+        HlcTimestamp { wall_ms: 1_000_000_000_000, counter: 0, node_id: "peer".into() }.to_string();
+    let _ = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "stale-peer".to_owned(),
+            since_seq: 0,
+            comparisons: vec![crate::db::SyncComparisonRecord {
+                id: comp.id.clone(),
+                ts: now,
+                scope_collection_id: None,
+                ordering: vec![vec![a.id.clone()], vec![b.id.clone()]],
+                created_at: Some(now),
+                hlc: stale_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM comparisons WHERE id = ?")
+        .bind(&comp.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0, "tombstone must suppress stale comparison resurrection");
 }

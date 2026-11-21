@@ -7,6 +7,7 @@ mod views_catalog;
 mod views_home;
 mod views_rank;
 mod views_reader;
+mod views_search;
 
 use std::sync::Arc;
 
@@ -50,8 +51,9 @@ pub fn router(service: Arc<RocheService>) -> Router<Arc<RocheService>> {
 
     let protected = Router::new()
         .route("/logout", post(auth::logout_post))
-        // Home & Active Collection Draws
+        // Home, Global Search & Active Collection Draws
         .route("/", get(views_home::home_get))
+        .route("/search", get(views_search::search_get))
         .route("/web/lists/{slug}/generator/toggle", post(views_home::post_generator_toggle))
         .route("/web/lists/{slug}/generator/finish", post(views_home::post_generator_finish))
         .route("/web/lists/{slug}/generator/abandon", post(views_home::post_generator_abandon))
@@ -76,6 +78,7 @@ pub fn router(service: Arc<RocheService>) -> Router<Arc<RocheService>> {
         .route("/web/feeds/create", post(views_reader::post_feed_create))
         .route("/web/feeds/refresh-all", post(views_reader::post_feed_refresh_all))
         .route("/web/feeds/{id}/refresh", post(views_reader::post_feed_refresh))
+        .route("/web/feeds/{id}/edit", post(views_reader::post_feed_edit))
         .route("/web/feeds/{id}/toggle-active", post(views_reader::post_feed_toggle_active))
         .route("/web/feeds/{id}/delete", post(views_reader::post_feed_delete))
         .route("/web/refresh-status", get(views_reader::refresh_status_get))
@@ -88,9 +91,13 @@ pub fn router(service: Arc<RocheService>) -> Router<Arc<RocheService>> {
         .route("/entries/{id}", get(views_catalog::entry_detail_get))
         .route("/web/entries/{id}/log", post(views_catalog::post_entry_log))
         .route("/web/entries/{id}/list-add", post(views_catalog::post_entry_list_add))
+        .route("/web/entries/{id}/queue-toggle", post(views_catalog::post_entry_queue_toggle))
+        .route("/web/entries/{id}/enrich", post(views_catalog::post_entry_enrich))
         .route("/web/entries/{id}/add-album", post(views_catalog::post_artist_add_album))
         .route("/web/entries/{id}/merge", post(views_catalog::post_entry_merge))
         .route("/diary", get(views_catalog::diary_get))
+        .route("/web/diary/{id}/edit", post(views_catalog::post_diary_edit))
+        .route("/web/diary/{id}/delete", post(views_catalog::post_diary_delete))
         .route("/queue", get(views_catalog::queue_get))
         .route("/web/log", post(views_catalog::post_quick_log))
         .route("/web/want/{queue}/complete/{entry_id}", post(views_catalog::post_want_complete))
@@ -100,6 +107,7 @@ pub fn router(service: Arc<RocheService>) -> Router<Arc<RocheService>> {
             "/rank/{slug}",
             get(views_rank::rank_session_get).post(views_rank::rank_session_post),
         )
+        .route("/web/comparisons/{id}/undo", post(views_rank::post_comparison_undo))
         .route_layer(middleware::from_fn_with_state(service, auth::require_web_auth_and_csrf))
         .layer(DefaultBodyLimit::max(MAX_WEB_FORM_BODY_BYTES))
         .layer(RequestBodyLimitLayer::new(MAX_WEB_FORM_BODY_BYTES));
@@ -137,7 +145,7 @@ async fn serve_js() -> Response {
         .into_response()
 }
 
-const WEB_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; media-src 'self' https: http:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'sameorigin'";
+const WEB_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; media-src 'self' https: http:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'";
 
 fn apply_web_security_headers(resp: &mut Response) {
     let headers = resp.headers_mut();

@@ -11,8 +11,8 @@ use axum::{
 };
 
 use super::{
-    AddListEntryForm, CreateListForm, ListPageQuery, ListsOverviewQuery,
-    load_existing_reader_item_ids, parse_optional_year, render_kind_options,
+    AddListEntryForm, CreateListForm, ListPageQuery, ListRemoveForm, ListsOverviewQuery,
+    load_existing_reader_item_ids, parse_optional_year, render_optional_kind_options,
     render_search_kind_options,
 };
 use crate::{
@@ -27,7 +27,7 @@ use crate::{
         html::{
             CreatorYearStyle, FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _, esc,
             parse_csv_list, rank_collection_href, redirect_with_flash, render_creator_year_meta,
-            render_inline_csrf_form, render_page, urlencode,
+            render_inline_csrf_form, render_page, safe_local_redirect, urlencode,
         },
         links::{load_artist_id_by_lower_name, sanitize_non_local_href},
         views_home::render_collection_draw_section,
@@ -100,6 +100,7 @@ pub(in crate::web) async fn lists_get(
         flash: &flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
+        search_query: None,
         body_html: &body,
     })
     .into_response())
@@ -374,12 +375,12 @@ fn render_overview_draw_popover(
                     esc(thumb),
                 );
             }
+            let draw_num = (gs.consumed_count + gs.abandoned_count + 1).min(gs.total_pool.max(1));
             let _ = write!(
                 out,
                 "<div class=\"draw-popover-info\">\
-                   <div class=\"draw-popover-kicker\">Current Draw &middot; #{} of {}</div>\
+                   <div class=\"draw-popover-kicker\">Current Draw &middot; #{draw_num} of {}</div>\
                    <div class=\"draw-popover-title\"><a href=\"{}\">{}</a></div>",
-                gs.consumed_count,
                 gs.total_pool,
                 esc(&entry_href),
                 esc(&entry.title),
@@ -398,14 +399,14 @@ fn render_overview_draw_popover(
                 csrf,
                 &[],
                 None,
-                "<button type=\"submit\" class=\"btn btn-small btn-primary\">Rank</button>",
+                "<button type=\"submit\" class=\"btn btn-small btn-primary\">Finish &amp; Rank</button>",
             );
             render_inline_csrf_form(
                 out,
                 &format!("/web/lists/{slug_enc}/generator/abandon"),
                 csrf,
                 &[("return_to", "/lists")],
-                None,
+                Some("Skip this draw and advance to the next item?"),
                 "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Skip</button>",
             );
             out.push_str("</div>");
@@ -460,7 +461,7 @@ fn render_lists_rail(
     } else {
         collections.iter().map(|c| c.member_count).sum()
     };
-    let max_comps = collections.iter().map(|c| c.comparison_count).max().unwrap_or(0);
+    let ranked_lists = collections.iter().filter(|c| c.comparison_count > 0).count();
 
     let _ = write!(
         out,
@@ -494,7 +495,7 @@ fn render_lists_rail(
              <div class=\"rail-stats\">\n\
                <div><span class=\"rail-stat-num\">{active_count}</span><span class=\"rail-stat-label\">Active</span></div>\n\
                <div><span class=\"rail-stat-num\">{total_entries}</span><span class=\"rail-stat-label\">Entries</span></div>\n\
-               <div><span class=\"rail-stat-num\">{max_comps}</span><span class=\"rail-stat-label\">Ranked</span></div>\n\
+               <div title=\"Lists with pairwise rankings\"><span class=\"rail-stat-num\">{ranked_lists}</span><span class=\"rail-stat-label\">Ranked</span></div>\n\
              </div>\n\
            </section>\n\
          </div>\n",
@@ -559,28 +560,101 @@ pub(in crate::web) async fn post_list_create(
     Ok(redirect_with_flash(&format!("/lists/{}", urlencode(slug)), "notice", "Created manual list"))
 }
 
+fn build_list_href(slug: &str, page: Option<usize>, tier: Option<char>, q: Option<&str>) -> String {
+    let mut params = Vec::new();
+    if let Some(t) = tier {
+        params.push(format!("tier={t}"));
+    }
+    if let Some(query) = q.map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(format!("q={}", urlencode(query)));
+    }
+    if let Some(p) = page.filter(|&p| p > 1) {
+        params.push(format!("page={p}"));
+    }
+    let base = format!("/lists/{}", urlencode(slug));
+    if params.is_empty() { base } else { format!("{base}?{}", params.join("&")) }
+}
+
+fn append_query_param(base: &str, key: &str, val: &str) -> String {
+    let (path_and_query, frag) = match base.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (base, None),
+    };
+    let sep = if path_and_query.contains('?') { '&' } else { '?' };
+    let mut out = format!("{path_and_query}{sep}{}={}", urlencode(key), urlencode(val));
+    if let Some(f) = frag {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
+struct ListDetailRenderCtx<'a> {
+    view: &'a RankedCollectionView,
+    full_total: usize,
+    full_tier_counts: [usize; 5],
+    active_tier: Option<char>,
+    active_q: Option<&'a str>,
+    undo_entry: Option<(String, String)>,
+    gen_state: Option<&'a CollectionGeneratorState>,
+    page_num: usize,
+    total_pages: usize,
+    current_href: &'a str,
+    artist_links: &'a HashMap<String, String>,
+    reader_item_ids: &'a HashSet<String>,
+    csrf: &'a str,
+}
+
 pub(in crate::web) async fn list_detail_get(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(slug): Path<String>,
     Query(q): Query<ListPageQuery>,
 ) -> Result<Response, WebError> {
+    let active_tier = q
+        .tier
+        .as_deref()
+        .map(str::trim)
+        .and_then(|s| s.chars().next())
+        .map(|c| c.to_ascii_uppercase())
+        .filter(|c| matches!(c, 'S' | 'A' | 'B' | 'C' | 'D'));
+    let active_q = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
     let filtered = service
         .catalog()
-        .get_filtered_ranked_collection(&slug, false, &RankedCollectionFilter::default())
+        .get_filtered_ranked_collection(
+            &slug,
+            false,
+            &RankedCollectionFilter { tier: active_tier, query: active_q },
+        )
         .await
         .web_err(&session)?;
     let view = filtered.view;
+    let full_total = filtered.full_total;
     let full_tier_counts = filtered.full_tier_counts;
-    let total_rows = filtered.full_total.min(view.rows.len());
+    let total_rows = view.rows.len();
     let total_pages = total_rows.max(1).div_ceil(LIST_PAGE_SIZE);
     let page_num = q.page.unwrap_or(1).clamp(1, total_pages);
     let start_idx = (page_num - 1) * LIST_PAGE_SIZE;
     let end_idx = (page_num * LIST_PAGE_SIZE).min(total_rows);
+
+    let is_editable_manual = view.collection.mode == CollectionMode::Manual
+        && view.collection.role == CollectionRole::List
+        && !view.collection.has_generator;
+
     let gen_state = if view.collection.mode == CollectionMode::Manual
         && view.collection.role == CollectionRole::List
     {
         service.catalog().get_collection_generator(&view.collection.id).await.ok()
+    } else {
+        None
+    };
+
+    let undo_entry = if is_editable_manual
+        && let Some(undo_id) = q.undo_remove.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && let Ok(Some(detail)) = service.catalog().get_entry_detail(undo_id).await
+    {
+        Some((detail.entry.id, detail.entry.title))
     } else {
         None
     };
@@ -600,18 +674,27 @@ pub(in crate::web) async fn list_detail_get(
         ),
     );
 
-    let mut body = String::with_capacity(14_336);
-    render_ranked_list_body(
-        &mut body,
-        &view,
+    let canonical_slug = view.collection.slug.as_deref().unwrap_or(&view.collection.id);
+    let current_href = build_list_href(canonical_slug, Some(page_num), active_tier, active_q);
+
+    let ctx = ListDetailRenderCtx {
+        view: &view,
+        full_total,
         full_tier_counts,
-        gen_state.as_ref(),
+        active_tier,
+        active_q,
+        undo_entry,
+        gen_state: gen_state.as_ref(),
         page_num,
         total_pages,
-        &artist_links,
-        &reader_item_ids,
-        &session.csrf_token,
-    );
+        current_href: &current_href,
+        artist_links: &artist_links,
+        reader_item_ids: &reader_item_ids,
+        csrf: &session.csrf_token,
+    };
+
+    let mut body = String::with_capacity(14_336);
+    render_ranked_list_body(&mut body, &ctx);
 
     let active_nav = if view.collection.slug.as_deref() == Some("starred") {
         NavSection::Starred
@@ -625,64 +708,44 @@ pub(in crate::web) async fn list_detail_get(
         flash: &q.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
+        search_query: None,
         body_html: &body,
     })
     .into_response())
 }
 
-fn count_tiers(rows: &[RankedEntryRow]) -> [usize; 5] {
-    let mut counts = [0usize; 5];
-    for row in rows {
-        match row.tier {
-            Some('S') => counts[0] += 1,
-            Some('A') => counts[1] += 1,
-            Some('B') => counts[2] += 1,
-            Some('C') => counts[3] += 1,
-            Some('D') => counts[4] += 1,
-            _ => {}
-        }
-    }
-    counts
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_ranked_list_body(
-    out: &mut String,
-    view: &RankedCollectionView,
-    full_tier_counts: [usize; 5],
-    gen_state: Option<&CollectionGeneratorState>,
-    page_num: usize,
-    total_pages: usize,
-    artist_links: &HashMap<String, String>,
-    reader_item_ids: &HashSet<String>,
-    csrf: &str,
-) {
+fn render_ranked_list_body(out: &mut String, ctx: &ListDetailRenderCtx<'_>) {
+    let view = ctx.view;
     let slug = view.collection.slug.as_deref().unwrap_or(&view.collection.id);
     let is_manual_list = view.collection.mode == CollectionMode::Manual
         && view.collection.role == CollectionRole::List;
     let is_editable_manual = is_manual_list && !view.collection.has_generator;
     let ranked_mode = view.comparison_count > 0;
+    let is_filtered = ctx.active_tier.is_some() || ctx.active_q.is_some();
 
-    let start = (page_num - 1) * LIST_PAGE_SIZE;
+    let start = (ctx.page_num - 1) * LIST_PAGE_SIZE;
     let end = (start + LIST_PAGE_SIZE).min(view.rows.len());
     let slice = &view.rows[start..end];
-    let page_tiers = count_tiers(slice);
 
     out.push_str(
         "<div class=\"lists-grid\">\n<section class=\"lists-main\" aria-label=\"List entries\">\n",
     );
+    let badge_text = if is_filtered {
+        format!("{} of {}", view.rows.len(), ctx.full_total)
+    } else {
+        ctx.full_total.to_string()
+    };
     let _ = write!(
         out,
         "<div class=\"list-detail-crumb\"><a class=\"reader-back-link\" href=\"/lists\">&larr; All Lists</a></div>\n\
          <div class=\"list-detail-head\">\n\
            <div class=\"list-detail-title-group\">\n\
              <h2>{}</h2>\n\
-             <span class=\"list-count-badge\">{}</span>\n\
+             <span class=\"list-count-badge\">{badge_text}</span>\n\
            </div>",
         esc(&view.collection.title),
-        view.rows.len(),
     );
-    if view.rows.len() >= 2 {
+    if ctx.full_total >= 2 {
         let rank_href = rank_collection_href(slug, view.collection.role == CollectionRole::Want);
         let _ = write!(
             out,
@@ -693,44 +756,117 @@ fn render_ranked_list_body(
     out.push_str("</div>\n");
 
     render_list_detail_lede(out, view);
-
-    if total_pages > 1 {
-        render_list_pager(out, slug, page_num, total_pages, "Pagination (top)");
+    if let Some((undo_id, undo_title)) = &ctx.undo_entry {
+        render_list_undo_banner(out, slug, undo_id, undo_title, ctx.current_href, ctx.csrf);
     }
 
-    if view.rows.is_empty() {
-        out.push_str("<p class=\"empty\">No entries in this list yet.</p>\n");
-    } else {
-        render_list_toolbar(out, slice.len(), ranked_mode, page_tiers);
-        render_ranked_table(
+    if ctx.total_pages > 1 {
+        render_list_pager(
             out,
-            slice,
-            ranked_mode,
-            is_editable_manual,
             slug,
-            artist_links,
-            reader_item_ids,
-            csrf,
+            ctx.page_num,
+            ctx.total_pages,
+            ctx.active_tier,
+            ctx.active_q,
+            "Pagination (top)",
         );
     }
 
-    if total_pages > 1 {
-        render_list_pager(out, slug, page_num, total_pages, "Pagination (bottom)");
+    render_list_entries_section(out, ctx, slug, slice, ranked_mode, is_editable_manual);
+
+    if ctx.total_pages > 1 {
+        render_list_pager(
+            out,
+            slug,
+            ctx.page_num,
+            ctx.total_pages,
+            ctx.active_tier,
+            ctx.active_q,
+            "Pagination (bottom)",
+        );
     }
     out.push_str("</section>\n");
 
-    render_list_detail_rail(
+    render_list_detail_rail(out, ctx, slug, ranked_mode, is_editable_manual);
+    out.push_str("</div>\n");
+}
+
+fn render_list_undo_banner(
+    out: &mut String,
+    slug: &str,
+    undo_id: &str,
+    undo_title: &str,
+    current_href: &str,
+    csrf: &str,
+) {
+    let add_action = format!("/web/lists/{}/add", urlencode(slug));
+    out.push_str("<div class=\"undo-banner\" role=\"status\"><span>Removed <strong>");
+    let _ = write!(out, "{}", esc(undo_title));
+    out.push_str("</strong> from this list.</span>");
+    render_inline_csrf_form(
         out,
-        view,
-        slug,
-        gen_state,
-        ranked_mode,
-        full_tier_counts,
-        is_editable_manual,
-        artist_links,
+        &add_action,
         csrf,
+        &[("title_or_id", undo_id), ("return_to", current_href)],
+        None,
+        "<button type=\"submit\" class=\"btn btn-small\">Undo</button>",
     );
     out.push_str("</div>\n");
+}
+
+fn render_list_entries_section(
+    out: &mut String,
+    ctx: &ListDetailRenderCtx<'_>,
+    slug: &str,
+    slice: &[crate::db::RankedEntryRow],
+    ranked_mode: bool,
+    is_editable_manual: bool,
+) {
+    if ctx.full_total == 0 {
+        out.push_str("<p class=\"empty\">No entries in this list yet.</p>\n");
+        return;
+    }
+    render_list_toolbar(
+        out,
+        slug,
+        ctx.full_total,
+        ranked_mode,
+        ctx.full_tier_counts,
+        ctx.active_tier,
+        ctx.active_q,
+    );
+    let clear_href = build_list_href(slug, None, None, None);
+    if slice.is_empty() {
+        let _ = writeln!(
+            out,
+            "<div id=\"roche-list-empty\" class=\"filter-empty-state\">\
+               <p>No entries match the current filter.</p>\
+               <a class=\"btn btn-small\" href=\"{}\">Clear filter</a>\
+             </div>",
+            esc(&clear_href),
+        );
+        return;
+    }
+    render_ranked_table(
+        out,
+        slice,
+        ranked_mode,
+        is_editable_manual,
+        slug,
+        ctx.current_href,
+        ctx.artist_links,
+        ctx.reader_item_ids,
+        ctx.csrf,
+    );
+    let _ = writeln!(
+        out,
+        "<div id=\"roche-list-empty\" class=\"filter-empty-state\" hidden>\
+           <p>No matching entries on this page.</p>\
+           <button type=\"button\" class=\"btn btn-small js-list-clear\">Clear filter</button>\
+           <a class=\"btn btn-small btn-ghost\" href=\"{}\">Reset all</a>\
+         </div>",
+        esc(&clear_href),
+    );
 }
 
 fn render_list_detail_lede(out: &mut String, view: &RankedCollectionView) {
@@ -751,29 +887,69 @@ fn render_list_detail_lede(out: &mut String, view: &RankedCollectionView) {
     out.push_str("</p>\n");
 }
 
-fn render_list_toolbar(out: &mut String, row_count: usize, ranked_mode: bool, tiers: [usize; 5]) {
+fn render_list_toolbar(
+    out: &mut String,
+    slug: &str,
+    full_total: usize,
+    ranked_mode: bool,
+    tiers: [usize; 5],
+    active_tier: Option<char>,
+    active_q: Option<&str>,
+) {
     out.push_str("<div class=\"list-toolbar\">\n");
     if ranked_mode {
+        let all_href = build_list_href(slug, None, None, active_q);
+        let all_attrs = if active_tier.is_none() {
+            "class=\"pill is-active\" aria-current=\"true\""
+        } else {
+            "class=\"pill\""
+        };
         let _ = writeln!(
             out,
             "<div class=\"list-tier-pills\" role=\"group\" aria-label=\"Filter by tier\">\n\
-               <button type=\"button\" class=\"pill is-active js-tier-pill\" data-tier=\"all\" aria-pressed=\"true\">All ({row_count})</button>",
+               <a {all_attrs} href=\"{}\">All ({full_total})</a>",
+            esc(&all_href),
         );
         for (idx, letter) in ['S', 'A', 'B', 'C', 'D'].into_iter().enumerate() {
-            if tiers[idx] > 0 {
+            if tiers[idx] > 0 || active_tier == Some(letter) {
+                let is_cur = active_tier == Some(letter);
+                let href = build_list_href(slug, None, Some(letter), active_q);
+                let active_cls = if is_cur { " is-active" } else { "" };
+                let aria_cur = if is_cur { " aria-current=\"true\"" } else { "" };
                 let _ = writeln!(
                     out,
-                    "<button type=\"button\" class=\"pill pill-tier-{letter} js-tier-pill\" data-tier=\"{letter}\" aria-pressed=\"false\">{letter} ({})</button>",
+                    "<a class=\"pill pill-tier-{letter}{active_cls}\"{aria_cur} href=\"{}\">{letter} ({})</a>",
+                    esc(&href),
                     tiers[idx],
                 );
             }
         }
         out.push_str("</div>\n");
     }
-    out.push_str(
-        "<input type=\"search\" id=\"roche-list-search\" class=\"list-filter-input\" placeholder=\"Filter list…\" aria-label=\"Filter entries in this list\">\n\
-       </div>\n",
+    let form_action = format!("/lists/{}", urlencode(slug));
+    let _ = write!(
+        out,
+        "<form method=\"get\" action=\"{}\" class=\"list-filter-form\">",
+        esc(&form_action),
     );
+    if let Some(t) = active_tier {
+        let _ = write!(out, "<input type=\"hidden\" name=\"tier\" value=\"{t}\">");
+    }
+    let _ = write!(
+        out,
+        "<input type=\"search\" id=\"roche-list-search\" name=\"q\" value=\"{}\" class=\"list-filter-input\" placeholder=\"Filter list…\" aria-label=\"Filter entries in this list\">\
+         <button type=\"submit\" class=\"btn btn-small btn-ghost\">Filter</button>",
+        esc(active_q.unwrap_or("")),
+    );
+    if active_tier.is_some() || active_q.is_some() {
+        let clear_href = build_list_href(slug, None, None, None);
+        let _ = write!(
+            out,
+            "<a class=\"btn btn-small btn-ghost\" href=\"{}\">Clear</a>",
+            esc(&clear_href),
+        );
+    }
+    out.push_str("</form>\n</div>\n");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -783,6 +959,7 @@ fn render_ranked_table(
     ranked_mode: bool,
     is_editable_manual: bool,
     slug: &str,
+    current_href: &str,
     artist_links: &HashMap<String, String>,
     reader_item_ids: &HashSet<String>,
     csrf: &str,
@@ -811,6 +988,7 @@ fn render_ranked_table(
             tier_break,
             is_editable_manual,
             slug,
+            current_href,
             artist_links,
             reader_item_ids,
             csrf,
@@ -827,6 +1005,7 @@ fn render_ranked_table_row(
     tier_break: bool,
     is_editable_manual: bool,
     slug: &str,
+    current_href: &str,
     artist_links: &HashMap<String, String>,
     reader_item_ids: &HashSet<String>,
     csrf: &str,
@@ -876,8 +1055,9 @@ fn render_ranked_table_row(
     if reader_item_ids.contains(&row.entry.id) {
         let _ = write!(
             out,
-            " <a class=\"badge ml-xs\" href=\"/reader/{}\">Read &rarr;</a>",
+            " <a class=\"badge ml-xs\" href=\"/reader/{}?return_to={}\">Read &rarr;</a>",
             esc(&entry_id_enc),
+            esc(&urlencode(current_href)),
         );
     }
     out.push_str("</div></div></td>");
@@ -909,54 +1089,61 @@ fn render_ranked_table_row(
             esc(&row.entry.title)
         );
         out.push_str("<td class=\"num\">");
-        render_inline_csrf_form(out, &remove_action, csrf, &[], None, &remove_btn);
+        render_inline_csrf_form(
+            out,
+            &remove_action,
+            csrf,
+            &[("return_to", current_href)],
+            None,
+            &remove_btn,
+        );
         out.push_str("</td>");
     }
     out.push_str("</tr>\n");
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_list_detail_rail(
     out: &mut String,
-    view: &RankedCollectionView,
+    ctx: &ListDetailRenderCtx<'_>,
     slug: &str,
-    gen_state: Option<&CollectionGeneratorState>,
     ranked_mode: bool,
-    page_tiers: [usize; 5],
     is_editable_manual: bool,
-    artist_links: &HashMap<String, String>,
-    csrf: &str,
 ) {
     out.push_str("<div class=\"lists-rail\">\n");
-    if let Some(gs) = gen_state
+    if let Some(gs) = ctx.gen_state
         && gs.enabled
     {
-        let list_return_to = format!("/lists/{}", urlencode(slug));
-        render_collection_draw_section(out, gs, artist_links, csrf, &list_return_to);
+        render_collection_draw_section(out, gs, ctx.artist_links, ctx.csrf, ctx.current_href);
     }
 
     if ranked_mode {
-        let max_tc = page_tiers.into_iter().max().unwrap_or(1).max(1);
+        let max_tc = ctx.full_tier_counts.into_iter().max().unwrap_or(1).max(1);
         out.push_str(
             "<section class=\"rail-block rail-card\">\n\
                <div class=\"section-head\"><h3>Tier Distribution</h3></div>\n\
                <div class=\"tier-dist\">\n",
         );
         for (idx, letter) in ['S', 'A', 'B', 'C', 'D'].into_iter().enumerate() {
-            let cnt = page_tiers[idx];
+            let cnt = ctx.full_tier_counts[idx];
+            let is_cur = ctx.active_tier == Some(letter);
+            let target_tier = if is_cur { None } else { Some(letter) };
+            let href = build_list_href(slug, None, target_tier, ctx.active_q);
+            let active_cls = if is_cur { " is-active" } else { "" };
+            let aria_cur = if is_cur { " aria-current=\"true\"" } else { "" };
             let _ = writeln!(
                 out,
-                "<button type=\"button\" class=\"tier-dist-row js-tier-dist-btn\" data-tier=\"{letter}\" aria-pressed=\"false\">\
+                "<a class=\"tier-dist-row{active_cls}\"{aria_cur} href=\"{}\">\
                    <span class=\"tier-dist-letter tier-{letter}\">{letter}</span>\
                    <progress class=\"tier-bar tier-bar-{letter}\" value=\"{cnt}\" max=\"{max_tc}\"></progress>\
                    <span class=\"tier-dist-count\">{cnt}</span>\
-                 </button>",
+                 </a>",
+                esc(&href),
             );
         }
         out.push_str("</div>\n</section>\n");
     }
 
-    if let Some(gs) = gen_state {
+    if let Some(gs) = ctx.gen_state {
         let slug_enc = urlencode(slug);
         let next_enabled = if gs.enabled { "false" } else { "true" };
         let label = if gs.enabled { "Pause Draw" } else { "Enable Draw" };
@@ -974,7 +1161,7 @@ fn render_list_detail_rail(
         render_inline_csrf_form(
             out,
             &toggle_action,
-            csrf,
+            ctx.csrf,
             &[("enabled", next_enabled), ("redirect_list", "true")],
             None,
             &btn_html,
@@ -986,9 +1173,9 @@ fn render_list_detail_rail(
                <div class=\"section-head\"><h3>Rankings</h3></div>\n\
                <p class=\"rail-note\">Compare entries head-to-head to infer S–D tiers and scores.</p>",
         );
-        if view.rows.len() >= 2 {
+        if ctx.full_total >= 2 {
             let rank_href =
-                rank_collection_href(slug, view.collection.role == CollectionRole::Want);
+                rank_collection_href(slug, ctx.view.collection.role == CollectionRole::Want);
             let _ = writeln!(
                 out,
                 "<a class=\"btn btn-primary btn-small\" href=\"{}\">Start Ranking</a>",
@@ -1003,22 +1190,23 @@ fn render_list_detail_rail(
     }
 
     if is_editable_manual {
-        render_manual_list_add_panel(out, slug, csrf);
+        render_manual_list_add_panel(out, slug, ctx.full_total == 0, ctx.csrf);
     }
     out.push_str("</div>\n");
 }
 
-fn render_manual_list_add_panel(out: &mut String, slug: &str, csrf: &str) {
+fn render_manual_list_add_panel(out: &mut String, slug: &str, default_open: bool, csrf: &str) {
+    let open_attrs = if default_open { " open data-default-open" } else { "" };
     let _ = write!(
         out,
         "<section class=\"rail-block rail-card\">\n\
-           <details class=\"editorial-panel rail-editorial-panel\">\n\
+           <details class=\"editorial-panel rail-editorial-panel\"{open_attrs}>\n\
              <summary>+ Add Work to List</summary>\n\
              <form method=\"post\" action=\"/web/lists/{slug_enc}/add\" class=\"rail-form\">\n\
                <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
                <div class=\"field\"><label for=\"add-title\">Title or Existing Entry ID</label>\n\
                  <input id=\"add-title\" name=\"title_or_id\" type=\"text\" required placeholder=\"e.g. Stalker\"></div>\n\
-               <div class=\"field\"><label for=\"add-kind\">Kind (if creating new)</label>\n\
+               <div class=\"field\"><label for=\"add-kind\">Kind (Auto matches existing)</label>\n\
                  <select id=\"add-kind\" name=\"kind\">{kind_opts}</select></div>\n\
                <div class=\"field\"><label for=\"add-creators\">Creators (comma-separated)</label>\n\
                  <input id=\"add-creators\" name=\"creators\" type=\"text\" placeholder=\"Andrei Tarkovsky\"></div>\n\
@@ -1030,7 +1218,7 @@ fn render_manual_list_add_panel(out: &mut String, slug: &str, csrf: &str) {
          </section>\n",
         slug_enc = esc(&urlencode(slug)),
         csrf = esc(csrf),
-        kind_opts = render_kind_options(EntryKind::Movie),
+        kind_opts = render_optional_kind_options(),
     );
 }
 
@@ -1039,35 +1227,51 @@ fn render_list_pager(
     slug: &str,
     page_num: usize,
     total_pages: usize,
+    active_tier: Option<char>,
+    active_q: Option<&str>,
     aria_label: &str,
 ) {
     let _ = write!(out, "<nav class=\"pager\" aria-label=\"{}\">", esc(aria_label));
     if page_num > 1 {
+        let href = build_list_href(slug, Some(page_num - 1), active_tier, active_q);
         let _ = write!(
             out,
-            "<a href=\"/lists/{}?page={}\"><span aria-hidden=\"true\">&larr;</span> Prev</a>",
-            esc(&urlencode(slug)),
-            page_num - 1
+            "<a href=\"{}\"><span aria-hidden=\"true\">&larr;</span> Prev</a>",
+            esc(&href),
         );
     }
     for p in 1..=total_pages {
         if p == page_num {
             let _ = write!(out, "<span class=\"current\" aria-current=\"page\">{p}</span>");
         } else if p == 1 || p == total_pages || p.abs_diff(page_num) <= 2 {
-            let _ = write!(out, "<a href=\"/lists/{}?page={p}\">{p}</a>", esc(&urlencode(slug)));
+            let href = build_list_href(slug, Some(p), active_tier, active_q);
+            let _ = write!(out, "<a href=\"{}\">{p}</a>", esc(&href));
         } else if p.abs_diff(page_num) == 3 {
             out.push_str("<span aria-hidden=\"true\">&hellip;</span>");
         }
     }
     if page_num < total_pages {
+        let href = build_list_href(slug, Some(page_num + 1), active_tier, active_q);
         let _ = write!(
             out,
-            "<a href=\"/lists/{}?page={}\">Next <span aria-hidden=\"true\">&rarr;</span></a>",
-            esc(&urlencode(slug)),
-            page_num + 1
+            "<a href=\"{}\">Next <span aria-hidden=\"true\">&rarr;</span></a>",
+            esc(&href),
         );
     }
     out.push_str("</nav>\n");
+}
+
+async fn infer_dominant_list_kind(service: &RocheService, slug: &str) -> EntryKind {
+    let Ok(view) = service.catalog().get_ranked_collection(slug, false).await else {
+        return EntryKind::Movie;
+    };
+    let mut counts: HashMap<EntryKind, usize> = HashMap::new();
+    for row in &view.rows {
+        if row.entry.kind != EntryKind::Collection {
+            *counts.entry(row.entry.kind).or_insert(0) += 1;
+        }
+    }
+    counts.into_iter().max_by_key(|(_, c)| *c).map_or(EntryKind::Movie, |(k, _)| k)
 }
 
 pub(in crate::web) async fn post_list_add_entry(
@@ -1076,13 +1280,11 @@ pub(in crate::web) async fn post_list_add_entry(
     Path(slug): Path<String>,
     Form(form): Form<AddListEntryForm>,
 ) -> Result<Response, WebError> {
+    let fallback = format!("/lists/{}", urlencode(&slug));
+    let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
     let query = form.title_or_id.trim();
     if query.is_empty() {
-        return Ok(redirect_with_flash(
-            &format!("/lists/{}", urlencode(&slug)),
-            "err",
-            "Title cannot be empty",
-        ));
+        return Ok(redirect_with_flash(&dest, "err", "Title cannot be empty"));
     }
 
     let parsed_kind = form
@@ -1099,12 +1301,15 @@ pub(in crate::web) async fn post_list_add_entry(
         || query.contains('=');
     let can_fuzzy_resolve = is_explicit_ref || (creators.is_empty() && year.is_none());
 
-    let entry_id = if can_fuzzy_resolve
+    let (entry, linked_existing) = if can_fuzzy_resolve
         && let Ok(existing) = service.catalog().resolve_entry(query, parsed_kind, None).await
     {
-        existing.id
+        (existing, true)
     } else {
-        let kind = parsed_kind.unwrap_or(EntryKind::Movie);
+        let kind = match parsed_kind {
+            Some(k) => k,
+            None => infer_dominant_list_kind(&service, &slug).await,
+        };
         let input = UpsertEntryInput {
             kind: Some(kind),
             title: query.to_owned(),
@@ -1112,22 +1317,31 @@ pub(in crate::web) async fn post_list_add_entry(
             release_year: year,
             ..UpsertEntryInput::default()
         };
-        service.catalog().upsert_entry(&input).await.web_err(&session)?.id
+        (service.catalog().upsert_entry(&input).await.web_err(&session)?, false)
     };
 
-    service.catalog().add_collection_entry(&slug, &entry_id, None).await.web_err(&session)?;
-    Ok(redirect_with_flash(&format!("/lists/{}", urlencode(&slug)), "notice", "Added work to list"))
+    service.catalog().add_collection_entry(&slug, &entry.id, None).await.web_err(&session)?;
+    let msg = if linked_existing {
+        format!("Linked existing {} '{}' to list", entry.kind.display_label(), entry.title)
+    } else {
+        format!("Created new {} '{}' and added to list", entry.kind.display_label(), entry.title)
+    };
+    Ok(redirect_with_flash(&dest, "notice", &msg))
 }
 
 pub(in crate::web) async fn post_list_remove_entry(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path((slug, entry_id)): Path<(String, String)>,
+    Form(form): Form<ListRemoveForm>,
 ) -> Result<Response, WebError> {
     let _ = service.catalog().remove_collection_entry(&slug, &entry_id).await.web_err(&session)?;
-    Ok(redirect_with_flash(
-        &format!("/lists/{}", urlencode(&slug)),
-        "notice",
-        "Removed work from list",
-    ))
+    let fallback = format!("/lists/{}", urlencode(&slug));
+    let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
+    let final_dest = if dest.starts_with("/lists/") {
+        append_query_param(&dest, "undo_remove", &entry_id)
+    } else {
+        dest
+    };
+    Ok(redirect_with_flash(&final_dest, "notice", "Removed work from list"))
 }

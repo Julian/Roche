@@ -7,7 +7,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use super::{AddTagForm, FinishItemForm, ItemReturnForm, ProgressForm, render_audio_play_button};
+use super::{
+    AddTagForm, FinishItemForm, ItemReturnForm, ProgressForm, ReaderQuery, render_audio_play_button,
+};
 use crate::{
     content::HtmlSanitizer,
     db::WANT_TO_READ_COLLECTION_ID,
@@ -19,10 +21,10 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            ARCHIVE_BOX_SVG, FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _, esc,
-            parse_form_bool, redirect_see_other, redirect_with_flash, render_feed_favicon,
-            render_inline_csrf_form, render_inline_csrf_form_with_class, render_page,
-            safe_local_redirect, urlencode,
+            ARCHIVE_BOX_SVG, NavSection, PageShell, RESTORE_BOX_SVG, WebError, WithWebCsrf as _,
+            esc, format_audio_duration, parse_form_bool, redirect_see_other, redirect_with_flash,
+            render_feed_favicon, render_inline_csrf_form, render_inline_csrf_form_with_class,
+            render_page, safe_local_redirect, urlencode,
         },
         links::sanitize_non_local_href,
     },
@@ -36,11 +38,11 @@ pub(in crate::web) async fn reader_get(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
-    Query(flash): Query<FlashQuery>,
+    Query(query): Query<ReaderQuery>,
 ) -> Result<Response, WebError> {
     let detail = service.items().get(&id).await.web_err(&session)?;
 
-    let (is_consumed, rank_slug) = match service.catalog().get_entry_detail(&id).await {
+    let (is_consumed, rank_slug, can_rank) = match service.catalog().get_entry_detail(&id).await {
         Ok(Some(ed)) => {
             let consumed = ed.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed);
             let slug = if consumed {
@@ -48,12 +50,18 @@ pub(in crate::web) async fn reader_get(
             } else {
                 None
             };
-            (consumed, slug)
+            let rankable = slug.is_some()
+                || ed.entry.kind.default_list_slug().is_some()
+                || ed.parents.iter().any(|p| p.kind == EntryKind::Collection);
+            (consumed, slug, rankable)
         }
-        _ => (false, None),
+        _ => (false, None, false),
     };
 
-    let active_nav = if detail.item.in_want_to_read {
+    let default_back = if detail.item.in_want_to_read { "/queue" } else { "/inbox" };
+    let return_to = safe_local_redirect(query.return_to.as_deref(), default_back);
+
+    let active_nav = if return_to.starts_with("/queue") || detail.item.in_want_to_read {
         NavSection::Queue
     } else if detail.item.feed_id.is_none() && detail.item.is_favorite {
         NavSection::Starred
@@ -64,7 +72,7 @@ pub(in crate::web) async fn reader_get(
         || detail.item.read_at.is_some()
         || detail.item.read_progress >= READER_AUTO_READ_THRESHOLD;
     let suppress_auto_finish =
-        flash.notice.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("Marked unfinished"));
+        query.flash.notice.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("Marked unfinished"));
 
     let mut body = String::with_capacity(14_336);
     render_reader_article(
@@ -72,7 +80,9 @@ pub(in crate::web) async fn reader_get(
         &detail,
         is_finished,
         suppress_auto_finish,
+        can_rank,
         rank_slug.as_deref(),
+        &return_to,
         &session.csrf_token,
     );
 
@@ -80,9 +90,10 @@ pub(in crate::web) async fn reader_get(
         title: &detail.item.title,
         active: active_nav,
         csrf_token: &session.csrf_token,
-        flash: &flash,
+        flash: &query.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
+        search_query: None,
         body_html: &body,
     })
     .into_response())
@@ -119,55 +130,87 @@ fn estimate_reading_minutes(detail: &ItemDetail) -> Option<usize> {
     if words == 0 { None } else { Some((words / 230).max(1)) }
 }
 
+fn back_label_for_return_to(return_to: &str) -> &'static str {
+    if return_to == "/" {
+        "Back to Home"
+    } else if return_to.starts_with("/queue") {
+        "Back to Queue"
+    } else if return_to.starts_with("/search") {
+        "Back to Search"
+    } else if return_to.starts_with("/lists/starred") || return_to.starts_with("/starred") {
+        "Back to Starred"
+    } else if return_to.starts_with("/lists") {
+        "Back to List"
+    } else {
+        "Back to Inbox"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_reader_article(
     out: &mut String,
     detail: &ItemDetail,
     is_finished: bool,
     suppress_auto_finish: bool,
+    can_rank: bool,
     rank_slug: Option<&str>,
+    return_to: &str,
     csrf: &str,
 ) {
     let item = &detail.item;
     let entry_kind = EntryKind::from_content_type(item.content_type);
     let id_enc = urlencode(&item.id);
-    let reader_path = format!("/reader/{id_enc}");
+    let reader_path = if return_to == "/inbox" || return_to == "/queue" {
+        format!("/reader/{id_enc}")
+    } else {
+        format!("/reader/{id_enc}?return_to={}", urlencode(return_to))
+    };
     let suppress_attr = if suppress_auto_finish { " data-suppress-auto-finish=\"1\"" } else { "" };
 
     let _ = writeln!(
         out,
         "<div class=\"reader-layout\">\n\
-         <article class=\"reader-article js-reader-root\" data-item-id=\"{}\" data-kind=\"{}\" data-progress=\"{:.4}\" data-finished=\"{}\"{suppress_attr}>",
+         <article class=\"reader-article js-reader-root\" data-item-id=\"{}\" data-kind=\"{}\" data-progress=\"{:.4}\" data-finished=\"{}\" data-back-href=\"{}\"{suppress_attr}>",
         esc(&item.id),
         entry_kind.as_str(),
         item.read_progress.clamp(0.0, 1.0),
         if is_finished { "1" } else { "0" },
+        esc(return_to),
     );
 
-    render_reader_header(out, detail, &id_enc, &reader_path, csrf);
+    render_reader_header(out, detail, &id_enc, &reader_path, return_to, rank_slug, csrf);
     render_reader_media_and_prose(out, detail);
-    render_reader_end_card(out, detail, &id_enc, &reader_path, is_finished, csrf);
+    render_reader_end_card(out, detail, &id_enc, &reader_path, is_finished, can_rank, csrf);
     render_reader_tags(out, detail, &id_enc, csrf);
     out.push_str("</article>\n");
-    render_reader_rail(out, detail, &id_enc, &reader_path, rank_slug, csrf);
+    render_reader_rail(out, detail, &id_enc, &reader_path, return_to, rank_slug, csrf);
     out.push_str("</div>\n");
 }
 
-fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail) {
+fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail, return_to: &str) {
     let item = &detail.item;
-    let (back_href, back_label) = if item.in_want_to_read {
-        ("/queue", "Back to Queue")
-    } else {
-        ("/inbox", "Back to Inbox")
-    };
+    let back_label = back_label_for_return_to(return_to);
     let _ = write!(
         out,
         "<div class=\"reader-crumb-row\">\n\
-           <a class=\"reader-back-link\" href=\"{back_href}\">&larr; {back_label}</a>\n\
+           <a class=\"reader-back-link js-reader-back-link\" href=\"{}\">&larr; {back_label}</a>\n\
            <span>",
+        esc(return_to),
     );
-    let read_mins = estimate_reading_minutes(detail);
-    if let Some(mins) = read_mins {
+    let mut wrote_meta = false;
+    if item.content_type == ContentType::Audio {
+        if let Some(dur) = item.duration.filter(|&d| d > 0) {
+            let _ = write!(out, "{} listen", esc(&format_audio_duration(dur)));
+            wrote_meta = true;
+            if item.read_progress >= 0.03 && item.read_progress < 0.98 {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let pct = (item.read_progress * 100.0).round().clamp(1.0, 99.0) as u32;
+                let _ = write!(out, " &middot; {pct}% listened");
+            }
+        }
+    } else if let Some(mins) = estimate_reading_minutes(detail) {
         let _ = write!(out, "{mins} min read");
+        wrote_meta = true;
     }
     if matches!(item.content_type, ContentType::Article | ContentType::Paper)
         && item.read_progress >= 0.05
@@ -175,7 +218,7 @@ fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail) {
     {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pct = (item.read_progress * 100.0).round().clamp(1.0, 99.0) as u32;
-        if read_mins.is_some() {
+        if wrote_meta {
             out.push_str(" &middot; ");
         }
         let _ = write!(
@@ -183,13 +226,10 @@ fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail) {
             "<button type=\"button\" class=\"pill js-reader-resume-btn\" data-resume-progress=\"{:.4}\">Resume at {pct}%</button>",
             item.read_progress.clamp(0.0, 1.0),
         );
+        wrote_meta = true;
     }
     if let Some(ext_href) = sanitize_non_local_href(item.url.as_str()) {
-        if read_mins.is_some()
-            || (matches!(item.content_type, ContentType::Article | ContentType::Paper)
-                && item.read_progress >= 0.05
-                && item.read_progress < 0.95)
-        {
+        if wrote_meta {
             out.push_str(" &middot; ");
         }
         let _ = write!(
@@ -201,25 +241,28 @@ fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail) {
     out.push_str("</span>\n</div>\n");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_reader_header(
     out: &mut String,
     detail: &ItemDetail,
     id_enc: &str,
     reader_path: &str,
+    return_to: &str,
+    rank_slug: Option<&str>,
     csrf: &str,
 ) {
     let item = &detail.item;
-    render_reader_crumb_row(out, detail);
+    render_reader_crumb_row(out, detail, return_to);
     out.push_str("<div class=\"reader-header\">\n<div class=\"reader-title-row\">\n");
 
-    let (star_glyph, star_pressed, star_cls) = if item.is_favorite {
-        ("&#9733;", "true", "btn btn-ghost reader-star-btn is-starred")
+    let (star_glyph, star_pressed, star_cls, star_action_word) = if item.is_favorite {
+        ("&#9733;", "true", "btn btn-ghost reader-star-btn is-starred", "Unstar")
     } else {
-        ("&#9734;", "false", "btn btn-ghost reader-star-btn")
+        ("&#9734;", "false", "btn btn-ghost reader-star-btn", "Star")
     };
     let star_btn = format!(
-        "<button type=\"submit\" class=\"{star_cls}\" title=\"Toggle Star\" aria-label=\"Star {}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
-        esc(&item.title),
+        "<button type=\"submit\" class=\"{star_cls}\" title=\"Toggle Star\" data-title=\"{title}\" aria-label=\"{star_action_word} {title}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
+        title = esc(&item.title),
     );
     render_inline_csrf_form(
         out,
@@ -239,7 +282,7 @@ fn render_reader_header(
         if let Some(fid) = item.feed_id.as_deref() {
             let _ = write!(
                 out,
-                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=all&amp;feed={}\">",
+                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=unread&amp;feed={}\">",
                 esc(&urlencode(fid)),
             );
             render_feed_favicon(out, icon_url, ft, true);
@@ -263,7 +306,7 @@ fn render_reader_header(
             out,
             &format!("/web/want/read/remove/{id_enc}"),
             csrf,
-            &[],
+            &[("return_to", reader_path)],
             None,
             "<button type=\"submit\" class=\"btn btn-small btn-ghost\">In Queue &times;</button>",
         );
@@ -277,33 +320,114 @@ fn render_reader_header(
             "<button type=\"submit\" class=\"btn btn-small btn-ghost\">+ Queue</button>",
         );
     }
-    out.push_str("</div>\n</div>\n</div>\n");
+    out.push_str("</div>\n</div>\n");
+    render_reader_mobile_tools(out, item, id_enc, return_to, rank_slug, csrf);
+    out.push_str("</div>\n");
+}
+
+fn render_reader_mobile_tools(
+    out: &mut String,
+    item: &crate::db::Item,
+    id_enc: &str,
+    return_to: &str,
+    rank_slug: Option<&str>,
+    csrf: &str,
+) {
+    out.push_str("<div class=\"reader-mobile-tools\">\n");
+    if item.feed_id.is_some() {
+        render_reader_archive_action(out, item, id_enc, return_to, csrf, false);
+    }
+    out.push_str(
+        "<div class=\"reader-size-controls\">\n\
+           <button type=\"button\" class=\"btn btn-small btn-ghost js-font-dec\" aria-label=\"Decrease text size\">A&minus;</button>\n\
+           <button type=\"button\" class=\"btn btn-small btn-ghost js-font-inc\" aria-label=\"Increase text size\">A+</button>\n\
+         </div>\n\
+         <details class=\"reader-mobile-drawer\">\n\
+           <summary class=\"btn btn-small btn-ghost\">Contents &amp; Info</summary>\n\
+           <div class=\"reader-mobile-drawer-body\">\n\
+             <div class=\"js-reader-mobile-toc-group\" hidden>\n\
+               <div class=\"reader-rail-title\">Contents</div>\n\
+               <ul class=\"reader-toc reader-mobile-toc-list js-reader-mobile-toc\"></ul>\n\
+             </div>\n\
+             <div class=\"reader-mobile-drawer-links\">\n",
+    );
+    let _ = writeln!(
+        out,
+        "<a class=\"reader-rail-link\" href=\"/entries/{}\">History &amp; Lists &rarr;</a>",
+        esc(id_enc),
+    );
+    if let Some(slug) = rank_slug {
+        let _ = writeln!(
+            out,
+            "<a class=\"reader-rail-link\" href=\"/rank/{slug}?focus={id}\">Compare &rarr;</a>",
+            slug = esc(&urlencode(slug)),
+            id = esc(&urlencode(&item.id)),
+        );
+    }
+    out.push_str("</div>\n</div>\n</details>\n</div>\n");
 }
 
 fn render_reader_media_and_prose(out: &mut String, detail: &ItemDetail) {
     let item = &detail.item;
+    let mut has_local_video = false;
+    let mut has_local_pdf = false;
     for m in &detail.media {
         match m.media_type {
             MediaType::Video => {
+                has_local_video = true;
                 let _ = writeln!(
                     out,
                     "<div class=\"reader-media-box\">\
-                       <video controls preload=\"metadata\" src=\"/web/media/{}\"></video>\
+                       <video class=\"js-reader-video\" data-item-id=\"{}\" data-progress=\"{:.4}\" controls preload=\"metadata\" src=\"/web/media/{}\"></video>\
                      </div>",
-                    esc(&urlencode(&m.id))
+                    esc(&item.id),
+                    item.read_progress.clamp(0.0, 1.0),
+                    esc(&urlencode(&m.id)),
                 );
             }
             MediaType::Pdf => {
+                has_local_pdf = true;
+                let media_href = format!("/web/media/{}", urlencode(&m.id));
                 let _ = writeln!(
                     out,
-                    "<div class=\"reader-media-box\">\
-                       <a class=\"btn\" href=\"/web/media/{}\" target=\"_blank\" rel=\"noopener\">Open Cached PDF &#8599;</a>\
+                    "<div class=\"reader-media-box reader-pdf-box\">\
+                       <div class=\"reader-pdf-bar\">\
+                         <span class=\"meta\">Cached PDF</span>\
+                         <a class=\"btn btn-small btn-ghost\" href=\"{href}\" target=\"_blank\" rel=\"noopener\">Open PDF in new tab &#8599;</a>\
+                       </div>\
+                       <iframe class=\"reader-pdf-frame\" src=\"{href}\" title=\"PDF viewer: {title}\" loading=\"lazy\"></iframe>\
                      </div>",
-                    esc(&urlencode(&m.id))
+                    href = esc(&media_href),
+                    title = esc(&item.title),
                 );
             }
             MediaType::Audio | MediaType::Thumbnail => {}
         }
+    }
+
+    if item.content_type == ContentType::Video
+        && !has_local_video
+        && let Some(ext_href) = sanitize_non_local_href(item.url.as_str())
+    {
+        out.push_str("<div class=\"reader-video-hero\">\n");
+        if let Some(thumb) = item.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
+            let _ = writeln!(
+                out,
+                "<a class=\"reader-video-thumb-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\">\
+                   <img class=\"reader-video-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">\
+                   <span class=\"reader-video-play-badge\" aria-hidden=\"true\">&#9654;</span>\
+                 </a>",
+                esc(ext_href),
+                esc(thumb),
+            );
+        }
+        let _ = writeln!(
+            out,
+            "<div class=\"reader-video-actions\">\
+               <a class=\"btn btn-primary btn-small\" href=\"{}\" target=\"_blank\" rel=\"noopener\">Watch Original &#8599;</a>\
+             </div>\n</div>",
+            esc(ext_href),
+        );
     }
 
     out.push_str("<div class=\"reader-prose\">\n");
@@ -314,7 +438,7 @@ fn render_reader_media_and_prose(out: &mut String, detail: &ItemDetail) {
         for para in summary.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
             let _ = writeln!(out, "<p>{}</p>", esc(para));
         }
-    } else {
+    } else if !has_local_pdf && !has_local_video && item.content_type != ContentType::Video {
         out.push_str("<p class=\"empty\">No extracted article text stored for this entry.</p>\n");
     }
     out.push_str("</div>\n");
@@ -326,19 +450,22 @@ fn render_reader_end_card(
     id_enc: &str,
     reader_path: &str,
     is_finished: bool,
+    can_rank: bool,
     csrf: &str,
 ) {
     let finish_action = format!("/web/items/{id_enc}/finish");
     let unfinish_action = format!("/web/items/{id_enc}/unfinish");
     out.push_str("<div class=\"reader-end-card\">\n<div class=\"reader-end-center\">\n");
-    render_inline_csrf_form(
-        out,
-        &finish_action,
-        csrf,
-        &[("rank_after", "1")],
-        None,
-        "<button type=\"submit\" class=\"btn btn-primary reader-end-rank-btn\">Rank</button>",
-    );
+    if can_rank {
+        render_inline_csrf_form(
+            out,
+            &finish_action,
+            csrf,
+            &[("rank_after", "1")],
+            None,
+            "<button type=\"submit\" class=\"btn btn-primary reader-end-rank-btn\">Finish &amp; Rank</button>",
+        );
+    }
     out.push_str("\n</div>\n<div class=\"reader-end-right\">\n");
     let (toggle_action, btn_cls, pressed, label, title) = if is_finished {
         (
@@ -417,11 +544,13 @@ fn render_reader_tags(out: &mut String, detail: &ItemDetail, id_enc: &str, csrf:
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_reader_rail(
     out: &mut String,
     detail: &ItemDetail,
     id_enc: &str,
     reader_path: &str,
+    return_to: &str,
     rank_slug: Option<&str>,
     csrf: &str,
 ) {
@@ -444,14 +573,14 @@ fn render_reader_rail(
              <div class=\"reader-rail-actions\">\n",
     );
 
-    let (star_glyph, star_pressed, star_cls) = if item.is_favorite {
-        ("&#9733;", "true", "rail-icon-btn js-star-toggle is-starred")
+    let (star_glyph, star_pressed, star_cls, star_action_word) = if item.is_favorite {
+        ("&#9733;", "true", "rail-icon-btn js-star-toggle is-starred", "Unstar")
     } else {
-        ("&#9734;", "false", "rail-icon-btn js-star-toggle")
+        ("&#9734;", "false", "rail-icon-btn js-star-toggle", "Star")
     };
     let star_btn = format!(
-        "<button type=\"submit\" class=\"{star_cls}\" title=\"Star\" aria-label=\"Star {}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
-        esc(&item.title),
+        "<button type=\"submit\" class=\"{star_cls}\" title=\"Star\" data-title=\"{title}\" aria-label=\"{star_action_word} {title}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
+        title = esc(&item.title),
     );
     render_inline_csrf_form(
         out,
@@ -471,7 +600,7 @@ fn render_reader_rail(
             out,
             &format!("/web/want/read/remove/{id_enc}"),
             csrf,
-            &[],
+            &[("return_to", reader_path)],
             None,
             &q_btn,
         );
@@ -490,8 +619,10 @@ fn render_reader_rail(
         );
     }
 
-    out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>\n");
-    render_reader_rail_archive(out, item, id_enc, reader_path, csrf);
+    if item.feed_id.is_some() {
+        out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>\n");
+        render_reader_archive_action(out, item, id_enc, return_to, csrf, true);
+    }
 
     let _ = writeln!(
         out,
@@ -511,34 +642,35 @@ fn render_reader_rail(
     out.push_str("</div>\n</div>\n");
 }
 
-fn render_reader_rail_archive(
+fn render_reader_archive_action(
     out: &mut String,
     item: &crate::db::Item,
     id_enc: &str,
-    reader_path: &str,
+    return_to: &str,
     csrf: &str,
+    icon_only: bool,
 ) {
-    let (arch_action, arch_title, arch_return) = if item.feed_id.is_some() {
-        if item.status == ItemStatus::Unread {
-            ("archive", "Archive (mark read)", "/inbox")
-        } else {
-            ("unarchive", "Move back to Inbox", "/inbox")
-        }
-    } else if item.in_want_to_read {
-        ("archive", "Remove from Queue", "/queue")
+    let (arch_action, arch_title, arch_label, icon_svg) = if item.status == ItemStatus::Unread {
+        ("archive", "Archive (mark read)", "Archive", ARCHIVE_BOX_SVG)
     } else {
-        ("unarchive", "Add to Queue", reader_path)
+        ("unarchive", "Move back to Inbox", "Restore", RESTORE_BOX_SVG)
     };
     let prog_str = format!("{:.4}", item.read_progress.clamp(0.0, 1.0));
-    let arch_btn = format!(
-        "<button type=\"submit\" class=\"rail-icon-btn\" title=\"{arch_title}\" aria-label=\"{arch_title}\">{ARCHIVE_BOX_SVG}</button>"
-    );
+    let arch_btn = if icon_only {
+        format!(
+            "<button type=\"submit\" class=\"rail-icon-btn js-reader-archive-btn\" title=\"{arch_title}\" aria-label=\"{arch_title}\">{icon_svg}</button>"
+        )
+    } else {
+        format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost js-reader-archive-btn\" title=\"{arch_title}\" aria-label=\"{arch_title}\">{icon_svg} {arch_label}</button>"
+        )
+    };
     render_inline_csrf_form_with_class(
         out,
         &format!("/web/items/{id_enc}/{arch_action}"),
         csrf,
         Some("js-reader-archive-form"),
-        &[("progress", &prog_str), ("return_to", arch_return)],
+        &[("progress", &prog_str), ("return_to", return_to)],
         None,
         &arch_btn,
     );

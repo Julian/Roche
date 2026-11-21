@@ -49,6 +49,7 @@ internal const val TOMBSTONE_ENTITY_TAG = "tag"
 internal const val TOMBSTONE_ENTITY_COLLECTION_ENTRY = "collection_entry"
 internal const val TOMBSTONE_ENTITY_COLLECTION_GENERATOR = "collection_generator"
 internal const val TOMBSTONE_ENTITY_CONSUMPTION_LOG = "consumption_log"
+internal const val TOMBSTONE_ENTITY_COMPARISON = "comparison"
 
 internal const val MAX_CONSECUTIVE_FAILURES = 20
 

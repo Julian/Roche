@@ -133,13 +133,16 @@ impl SyncRepo<'_> {
                     )
                     .await?;
                 }
+                ActivityEntityType::Comparison => {
+                    Self::apply_comparison_tombstone_in_tx(conn, key, safe_deleted_at, &tomb_hlc)
+                        .await?;
+                }
                 ActivityEntityType::Feed
                 | ActivityEntityType::Item
                 | ActivityEntityType::Tag
                 | ActivityEntityType::Entry
                 | ActivityEntityType::Media
-                | ActivityEntityType::Collection
-                | ActivityEntityType::Comparison => {}
+                | ActivityEntityType::Collection => {}
             }
         }
         Self::finalize_deferred_entry_deletes_in_tx(conn, ctx).await?;
@@ -533,6 +536,32 @@ impl SyncRepo<'_> {
         Self::record_tombstone_with_hlc(
             &mut *conn,
             ActivityEntityType::ConsumptionLog,
+            key,
+            deleted_at,
+            tomb_hlc,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn apply_comparison_tombstone_in_tx(
+        conn: &mut SqliteConnection,
+        key: &str,
+        deleted_at: DateTime<Utc>,
+        tomb_hlc: &str,
+    ) -> Result<()> {
+        let existing_hlc: Option<String> =
+            sqlx::query_scalar("SELECT hlc FROM comparisons WHERE id = ?")
+                .bind(key)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if existing_hlc.as_deref().is_some_and(|h| h > tomb_hlc) {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM comparisons WHERE id = ?").bind(key).execute(&mut *conn).await?;
+        Self::record_tombstone_with_hlc(
+            &mut *conn,
+            ActivityEntityType::Comparison,
             key,
             deleted_at,
             tomb_hlc,

@@ -55,6 +55,35 @@ impl CatalogRepo<'_> {
         Ok(record)
     }
 
+    /// Deletes a comparison by ID and records a sync tombstone so Rank Undo propagates cleanly.
+    pub async fn delete_comparison(&self, comparison_id: &str) -> CatalogResult<bool> {
+        let trimmed = comparison_id.trim();
+        if trimmed.is_empty() {
+            return Ok(false);
+        }
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        let res = sqlx::query("DELETE FROM comparisons WHERE id = ?")
+            .bind(trimmed)
+            .execute(&mut *tx)
+            .await?;
+        let deleted = res.rows_affected() > 0;
+        if deleted {
+            SyncRepo::record_activity(
+                &mut tx,
+                ActivityEntityType::Comparison,
+                trimmed,
+                ActivityAction::Delete,
+                now,
+            )
+            .await?;
+            SyncRepo::record_tombstone(&mut tx, ActivityEntityType::Comparison, trimmed, now)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
     pub(super) async fn append_comparison_in_tx(
         tx: &mut SqliteConnection,
         clean_scope: Option<String>,

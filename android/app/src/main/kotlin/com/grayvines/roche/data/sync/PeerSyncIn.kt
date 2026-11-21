@@ -8,6 +8,7 @@ import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.STARRED_SLUG
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_GENERATOR
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_COMPARISON
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_CONSUMPTION_LOG
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_ENTRY
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_FEED
@@ -373,6 +374,7 @@ private suspend fun applyIncomingTombstonesInTx(
                 applyGeneratorTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_CONSUMPTION_LOG ->
                 applyConsumptionLogTombstone(dao, rawKey, deletedAt, tombHlc)
+            TOMBSTONE_ENTITY_COMPARISON -> applyComparisonTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_ENTRY -> applyEntryTombstone(dao, rawKey, deletedAt, tombHlc)
         }
     }
@@ -493,6 +495,20 @@ private suspend fun applyConsumptionLogTombstone(
     if (existing != null && compareHlc(existing.hlc, tombHlc) > 0) return
     dao.deleteConsumptionLogById(logId)
     upsertCleanTombstone(dao, TOMBSTONE_ENTITY_CONSUMPTION_LOG, logId, deletedAt, tombHlc)
+}
+
+private suspend fun applyComparisonTombstone(
+    dao: RocheDao,
+    rawKey: String,
+    deletedAt: String,
+    tombHlc: String,
+) {
+    val compId = rawKey.trim()
+    if (compId.isEmpty()) return
+    val existing = dao.getComparisonById(compId)
+    if (existing != null && compareHlc(existing.hlc, tombHlc) > 0) return
+    dao.deleteComparisonById(compId)
+    upsertCleanTombstone(dao, TOMBSTONE_ENTITY_COMPARISON, compId, deletedAt, tombHlc)
 }
 
 private suspend fun isProtectedTombstoneTarget(dao: RocheDao, entryId: String): Boolean {

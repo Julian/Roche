@@ -277,6 +277,16 @@ impl<'a> CatalogService<'a> {
         Ok(self.repo.list_diary(year, status, limit).await?)
     }
 
+    pub async fn list_diary_page(
+        &self,
+        year: Option<i32>,
+        status: Option<ConsumptionStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ConsumptionLogView>, AppError> {
+        Ok(self.repo.list_diary_page(year, status, limit, offset).await?)
+    }
+
     pub async fn list_diary_year_counts(
         &self,
         status: Option<ConsumptionStatus>,
@@ -323,6 +333,10 @@ impl<'a> CatalogService<'a> {
 
     pub async fn delete_consumption_log(&self, log_id: &str) -> Result<bool, AppError> {
         Ok(self.repo.delete_consumption_log(log_id).await?)
+    }
+
+    pub async fn delete_comparison(&self, comparison_id: &str) -> Result<bool, AppError> {
+        Ok(self.repo.delete_comparison(comparison_id).await?)
     }
 
     /// Logs a consumption event for either an existing `entry_id` or an inline `UpsertEntryInput`.

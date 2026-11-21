@@ -473,7 +473,18 @@ impl CatalogRepo<'_> {
         status: Option<ConsumptionStatus>,
         limit: usize,
     ) -> CatalogResult<Vec<ConsumptionLogView>> {
+        self.list_diary_page(year, status, limit, 0).await
+    }
+
+    pub async fn list_diary_page(
+        &self,
+        year: Option<i32>,
+        status: Option<ConsumptionStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> CatalogResult<Vec<ConsumptionLogView>> {
         let cap = i64::try_from(limit.clamp(1, 2_000)).unwrap_or(200);
+        let skip = i64::try_from(offset).unwrap_or(0).max(0);
         let mut qb = QueryBuilder::<Sqlite>::new(
             "SELECT cl.id, cl.entry_id, cl.ts, cl.status, cl.notes, cl.created_at
              FROM consumption_log cl
@@ -496,7 +507,9 @@ impl CatalogRepo<'_> {
             qb.push(" AND cl.status = ").push_bind(st);
         }
         qb.push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) DESC, cl.id DESC LIMIT ")
-            .push_bind(cap);
+            .push_bind(cap)
+            .push(" OFFSET ")
+            .push_bind(skip);
 
         let log_rows: Vec<ConsumptionLogRow> = qb.build_query_as().fetch_all(self.pool).await?;
         let unique_entry_ids: Vec<String> = log_rows

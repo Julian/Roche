@@ -5,17 +5,20 @@ use std::{
 };
 
 use axum::{
-    Form,
+    Form, Json,
     extract::{Extension, Path, Query, State},
     response::{IntoResponse, Response},
 };
 
 use super::{
-    AddArtistAlbumForm, EntryAddToListForm, EntryLogForm, EntryMergeForm, parse_consumption_status,
-    parse_optional_year,
+    AddArtistAlbumForm, EntryAddToListForm, EntryDetailQuery, EntryLogForm, EntryMergeForm,
+    EntryQueueToggleForm, parse_consumption_status, parse_optional_year,
 };
 use crate::{
-    db::{CatalogEntry, CollectionSummary, EntryDetailView, EntryIdentifier, UpsertEntryInput},
+    db::{
+        CatalogEntry, CollectionSummary, EntryDetailView, EntryIdentifier, UpsertEntryInput,
+        WANT_TO_READ_SLUG,
+    },
     domain::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind},
     service::{
         AppError, EntryListAppearance, RocheService,
@@ -27,9 +30,10 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _, esc, parse_form_bool,
-            redirect_with_flash, render_inline_csrf_form_with_class, render_page,
-            safe_local_redirect, urlencode,
+            NavSection, PageShell, WebError, WithWebCsrf as _, consumption_status_label, esc,
+            parse_form_bool, redirect_with_flash, render_inline_csrf_form,
+            render_inline_csrf_form_with_class, render_page, safe_local_redirect,
+            safe_web_error_message, urlencode,
         },
         links::{
             WebLinkIcon, collect_web_external_links, extract_entry_tags,
@@ -41,9 +45,16 @@ use crate::{
 const CLOCK_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"8\" cy=\"8\" r=\"6\"/><path d=\"M8 4.5v3.75l2.5 1.5\"/></svg>";
 
 struct EntryParentListLink {
+    id: String,
     slug: String,
     title: String,
     has_generator: bool,
+    is_editable_manual: bool,
+}
+
+enum MergePreviewState {
+    Ready(Box<EntryDetailView>),
+    Error(String),
 }
 
 struct EntryRenderCtx<'a> {
@@ -51,7 +62,11 @@ struct EntryRenderCtx<'a> {
     tracks: &'a [AlbumTrack],
     appearances: &'a [EntryListAppearance],
     parent_lists: &'a [EntryParentListLink],
-    manual_lists: &'a [CollectionSummary],
+    available_manual_lists: &'a [CollectionSummary],
+    want_queue_slug: Option<&'a str>,
+    needs_enrich: bool,
+    merge_preview_query: Option<&'a str>,
+    merge_preview: Option<&'a MergePreviewState>,
     artist_links: &'a HashMap<String, String>,
     child_tiers: &'a HashMap<String, char>,
     has_reader_item: bool,
@@ -62,7 +77,7 @@ pub(in crate::web) async fn entry_detail_get(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
-    Query(flash): Query<FlashQuery>,
+    Query(query): Query<EntryDetailQuery>,
 ) -> Result<Response, WebError> {
     let detail =
         service.catalog().get_entry_detail(&id).await.web_err(&session)?.ok_or_else(|| {
@@ -72,8 +87,7 @@ pub(in crate::web) async fn entry_detail_get(
                 session.theme,
             )
         })?;
-    service.enrich().spawn_artist_enrichment_if_needed(&detail);
-    service.enrich().spawn_album_tracklist_enrichment_if_needed(&detail);
+    let needs_enrich = service.enrich().needs_enrichment(&detail);
 
     let mut relevant_creators: Vec<String> = detail.entry.creators.clone();
     relevant_creators.extend(detail.children.iter().flat_map(|c| c.creators.iter().cloned()));
@@ -83,13 +97,21 @@ pub(in crate::web) async fn entry_detail_get(
     let (artist_links, appearances, collections_res, reader_ids_res, child_tiers) = tokio::join!(
         load_artist_id_by_lower_name(&service, &relevant_creators),
         catalog.load_entry_ranked_appearances(&detail),
-        catalog.list_collections(false, false),
+        catalog.list_collections(true, false),
         items.existing_ids(std::slice::from_ref(&detail.entry.id)),
         load_child_entry_tiers(&service, &detail.children),
     );
     let all_lists = collections_res.unwrap_or_default();
     let list_by_id: HashMap<&str, &CollectionSummary> =
         all_lists.iter().map(|c| (c.id.as_str(), c)).collect();
+
+    let want_queue_slug: Option<String> =
+        detail.parents.iter().filter(|p| p.kind == EntryKind::Collection).find_map(|p| {
+            let col = list_by_id.get(p.id.as_str())?;
+            (col.role == CollectionRole::Want)
+                .then(|| col.slug.clone().unwrap_or_else(|| col.id.clone()))
+        });
+
     let parent_lists: Vec<EntryParentListLink> = detail
         .parents
         .iter()
@@ -100,18 +122,32 @@ pub(in crate::web) async fn entry_detail_get(
                 return None;
             }
             Some(EntryParentListLink {
+                id: col.id.clone(),
                 slug: col.slug.clone().unwrap_or_else(|| col.id.clone()),
                 title: col.title.clone(),
                 has_generator: col.has_generator,
+                is_editable_manual: col.mode == CollectionMode::Manual
+                    && !col.has_generator
+                    && col.role == CollectionRole::List,
             })
         })
         .collect();
-    let manual_lists: Vec<CollectionSummary> = all_lists
-        .into_iter()
+    let joined_list_ids: HashSet<&str> = parent_lists.iter().map(|p| p.id.as_str()).collect();
+    let available_manual_lists: Vec<CollectionSummary> = all_lists
+        .iter()
         .filter(|c| {
-            c.mode == CollectionMode::Manual && !c.has_generator && c.role == CollectionRole::List
+            c.mode == CollectionMode::Manual
+                && !c.has_generator
+                && c.role == CollectionRole::List
+                && !joined_list_ids.contains(c.id.as_str())
         })
+        .cloned()
         .collect();
+
+    let merge_preview_query =
+        query.merge_preview.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let merge_preview = load_merge_preview(&service, &detail.entry.id, merge_preview_query).await;
+
     let has_reader_item = reader_ids_res.is_ok_and(|ids| ids.contains(&detail.entry.id));
     let tracks = extract_album_tracks(&detail);
 
@@ -120,7 +156,11 @@ pub(in crate::web) async fn entry_detail_get(
         tracks: &tracks,
         appearances: &appearances,
         parent_lists: &parent_lists,
-        manual_lists: &manual_lists,
+        available_manual_lists: &available_manual_lists,
+        want_queue_slug: want_queue_slug.as_deref(),
+        needs_enrich,
+        merge_preview_query,
+        merge_preview: merge_preview.as_ref(),
         artist_links: &artist_links,
         child_tiers: &child_tiers,
         has_reader_item,
@@ -133,12 +173,37 @@ pub(in crate::web) async fn entry_detail_get(
         title: &detail.entry.title,
         active: NavSection::Lists,
         csrf_token: &session.csrf_token,
-        flash: &flash,
+        flash: &query.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
+        search_query: None,
         body_html: &body,
     })
     .into_response())
+}
+
+async fn load_merge_preview(
+    service: &RocheService,
+    source_id: &str,
+    merge_preview_query: Option<&str>,
+) -> Option<MergePreviewState> {
+    let raw_target = merge_preview_query?;
+    Some(match service.catalog().resolve_entry(raw_target, None, None).await {
+        Ok(target) if target.id == source_id => {
+            MergePreviewState::Error("Cannot merge an entry into itself.".to_owned())
+        }
+        Ok(target) => match service.catalog().get_entry_detail(&target.id).await {
+            Ok(Some(target_detail)) => MergePreviewState::Ready(Box::new(target_detail)),
+            _ => MergePreviewState::Error(format!(
+                "Could not load canonical target '{}'.",
+                target.title
+            )),
+        },
+        Err(err) => {
+            let safe_msg = safe_web_error_message(&err);
+            MergePreviewState::Error(format!("Could not find target '{raw_target}': {safe_msg}"))
+        }
+    })
 }
 
 async fn load_child_entry_tiers(
@@ -151,8 +216,26 @@ async fn load_child_entry_tiers(
 fn render_entry_detail_body(out: &mut String, ctx: &EntryRenderCtx<'_>) {
     out.push_str("<div class=\"entry-grid\">\n<div class=\"entry-main\">\n");
     render_entry_crumb(out, &ctx.detail.entry);
+    if ctx.needs_enrich {
+        let msg = if ctx.detail.entry.kind == EntryKind::Artist {
+            "Fetching artist bio &amp; discography…"
+        } else {
+            "Fetching album tracklist…"
+        };
+        let _ = writeln!(
+            out,
+            "<div class=\"entry-enrich-banner js-entry-enrich\" data-entry-id=\"{}\" role=\"status\">{msg}</div>",
+            esc(&ctx.detail.entry.id),
+        );
+    }
     render_entry_hero(out, ctx);
-    render_entry_action_bar(out, &ctx.detail.entry, ctx.has_reader_item);
+    render_entry_action_bar(
+        out,
+        &ctx.detail.entry,
+        ctx.has_reader_item,
+        ctx.want_queue_slug,
+        ctx.csrf,
+    );
     if !ctx.tracks.is_empty() {
         render_album_tracklist(out, &ctx.detail.entry, ctx.tracks);
     }
@@ -279,18 +362,50 @@ fn render_entry_meta_line(
     out.push_str("</p>\n");
 }
 
-fn render_entry_action_bar(out: &mut String, entry: &CatalogEntry, has_reader_item: bool) {
+fn render_entry_action_bar(
+    out: &mut String,
+    entry: &CatalogEntry,
+    has_reader_item: bool,
+    want_queue_slug: Option<&str>,
+    csrf: &str,
+) {
     let links = collect_web_external_links(entry, Some("Open Source"));
-    if !has_reader_item && links.is_empty() {
+    let can_queue = entry.kind.default_want_slug().is_some();
+    if !has_reader_item && !can_queue && links.is_empty() {
         return;
     }
+    let id_enc = urlencode(&entry.id);
+    let return_to = format!("/entries/{id_enc}");
     out.push_str("<div class=\"entry-action-bar\">\n");
     if has_reader_item {
         let _ = writeln!(
             out,
-            "<a class=\"btn btn-primary btn-small\" href=\"/reader/{}\">Open in Reader &rarr;</a>",
-            esc(&urlencode(&entry.id)),
+            "<a class=\"btn btn-primary btn-small\" href=\"/reader/{id_enc}?return_to={}\">Open in Reader &rarr;</a>",
+            esc(&urlencode(&return_to)),
         );
+    }
+    if can_queue {
+        let toggle_action = format!("/web/entries/{id_enc}/queue-toggle");
+        if let Some(q_slug) = want_queue_slug {
+            render_inline_csrf_form(
+                out,
+                &toggle_action,
+                csrf,
+                &[("in_queue", "false"), ("queue_slug", q_slug), ("return_to", &return_to)],
+                None,
+                "<button type=\"submit\" class=\"btn btn-small btn-ghost is-in-queue\" title=\"Remove from Queue\">&#10003; In Queue</button>",
+            );
+        } else {
+            let default_q = entry.kind.default_want_slug().unwrap_or(WANT_TO_READ_SLUG);
+            render_inline_csrf_form(
+                out,
+                &toggle_action,
+                csrf,
+                &[("in_queue", "true"), ("queue_slug", default_q), ("return_to", &return_to)],
+                None,
+                "<button type=\"submit\" class=\"btn btn-small btn-ghost\" title=\"Add to Queue\">+ Add to Queue</button>",
+            );
+        }
     }
     if !links.is_empty() {
         out.push_str("<ul class=\"external-links\">\n");
@@ -353,9 +468,14 @@ fn render_album_tracklist(out: &mut String, album: &CatalogEntry, tracks: &[Albu
         );
         if let Some((href, external)) = track_href {
             let ext_attrs = if external { " target=\"_blank\" rel=\"noopener\"" } else { "" };
+            let ext_mark = if external {
+                " <span class=\"track-ext-mark\" aria-hidden=\"true\">&#8599;</span>"
+            } else {
+                ""
+            };
             let _ = write!(
                 out,
-                "<a class=\"track-title\" href=\"{}\"{ext_attrs}>{}</a>",
+                "<a class=\"track-title\" href=\"{}\"{ext_attrs}>{}{ext_mark}</a>",
                 esc(&href),
                 esc(&track.title),
             );
@@ -579,8 +699,20 @@ fn render_entry_rail(out: &mut String, ctx: &EntryRenderCtx<'_>) {
         render_rail_rankings_card(out, &ctx.detail.entry.id, ctx.appearances);
     }
     render_rail_diary_card(out, ctx.detail, ctx.csrf);
-    render_rail_lists_card(out, &ctx.detail.entry.id, ctx.parent_lists, ctx.manual_lists, ctx.csrf);
-    render_rail_merge_card(out, &ctx.detail.entry.id, ctx.csrf);
+    render_rail_lists_card(
+        out,
+        &ctx.detail.entry.id,
+        ctx.parent_lists,
+        ctx.available_manual_lists,
+        ctx.csrf,
+    );
+    render_rail_merge_card(
+        out,
+        &ctx.detail.entry.id,
+        ctx.merge_preview_query,
+        ctx.merge_preview,
+        ctx.csrf,
+    );
     out.push_str("</div>\n");
 }
 
@@ -646,32 +778,19 @@ fn render_rail_diary_card(out: &mut String, detail: &EntryDetailView, csrf: &str
         "<section class=\"rail-block rail-card\" aria-label=\"Diary\">\n\
            <div class=\"section-head\"><h3>Diary</h3>{count_badge}</div>",
     );
+    let id_enc = urlencode(&detail.entry.id);
+    let return_to = format!("/entries/{id_enc}");
+
     if detail.log_history.is_empty() {
         out.push_str("<p class=\"rail-note\">Not logged in Diary yet.</p>\n");
     } else {
         out.push_str("<ul class=\"entry-history-list\">\n");
         for log in &detail.log_history {
-            let status_label = match log.status {
-                ConsumptionStatus::Consumed => "Finished",
-                ConsumptionStatus::Started => "Started",
-                ConsumptionStatus::Abandoned => "Skipped",
-            };
-            let _ = write!(
-                out,
-                "<li class=\"entry-history-row\">\
-                   <span class=\"entry-history-date\">{}</span>\
-                   <span class=\"badge\">{status_label}</span>",
-                log.ts.format("%b %-d, %Y"),
-            );
-            if let Some(notes) = log.notes.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                let _ = write!(out, "<span class=\"entry-history-note\">{}</span>", esc(notes));
-            }
-            out.push_str("</li>\n");
+            render_entry_diary_row(out, log, &return_to, csrf);
         }
         out.push_str("</ul>\n");
     }
 
-    let id_enc = urlencode(&detail.entry.id);
     let subhead = if is_music { "Log a play" } else { "Log activity" };
     let placeholder = if is_music { "Thoughts, standout tracks…" } else { "Optional note…" };
     let _ = write!(
@@ -681,7 +800,7 @@ fn render_rail_diary_card(out: &mut String, detail: &EntryDetailView, csrf: &str
            <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
            <div class=\"field\">\n\
              <label for=\"log-status\">Status</label>\n\
-             <select id=\"log-status\" name=\"status\">\n\
+             <select id=\"log-status\" name=\"status\" class=\"js-log-status-select\">\n\
                <option value=\"consumed\">Finished</option>\n\
                <option value=\"started\">Started</option>\n\
                <option value=\"abandoned\">Skipped</option>\n\
@@ -692,7 +811,7 @@ fn render_rail_diary_card(out: &mut String, detail: &EntryDetailView, csrf: &str
              <textarea id=\"log-notes\" name=\"notes\" class=\"textarea-compact\" placeholder=\"{placeholder}\"></textarea>\n\
            </div>\n\
            <div class=\"field field-check\">\n\
-             <input id=\"log-rank\" name=\"rank_after\" type=\"checkbox\" value=\"1\" checked>\n\
+             <input id=\"log-rank\" name=\"rank_after\" type=\"checkbox\" value=\"1\" checked class=\"js-log-rank-check\">\n\
              <label for=\"log-rank\">Rank after logging</label>\n\
            </div>\n\
            <button type=\"submit\" class=\"btn btn-primary btn-small\">Save Log</button>\n\
@@ -703,16 +822,80 @@ fn render_rail_diary_card(out: &mut String, detail: &EntryDetailView, csrf: &str
     );
 }
 
+fn render_entry_diary_row(
+    out: &mut String,
+    log: &crate::db::ConsumptionLogRow,
+    return_to: &str,
+    csrf: &str,
+) {
+    let status_label = consumption_status_label(log.status);
+    let log_id_enc = urlencode(&log.id);
+    let date_iso = log.ts.format("%Y-%m-%d").to_string();
+    let note_val = log.notes.as_deref().map_or("", str::trim);
+    let sel_finished = if log.status == ConsumptionStatus::Consumed { " selected" } else { "" };
+    let sel_started = if log.status == ConsumptionStatus::Started { " selected" } else { "" };
+    let sel_skipped = if log.status == ConsumptionStatus::Abandoned { " selected" } else { "" };
+
+    let _ = write!(
+        out,
+        "<li class=\"entry-history-row\">\
+           <div class=\"entry-history-main\">\
+             <span class=\"entry-history-date\">{}</span>\
+             <span class=\"badge\">{status_label}</span>",
+        log.ts.format("%b %-d, %Y"),
+    );
+    if !note_val.is_empty() {
+        let _ = write!(out, "<span class=\"entry-history-note\">{}</span>", esc(note_val));
+    }
+    let _ = write!(
+        out,
+        "</div>\
+         <div class=\"entry-history-actions\">\
+           <details class=\"diary-edit-details\">\
+             <summary class=\"link-btn\" aria-label=\"Edit diary entry from {}\">Edit</summary>\
+             <form method=\"post\" action=\"/web/diary/{log_id_enc}/edit\" class=\"diary-edit-form\">\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
+               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\
+               <div class=\"diary-edit-row\">\
+                 <select name=\"status\" aria-label=\"Diary status\">\
+                   <option value=\"consumed\"{sel_finished}>Finished</option>\
+                   <option value=\"started\"{sel_started}>Started</option>\
+                   <option value=\"abandoned\"{sel_skipped}>Skipped</option>\
+                 </select>\
+                 <input type=\"date\" name=\"date\" value=\"{date_iso}\" aria-label=\"Diary date\">\
+               </div>\
+               <textarea name=\"notes\" class=\"textarea-compact\" placeholder=\"Note…\" aria-label=\"Diary note\">{note_esc}</textarea>\
+               <button type=\"submit\" class=\"btn btn-primary btn-small\">Save</button>\
+             </form>\
+           </details>",
+        log.ts.format("%b %-d, %Y"),
+        csrf = esc(csrf),
+        ret = esc(return_to),
+        note_esc = esc(note_val),
+    );
+    render_inline_csrf_form(
+        out,
+        &format!("/web/diary/{log_id_enc}/delete"),
+        csrf,
+        &[("return_to", return_to)],
+        Some("Delete this diary entry?"),
+        "<button type=\"submit\" class=\"link-btn link-btn-danger\" aria-label=\"Delete diary entry\">&times;</button>",
+    );
+    out.push_str("</div></li>\n");
+}
+
 fn render_rail_lists_card(
     out: &mut String,
     entry_id: &str,
     parent_lists: &[EntryParentListLink],
-    manual_lists: &[CollectionSummary],
+    available_manual_lists: &[CollectionSummary],
     csrf: &str,
 ) {
-    if parent_lists.is_empty() && manual_lists.is_empty() {
+    if parent_lists.is_empty() && available_manual_lists.is_empty() {
         return;
     }
+    let id_enc = urlencode(entry_id);
+    let return_to = format!("/entries/{id_enc}");
     out.push_str(
         "<section class=\"rail-block rail-card\" aria-label=\"Lists\">\n\
            <div class=\"section-head\"><h3>Lists</h3></div>\n",
@@ -722,17 +905,33 @@ fn render_rail_lists_card(
         for parent in parent_lists {
             let draw_badge =
                 if parent.has_generator { "<span class=\"badge\">Draw</span>" } else { "" };
-            let _ = writeln!(
+            let slug_enc = urlencode(&parent.slug);
+            let _ = write!(
                 out,
-                "<li><a href=\"/lists/{}\">{}</a>{draw_badge}</li>",
-                esc(&urlencode(&parent.slug)),
+                "<li class=\"rail-list-link-row\"><span class=\"rail-list-link-left\"><a href=\"/lists/{slug_enc}\">{}</a>{draw_badge}</span>",
                 esc(&parent.title),
             );
+            if parent.is_editable_manual {
+                let remove_action = format!("/web/lists/{slug_enc}/remove/{id_enc}");
+                let remove_btn = format!(
+                    "<button type=\"submit\" class=\"link-btn\" title=\"Remove from {}\" aria-label=\"Remove from {}\"><span aria-hidden=\"true\">&times;</span></button>",
+                    esc(&parent.title),
+                    esc(&parent.title),
+                );
+                render_inline_csrf_form(
+                    out,
+                    &remove_action,
+                    csrf,
+                    &[("return_to", &return_to)],
+                    None,
+                    &remove_btn,
+                );
+            }
+            out.push_str("</li>\n");
         }
         out.push_str("</ul>\n");
     }
-    if !manual_lists.is_empty() {
-        let id_enc = urlencode(entry_id);
+    if !available_manual_lists.is_empty() {
         let _ = write!(
             out,
             "<form method=\"post\" action=\"/web/entries/{}/list-add\" class=\"rail-inline-add\">\n\
@@ -741,7 +940,7 @@ fn render_rail_lists_card(
             esc(&id_enc),
             esc(csrf),
         );
-        for col in manual_lists {
+        for col in available_manual_lists {
             let key = col.slug.as_deref().unwrap_or(&col.id);
             let _ = write!(out, "<option value=\"{}\">{}</option>", esc(key), esc(&col.title));
         }
@@ -752,26 +951,72 @@ fn render_rail_lists_card(
     out.push_str("</section>\n");
 }
 
-fn render_rail_merge_card(out: &mut String, entry_id: &str, csrf: &str) {
+fn render_rail_merge_card(
+    out: &mut String,
+    entry_id: &str,
+    merge_preview_query: Option<&str>,
+    merge_preview: Option<&MergePreviewState>,
+    csrf: &str,
+) {
     let id_enc = urlencode(entry_id);
+    let open_attr = if merge_preview.is_some() { " open" } else { "" };
     let _ = write!(
         out,
         "<section class=\"rail-block rail-card\">\n\
-           <details class=\"rail-details\">\n\
+           <details class=\"rail-details\"{open_attr}>\n\
              <summary>Merge Duplicate&hellip;</summary>\n\
-             <form method=\"post\" action=\"/web/entries/{id_enc}/merge\" class=\"rail-form\" data-confirm=\"Merge this duplicate into the target canonical entry? This action cannot be undone.\">\n\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+             <form method=\"get\" action=\"/entries/{id_enc}\" class=\"rail-form\">\n\
                <p class=\"rail-note\">Folds identifiers, list memberships, diary logs, and comparisons from this duplicate into the target canonical entry.</p>\n\
                <div class=\"field\">\n\
-                 <input name=\"canonical_query\" type=\"text\" required aria-label=\"Canonical entry UUID, URL, or exact title\" placeholder=\"Canonical UUID, URL, or exact title\">\n\
+                 <input name=\"merge_preview\" type=\"text\" required value=\"{q}\" aria-label=\"Canonical entry UUID, URL, or exact title\" placeholder=\"Canonical UUID, URL, or exact title\">\n\
                </div>\n\
-               <button type=\"submit\" class=\"btn btn-small\">Merge Duplicate</button>\n\
-             </form>\n\
-           </details>\n\
-         </section>\n",
+               <button type=\"submit\" class=\"btn btn-small\">Preview Merge</button>\n\
+             </form>\n",
         id_enc = esc(&id_enc),
-        csrf = esc(csrf),
+        q = esc(merge_preview_query.unwrap_or("")),
     );
+    if let Some(preview) = merge_preview {
+        match preview {
+            MergePreviewState::Error(msg) => {
+                let _ = writeln!(
+                    out,
+                    "<p class=\"merge-preview-err\" role=\"alert\">{}</p>",
+                    esc(msg),
+                );
+            }
+            MergePreviewState::Ready(target) => {
+                let creators = if target.entry.creators.is_empty() {
+                    String::new()
+                } else {
+                    format!(" &mdash; {}", esc(&target.entry.creators.join(", ")))
+                };
+                let year =
+                    target.entry.release_year.map_or_else(String::new, |y| format!(" ({y})"));
+                let log_count = target.log_history.len();
+                let log_word = if log_count == 1 { "diary log" } else { "diary logs" };
+                let _ = write!(
+                    out,
+                    "<div class=\"merge-preview-card\">\n\
+                       <p class=\"merge-preview-kicker\">Merge target</p>\n\
+                       <p class=\"merge-preview-title\"><strong>{}</strong>{creators}{year}</p>\n\
+                       <p class=\"merge-preview-meta\"><span class=\"badge\">{}</span> &middot; {log_count} {log_word}</p>\n\
+                       <form method=\"post\" action=\"/web/entries/{id_enc}/merge\" class=\"merge-confirm-actions\">\n\
+                         <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+                         <input type=\"hidden\" name=\"canonical_id\" value=\"{target_id}\">\n\
+                         <button type=\"submit\" class=\"btn btn-small btn-danger\">Confirm Merge</button>\n\
+                         <a class=\"btn btn-small btn-ghost\" href=\"/entries/{id_enc}\">Cancel</a>\n\
+                       </form>\n\
+                     </div>\n",
+                    esc(&target.entry.title),
+                    esc(target.entry.kind.display_label()),
+                    id_enc = esc(&id_enc),
+                    csrf = esc(csrf),
+                    target_id = esc(&target.entry.id),
+                );
+            }
+        }
+    }
+    out.push_str("</details>\n</section>\n");
 }
 
 fn format_track_duration(ms: u64) -> String {
@@ -846,18 +1091,91 @@ pub(in crate::web) async fn post_entry_list_add(
     Ok(redirect_with_flash(&dest, "notice", msg))
 }
 
+pub(in crate::web) async fn post_entry_queue_toggle(
+    State(service): State<Arc<RocheService>>,
+    Extension(session): Extension<WebSession>,
+    Path(id): Path<String>,
+    Form(form): Form<EntryQueueToggleForm>,
+) -> Result<Response, WebError> {
+    let fallback = format!("/entries/{}", urlencode(&id));
+    let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
+    let detail =
+        service.catalog().get_entry_detail(&id).await.web_err(&session)?.ok_or_else(|| {
+            WebError::from_app(
+                AppError::not_found(format!("Entry '{id}' not found")),
+                Some(&session.csrf_token),
+                session.theme,
+            )
+        })?;
+    let queue_slug = form
+        .queue_slug
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| detail.entry.kind.default_want_slug())
+        .unwrap_or(WANT_TO_READ_SLUG);
+
+    if parse_form_bool(Some(&form.in_queue)) {
+        let col =
+            service.catalog().get_or_create_want_collection(queue_slug).await.web_err(&session)?;
+        service.catalog().add_collection_entry(&col.id, &id, None).await.web_err(&session)?;
+        Ok(redirect_with_flash(&dest, "notice", "Added to Queue"))
+    } else {
+        let _ = service.catalog().unwant_entry(queue_slug, &id).await.web_err(&session)?;
+        Ok(redirect_with_flash(&dest, "notice", "Removed from Queue"))
+    }
+}
+
+pub(in crate::web) async fn post_entry_enrich(
+    State(service): State<Arc<RocheService>>,
+    Extension(session): Extension<WebSession>,
+    Path(id): Path<String>,
+) -> Result<Response, WebError> {
+    let before =
+        service.catalog().get_entry_detail(&id).await.web_err(&session)?.ok_or_else(|| {
+            WebError::from_app(
+                AppError::not_found(format!("Entry '{id}' not found")),
+                Some(&session.csrf_token),
+                session.theme,
+            )
+        })?;
+    let after = service.enrich().enrich_entry_now(&id).await.web_err(&session)?;
+    let enriched = before.entry.summary != after.entry.summary
+        || before.entry.thumbnail_url != after.entry.thumbnail_url
+        || before.entry.metadata != after.entry.metadata
+        || before.entry.identifiers.len() != after.entry.identifiers.len()
+        || before.children.len() != after.children.len();
+    Ok(Json(serde_json::json!({ "enriched": enriched })).into_response())
+}
+
 pub(in crate::web) async fn post_entry_merge(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<EntryMergeForm>,
 ) -> Result<Response, WebError> {
-    let target = service
-        .catalog()
-        .resolve_entry(&form.canonical_query, None, None)
-        .await
-        .web_err(&session)?;
-    let canon = service.catalog().merge_entries(&id, &target.id).await.web_err(&session)?;
+    let target_id = if let Some(cid) =
+        form.canonical_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    {
+        cid.to_owned()
+    } else if let Some(q) = form.canonical_query.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    {
+        service.catalog().resolve_entry(q, None, None).await.web_err(&session)?.id
+    } else {
+        return Ok(redirect_with_flash(
+            &format!("/entries/{}", urlencode(&id)),
+            "err",
+            "Specify a canonical entry target first",
+        ));
+    };
+    if target_id == id {
+        return Ok(redirect_with_flash(
+            &format!("/entries/{}", urlencode(&id)),
+            "err",
+            "Cannot merge an entry into itself",
+        ));
+    }
+    let canon = service.catalog().merge_entries(&id, &target_id).await.web_err(&session)?;
     Ok(redirect_with_flash(
         &format!("/entries/{}", urlencode(&canon.id)),
         "notice",

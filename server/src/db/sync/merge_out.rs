@@ -302,7 +302,7 @@ impl SyncRepo<'_> {
         cutoff_seq: i64,
         stub_budget: Option<usize>,
     ) -> Result<Option<SyncPageDelta>> {
-        let collection_entries: Vec<SyncCollectionEntryRecord> = sqlx::query_as(
+        let mut collection_entries: Vec<SyncCollectionEntryRecord> = sqlx::query_as(
             "SELECT ce.collection_id, ce.entry_id, ce.position, ce.added_at, ce.hlc
              FROM collection_entries ce
              LEFT JOIN collection_specs cs ON cs.collection_id = ce.collection_id
@@ -324,6 +324,13 @@ impl SyncRepo<'_> {
         .bind(effective_since)
         .bind(cutoff_seq)
         .fetch_all(&mut *conn)
+        .await?;
+
+        Self::append_missing_generator_memberships_in_tx(
+            conn,
+            &mut collection_entries,
+            &collection_generators,
+        )
         .await?;
 
         let consumption_log: Vec<SyncConsumptionLogRecord> = sqlx::query_as(
@@ -363,31 +370,20 @@ impl SyncRepo<'_> {
         .fetch_all(&mut *conn)
         .await?;
 
-        // Ensure EVERY outgoing child record on this page has its referenced `entries` present
-        // (future-referenced stubs omit large `content_html` bodies since their full payload
-        // arrives on their own `sync_seq` page). If required stubs overflow `stub_budget`, return
-        // `Ok(None)` so the caller shrinks `cutoff_seq` rather than silently breaking FK integrity.
-        let present_ids: HashSet<String> = raw_entries.iter().map(|r| r.id.clone()).collect();
-        let missing_refs = collect_missing_referenced_entry_ids(
-            &present_ids,
+        let Some(future_ref_ids) = Self::append_referenced_entries_in_tx(
+            conn,
+            &mut raw_entries,
             &collection_entries,
             &collection_generators,
             &consumption_log,
             &comparisons,
-        );
-        let mut future_ref_ids = HashSet::new();
-        if !missing_refs.is_empty() {
-            let Some(extra) =
-                Self::fetch_future_referenced_entries(conn, &missing_refs, cutoff_seq, stub_budget)
-                    .await?
-            else {
-                return Ok(None);
-            };
-            for row in &extra {
-                future_ref_ids.insert(row.id.clone());
-            }
-            raw_entries.extend(extra);
-        }
+            cutoff_seq,
+            stub_budget,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
 
         let entries = Self::hydrate_outgoing_entries(conn, raw_entries, &future_ref_ids).await?;
         Ok(Some(SyncPageDelta {
@@ -398,6 +394,70 @@ impl SyncRepo<'_> {
             comparisons,
             tombstones,
         }))
+    }
+
+    /// Ensures every outgoing child record on this page has its referenced `entries` present
+    /// (bundling generator target entries regardless of `sync_seq` and fetching future-seq stubs
+    /// for other child references). Returns `Ok(None)` if required stubs overflow `stub_budget`.
+    #[allow(clippy::too_many_arguments)]
+    async fn append_referenced_entries_in_tx(
+        conn: &mut SqliteConnection,
+        raw_entries: &mut Vec<RawSyncEntryRow>,
+        collection_entries: &[SyncCollectionEntryRecord],
+        collection_generators: &[SyncCollectionGeneratorRecord],
+        consumption_log: &[SyncConsumptionLogRecord],
+        comparisons: &[SyncComparisonRecord],
+        cutoff_seq: i64,
+        stub_budget: Option<usize>,
+    ) -> Result<Option<HashSet<String>>> {
+        let mut present_ids: HashSet<String> = raw_entries.iter().map(|r| r.id.clone()).collect();
+        let mut future_ref_ids = HashSet::new();
+        let mut remaining_stub_budget = stub_budget;
+        let generator_entry_refs =
+            collect_missing_generator_entry_ids(&present_ids, collection_generators);
+        if !generator_entry_refs.is_empty() {
+            let Some((extra_gen, used_gen)) = Self::fetch_referenced_entries_any_seq(
+                conn,
+                &generator_entry_refs,
+                remaining_stub_budget,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            remaining_stub_budget =
+                remaining_stub_budget.map(|budget| budget.saturating_sub(used_gen));
+            for row in &extra_gen {
+                present_ids.insert(row.id.clone());
+                future_ref_ids.insert(row.id.clone());
+            }
+            raw_entries.extend(extra_gen);
+        }
+
+        let missing_refs = collect_missing_referenced_entry_ids(
+            &present_ids,
+            collection_entries,
+            collection_generators,
+            consumption_log,
+            comparisons,
+        );
+        if !missing_refs.is_empty() {
+            let Some(extra) = Self::fetch_future_referenced_entries(
+                conn,
+                &missing_refs,
+                cutoff_seq,
+                remaining_stub_budget,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            for row in &extra {
+                future_ref_ids.insert(row.id.clone());
+            }
+            raw_entries.extend(extra);
+        }
+        Ok(Some(future_ref_ids))
     }
 
     async fn load_comparisons_in_tx(
@@ -430,6 +490,85 @@ impl SyncRepo<'_> {
                 })
             })
             .collect())
+    }
+
+    /// Appends the `(collection_id, current_entry_id)` pool membership row for every outgoing
+    /// collection generator when not already present on this page, so incremental peers always
+    /// receive the drawn work's membership alongside the draw itself.
+    async fn append_missing_generator_memberships_in_tx(
+        conn: &mut SqliteConnection,
+        collection_entries: &mut Vec<SyncCollectionEntryRecord>,
+        collection_generators: &[SyncCollectionGeneratorRecord],
+    ) -> Result<()> {
+        if collection_generators.is_empty() {
+            return Ok(());
+        }
+        let mut seen: HashSet<(String, String)> = collection_entries
+            .iter()
+            .map(|ce| (ce.collection_id.clone(), ce.entry_id.clone()))
+            .collect();
+        for generator in collection_generators {
+            let Some(cur_id) =
+                generator.current_entry_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let key = (generator.collection_id.clone(), cur_id.to_owned());
+            if seen.contains(&key) {
+                continue;
+            }
+            let row: Option<SyncCollectionEntryRecord> = sqlx::query_as(
+                "SELECT ce.collection_id, ce.entry_id, ce.position, ce.added_at, ce.hlc
+                 FROM collection_entries ce
+                 LEFT JOIN collection_specs cs ON cs.collection_id = ce.collection_id
+                 WHERE ce.collection_id = ? AND ce.entry_id = ?
+                   AND (cs.mode IS NULL OR cs.mode != 'dynamic')
+                 LIMIT 1",
+            )
+            .bind(&generator.collection_id)
+            .bind(cur_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            if let Some(mem) = row {
+                seen.insert(key);
+                collection_entries.push(mem);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetches entries in `candidate_ids` regardless of `sync_seq`, used to bundle active
+    /// generator targets and collections alongside `collection_generators` deltas.
+    async fn fetch_referenced_entries_any_seq(
+        conn: &mut SqliteConnection,
+        candidate_ids: &[String],
+        stub_budget: Option<usize>,
+    ) -> Result<Option<(Vec<RawSyncEntryRow>, usize)>> {
+        let mut out = Vec::new();
+        let mut used = 0usize;
+        for chunk in candidate_ids.chunks(SQLITE_BIND_CHUNK) {
+            let mut qb = QueryBuilder::<Sqlite>::new(concat!(
+                "SELECT ",
+                sync_entry_columns!(),
+                " FROM entries WHERE id IN ("
+            ));
+            push_bound_id_list(&mut qb, chunk);
+            qb.push(concat!(") AND ", exclude_dynamic_or_system_collection_sql!()));
+            let rows: Vec<RawSyncEntryRow> = qb.build_query_as().fetch_all(&mut *conn).await?;
+            for row in rows {
+                let est = 256usize
+                    .saturating_add(row.title.len())
+                    .saturating_add(row.summary.as_deref().map_or(0, str::len))
+                    .saturating_add(row.creators_json.len())
+                    .saturating_add(row.metadata_json.len());
+                used = used.saturating_add(est);
+                if stub_budget.is_some_and(|budget| used > budget) {
+                    return Ok(None);
+                }
+                out.push(row);
+            }
+        }
+        Ok(Some((out, used)))
     }
 
     /// Fetches all entries in `candidate_ids` with `sync_seq > cutoff_seq`.
@@ -798,6 +937,27 @@ where
         out.extend(rows);
     }
     Ok(out)
+}
+
+fn collect_missing_generator_entry_ids(
+    present_ids: &HashSet<String>,
+    collection_generators: &[SyncCollectionGeneratorRecord],
+) -> Vec<String> {
+    let mut missing = HashSet::new();
+    let mut push_ref = |id: &str| {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() && trimmed != UP_NEXT_COLLECTION_ID && !present_ids.contains(trimmed)
+        {
+            missing.insert(trimmed.to_owned());
+        }
+    };
+    for g in collection_generators {
+        push_ref(&g.collection_id);
+        if let Some(ref cur) = g.current_entry_id {
+            push_ref(cur);
+        }
+    }
+    missing.into_iter().collect()
 }
 
 fn collect_missing_referenced_entry_ids(

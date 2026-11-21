@@ -277,6 +277,8 @@ pub struct ItemFilter {
     pub collection_id: Option<String>,
     #[serde(default)]
     pub inbox_only: Option<bool>,
+    #[serde(default)]
+    pub in_progress_only: Option<bool>,
     pub content_type: Option<ContentType>,
     pub is_favorite: Option<bool>,
     pub is_read: Option<bool>,

@@ -175,7 +175,33 @@ pub(super) fn rank_collection_href(slug: &str, want: bool) -> String {
 
 pub(super) const ARCHIVE_BOX_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"2\" y=\"2.5\" width=\"12\" height=\"3\" rx=\"0.75\"/><path d=\"M3 5.5v7a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-7\"/><path d=\"M6.25 8.75h3.5\"/></svg>";
 
+pub(super) const RESTORE_BOX_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3 7.5a5 5 0 1 1 1.4 3.6\"/><path d=\"M3 4v3.5h3.5\"/></svg>";
+
 pub(super) const REFRESH_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><path d=\"M13.5 8a5.5 5.5 0 1 1-1.4-3.7\" stroke-linecap=\"round\"/><path d=\"M13.5 2.5v2.8h-2.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
+
+#[must_use]
+pub(super) const fn consumption_status_label(status: ConsumptionStatus) -> &'static str {
+    match status {
+        ConsumptionStatus::Consumed => "Finished",
+        ConsumptionStatus::Started => "Started",
+        ConsumptionStatus::Abandoned => "Skipped",
+    }
+}
+
+#[must_use]
+pub(super) fn format_audio_duration(secs: i64) -> String {
+    let clamped = secs.max(0);
+    let hours = clamped / 3_600;
+    let mins = (clamped % 3_600) / 60;
+    let rem_secs = clamped % 60;
+    if hours > 0 {
+        format!("{hours}h {mins:02}m")
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        format!("{rem_secs}s")
+    }
+}
 
 #[must_use]
 pub(super) const fn content_type_label(ct: ContentType) -> &'static str {
@@ -359,6 +385,35 @@ pub(super) fn render_inline_csrf_form_with_class(
     out.push_str("</form>");
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_triage_form(
+    out: &mut String,
+    action: &str,
+    csrf: &str,
+    hidden_fields: &[(&str, &str)],
+    triage_kind: &str,
+    item_title: &str,
+    undo_action: &str,
+    button_html: &str,
+) {
+    let _ = write!(
+        out,
+        "<form method=\"post\" action=\"{}\" class=\"inline-form js-triage-form\" data-triage-kind=\"{}\" data-triage-title=\"{}\" data-undo-action=\"{}\">\
+           <input type=\"hidden\" name=\"_csrf\" value=\"{}\">",
+        esc(action),
+        esc(triage_kind),
+        esc(item_title),
+        esc(undo_action),
+        esc(csrf),
+    );
+    for (name, value) in hidden_fields {
+        let _ =
+            write!(out, "<input type=\"hidden\" name=\"{}\" value=\"{}\">", esc(name), esc(value));
+    }
+    out.push_str(button_html);
+    out.push_str("</form>");
+}
+
 pub(super) fn render_diary_row_with_tier(
     out: &mut String,
     row: &ConsumptionLogView,
@@ -383,7 +438,11 @@ pub(super) fn render_diary_row_with_tier(
         CreatorYearStyle::InlineSoft { open_new_tab: false },
     );
     if row.status != ConsumptionStatus::Consumed {
-        let _ = write!(out, " <span class=\"status-tag\">({})</span>", row.status.as_str());
+        let _ = write!(
+            out,
+            " <span class=\"status-tag\">({})</span>",
+            consumption_status_label(row.status)
+        );
     }
     out.push_str("</span><span class=\"diary-meta\">");
     if let Some(t) = tier {
@@ -441,6 +500,7 @@ pub(super) struct PageShell<'a> {
     pub flash: &'a FlashQuery,
     pub is_refreshing: bool,
     pub theme: Option<&'static str>,
+    pub search_query: Option<&'a str>,
     pub body_html: &'a str,
 }
 
@@ -506,49 +566,177 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
         "\n</main>\n\
          <footer class=\"colophon\">\n\
            <span class=\"colophon-brand\"><span aria-hidden=\"true\">&#10086;</span> <span>Roche &middot; Reader, Podcasts &amp; Ranked Library</span></span>\n\
-           <form class=\"logout-form\" method=\"post\" action=\"/logout\">\n\
-             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <button type=\"submit\" class=\"link-btn\">Sign out</button>\n\
-           </form>\n\
+           <div class=\"colophon-actions\">\n\
+             <button type=\"button\" id=\"roche-shortcuts-btn\" class=\"link-btn colophon-shortcuts-btn\" aria-label=\"Keyboard shortcuts\">Shortcuts (?)</button>\n\
+             <form class=\"logout-form\" method=\"post\" action=\"/logout\">\n\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+               <button type=\"submit\" class=\"link-btn\">Sign out</button>\n\
+             </form>\n\
+           </div>\n\
          </footer>\n\
+         <div id=\"roche-toast-region\" class=\"roche-toast-region\" role=\"status\" aria-live=\"polite\" aria-atomic=\"true\"></div>\n\
          <aside id=\"roche-player-bar\" class=\"player-bar\" aria-label=\"Audio player\" hidden>\n\
            <div class=\"player-inner\">\n\
              <div class=\"player-meta\">\n\
                <div id=\"roche-player-title\" class=\"player-title\">Episode</div>\n\
                <div id=\"roche-player-sub\" class=\"player-sub\">Podcast</div>\n\
+               <div id=\"roche-player-err\" class=\"player-err\" role=\"alert\" hidden></div>\n\
+             </div>\n\
+             <div class=\"player-seek-group\">\n\
+               <button type=\"button\" id=\"roche-player-back\" class=\"btn btn-small btn-ghost\" aria-label=\"Rewind 15 seconds\">&minus;15s</button>\n\
+               <button type=\"button\" id=\"roche-player-fwd\" class=\"btn btn-small btn-ghost\" aria-label=\"Forward 30 seconds\">+30s</button>\n\
              </div>\n\
              <audio id=\"roche-audio\" controls preload=\"metadata\" aria-label=\"Podcast audio player\"></audio>\n\
-             <button type=\"button\" id=\"roche-player-speed\" class=\"btn btn-small\" aria-label=\"Playback speed: 1x\">1x</button>\n\
-             <a id=\"roche-player-link\" href=\"/\" class=\"btn btn-small\" aria-label=\"Open episode notes\">Notes</a>\n\
-             <button type=\"button\" id=\"roche-player-close\" class=\"btn btn-small btn-ghost\" aria-label=\"Close player\"><span aria-hidden=\"true\">&times;</span></button>\n\
+             <div class=\"player-util-controls\">\n\
+               <button type=\"button\" id=\"roche-player-speed\" class=\"btn btn-small\" aria-label=\"Playback speed: 1x\">1x</button>\n\
+               <a id=\"roche-player-link\" href=\"/\" class=\"btn btn-small\" aria-label=\"Open episode notes\">Notes</a>\n\
+               <button type=\"button\" id=\"roche-player-close\" class=\"btn btn-small btn-ghost\" aria-label=\"Close player\"><span aria-hidden=\"true\">&times;</span></button>\n\
+             </div>\n\
            </div>\n\
-         </aside>\n\
-         <script src=\"/static/roche.js\" defer></script>\n\
-         </body>\n\
-         </html>\n",
+         </aside>\n",
         csrf = esc(shell.csrf_token),
     );
+    render_quick_log_dialog(&mut out, shell.csrf_token, shell.active.default_path());
+    render_shortcuts_dialog(&mut out);
+    out.push_str("<script src=\"/static/roche.js\" defer></script>\n</body>\n</html>\n");
 
     Html(out)
 }
 
+fn render_quick_log_dialog(out: &mut String, csrf: &str, default_return: &str) {
+    let _ = write!(
+        out,
+        "<dialog id=\"roche-quick-log-dialog\" class=\"roche-modal\" aria-labelledby=\"roche-ql-heading\">\n\
+           <div class=\"roche-modal-head\">\n\
+             <h2 id=\"roche-ql-heading\">Quick Log &amp; Capture</h2>\n\
+             <button type=\"button\" class=\"btn btn-small btn-ghost js-modal-close\" aria-label=\"Close dialog\"><span aria-hidden=\"true\">&times;</span></button>\n\
+           </div>\n\
+           <div class=\"roche-modal-tabs\" role=\"tablist\" aria-label=\"Capture mode\">\n\
+             <button type=\"button\" class=\"pill is-active js-ql-tab\" role=\"tab\" id=\"roche-ql-tab-media\" aria-selected=\"true\" aria-controls=\"roche-ql-panel-media\" data-tab=\"media\">Log / Queue Media</button>\n\
+             <button type=\"button\" class=\"pill js-ql-tab\" role=\"tab\" id=\"roche-ql-tab-url\" aria-selected=\"false\" aria-controls=\"roche-ql-panel-url\" data-tab=\"url\">Save URL</button>\n\
+           </div>\n\
+           <div id=\"roche-ql-panel-media\" class=\"roche-modal-body\" role=\"tabpanel\" aria-labelledby=\"roche-ql-tab-media\">\n\
+             <form method=\"post\" action=\"/web/log\" class=\"rail-form js-modal-return-form\">\n\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
+               <div class=\"field\"><label for=\"qlm-title\">Title</label>\n\
+                 <input id=\"qlm-title\" name=\"title\" type=\"text\" required placeholder=\"e.g. Drive My Car\"></div>\n\
+               <div class=\"roche-modal-grid\">\n\
+                 <div class=\"field\"><label for=\"qlm-kind\">Kind</label>\n\
+                   <select id=\"qlm-kind\" name=\"kind\">\n\
+                     <option value=\"movie\">Movie</option>\n\
+                     <option value=\"album\">Album</option>\n\
+                     <option value=\"book\">Book</option>\n\
+                     <option value=\"tv\">TV</option>\n\
+                     <option value=\"game\">Game</option>\n\
+                     <option value=\"song\">Song</option>\n\
+                     <option value=\"article\">Article</option>\n\
+                     <option value=\"paper\">Paper</option>\n\
+                     <option value=\"video\">Video</option>\n\
+                     <option value=\"podcast_episode\">Podcast Episode</option>\n\
+                   </select></div>\n\
+                 <div class=\"field\"><label for=\"qlm-action\">Status</label>\n\
+                   <select id=\"qlm-action\" name=\"action\" class=\"js-log-status-select\">\n\
+                     <option value=\"consumed\">Finished</option>\n\
+                     <option value=\"want\">Add to Queue</option>\n\
+                     <option value=\"started\">Started</option>\n\
+                     <option value=\"abandoned\">Skipped</option>\n\
+                   </select></div>\n\
+               </div>\n\
+               <div class=\"roche-modal-grid\">\n\
+                 <div class=\"field\"><label for=\"qlm-creators\">Creator / Artist / Director</label>\n\
+                   <input id=\"qlm-creators\" name=\"creators\" type=\"text\" placeholder=\"Optional\"></div>\n\
+                 <div class=\"field\"><label for=\"qlm-year\">Release Year</label>\n\
+                   <input id=\"qlm-year\" name=\"release_year\" type=\"number\" min=\"1000\" max=\"2100\" placeholder=\"2024\"></div>\n\
+               </div>\n\
+               <div class=\"field\"><label for=\"qlm-ident\">URL / Spotify / IMDb / ISBN (optional)</label>\n\
+                 <input id=\"qlm-ident\" name=\"identifier\" type=\"text\" placeholder=\"Optional link or ID\"></div>\n\
+               <div class=\"field\"><label for=\"qlm-notes\">Notes (optional)</label>\n\
+                 <textarea id=\"qlm-notes\" name=\"notes\" class=\"textarea-compact\" placeholder=\"Impressions or thoughts…\"></textarea></div>\n\
+               <div class=\"field field-check\">\n\
+                 <input id=\"qlm-rank\" name=\"rank_after\" type=\"checkbox\" value=\"1\" class=\"js-log-rank-check\" checked>\n\
+                 <label for=\"qlm-rank\">Rank after logging</label></div>\n\
+               <div class=\"roche-modal-actions\">\n\
+                 <button type=\"button\" class=\"btn btn-small btn-ghost js-modal-close\">Cancel</button>\n\
+                 <button type=\"submit\" class=\"btn btn-primary btn-small\">Save</button>\n\
+               </div>\n\
+             </form>\n\
+           </div>\n\
+           <div id=\"roche-ql-panel-url\" class=\"roche-modal-body\" role=\"tabpanel\" aria-labelledby=\"roche-ql-tab-url\" hidden>\n\
+             <form method=\"post\" action=\"/web/items/save\" class=\"rail-form js-modal-return-form\">\n\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
+               <div class=\"field\"><label for=\"qlm-url\">Article, Paper, or Video URL</label>\n\
+                 <input id=\"qlm-url\" name=\"url\" type=\"url\" required placeholder=\"https://example.com/essay\"></div>\n\
+               <div class=\"field\"><label for=\"qlm-url-title\">Custom Title (optional)</label>\n\
+                 <input id=\"qlm-url-title\" name=\"title\" type=\"text\" placeholder=\"Auto-detected from page\"></div>\n\
+               <div class=\"field\"><label for=\"qlm-url-tags\">Tags (comma-separated, optional)</label>\n\
+                 <input id=\"qlm-url-tags\" name=\"tags\" type=\"text\" placeholder=\"systems, design\"></div>\n\
+               <div class=\"roche-modal-actions\">\n\
+                 <button type=\"button\" class=\"btn btn-small btn-ghost js-modal-close\">Cancel</button>\n\
+                 <button type=\"submit\" class=\"btn btn-primary btn-small\">Save to Queue</button>\n\
+               </div>\n\
+             </form>\n\
+           </div>\n\
+         </dialog>\n",
+        csrf = esc(csrf),
+        ret = esc(default_return),
+    );
+}
+
+fn render_shortcuts_dialog(out: &mut String) {
+    out.push_str(
+        "<dialog id=\"roche-shortcuts-dialog\" class=\"roche-modal\" aria-labelledby=\"roche-kbd-heading\">\n\
+           <div class=\"roche-modal-head\">\n\
+             <h2 id=\"roche-kbd-heading\">Keyboard Shortcuts</h2>\n\
+             <button type=\"button\" class=\"btn btn-small btn-ghost js-modal-close\" aria-label=\"Close dialog\"><span aria-hidden=\"true\">&times;</span></button>\n\
+           </div>\n\
+           <div class=\"roche-modal-body shortcuts-grid\">\n\
+             <div class=\"shortcuts-group\">\n\
+               <h3>Global</h3>\n\
+               <dl class=\"shortcuts-list\">\n\
+                 <dt><kbd>/</kbd></dt><dd>Search (stream on Inbox, global elsewhere)</dd>\n\
+                 <dt><kbd>c</kbd></dt><dd>Open Quick Log &amp; Save URL</dd>\n\
+                 <dt><kbd>?</kbd></dt><dd>Toggle this shortcut help</dd>\n\
+                 <dt><kbd>Esc</kbd></dt><dd>Close modal, drawer, or search</dd>\n\
+               </dl>\n\
+             </div>\n\
+             <div class=\"shortcuts-group\">\n\
+               <h3>Inbox &amp; Reader</h3>\n\
+               <dl class=\"shortcuts-list\">\n\
+                 <dt><kbd>j</kbd><kbd>k</kbd></dt><dd>Next / previous item</dd>\n\
+                 <dt><kbd>Enter</kbd><kbd>o</kbd></dt><dd>Open selected item</dd>\n\
+                 <dt><kbd>e</kbd></dt><dd>Archive / restore item</dd>\n\
+                 <dt><kbd>s</kbd></dt><dd>Toggle star</dd>\n\
+                 <dt><kbd>q</kbd></dt><dd>Add to Queue</dd>\n\
+                 <dt><kbd>[</kbd><kbd>]</kbd></dt><dd>Decrease / increase Reader text size</dd>\n\
+               </dl>\n\
+             </div>\n\
+           </div>\n\
+         </dialog>\n",
+    );
+}
+
 fn render_masthead(out: &mut String, shell: &PageShell<'_>) {
     let refresh_return = shell.active.default_path();
-    // TODO(backend): point global masthead search to unified items+catalog-entries search endpoint
+    let search_val = shell.search_query.unwrap_or("");
     let _ = write!(
         out,
         "<header class=\"masthead\" id=\"roche-masthead\">\n\
            <div class=\"masthead-top\">\n\
              <h1><a href=\"/\">Roche</a></h1>\n\
-             <form method=\"get\" action=\"/inbox\" class=\"masthead-search\" id=\"roche-masthead-search\" role=\"search\">\n\
-               <input type=\"hidden\" name=\"status\" value=\"all\">\n\
+             <form method=\"get\" action=\"/search\" class=\"masthead-search\" id=\"roche-masthead-search\" role=\"search\" aria-label=\"Global search\">\n\
                <svg class=\"icon search-icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><circle cx=\"7\" cy=\"7\" r=\"4.5\"/><path d=\"M10.5 10.5L14 14\" stroke-linecap=\"round\"/></svg>\n\
-               <input type=\"search\" name=\"q\" id=\"roche-global-search\" class=\"masthead-search-input\" placeholder=\"Search…\" aria-label=\"Search Roche\">\n\
+               <input type=\"search\" name=\"q\" id=\"roche-global-search\" class=\"masthead-search-input\" value=\"{search_val}\" placeholder=\"Search Roche…\" aria-label=\"Search Roche\">\n\
                <kbd class=\"search-kbd\" aria-hidden=\"true\">/</kbd>\n\
              </form>\n\
              <div class=\"masthead-utils\">\n\
                <button type=\"button\" id=\"roche-search-toggle\" class=\"util-btn masthead-search-toggle\" aria-label=\"Search\" aria-expanded=\"false\" aria-controls=\"roche-masthead-search\">\n\
                  <svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><circle cx=\"7\" cy=\"7\" r=\"4.5\"/><path d=\"M10.5 10.5L14 14\" stroke-linecap=\"round\"/></svg>\n\
+               </button>\n\
+               <button type=\"button\" id=\"roche-quick-log-btn\" class=\"util-btn masthead-quick-log\" title=\"Quick Log or Save URL (c)\" aria-label=\"Quick Log or Save URL\">\n\
+                 <span aria-hidden=\"true\">+</span>\n\
+                 <span class=\"util-label\">Log</span>\n\
                </button>\n\
                <form id=\"roche-masthead-refresh\" class=\"inline-form\" method=\"post\" action=\"/web/feeds/refresh-all\">\n\
                  <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
@@ -567,6 +755,7 @@ fn render_masthead(out: &mut String, shell: &PageShell<'_>) {
            <nav id=\"roche-nav\" class=\"primary-nav\" aria-label=\"Primary\">",
         csrf = esc(shell.csrf_token),
         refresh_return = esc(refresh_return),
+        search_val = esc(search_val),
     );
     for (sec, href, label) in NAV_ITEMS {
         let attrs =
@@ -745,6 +934,7 @@ pub(super) fn render_error_page(
                 flash: &FlashQuery::default(),
                 is_refreshing: false,
                 theme,
+                search_query: None,
                 body_html: &body,
             })
         },
@@ -780,6 +970,10 @@ impl<T> WithWebCsrf<T> for Result<T, AppError> {
     fn web_err(self, session: &WebSession) -> Result<T, WebError> {
         self.map_err(|err| WebError::from_app(err, Some(&session.csrf_token), session.theme))
     }
+}
+
+pub(super) fn safe_web_error_message(err: &AppError) -> String {
+    classify_web_app_error(err).2
 }
 
 fn classify_web_app_error(err: &AppError) -> (StatusCode, &'static str, String, Option<u64>) {

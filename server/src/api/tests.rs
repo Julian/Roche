@@ -2246,7 +2246,7 @@ async fn test_export_data_includes_legacy_and_unified_catalog_fields_backward_co
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn test_wave_2a_sync_peer_binding_diary_crud_enrich_and_workspace_search() {
+async fn test_sync_peer_binding_diary_crud_enrich_and_workspace_search() {
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let app = ApiRoutes::router_with_fetcher(&db, FakeFeedFetcher);
     let token_a = TokenManager::new(db.auth()).create("Pixel A", 32).await.unwrap();
@@ -2371,7 +2371,7 @@ async fn test_wave_2a_sync_peer_binding_diary_crud_enrich_and_workspace_search()
 }
 
 #[tokio::test]
-async fn test_wave_2a_concurrency_503_and_timeout_408_json_vs_html() {
+async fn test_concurrency_503_and_timeout_408_json_vs_html() {
     use axum::{Router, middleware, routing::get};
 
     let zero_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));

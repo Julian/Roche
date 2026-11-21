@@ -79,6 +79,65 @@
     curMain.prepend(banner);
   };
 
+  const WANT_TO_READ_COLLECTION_ID = "2ef71101-a716-5331-9515-cb7b5ce8b3c3";
+  let syncPlayButtonsFn = null;
+  let navigateViaPjaxFn = null;
+
+  const showToast = (message, opts = {}) => {
+    const region = document.getElementById("roche-toast-region");
+    if (!region || !message) return;
+    const toast = document.createElement("div");
+    toast.className = `roche-toast${opts.isError ? " is-error" : ""}`;
+    toast.setAttribute("role", opts.isError ? "alert" : "status");
+
+    const text = document.createElement("span");
+    text.className = "roche-toast-msg";
+    text.textContent = message;
+    toast.appendChild(text);
+
+    let dismissTimer = null;
+    const dismiss = () => {
+      if (dismissTimer) window.clearTimeout(dismissTimer);
+      toast.remove();
+    };
+
+    if (typeof opts.onUndo === "function") {
+      const undoBtn = document.createElement("button");
+      undoBtn.type = "button";
+      undoBtn.className = "btn btn-small roche-toast-undo";
+      undoBtn.textContent = opts.undoLabel || "Undo";
+      undoBtn.addEventListener("click", () => {
+        dismiss();
+        opts.onUndo();
+      });
+      toast.appendChild(undoBtn);
+    }
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "roche-toast-close";
+    closeBtn.setAttribute("aria-label", "Dismiss notification");
+    closeBtn.textContent = "×";
+    closeBtn.addEventListener("click", dismiss);
+    toast.appendChild(closeBtn);
+
+    region.replaceChildren(toast);
+    const startTimer = () => {
+      dismissTimer = window.setTimeout(dismiss, opts.durationMs || 7000);
+    };
+    const pauseTimer = () => {
+      if (dismissTimer) {
+        window.clearTimeout(dismissTimer);
+        dismissTimer = null;
+      }
+    };
+    toast.addEventListener("mouseenter", pauseTimer);
+    toast.addEventListener("focusin", pauseTimer);
+    toast.addEventListener("mouseleave", startTimer);
+    toast.addEventListener("focusout", startTimer);
+    startTimer();
+  };
+
   /* Confirmation handler for destructive forms (runs before PJAX & refresh-banner listeners) */
   document.addEventListener("submit", (ev) => {
     const form = ev.target;
@@ -98,6 +157,9 @@
 
     const titleEl = document.getElementById("roche-player-title");
     const subEl = document.getElementById("roche-player-sub");
+    const errEl = document.getElementById("roche-player-err");
+    const backBtn = document.getElementById("roche-player-back");
+    const fwdBtn = document.getElementById("roche-player-fwd");
     const speedBtn = document.getElementById("roche-player-speed");
     const closeBtn = document.getElementById("roche-player-close");
     const readerLink = document.getElementById("roche-player-link");
@@ -110,6 +172,17 @@
     let activePjaxController = null;
     let pendingSeekListener = null;
     let lastRenderedUrl = `${window.location.pathname}${window.location.search}`;
+
+    const setPlayerError = (msg) => {
+      if (!errEl) return;
+      if (msg) {
+        errEl.textContent = msg;
+        errEl.hidden = false;
+      } else {
+        errEl.textContent = "";
+        errEl.hidden = true;
+      }
+    };
 
     const clearPendingSeekListener = () => {
       if (pendingSeekListener) {
@@ -158,13 +231,31 @@
       for (const btn of document.querySelectorAll(".js-play-audio")) {
         const isCurrent = Boolean(playingId && btn.getAttribute("data-item-id") === playingId);
         const title = btn.getAttribute("data-title") || "Audio";
+        btn.classList.toggle("is-playing", isCurrent);
         btn.setAttribute("aria-pressed", isCurrent ? "true" : "false");
         btn.setAttribute("aria-label", `${isCurrent ? "Pause" : "Play"} ${title}`);
+        const glyph = btn.querySelector(".js-play-glyph");
+        if (glyph) glyph.textContent = isCurrent ? "⏸" : "▶";
+        const label = btn.querySelector(".js-play-label");
+        if (label) label.textContent = isCurrent ? "Pause" : "Play";
+      }
+    };
+    syncPlayButtonsFn = syncPlayButtons;
+
+    const safePlay = () => {
+      const p = audio.play?.();
+      if (p && typeof p.catch === "function") {
+        p.catch((err) => {
+          if (err?.name === "AbortError") return;
+          setPlayerError("Playback could not start. Press Play on the player bar to retry.");
+          syncPlayButtons();
+        });
       }
     };
 
     const loadTrack = (meta, autoplay) => {
       clearPendingSeekListener();
+      setPlayerError("");
       if (activeItem?.itemId && activeItem.itemId !== meta.itemId) {
         flushActiveProgress(true);
       }
@@ -218,7 +309,7 @@
         audio.addEventListener("loadedmetadata", applyInitialSeek, { once: true });
       }
       if (autoplay) {
-        audio.play?.()?.catch?.(() => {});
+        safePlay();
       }
       saveSession();
     };
@@ -239,6 +330,17 @@
     });
 
     audio.addEventListener("play", () => {
+      setPlayerError("");
+      syncPlayButtons();
+    });
+
+    audio.addEventListener("playing", () => {
+      setPlayerError("");
+    });
+
+    audio.addEventListener("error", () => {
+      if (!activeItem) return;
+      setPlayerError("Audio stream failed to load.");
       syncPlayButtons();
     });
 
@@ -261,6 +363,20 @@
       saveSession();
     });
 
+    const seekBy = (deltaSecs) => {
+      if (!activeItem) return;
+      const dur = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : Infinity;
+      const next = Math.max(0, Math.min(dur, (audio.currentTime || 0) + deltaSecs));
+      try {
+        audio.currentTime = next;
+      } catch {}
+      saveSession();
+      flushActiveProgress(false);
+    };
+
+    backBtn?.addEventListener("click", () => seekBy(-15));
+    fwdBtn?.addEventListener("click", () => seekBy(30));
+
     speedBtn?.addEventListener("click", () => {
       const cur = desiredRate || audio.playbackRate || 1;
       const idx = SPEEDS.indexOf(cur);
@@ -273,6 +389,7 @@
 
     closeBtn?.addEventListener("click", () => {
       clearPendingSeekListener();
+      setPlayerError("");
       flushActiveProgress(true);
       audio.pause();
       audio.removeAttribute("src");
@@ -298,7 +415,7 @@
       const clickedId = btn.getAttribute("data-item-id") || "";
       if (activeItem && clickedId && activeItem.itemId === clickedId && audio.getAttribute("src")) {
         if (audio.paused) {
-          audio.play?.()?.catch?.(() => {});
+          safePlay();
         } else {
           audio.pause();
         }
@@ -318,26 +435,39 @@
       );
     });
 
-    const isAudioPlaying = () => Boolean(activeItem && !audio.paused);
+    const hasLoadedAudio = () => Boolean(activeItem && !bar.hidden && audio.getAttribute("src"));
 
     const applyPjaxHtml = (html, finalUrl, fallbackUrl, pushHistory, targetHash) => {
       const doc = new DOMParser().parseFromString(html, "text/html");
       const nextMain = doc.getElementById("roche-main");
       const curMain = document.getElementById("roche-main");
       if (!nextMain || !curMain) {
-        if (!isAudioPlaying() && fallbackUrl) {
+        if (!hasLoadedAudio() && fallbackUrl) {
           window.location.href = fallbackUrl;
         } else {
           showInlinePjaxError("Received an unexpected page response.");
         }
         return false;
       }
+      for (const dlg of document.querySelectorAll("dialog[open]")) {
+        try {
+          dlg.close();
+        } catch {}
+      }
       syncCsrfFromDoc(doc);
+      if (!nextMain.querySelector(".js-reader-root")) {
+        document.getElementById("roche-read-progress")?.remove();
+      }
       curMain.replaceChildren(...Array.from(nextMain.childNodes));
       const nextNav = doc.getElementById("roche-nav");
       const curNav = document.getElementById("roche-nav");
       if (nextNav && curNav) {
         curNav.replaceChildren(...Array.from(nextNav.childNodes));
+      }
+      const nextSearchInput = doc.getElementById("roche-global-search");
+      const curSearchInput = document.getElementById("roche-global-search");
+      if (nextSearchInput && curSearchInput) {
+        curSearchInput.value = nextSearchInput.value || "";
       }
       const nextRefresh = doc.getElementById("roche-refresh-banner");
       const curRefresh = document.getElementById("roche-refresh-banner");
@@ -389,6 +519,8 @@
       activePjaxController = controller;
       const opts = { ...(fetchOpts || {}) };
       if (controller) opts.signal = controller.signal;
+      const curMain = document.getElementById("roche-main");
+      curMain?.setAttribute("aria-busy", "true");
 
       try {
         const resp = await fetch(reqUrl, opts);
@@ -403,7 +535,7 @@
             curDest && curDest !== "/" && !curDest.startsWith("/login")
               ? `/login?return_to=${encodeURIComponent(curDest)}`
               : "/login";
-          if (!isAudioPlaying()) {
+          if (!hasLoadedAudio()) {
             window.location.href = loginHref;
           } else {
             showInlinePjaxError("Your session has expired. Audio playback continues —", {
@@ -427,7 +559,7 @@
           return;
         }
         if (!resp.ok && resp.status !== 400 && resp.status !== 404 && resp.status !== 409) {
-          if (!isPost && !isAudioPlaying() && fallbackUrl) {
+          if (!isPost && !hasLoadedAudio() && fallbackUrl) {
             window.location.href = fallbackUrl;
           } else {
             showInlinePjaxError(`Server error (${resp.status}). Please try again.`);
@@ -442,7 +574,7 @@
       } catch (err) {
         if (err?.name === "AbortError") return;
         if (controller && activePjaxController !== controller) return;
-        if (!isPost && !isAudioPlaying() && fallbackUrl) {
+        if (!isPost && !hasLoadedAudio() && fallbackUrl) {
           window.location.href = fallbackUrl;
         } else {
           showInlinePjaxError("Network error while loading page. Audio playback continues.");
@@ -450,13 +582,39 @@
       } finally {
         if (controller && activePjaxController === controller) {
           activePjaxController = null;
+          document.getElementById("roche-main")?.removeAttribute("aria-busy");
         }
       }
     };
 
-    /* Seamless PJAX navigation & form submission while audio is playing so playback never drops */
+    navigateViaPjaxFn = (href) => {
+      if (!href) return;
+      if (!hasLoadedAudio()) {
+        window.location.href = href;
+        return;
+      }
+      try {
+        const url = new URL(href, window.location.origin);
+        if (url.origin !== window.location.origin) {
+          window.location.href = href;
+          return;
+        }
+        void runPjaxFetch(
+          `${url.pathname}${url.search}`,
+          { credentials: "same-origin" },
+          href,
+          true,
+          url.hash,
+          false
+        );
+      } catch {
+        window.location.href = href;
+      }
+    };
+
+    /* Seamless PJAX navigation & form submission while player bar holds an episode */
     document.addEventListener("click", (ev) => {
-      if (!isAudioPlaying()) return;
+      if (!hasLoadedAudio()) return;
       if (
         ev.defaultPrevented ||
         ev.button !== 0 ||
@@ -503,9 +661,10 @@
     });
 
     document.addEventListener("submit", (ev) => {
-      if (!isAudioPlaying() || ev.defaultPrevented) return;
+      if (!hasLoadedAudio() || ev.defaultPrevented) return;
       const form = ev.target;
       if (!form || form.tagName !== "FORM" || form.target) return;
+      if (form.classList.contains("js-triage-form")) return;
       const actionRaw = form.getAttribute("action") || window.location.href;
       let actionUrl;
       try {
@@ -569,7 +728,7 @@
     });
 
     window.addEventListener("popstate", () => {
-      if (!pjaxNavigated && !isAudioPlaying()) return;
+      if (!pjaxNavigated && !hasLoadedAudio()) return;
       const targetPathSearch = `${window.location.pathname}${window.location.search}`;
       if (targetPathSearch === lastRenderedUrl) return;
       void runPjaxFetch(
@@ -593,7 +752,7 @@
     } catch {}
   };
 
-  /* --- 2. Reader Scroll Progress --- */
+  /* --- 2. Reader Scroll & Video Progress --- */
   let readerCleanup = null;
   const initReaderProgress = () => {
     if (readerCleanup) {
@@ -602,75 +761,131 @@
     }
     const root = document.querySelector(".js-reader-root[data-item-id]");
     if (!root) return;
-    const kind = root.getAttribute("data-kind") || "article";
-    if (kind !== "article" && kind !== "paper") return;
 
     const itemId = root.getAttribute("data-item-id");
-    let best = Number.parseFloat(root.getAttribute("data-progress") || "0") || 0;
-    let lastPosted = best;
-    let timer = null;
+    const kind = root.getAttribute("data-kind") || "article";
+    const cleanups = [];
 
-    const maxScrollablePixels = () =>
-      Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-
-    const measureFraction = () => {
-      const maxScroll = maxScrollablePixels();
-      if (maxScroll <= 8) return 1.0;
-      return Math.max(0, Math.min(1, window.scrollY / maxScroll));
-    };
-
-    const checkProgress = (forceFlush) => {
-      if (!forceFlush && maxScrollablePixels() <= 8) return;
-      const frac = measureFraction();
-      if (frac > best) best = frac;
-      const crossedNinety = lastPosted < 0.9 && best >= 0.9;
-      if (forceFlush || crossedNinety || best - lastPosted >= 0.05) {
-        lastPosted = best;
-        postProgress(itemId, best, Boolean(forceFlush));
+    const video = root.querySelector("video.js-reader-video");
+    if (video && itemId) {
+      const savedProg = Number.parseFloat(video.getAttribute("data-progress") || "0") || 0;
+      let lastSentAt = 0;
+      let doneSent = false;
+      const applyVideoSeek = () => {
+        if (savedProg > 0.02 && savedProg < 0.98 && Number.isFinite(video.duration) && video.duration > 0) {
+          try {
+            video.currentTime = savedProg * video.duration;
+          } catch {}
+        }
+      };
+      if (video.readyState >= 1) {
+        applyVideoSeek();
+      } else {
+        video.addEventListener("loadedmetadata", applyVideoSeek, { once: true });
       }
-    };
-
-    const onScroll = () => {
-      if (timer) return;
-      timer = window.setTimeout(() => {
-        timer = null;
-        checkProgress(false);
-      }, 350);
-    };
-
-    window.addEventListener("scroll", onScroll, { passive: true });
-
-    const layoutScope = root.closest(".reader-layout") || document;
-    const archiveForms = Array.from(layoutScope.querySelectorAll(".js-reader-archive-form"));
-    const onArchiveSubmit = (ev) => {
-      const formEl = ev.currentTarget;
-      const hiddenProg = formEl?.querySelector("input[name='progress']");
-      const live = Math.max(best, measureFraction());
-      if (hiddenProg) hiddenProg.value = live.toFixed(4);
-    };
-    for (const formEl of archiveForms) {
-      formEl.addEventListener("submit", onArchiveSubmit);
+      const onTime = () => {
+        if (!Number.isFinite(video.duration) || video.duration <= 0) return;
+        const frac = video.currentTime / video.duration;
+        const now = Date.now();
+        if (frac >= 0.96 && !doneSent) {
+          doneSent = true;
+          postProgress(itemId, 1.0, true);
+        } else if (now - lastSentAt >= 5000) {
+          lastSentAt = now;
+          postProgress(itemId, frac, false);
+        }
+      };
+      const onPause = () => {
+        if (!Number.isFinite(video.duration) || video.duration <= 0) return;
+        postProgress(itemId, video.currentTime / video.duration, true);
+      };
+      const onEnded = () => {
+        doneSent = true;
+        postProgress(itemId, 1.0, true);
+      };
+      video.addEventListener("timeupdate", onTime);
+      video.addEventListener("pause", onPause);
+      video.addEventListener("ended", onEnded);
+      cleanups.push(() => {
+        video.removeEventListener("timeupdate", onTime);
+        video.removeEventListener("pause", onPause);
+        video.removeEventListener("ended", onEnded);
+      });
     }
 
-    const resumeBtn = root.querySelector(".js-reader-resume-btn");
-    const onResumeClick = () => {
-      const targetFrac = Number.parseFloat(resumeBtn?.getAttribute("data-resume-progress") || "0");
-      if (!Number.isFinite(targetFrac) || targetFrac <= 0) return;
-      const targetY = Math.round(targetFrac * maxScrollablePixels());
-      const reducedMotion = Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
-      window.scrollTo({ top: targetY, behavior: reducedMotion ? "auto" : "smooth" });
-      if (resumeBtn) resumeBtn.hidden = true;
-    };
-    resumeBtn?.addEventListener("click", onResumeClick);
+    if (kind === "article" || kind === "paper") {
+      let best = Number.parseFloat(root.getAttribute("data-progress") || "0") || 0;
+      let lastPosted = best;
+      let timer = null;
 
-    readerCleanup = () => {
-      window.removeEventListener("scroll", onScroll);
+      const maxScrollablePixels = () =>
+        Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+
+      const measureFraction = () => {
+        const maxScroll = maxScrollablePixels();
+        if (maxScroll <= 8) return 1.0;
+        return Math.max(0, Math.min(1, window.scrollY / maxScroll));
+      };
+
+      const checkProgress = (forceFlush) => {
+        if (!forceFlush && maxScrollablePixels() <= 8) return;
+        const frac = measureFraction();
+        if (frac > best) best = frac;
+        const crossedNinety = lastPosted < 0.9 && best >= 0.9;
+        if (forceFlush || crossedNinety || best - lastPosted >= 0.05) {
+          lastPosted = best;
+          postProgress(itemId, best, Boolean(forceFlush));
+        }
+      };
+
+      const onScroll = () => {
+        if (timer) return;
+        timer = window.setTimeout(() => {
+          timer = null;
+          checkProgress(false);
+        }, 350);
+      };
+
+      window.addEventListener("scroll", onScroll, { passive: true });
+
+      const layoutScope = root.closest(".reader-layout") || document;
+      const archiveForms = Array.from(layoutScope.querySelectorAll(".js-reader-archive-form"));
+      const onArchiveSubmit = (ev) => {
+        const formEl = ev.currentTarget;
+        const hiddenProg = formEl?.querySelector("input[name='progress']");
+        const live = Math.max(best, measureFraction());
+        if (hiddenProg) hiddenProg.value = live.toFixed(4);
+      };
       for (const formEl of archiveForms) {
-        formEl.removeEventListener("submit", onArchiveSubmit);
+        formEl.addEventListener("submit", onArchiveSubmit);
       }
-      resumeBtn?.removeEventListener("click", onResumeClick);
-      if (timer) window.clearTimeout(timer);
-    };
+
+      const resumeBtn = root.querySelector(".js-reader-resume-btn");
+      const onResumeClick = () => {
+        const targetFrac = Number.parseFloat(resumeBtn?.getAttribute("data-resume-progress") || "0");
+        if (!Number.isFinite(targetFrac) || targetFrac <= 0) return;
+        const targetY = Math.round(targetFrac * maxScrollablePixels());
+        const reducedMotion = Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+        window.scrollTo({ top: targetY, behavior: reducedMotion ? "auto" : "smooth" });
+        if (resumeBtn) resumeBtn.hidden = true;
+      };
+      resumeBtn?.addEventListener("click", onResumeClick);
+
+      cleanups.push(() => {
+        window.removeEventListener("scroll", onScroll);
+        for (const formEl of archiveForms) {
+          formEl.removeEventListener("submit", onArchiveSubmit);
+        }
+        resumeBtn?.removeEventListener("click", onResumeClick);
+        if (timer) window.clearTimeout(timer);
+      });
+    }
+
+    if (cleanups.length > 0) {
+      readerCleanup = () => {
+        for (const fn of cleanups) fn();
+      };
+    }
   };
 
   /* --- 3. Interactive k-Way Ranking Board (Side-by-Side Tie Buckets + Drag & Drop) --- */
@@ -791,6 +1006,10 @@
           } else {
             card.removeAttribute("aria-current");
           }
+          const upBtn = card.querySelector(".js-card-up");
+          if (upBtn) upBtn.disabled = !isTiedBucket && bIdx === 0;
+          const downBtn = card.querySelector(".js-card-down");
+          if (downBtn) downBtn.disabled = !isTiedBucket && bIdx === buckets.length - 1;
           const tieBtn = card.querySelector(".js-card-tie");
           if (tieBtn) {
             const title = cardTitle(card);
@@ -841,7 +1060,13 @@
         if (!previouslyFocused.disabled && previouslyFocused.isConnected) {
           previouslyFocused.focus({ preventScroll: true });
         } else if (selectedCard?.isConnected) {
-          selectedCard.focus({ preventScroll: true });
+          const fallbackBtn =
+            (previouslyFocused.classList?.contains("js-card-up") &&
+              selectedCard.querySelector(".js-card-down:not(:disabled)")) ||
+            (previouslyFocused.classList?.contains("js-card-down") &&
+              selectedCard.querySelector(".js-card-up:not(:disabled)")) ||
+            selectedCard.querySelector(".js-card-up:not(:disabled), .js-card-down:not(:disabled)");
+          (fallbackBtn || selectedCard).focus({ preventScroll: true });
         }
       }
       if (announcement) announce(announcement);
@@ -966,37 +1191,38 @@
       }
     };
 
-    list.addEventListener("dragstart", (ev) => {
-      if (ev.target?.closest?.("a, button")) {
-        ev.preventDefault();
-        return;
-      }
-      const card = ev.target?.closest?.(".js-rank-card");
-      if (!card) return;
-      draggedCard = card;
-      selectedCard = card;
-      card.classList.add("is-dragging");
-      if (ev.dataTransfer) {
-        ev.dataTransfer.effectAllowed = "move";
-        ev.dataTransfer.setData("text/plain", card.getAttribute("data-entry-id") || "");
-      }
-    });
+    let dragRects = [];
+    const snapshotBucketRects = () => {
+      dragRects = Array.from(list.querySelectorAll(".rank-bucket")).map((el) => {
+        const rect = el.getBoundingClientRect();
+        return {
+          el,
+          bucketIndex: Number.parseInt(el.dataset.bucketIndex || "0", 10),
+          top: rect.top,
+          bottom: rect.bottom,
+          height: rect.height,
+        };
+      });
+    };
 
-    list.addEventListener("dragover", (ev) => {
+    const updateDropHintAtY = (clientY) => {
       if (!draggedCard) return;
-      const bucketEl = ev.target?.closest?.(".rank-bucket");
-      if (!bucketEl) return;
-      ev.preventDefault();
-      if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
-
-      const bIdx = Number.parseInt(bucketEl.dataset.bucketIndex || "0", 10);
+      if (dragRects.length === 0) snapshotBucketRects();
       const src = findCoords(draggedCard);
       if (!src) return;
       const srcSolo = buckets[src.b].length === 1;
 
-      const rect = bucketEl.getBoundingClientRect();
-      const relY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
+      let hit = dragRects.find((r) => clientY >= r.top && clientY <= r.bottom);
+      if (!hit && dragRects.length > 0) {
+        hit = clientY < dragRects[0].top ? dragRects[0] : dragRects[dragRects.length - 1];
+      }
+      if (!hit) {
+        clearDropHints();
+        return;
+      }
 
+      const bIdx = hit.bucketIndex;
+      const relY = hit.height > 0 ? (clientY - hit.top) / hit.height : 0.5;
       let mode = "tie";
       if (relY < 0.27) {
         mode = "before";
@@ -1026,9 +1252,33 @@
 
       clearDropHints();
       dropTarget = { bucketIndex: bIdx, mode };
-      bucketEl.classList.add(
+      hit.el.classList.add(
         mode === "before" ? "is-drop-before" : mode === "after" ? "is-drop-after" : "is-drop-tie"
       );
+    };
+
+    list.addEventListener("dragstart", (ev) => {
+      if (ev.target?.closest?.("a, button")) {
+        ev.preventDefault();
+        return;
+      }
+      const card = ev.target?.closest?.(".js-rank-card");
+      if (!card) return;
+      draggedCard = card;
+      selectedCard = card;
+      snapshotBucketRects();
+      card.classList.add("is-dragging");
+      if (ev.dataTransfer) {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", card.getAttribute("data-entry-id") || "");
+      }
+    });
+
+    list.addEventListener("dragover", (ev) => {
+      if (!draggedCard) return;
+      ev.preventDefault();
+      if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
+      updateDropHintAtY(ev.clientY);
     });
 
     list.addEventListener("dragleave", (ev) => {
@@ -1044,6 +1294,7 @@
       const target = dropTarget;
       card.classList.remove("is-dragging");
       draggedCard = null;
+      dragRects = [];
       clearDropHints();
       if (target) {
         applyDrop(card, target.bucketIndex, target.mode);
@@ -1053,8 +1304,49 @@
     list.addEventListener("dragend", () => {
       if (draggedCard) draggedCard.classList.remove("is-dragging");
       draggedCard = null;
+      dragRects = [];
       clearDropHints();
     });
+
+    /* Touch / pen drag support via Pointer Events on grip handle */
+    let activePointerId = null;
+    list.addEventListener("pointerdown", (ev) => {
+      if (ev.pointerType !== "touch" && ev.pointerType !== "pen") return;
+      const grip = ev.target?.closest?.(".rank-grip");
+      const card = grip?.closest?.(".js-rank-card");
+      if (!card) return;
+      ev.preventDefault();
+      activePointerId = ev.pointerId;
+      draggedCard = card;
+      selectedCard = card;
+      snapshotBucketRects();
+      card.classList.add("is-dragging");
+      try {
+        grip.setPointerCapture?.(ev.pointerId);
+      } catch {}
+    });
+
+    list.addEventListener("pointermove", (ev) => {
+      if (activePointerId === null || ev.pointerId !== activePointerId || !draggedCard) return;
+      ev.preventDefault();
+      updateDropHintAtY(ev.clientY);
+    });
+
+    const finishPointerDrag = (ev) => {
+      if (activePointerId === null || ev.pointerId !== activePointerId) return;
+      activePointerId = null;
+      const card = draggedCard;
+      const target = dropTarget;
+      if (card) card.classList.remove("is-dragging");
+      draggedCard = null;
+      dragRects = [];
+      clearDropHints();
+      if (card && target) {
+        applyDrop(card, target.bucketIndex, target.mode);
+      }
+    };
+    list.addEventListener("pointerup", finishPointerDrag);
+    list.addEventListener("pointercancel", finishPointerDrag);
 
     list.addEventListener("focusin", (ev) => {
       const card = ev.target?.closest?.(".js-rank-card");
@@ -1485,31 +1777,274 @@
         if (open) searchInput?.focus();
       });
     }
+    if (searchInput && searchInput.dataset.escBound !== "1") {
+      searchInput.dataset.escBound = "1";
+      searchInput.addEventListener("keydown", (ev) => {
+        if (ev.key === "Escape") {
+          searchInput.blur();
+          if (masthead?.classList.contains("is-search-open")) {
+            masthead.classList.remove("is-search-open");
+            searchToggle?.setAttribute("aria-expanded", "false");
+          }
+        }
+      });
+    }
+
+    /* Quick Log & Shortcuts modals */
+    const qlDialog = document.getElementById("roche-quick-log-dialog");
+    const qlBtn = document.getElementById("roche-quick-log-btn");
+    const kbdDialog = document.getElementById("roche-shortcuts-dialog");
+    const kbdBtn = document.getElementById("roche-shortcuts-btn");
+
+    const openQuickLogDialog = (tabName = "media") => {
+      if (!qlDialog || typeof qlDialog.showModal !== "function") return;
+      const curReturn = `${window.location.pathname}${window.location.search}`;
+      for (const f of qlDialog.querySelectorAll(".js-modal-return-form")) {
+        const ret = f.querySelector('input[name="return_to"]');
+        if (ret) ret.value = curReturn || "/";
+      }
+      selectQlTab(tabName);
+      if (!qlDialog.open) qlDialog.showModal();
+      const targetInput =
+        tabName === "url"
+          ? document.getElementById("qlm-url")
+          : document.getElementById("qlm-title");
+      targetInput?.focus();
+    };
+
+    const selectQlTab = (tabName) => {
+      if (!qlDialog) return;
+      const isUrl = tabName === "url";
+      for (const tab of qlDialog.querySelectorAll(".js-ql-tab")) {
+        const active = (tab.getAttribute("data-tab") || "media") === (isUrl ? "url" : "media");
+        tab.classList.toggle("is-active", active);
+        tab.setAttribute("aria-selected", active ? "true" : "false");
+      }
+      const mediaPanel = document.getElementById("roche-ql-panel-media");
+      const urlPanel = document.getElementById("roche-ql-panel-url");
+      if (mediaPanel) mediaPanel.hidden = isUrl;
+      if (urlPanel) urlPanel.hidden = !isUrl;
+    };
+
+    if (qlDialog && qlDialog.dataset.bound !== "1") {
+      qlDialog.dataset.bound = "1";
+      for (const tab of qlDialog.querySelectorAll(".js-ql-tab")) {
+        tab.addEventListener("click", () => {
+          const nextTab = tab.getAttribute("data-tab") || "media";
+          selectQlTab(nextTab);
+          const firstField =
+            nextTab === "url"
+              ? document.getElementById("qlm-url")
+              : document.getElementById("qlm-title");
+          firstField?.focus();
+        });
+      }
+      for (const btn of qlDialog.querySelectorAll(".js-modal-close")) {
+        btn.addEventListener("click", () => qlDialog.close());
+      }
+      qlDialog.addEventListener("click", (ev) => {
+        if (ev.target === qlDialog) qlDialog.close();
+      });
+    }
+    if (qlBtn && qlBtn.dataset.bound !== "1") {
+      qlBtn.dataset.bound = "1";
+      qlBtn.addEventListener("click", () => openQuickLogDialog("media"));
+    }
+
+    if (kbdDialog && kbdDialog.dataset.bound !== "1") {
+      kbdDialog.dataset.bound = "1";
+      for (const btn of kbdDialog.querySelectorAll(".js-modal-close")) {
+        btn.addEventListener("click", () => kbdDialog.close());
+      }
+      kbdDialog.addEventListener("click", (ev) => {
+        if (ev.target === kbdDialog) kbdDialog.close();
+      });
+    }
+    if (kbdBtn && kbdBtn.dataset.bound !== "1") {
+      kbdBtn.dataset.bound = "1";
+      kbdBtn.addEventListener("click", () => {
+        if (kbdDialog && typeof kbdDialog.showModal === "function" && !kbdDialog.open) {
+          kbdDialog.showModal();
+        }
+      });
+    }
 
     if (document.body && document.body.dataset.globalKeysBound !== "1") {
       document.body.dataset.globalKeysBound = "1";
       document.addEventListener("keydown", (ev) => {
-        if (ev.key !== "/" || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+        if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
         const target = ev.target;
         if (target?.matches?.("input, textarea, select, [contenteditable]")) return;
-        if (document.getElementById("roche-rank-board") || document.querySelector(".js-rank-form")) {
+        const openDialog = document.querySelector("dialog[open]");
+        if (openDialog) {
+          if (ev.key === "?" && openDialog === kbdDialog) {
+            ev.preventDefault();
+            kbdDialog.close();
+          }
           return;
         }
-        const input = document.getElementById("roche-global-search");
-        if (!input) return;
-        ev.preventDefault();
-        const hdr = document.getElementById("roche-masthead");
-        const searchWrap = document.getElementById("roche-masthead-search");
-        if (
-          hdr &&
-          ((searchWrap && window.getComputedStyle(searchWrap).display === "none") ||
-            window.getComputedStyle(input).display === "none")
-        ) {
-          hdr.classList.add("is-search-open");
-          document.getElementById("roche-search-toggle")?.setAttribute("aria-expanded", "true");
+
+        const isRankBoard = Boolean(
+          document.getElementById("roche-rank-board") || document.querySelector(".js-rank-form")
+        );
+
+        if (ev.key === "?") {
+          if (kbdDialog && typeof kbdDialog.showModal === "function") {
+            ev.preventDefault();
+            kbdDialog.showModal();
+          }
+          return;
         }
-        input.focus();
-        input.select();
+        if (ev.key === "c" && !isRankBoard) {
+          if (qlDialog && typeof qlDialog.showModal === "function") {
+            ev.preventDefault();
+            openQuickLogDialog("media");
+          }
+          return;
+        }
+        if (ev.key === "/" && !isRankBoard) {
+          const inboxSearch = document.getElementById("roche-inbox-search");
+          const input = inboxSearch || document.getElementById("roche-global-search");
+          if (!input) return;
+          ev.preventDefault();
+          if (!inboxSearch) {
+            const hdr = document.getElementById("roche-masthead");
+            const searchWrap = document.getElementById("roche-masthead-search");
+            if (
+              hdr &&
+              ((searchWrap && window.getComputedStyle(searchWrap).display === "none") ||
+                window.getComputedStyle(input).display === "none")
+            ) {
+              hdr.classList.add("is-search-open");
+              document.getElementById("roche-search-toggle")?.setAttribute("aria-expanded", "true");
+            }
+          }
+          input.focus();
+          input.select();
+          return;
+        }
+
+        if (isRankBoard) return;
+
+        /* Reader shortcuts: [, ], e, s, Escape */
+        const readerRoot = document.querySelector(".js-reader-root");
+        if (readerRoot) {
+          if (ev.key === "[") {
+            ev.preventDefault();
+            document.querySelector(".js-font-dec")?.click();
+            return;
+          }
+          if (ev.key === "]") {
+            ev.preventDefault();
+            document.querySelector(".js-font-inc")?.click();
+            return;
+          }
+          if (ev.key === "e") {
+            const archiveForm = document.querySelector(".js-reader-archive-form");
+            if (archiveForm) {
+              ev.preventDefault();
+              if (typeof archiveForm.requestSubmit === "function") archiveForm.requestSubmit();
+              else archiveForm.submit();
+            }
+            return;
+          }
+          if (ev.key === "s") {
+            const starBtn = document.querySelector(".js-star-toggle, .reader-star-btn");
+            if (starBtn) {
+              ev.preventDefault();
+              starBtn.click();
+            }
+            return;
+          }
+          if (ev.key === "Escape") {
+            const openDetails = document.querySelector("#roche-main details[open]:not([data-default-open])");
+            if (openDetails) {
+              openDetails.open = false;
+              return;
+            }
+            const backLink = document.querySelector(".js-reader-back-link");
+            if (backLink?.href) {
+              ev.preventDefault();
+              if (navigateViaPjaxFn) navigateViaPjaxFn(backLink.href);
+              else window.location.href = backLink.href;
+            }
+            return;
+          }
+        }
+
+        /* Inbox / Starred keyboard triage: j/k, Enter/o, e, s, q */
+        const rows = Array.from(document.querySelectorAll(".js-kbd-row")).filter((r) => !r.hidden);
+        if (rows.length > 0) {
+          let curIdx = rows.findIndex((r) => r.classList.contains("is-kbd-selected"));
+          const selectRow = (idx) => {
+            for (const r of rows) r.classList.remove("is-kbd-selected");
+            const chosen = rows[idx];
+            if (!chosen) return null;
+            chosen.classList.add("is-kbd-selected");
+            chosen.scrollIntoView?.({ block: "nearest" });
+            return chosen;
+          };
+
+          if (ev.key === "j") {
+            ev.preventDefault();
+            selectRow(curIdx < 0 ? 0 : Math.min(rows.length - 1, curIdx + 1));
+            return;
+          }
+          if (ev.key === "k") {
+            ev.preventDefault();
+            selectRow(curIdx <= 0 ? 0 : curIdx - 1);
+            return;
+          }
+          const activeRow = curIdx >= 0 ? rows[curIdx] : null;
+          if (!activeRow) return;
+          if (ev.key === "o" || ev.key === "Enter") {
+            if (ev.key === "Enter" && target?.closest?.("a, button, summary")) return;
+            const link = activeRow.querySelector(".js-kbd-open");
+            if (link?.href) {
+              ev.preventDefault();
+              if (navigateViaPjaxFn) navigateViaPjaxFn(link.href);
+              else window.location.href = link.href;
+            }
+            return;
+          }
+          if (ev.key === "e") {
+            const archForm = activeRow.querySelector(
+              '.js-triage-form[data-triage-kind="archive"], .js-triage-form[data-triage-kind="unarchive"]'
+            );
+            if (archForm) {
+              ev.preventDefault();
+              const nextIdx = Math.min(rows.length - 2, curIdx);
+              if (typeof archForm.requestSubmit === "function") archForm.requestSubmit();
+              else archForm.submit();
+              window.requestAnimationFrame(() => {
+                const rem = Array.from(document.querySelectorAll(".js-kbd-row")).filter((r) => !r.hidden);
+                if (rem.length > 0 && nextIdx >= 0) {
+                  for (const r of rem) r.classList.remove("is-kbd-selected");
+                  rem[Math.min(rem.length - 1, nextIdx)]?.classList.add("is-kbd-selected");
+                }
+              });
+            }
+            return;
+          }
+          if (ev.key === "s") {
+            const starBtn = activeRow.querySelector(".inbox-star-btn");
+            if (starBtn) {
+              ev.preventDefault();
+              starBtn.click();
+            }
+            return;
+          }
+          if (ev.key === "q") {
+            const qForm = activeRow.querySelector(
+              '.js-triage-form[data-triage-kind="queue"], .js-triage-form[data-triage-kind="unqueue"]'
+            );
+            if (qForm) {
+              ev.preventDefault();
+              if (typeof qForm.requestSubmit === "function") qForm.requestSubmit();
+              else qForm.submit();
+            }
+          }
+        }
       });
     }
 
@@ -1526,10 +2061,12 @@
   };
 
   const initSleeveDrawers = () => {
-    for (const container of document.querySelectorAll(".sleeve-actions")) {
+    for (const container of document.querySelectorAll(".js-sleeve-drawers, .sleeve-actions")) {
       if (container.dataset.bound === "1") continue;
       container.dataset.bound = "1";
-      const drawers = Array.from(container.querySelectorAll("details.album-inline-details"));
+      const drawers = Array.from(
+        container.querySelectorAll("details.album-inline-details, details.sleeve-rank-details, details.sleeve-skip-details")
+      );
       for (const drawer of drawers) {
         drawer.addEventListener("toggle", () => {
           if (!drawer.open) return;
@@ -1539,20 +2076,49 @@
         });
       }
     }
+    if (document.body && document.body.dataset.sleeveEscBound !== "1") {
+      document.body.dataset.sleeveEscBound = "1";
+      document.addEventListener("keydown", (ev) => {
+        if (ev.key !== "Escape") return;
+        for (const d of document.querySelectorAll(
+          ".js-sleeve-drawers details[open], .sleeve-actions details[open]"
+        )) {
+          d.open = false;
+        }
+      });
+    }
   };
 
   const initSidebarFeedFilter = () => {
     const input = document.querySelector(".sidebar-feed-filter");
     const list = document.getElementById("proto-feed-list") || document.getElementById("roche-sidebar-feeds");
+    const emptyEl = document.getElementById("roche-sidebar-feeds-empty");
     if (!input || !list || input.dataset.bound === "1") return;
     input.dataset.bound = "1";
     input.addEventListener("input", () => {
       const q = input.value.trim().toLowerCase();
+      let visible = 0;
       for (const li of list.children) {
         const name = (li.getAttribute("data-feed-name") || li.textContent || "").toLowerCase();
-        li.hidden = Boolean(q && !name.includes(q));
+        const hide = Boolean(q && !name.includes(q));
+        li.hidden = hide;
+        if (!hide) visible += 1;
       }
+      if (emptyEl) emptyEl.hidden = !(q && visible === 0);
     });
+  };
+
+  const initMobileFeedSelect = () => {
+    for (const sel of document.querySelectorAll(".js-mobile-feed-select")) {
+      if (sel.dataset.bound === "1") continue;
+      sel.dataset.bound = "1";
+      sel.addEventListener("change", () => {
+        const dest = sel.value;
+        if (!dest) return;
+        if (navigateViaPjaxFn) navigateViaPjaxFn(dest);
+        else window.location.href = dest;
+      });
+    }
   };
 
   const initFaviconFallbacks = () => {
@@ -1644,11 +2210,13 @@
       }
     }
 
-    // 3. Auto-build Table of Contents from normalized h3/h4 (or h2/h3) headings in prose
+    // 3. Auto-build Table of Contents for both desktop rail and mobile drawer
     const tocList = document.getElementById("roche-reader-toc");
     const tocGroup = document.getElementById("roche-reader-toc-group");
-    if (tocList && prose && tocList.dataset.built !== "1") {
-      tocList.dataset.built = "1";
+    const mobileTocList = document.querySelector(".js-reader-mobile-toc");
+    const mobileTocGroup = document.querySelector(".js-reader-mobile-toc-group");
+    if ((tocList || mobileTocList) && prose && root.dataset.tocBuilt !== "1") {
+      root.dataset.tocBuilt = "1";
       const candidateHeadings = Array.from(prose.querySelectorAll("h2, h3, h4")).filter(
         (h) => (h.textContent || "").trim().length > 0
       );
@@ -1661,25 +2229,39 @@
         return lvl <= minLevel + 1;
       });
       if (headings.length >= 2) {
-        const linkById = new Map();
-        headings.forEach((h, i) => {
-          if (!h.id) h.id = `sec-${i + 1}`;
-          const lvl = Number.parseInt(h.tagName.slice(1), 10) || minLevel;
+        const linksById = new Map();
+        const appendTocItem = (targetList, h, lvl, closeMobileDrawer) => {
           const li = document.createElement("li");
           if (lvl > minLevel) li.className = "toc-sub";
           const a = document.createElement("a");
           a.href = `#${h.id}`;
           a.textContent = h.textContent.trim();
+          if (closeMobileDrawer) {
+            a.addEventListener("click", () => {
+              const d = targetList.closest("details");
+              if (d) d.open = false;
+            });
+          }
           li.appendChild(a);
-          tocList.appendChild(li);
-          linkById.set(h.id, a);
+          targetList.appendChild(li);
+          const listArr = linksById.get(h.id) || [];
+          listArr.push(a);
+          linksById.set(h.id, listArr);
+        };
+        headings.forEach((h, i) => {
+          if (!h.id) h.id = `sec-${i + 1}`;
+          const lvl = Number.parseInt(h.tagName.slice(1), 10) || minLevel;
+          if (tocList) appendTocItem(tocList, h, lvl, false);
+          if (mobileTocList) appendTocItem(mobileTocList, h, lvl, true);
         });
         const markCurrentToc = (activeId) => {
-          for (const [id, anchor] of linkById.entries()) {
+          for (const [id, anchors] of linksById.entries()) {
             const isCur = id === activeId;
-            anchor.classList.toggle("is-current", isCur);
-            if (isCur) anchor.setAttribute("aria-current", "true");
-            else anchor.removeAttribute("aria-current");
+            for (const anchor of anchors) {
+              anchor.classList.toggle("is-current", isCur);
+              if (isCur) anchor.setAttribute("aria-current", "true");
+              else anchor.removeAttribute("aria-current");
+            }
           }
         };
         markCurrentToc(headings[0].id);
@@ -1699,8 +2281,10 @@
           cleanups.push(() => io.disconnect());
         }
         if (tocGroup) tocGroup.hidden = false;
-      } else if (tocGroup) {
-        tocGroup.hidden = true;
+        if (mobileTocGroup) mobileTocGroup.hidden = false;
+      } else {
+        if (tocGroup) tocGroup.hidden = true;
+        if (mobileTocGroup) mobileTocGroup.hidden = true;
       }
     }
 
@@ -1812,22 +2396,32 @@
       const btn = ev.target?.closest?.(".inbox-star-btn, .reader-star-btn, .js-star-toggle");
       if (!btn) return;
       const form = btn.closest("form");
-      const nextStarred = btn.getAttribute("aria-pressed") !== "true";
-      const syncBtn = (el) => {
-        el.classList.toggle("is-starred", nextStarred);
-        el.setAttribute("aria-pressed", nextStarred ? "true" : "false");
-        const glyphHost = el.querySelector("span[aria-hidden]") || el;
-        glyphHost.textContent = nextStarred ? "★" : "☆";
+      const prevStarred = btn.getAttribute("aria-pressed") === "true";
+      const nextStarred = !prevStarred;
+      const isReaderGroup =
+        btn.classList.contains("reader-star-btn") || btn.classList.contains("js-star-toggle");
+      const targets = isReaderGroup
+        ? Array.from(document.querySelectorAll(".reader-star-btn, .js-star-toggle"))
+        : [btn];
+
+      const applyStarState = (starred) => {
+        for (const el of targets) {
+          el.classList.toggle("is-starred", starred);
+          el.setAttribute("aria-pressed", starred ? "true" : "false");
+          const curLabel = el.getAttribute("aria-label") || "";
+          if (curLabel.startsWith("Star ")) {
+            el.setAttribute("aria-label", starred ? `Unstar ${curLabel.slice(5)}` : curLabel);
+          } else if (curLabel.startsWith("Unstar ")) {
+            el.setAttribute("aria-label", starred ? curLabel : `Star ${curLabel.slice(7)}`);
+          } else if (curLabel) {
+            el.setAttribute("aria-label", starred ? "Unstar" : "Star");
+          }
+          const glyphHost = el.querySelector("span[aria-hidden]") || el;
+          glyphHost.textContent = starred ? "★" : "☆";
+        }
       };
 
-      // On Reader, keep header star and sticky rail star in sync
-      if (btn.classList.contains("reader-star-btn") || btn.classList.contains("js-star-toggle")) {
-        for (const el of document.querySelectorAll(".reader-star-btn, .js-star-toggle")) {
-          syncBtn(el);
-        }
-      } else {
-        syncBtn(btn);
-      }
+      applyStarState(nextStarred);
 
       if (!form) return;
       const action = form.getAttribute("action") || "";
@@ -1847,7 +2441,196 @@
         },
         body: params.toString(),
         credentials: "same-origin",
-      }).catch(() => {});
+      })
+        .then((resp) => {
+          if (!resp.ok || isLoginUrl(resp.url)) {
+            applyStarState(prevStarred);
+            showToast("Could not update star — please try again.", { isError: true });
+          }
+        })
+        .catch(() => {
+          applyStarState(prevStarred);
+          showToast("Network error while updating star.", { isError: true });
+        });
+    });
+  };
+
+  const initInPlaceTriage = () => {
+    if (document.body?.dataset.triageDelegationBound === "1") return;
+    if (document.body) document.body.dataset.triageDelegationBound = "1";
+
+    const adjustUnreadCounters = (delta) => {
+      if (!delta) return;
+      for (const badge of document.querySelectorAll(".js-unread-count")) {
+        const cur = Number.parseInt(badge.textContent || "", 10);
+        if (Number.isFinite(cur)) {
+          badge.textContent = String(Math.max(0, cur + delta));
+        }
+      }
+    };
+
+    const postSimpleWebAction = (actionUrl, extraPairs = []) => {
+      const csrf = getCsrfToken();
+      const params = new URLSearchParams();
+      params.append("_csrf", csrf);
+      for (const [k, v] of extraPairs) params.append(k, v);
+      return fetch(actionUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "X-Roche-Csrf": csrf,
+        },
+        body: params.toString(),
+        credentials: "same-origin",
+      });
+    };
+
+    const setQueueFormState = (form, nowQueued) => {
+      const btn = form.querySelector("button[type='submit']");
+      const title = form.getAttribute("data-triage-title") || "item";
+      const curAction = form.getAttribute("action") || "";
+      const undoAction = form.getAttribute("data-undo-action") || "";
+      if (undoAction) {
+        form.setAttribute("action", undoAction);
+        form.setAttribute("data-undo-action", curAction);
+      }
+      form.setAttribute("data-triage-kind", nowQueued ? "unqueue" : "queue");
+      let slugInput = form.querySelector('input[name="list_slug_or_id"]');
+      if (nowQueued) {
+        slugInput?.remove();
+      } else if (!slugInput) {
+        slugInput = document.createElement("input");
+        slugInput.type = "hidden";
+        slugInput.name = "list_slug_or_id";
+        slugInput.value = WANT_TO_READ_COLLECTION_ID;
+        form.appendChild(slugInput);
+      }
+      if (btn) {
+        btn.classList.toggle("is-in-queue", nowQueued);
+        btn.setAttribute("aria-label", nowQueued ? `Remove ${title} from Queue` : `Add ${title} to Queue`);
+        btn.setAttribute("title", nowQueued ? "Remove from Queue" : "Add to Queue");
+        btn.textContent = nowQueued ? "✓ In Queue" : "+ Queue";
+      }
+    };
+
+    document.addEventListener("submit", (ev) => {
+      if (ev.defaultPrevented) return;
+      const form = ev.target;
+      if (!form || !form.classList?.contains("js-triage-form")) return;
+      const action = form.getAttribute("action") || "";
+      if (!action.startsWith("/web/")) return;
+
+      ev.preventDefault();
+      const kind = form.getAttribute("data-triage-kind") || "";
+      const title = form.getAttribute("data-triage-title") || "item";
+      const undoAction = form.getAttribute("data-undo-action") || "";
+      const row = form.closest(".js-triage-row");
+
+      const fd = new FormData(form);
+      const params = new URLSearchParams();
+      for (const [k, v] of fd.entries()) {
+        if (typeof v === "string") params.append(k, v);
+      }
+
+      const sendRequest = () =>
+        fetch(action, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Roche-Csrf": getCsrfToken(),
+          },
+          body: params.toString(),
+          credentials: "same-origin",
+        });
+
+      if (kind === "queue" || kind === "unqueue") {
+        const becomingQueued = kind === "queue";
+        setQueueFormState(form, becomingQueued);
+        sendRequest()
+          .then((resp) => {
+            if (!resp.ok || isLoginUrl(resp.url)) {
+              setQueueFormState(form, !becomingQueued);
+              showToast("Could not update Queue — please try again.", { isError: true });
+              return;
+            }
+            showToast(becomingQueued ? `Added "${title}" to Queue` : `Removed "${title}" from Queue`, {
+              onUndo: () => {
+                const revAction = form.getAttribute("action") || "";
+                const revExtras = !becomingQueued
+                  ? [["list_slug_or_id", WANT_TO_READ_COLLECTION_ID]]
+                  : [];
+                setQueueFormState(form, !becomingQueued);
+                postSimpleWebAction(revAction, revExtras)
+                  .then((undoResp) => {
+                    if (!undoResp.ok || isLoginUrl(undoResp.url)) {
+                      setQueueFormState(form, becomingQueued);
+                      showToast("Could not undo Queue change.", { isError: true });
+                    }
+                  })
+                  .catch(() => {
+                    setQueueFormState(form, becomingQueued);
+                    showToast("Network error while undoing Queue change.", { isError: true });
+                  });
+              },
+            });
+          })
+          .catch(() => {
+            setQueueFormState(form, !becomingQueued);
+            showToast("Network error while updating Queue.", { isError: true });
+          });
+        return;
+      }
+
+      const inboxStatusParam =
+        window.location.pathname === "/inbox"
+          ? new URLSearchParams(window.location.search).get("status")
+          : null;
+      if (!row || (inboxStatusParam === "all" && (kind === "archive" || kind === "unarchive"))) {
+        form.submit();
+        return;
+      }
+
+      const unreadDelta = kind === "archive" ? -1 : kind === "unarchive" ? 1 : 0;
+      row.hidden = true;
+      adjustUnreadCounters(unreadDelta);
+
+      sendRequest()
+        .then((resp) => {
+          if (!resp.ok || isLoginUrl(resp.url)) {
+            row.hidden = false;
+            adjustUnreadCounters(-unreadDelta);
+            showToast("Action failed — please try again.", { isError: true });
+            return;
+          }
+          const verb =
+            kind === "archive" ? "Archived" : kind === "unarchive" ? "Restored" : "Marked finished";
+          showToast(`${verb} "${title}"`, {
+            onUndo: undoAction
+              ? () => {
+                  row.hidden = false;
+                  adjustUnreadCounters(-unreadDelta);
+                  postSimpleWebAction(undoAction)
+                    .then((undoResp) => {
+                      if (!undoResp.ok || isLoginUrl(undoResp.url)) {
+                        row.hidden = true;
+                        adjustUnreadCounters(unreadDelta);
+                        showToast("Could not undo action.", { isError: true });
+                      }
+                    })
+                    .catch(() => {
+                      row.hidden = true;
+                      adjustUnreadCounters(unreadDelta);
+                      showToast("Network error while undoing action.", { isError: true });
+                    });
+                }
+              : undefined,
+          });
+        })
+        .catch(() => {
+          row.hidden = false;
+          adjustUnreadCounters(-unreadDelta);
+          showToast("Network error — please try again.", { isError: true });
+        });
     });
   };
 
@@ -1857,12 +2640,55 @@
     list.dataset.bound = "1";
     const input = document.getElementById("roche-feeds-search");
     const kindSelect = document.getElementById("roche-feeds-kind");
+    const emptyEl = document.getElementById("roche-feeds-empty");
+    const clearBtn = document.querySelector(".js-feeds-clear");
     const pills = Array.from(document.querySelectorAll(".js-feeds-pill"));
-    let activeStatus = "all";
+    const statBtns = Array.from(document.querySelectorAll(".js-feeds-stat-btn"));
 
-    const apply = () => {
+    const initialPill = pills.find((p) => p.classList.contains("is-active"));
+    let activeStatus = initialPill?.getAttribute("data-status") || "all";
+
+    const buildFeedsUrl = () => {
+      const params = new URLSearchParams();
+      if (activeStatus && activeStatus !== "all") params.set("status", activeStatus);
+      const kindVal = (kindSelect?.value || "all").toLowerCase();
+      if (kindVal && kindVal !== "all") params.set("kind", kindVal);
+      const qVal = (input?.value || "").trim();
+      if (qVal) params.set("q", qVal);
+      const qs = params.toString();
+      return qs ? `/feeds?${qs}` : "/feeds";
+    };
+
+    const syncPreserveForms = () => {
+      const dest = buildFeedsUrl();
+      for (const f of document.querySelectorAll(".js-feeds-preserve-form")) {
+        const ret = f.querySelector('input[name="return_to"]');
+        if (ret) ret.value = dest;
+      }
+      if (window.location.pathname === "/feeds" && typeof window.history?.replaceState === "function") {
+        try {
+          window.history.replaceState(window.history.state, "", dest);
+        } catch {}
+      }
+    };
+
+    const setActiveStatus = (nextStatus) => {
+      activeStatus = nextStatus || "all";
+      for (const p of pills) {
+        const isCur = (p.getAttribute("data-status") || "all") === activeStatus;
+        p.classList.toggle("is-active", isCur);
+        p.setAttribute("aria-pressed", isCur ? "true" : "false");
+      }
+      for (const b of statBtns) {
+        const isCur = (b.getAttribute("data-status") || "") === activeStatus;
+        b.classList.toggle("is-active", isCur);
+      }
+    };
+
+    const apply = (syncUrl = true) => {
       const q = (input?.value || "").trim().toLowerCase();
       const activeKind = (kindSelect?.value || "all").toLowerCase();
+      let visible = 0;
       for (const row of list.children) {
         const hay = (row.getAttribute("data-feed-search") || "").toLowerCase();
         const kind = (row.getAttribute("data-feed-kind") || "").toLowerCase();
@@ -1875,23 +2701,37 @@
           (activeStatus === "paused" && paused);
         const matchKind = activeKind === "all" || kind === activeKind;
         const matchQuery = !q || hay.includes(q);
-        row.hidden = !(matchStatus && matchKind && matchQuery);
+        const show = matchStatus && matchKind && matchQuery;
+        row.hidden = !show;
+        if (show) visible += 1;
       }
+      if (emptyEl) emptyEl.hidden = !(list.children.length > 0 && visible === 0);
+      if (syncUrl) syncPreserveForms();
     };
 
-    input?.addEventListener("input", apply);
-    kindSelect?.addEventListener("change", apply);
+    input?.addEventListener("input", () => apply(true));
+    kindSelect?.addEventListener("change", () => apply(true));
     for (const pill of pills) {
       pill.addEventListener("click", () => {
-        activeStatus = pill.getAttribute("data-status") || "all";
-        for (const p of pills) {
-          const isCur = p === pill;
-          p.classList.toggle("is-active", isCur);
-          p.setAttribute("aria-pressed", isCur ? "true" : "false");
-        }
-        apply();
+        setActiveStatus(pill.getAttribute("data-status") || "all");
+        apply(true);
       });
     }
+    for (const statBtn of statBtns) {
+      statBtn.addEventListener("click", () => {
+        const st = statBtn.getAttribute("data-status") || "all";
+        setActiveStatus(activeStatus === st ? "all" : st);
+        apply(true);
+      });
+    }
+    clearBtn?.addEventListener("click", () => {
+      setActiveStatus("all");
+      if (kindSelect) kindSelect.value = "all";
+      if (input) input.value = "";
+      apply(true);
+    });
+    setActiveStatus(activeStatus);
+    apply(false);
   };
 
   const initListFilter = () => {
@@ -1899,50 +2739,26 @@
     if (!tbody || tbody.dataset.bound === "1") return;
     tbody.dataset.bound = "1";
     const input = document.getElementById("roche-list-search");
-    const pills = Array.from(document.querySelectorAll(".js-tier-pill"));
-    const distRows = Array.from(document.querySelectorAll(".js-tier-dist-btn"));
-    let activeTier = "all";
-
-    const syncButtons = () => {
-      for (const p of pills) {
-        const isCur = (p.getAttribute("data-tier") || "all") === activeTier;
-        p.classList.toggle("is-active", isCur);
-        p.setAttribute("aria-pressed", isCur ? "true" : "false");
-      }
-      for (const r of distRows) {
-        const isCur = (r.getAttribute("data-tier") || "") === activeTier;
-        r.classList.toggle("is-active", isCur);
-        r.setAttribute("aria-pressed", isCur ? "true" : "false");
-      }
-    };
+    const emptyEl = document.getElementById("roche-list-empty");
+    const clearBtn = document.querySelector(".js-list-clear");
 
     const apply = () => {
       const q = (input?.value || "").trim().toLowerCase();
+      let visible = 0;
       for (const row of tbody.children) {
         const hay = (row.getAttribute("data-work-search") || "").toLowerCase();
-        const tier = row.getAttribute("data-tier") || "";
-        const matchTier = activeTier === "all" || tier === activeTier;
-        const matchQuery = !q || hay.includes(q);
-        row.hidden = !(matchTier && matchQuery);
+        const show = !q || hay.includes(q);
+        row.hidden = !show;
+        if (show) visible += 1;
       }
+      if (emptyEl) emptyEl.hidden = !(tbody.children.length > 0 && visible === 0);
     };
 
     input?.addEventListener("input", apply);
-    for (const pill of pills) {
-      pill.addEventListener("click", () => {
-        activeTier = pill.getAttribute("data-tier") || "all";
-        syncButtons();
-        apply();
-      });
-    }
-    for (const btn of distRows) {
-      btn.addEventListener("click", () => {
-        const t = btn.getAttribute("data-tier") || "all";
-        activeTier = activeTier === t ? "all" : t;
-        syncButtons();
-        apply();
-      });
-    }
+    clearBtn?.addEventListener("click", () => {
+      if (input) input.value = "";
+      apply();
+    });
   };
 
   const initListsViewToggle = () => {
@@ -2008,10 +2824,13 @@
   const initDiaryFilter = () => {
     const input = document.getElementById("roche-diary-search");
     const root = document.getElementById("roche-diary-months");
+    const emptyEl = document.getElementById("roche-diary-empty");
+    const clearBtn = document.querySelector(".js-diary-clear");
     if (!input || !root || input.dataset.bound === "1") return;
     input.dataset.bound = "1";
-    input.addEventListener("input", () => {
+    const apply = () => {
       const q = input.value.trim().toLowerCase();
+      let visibleMonths = 0;
       for (const sec of root.querySelectorAll(".diary-month")) {
         let visible = 0;
         for (const row of sec.querySelectorAll(".diary-entry-row")) {
@@ -2021,13 +2840,100 @@
           if (!hide) visible += 1;
         }
         sec.hidden = visible === 0;
+        if (visible > 0) visibleMonths += 1;
       }
+      if (emptyEl) emptyEl.hidden = !(q && visibleMonths === 0);
+    };
+    input.addEventListener("input", apply);
+    clearBtn?.addEventListener("click", () => {
+      input.value = "";
+      apply();
     });
+  };
+
+  const initEntryEnrichment = () => {
+    const banner = document.querySelector(".js-entry-enrich[data-entry-id]");
+    if (!banner || banner.dataset.triggered === "1") return;
+    banner.dataset.triggered = "1";
+    const entryId = banner.getAttribute("data-entry-id");
+    if (!entryId) return;
+    const expectedPath = window.location.pathname;
+    fetch(`/web/entries/${encodeURIComponent(entryId)}/enrich`, {
+      method: "POST",
+      headers: { "X-Roche-Csrf": getCsrfToken() },
+      credentials: "same-origin",
+    })
+      .then((resp) => (resp.ok ? resp.json() : null))
+      .then(async (data) => {
+        if (window.location.pathname !== expectedPath) return;
+        if (data?.enriched && !hasDirtyFormOrOpenDetails()) {
+          const pageResp = await fetch(`${window.location.pathname}${window.location.search}`, {
+            credentials: "same-origin",
+          });
+          if (pageResp.ok && window.location.pathname === expectedPath && !hasDirtyFormOrOpenDetails()) {
+            const html = await pageResp.text();
+            const doc = new DOMParser().parseFromString(html, "text/html");
+            const nextMain = doc.getElementById("roche-main");
+            const curMain = document.getElementById("roche-main");
+            if (nextMain && curMain) {
+              syncCsrfFromDoc(doc);
+              curMain.replaceChildren(...Array.from(nextMain.childNodes));
+              initPageWidgets();
+              return;
+            }
+          }
+        }
+        banner.remove();
+      })
+      .catch(() => {
+        banner.remove();
+      });
+  };
+
+  const initLogStatusRankSync = () => {
+    for (const sel of document.querySelectorAll(".js-log-status-select")) {
+      if (sel.dataset.bound === "1") continue;
+      sel.dataset.bound = "1";
+      const form = sel.closest("form");
+      const rankCheck = form?.querySelector(".js-log-rank-check");
+      if (!rankCheck) continue;
+      const sync = () => {
+        const val = (sel.value || "").toLowerCase();
+        const canRank = val === "consumed" || val === "want";
+        rankCheck.disabled = !canRank;
+        if (!canRank) rankCheck.checked = false;
+        rankCheck.closest(".field-check")?.classList.toggle("is-disabled", !canRank);
+      };
+      sel.addEventListener("change", sync);
+      sync();
+    }
+  };
+
+  const initCopyButtons = () => {
+    for (const btn of document.querySelectorAll(".js-copy-text[data-copy-text]")) {
+      if (btn.dataset.bound === "1") continue;
+      btn.dataset.bound = "1";
+      btn.addEventListener("click", async () => {
+        const text = btn.getAttribute("data-copy-text") || "";
+        if (!text) return;
+        const orig = btn.textContent || "Copy";
+        try {
+          if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(text);
+          }
+          btn.textContent = "Copied ✓";
+          window.setTimeout(() => {
+            btn.textContent = orig;
+          }, 1800);
+        } catch {}
+      });
+    }
   };
 
   const initPageWidgets = () => {
     stripFlashParamsFromUrl();
     scrollActiveNavIntoView();
+    syncPlayButtonsFn?.();
     initReaderProgress();
     initReaderExtras();
     initRankBoard();
@@ -2035,12 +2941,17 @@
     initRefreshBanner();
     initSleeveDrawers();
     initSidebarFeedFilter();
+    initMobileFeedSelect();
     initFeedsFilter();
     initListFilter();
     initListsViewToggle();
     initDiaryFilter();
+    initEntryEnrichment();
+    initLogStatusRankSync();
+    initCopyButtons();
     initFaviconFallbacks();
     initOptimisticStars();
+    initInPlaceTriage();
   };
 
   if (document.readyState === "loading") {

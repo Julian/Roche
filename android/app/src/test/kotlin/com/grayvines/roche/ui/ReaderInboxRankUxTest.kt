@@ -20,7 +20,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
-class Wave1CQuickWinsTest {
+class ReaderInboxRankUxTest {
     @Test
     fun `matchesScope applies active InboxFilter within feed and tag scopes`() {
         val unreadPaper =

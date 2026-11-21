@@ -951,6 +951,9 @@ interface RocheDao {
     @Query("SELECT * FROM comparisons WHERE isLocalDirty = 1")
     suspend fun getDirtyComparisons(): List<ComparisonEntity>
 
+    @Query("SELECT * FROM comparisons WHERE id = :id LIMIT 1")
+    suspend fun getComparisonById(id: String): ComparisonEntity?
+
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertComparisonIgnore(comparison: ComparisonEntity)
 

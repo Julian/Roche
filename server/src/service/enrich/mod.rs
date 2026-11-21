@@ -37,7 +37,6 @@ use crate::{
 const MAX_SUMMARY_CHARS: usize = 600;
 const MAX_ENRICH_ATTEMPT_CACHE: usize = 4_096;
 pub const MAX_CONCURRENT_ENRICH_TASKS: usize = 4;
-const FAILED_ENRICH_TTL: Duration = Duration::from_mins(30);
 const ON_DEMAND_ENRICH_COOLDOWN: Duration = Duration::from_secs(60);
 
 pub trait ArtistMetadataFetcher: Send + Sync {
@@ -79,6 +78,11 @@ pub struct EnrichAttemptCache {
 }
 
 impl EnrichAttemptCache {
+    #[must_use]
+    pub fn has_recent_attempt(&self, key: &str, now: Instant, ttl: Duration) -> bool {
+        self.entries.get(key).is_some_and(|&prev| now.saturating_duration_since(prev) < ttl)
+    }
+
     pub fn should_attempt_and_mark(&mut self, key: String, now: Instant, ttl: Duration) -> bool {
         if let Some(&prev) = self.entries.get(&key)
             && now.saturating_duration_since(prev) < ttl
@@ -103,7 +107,6 @@ pub struct ArtistEnricher {
     http_client: Option<SafeHttpClient>,
     attempt_cache: Mutex<EnrichAttemptCache>,
     semaphore: Arc<tokio::sync::Semaphore>,
-    failed_ttl: Duration,
 }
 
 impl ArtistEnricher {
@@ -116,13 +119,17 @@ impl ArtistEnricher {
             http_client,
             attempt_cache: Mutex::new(EnrichAttemptCache::default()),
             semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ENRICH_TASKS)),
-            failed_ttl: FAILED_ENRICH_TTL,
         }
     }
 
     #[must_use]
     pub fn default_for_runtime() -> Self {
         Self::new(!cfg!(test))
+    }
+
+    #[must_use]
+    pub fn has_recent_attempt(&self, key: &str, now: Instant, ttl: Duration) -> bool {
+        self.attempt_cache.lock().is_ok_and(|guard| guard.has_recent_attempt(key, now, ttl))
     }
 
     /// Reserves a bounded concurrency permit and records `attempt_key` in the TTL cache
@@ -155,64 +162,24 @@ pub struct EnrichService<'a> {
 }
 
 impl EnrichService<'_> {
-    pub fn spawn_artist_enrichment_if_needed(&self, detail: &EntryDetailView) {
+    /// Returns `true` when on-demand enrichment is enabled, `detail` is an Artist or Album with
+    /// missing enrichable metadata, and no enrichment attempt was made within the cooldown window.
+    #[must_use]
+    pub fn needs_enrichment(&self, detail: &EntryDetailView) -> bool {
         let enricher = &self.service.artist_enricher;
-        if !enricher.enabled || !should_attempt_enrichment(detail) {
-            return;
+        if !enricher.enabled || enricher.http_client.is_none() {
+            return false;
         }
-        if enricher.http_client.is_none() {
-            return;
-        }
-        let can_resolve_spotify = detail.entry.identifier("spotify").is_none()
-            && detail.children.iter().any(|c| spotify::child_spotify_web_url(c).is_some());
-        let attempt_key = format!("{}|sp={can_resolve_spotify}", detail.entry.id);
-        let Some(permit) =
-            enricher.try_reserve_slot(attempt_key, Instant::now(), enricher.failed_ttl)
-        else {
-            return;
+        let key = match detail.entry.kind {
+            EntryKind::Artist if should_attempt_enrichment(detail) => {
+                format!("on-demand|artist|{}", detail.entry.id)
+            }
+            EntryKind::Album if should_attempt_album_tracklist_enrichment(detail) => {
+                format!("on-demand|album|{}", detail.entry.id)
+            }
+            _ => return false,
         };
-        let svc = self.service.clone();
-        let mut detail_bg = detail.clone();
-        self.service.spawn_background(async move {
-            let _permit = permit;
-            let Some(client) = svc.artist_enricher.http_client.as_ref() else {
-                return;
-            };
-            let _ = tokio::time::timeout(
-                Duration::from_secs(4),
-                enrich_artist_detail_with_fetcher(&svc, &mut detail_bg, client),
-            )
-            .await;
-        });
-    }
-
-    pub fn spawn_album_tracklist_enrichment_if_needed(&self, detail: &EntryDetailView) {
-        let enricher = &self.service.artist_enricher;
-        if !enricher.enabled || !should_attempt_album_tracklist_enrichment(detail) {
-            return;
-        }
-        if enricher.http_client.is_none() {
-            return;
-        }
-        let attempt_key = format!("album-tracks|{}", detail.entry.id);
-        let Some(permit) =
-            enricher.try_reserve_slot(attempt_key, Instant::now(), enricher.failed_ttl)
-        else {
-            return;
-        };
-        let svc = self.service.clone();
-        let mut detail_bg = detail.clone();
-        self.service.spawn_background(async move {
-            let _permit = permit;
-            let Some(client) = svc.artist_enricher.http_client.as_ref() else {
-                return;
-            };
-            let _ = tokio::time::timeout(
-                Duration::from_secs(4),
-                enrich_album_tracklist_with_fetcher(&svc, &mut detail_bg, client),
-            )
-            .await;
-        });
+        !enricher.has_recent_attempt(&key, Instant::now(), ON_DEMAND_ENRICH_COOLDOWN)
     }
 
     /// Triggers bounded on-demand metadata enrichment for an `Artist` (bio, portrait, Spotify/Wikipedia
