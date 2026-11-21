@@ -2,17 +2,20 @@
 
 package com.grayvines.roche.data.enrichment
 
+import com.grayvines.roche.core.SCHEME_YOUTUBE
 import com.grayvines.roche.core.buildYoutubeMusicAlbumUrl
 import com.grayvines.roche.core.coreJson
 import com.grayvines.roche.core.deterministicTitleEntryId
 import com.grayvines.roche.core.encodeQueryValue
 import com.grayvines.roche.core.externalIdentifierUrl
 import com.grayvines.roche.core.extractQueryParam
+import com.grayvines.roche.core.isAllowedHostForScheme
 import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.core.sanitizeHttpUrl
 import com.grayvines.roche.core.sanitizeYoutubeMusicToken
 import com.grayvines.roche.core.stripAlbumEditionSuffix
 import com.grayvines.roche.core.stripYoutubePlaylistPrefix
+import com.grayvines.roche.core.validatedBrandedHttpsUrl
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.attachEntryIdentifiers
@@ -330,11 +333,17 @@ internal fun parseOdesliLinksPayload(rawJson: String): Map<String, String> {
     val out = LinkedHashMap<String, String>()
 
     extractOdesliYoutubeId(links, entities)?.let { out[SCHEME_YT_MUSIC] = it }
-    extractPlatformUrl(links, "appleMusic")?.let { out[SCHEME_APPLE_MUSIC] = it }
-        ?: extractPlatformUrl(links, "itunes")?.let { out[SCHEME_APPLE_MUSIC] = it }
-    extractPlatformUrl(links, SCHEME_TIDAL)?.let { out[SCHEME_TIDAL] = it }
-    extractPlatformUrl(links, SCHEME_DEEZER)?.let { out[SCHEME_DEEZER] = it }
-    extractPlatformUrl(links, "amazonMusic")?.let { out[SCHEME_AMAZON_MUSIC] = it }
+    extractPlatformUrl(links, "appleMusic", SCHEME_APPLE_MUSIC)?.let {
+        out[SCHEME_APPLE_MUSIC] = it
+    }
+        ?: extractPlatformUrl(links, "itunes", SCHEME_APPLE_MUSIC)?.let {
+            out[SCHEME_APPLE_MUSIC] = it
+        }
+    extractPlatformUrl(links, SCHEME_TIDAL, SCHEME_TIDAL)?.let { out[SCHEME_TIDAL] = it }
+    extractPlatformUrl(links, SCHEME_DEEZER, SCHEME_DEEZER)?.let { out[SCHEME_DEEZER] = it }
+    extractPlatformUrl(links, "amazonMusic", SCHEME_AMAZON_MUSIC)?.let {
+        out[SCHEME_AMAZON_MUSIC] = it
+    }
     return out
 }
 
@@ -353,8 +362,8 @@ private fun extractOdesliYoutubeId(
     links: JsonObject,
     entities: JsonObject?,
 ): String? {
-    val ytMusicUrl = extractPlatformUrl(links, "youtubeMusic")
-    val ytUrl = extractPlatformUrl(links, "youtube")
+    val ytMusicUrl = extractPlatformUrl(links, "youtubeMusic", SCHEME_YT_MUSIC)
+    val ytUrl = extractPlatformUrl(links, "youtube", SCHEME_YOUTUBE)
     val directBrowse =
         extractYoutubeBrowseIdFromUrl(ytMusicUrl) ?: extractBrowseIdFromEntities(entities)
     return directBrowse
@@ -405,10 +414,17 @@ private fun extractYoutubeIdFromUrl(rawUrl: String?): String? {
     return listParam?.takeIf { it.isNotEmpty() }
 }
 
-private fun extractPlatformUrl(links: JsonObject, key: String): String? =
+private fun extractPlatformUrl(
+    links: JsonObject,
+    key: String,
+    allowedScheme: String,
+): String? =
     ((links[key] as? JsonObject)?.get("url") as? JsonPrimitive)
         ?.contentOrNull
         ?.let(::sanitizeHttpUrl)
+        ?.let { url ->
+            validatedBrandedHttpsUrl(url) { host -> isAllowedHostForScheme(allowedScheme, host) }
+        }
 
 internal data class InnertubeAlbumCandidate(
     val primaryTitle: String,

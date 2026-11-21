@@ -14,6 +14,7 @@ object EpRankingEngine {
     const val COLD_START_VARIANCE: Double = 1.0 / PRIOR_ALPHA
     const val MIN_K: Int = 2
     const val MAX_K_DEFAULT: Int = 5
+    const val MAX_COMPARISON_WIDTH: Int = 64
     const val MIN_CONFUSABILITY: Double = 0.15
     const val RANDOM_SEED_EVERY: Int = 5
     const val N_QUANTILES: Int = 5
@@ -54,11 +55,18 @@ object EpRankingEngine {
                     !seen.add(trimmed) -> "ordering must not repeat entry ID '$trimmed'"
                     else -> null
                 }
-            if (entryError != null) {
-                duplicateOrBlank = entryError
+            total += 1
+            val stepError =
+                entryError
+                    ?: if (total > MAX_COMPARISON_WIDTH) {
+                        "a comparison cannot include more than $MAX_COMPARISON_WIDTH entries"
+                    } else {
+                        null
+                    }
+            if (stepError != null) {
+                duplicateOrBlank = stepError
                 break
             }
-            total += 1
         }
         return duplicateOrBlank
             ?: if (total < MIN_K) "a comparison needs at least $MIN_K entries" else null
@@ -132,7 +140,9 @@ object EpRankingEngine {
             if (itemIds.isEmpty() || orderings.isEmpty()) {
                 emptyList()
             } else {
-                orderings.flatMap(::toPairs)
+                orderings
+                    .filter { ord -> ord.sumOf { it.size } <= MAX_COMPARISON_WIDTH }
+                    .flatMap(::toPairs)
             }
         if (rawPairs.isNotEmpty()) {
             solveAllConnectedComponents(itemIds.toHashSet(), rawPairs, scores)

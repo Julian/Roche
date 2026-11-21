@@ -35,7 +35,6 @@ private val YOUTUBE_CHANNEL_URL_REGEX =
 private val YOUTUBE_CHANNEL_PATH_REGEX =
     Regex("""/channel/([A-Za-z0-9_-]{24})""", RegexOption.IGNORE_CASE)
 private val YOUTUBE_VIDEO_ID_REGEX = Regex("""^[A-Za-z0-9_-]{1,$MAX_YOUTUBE_VIDEO_ID_LEN}$""")
-private val ARXIV_ID_REGEX = Regex("""^[A-Za-z0-9._/-]+$""")
 
 internal fun isLocalTagId(id: String): Boolean =
     id.startsWith(LOCAL_TAG_PREFIX) && !id.startsWith(SERVER_TAG_PREFIX)
@@ -186,9 +185,6 @@ private fun isArxivPaperPath(parts: Pair<String, String>): Boolean =
     isArxivHost(parts) &&
         (parts.second.startsWith(ARXIV_ABS_PATH_PREFIX) ||
             parts.second.startsWith(ARXIV_PDF_PATH_PREFIX))
-
-private fun isValidArxivId(arxivId: String): Boolean =
-    ".." !in arxivId && arxivId.count { it == '/' } <= 1 && ARXIV_ID_REGEX.matches(arxivId)
 
 private fun isYoutubeHost(parts: Pair<String, String>?): Boolean =
     parts != null && parts.first in YOUTUBE_HOSTS

@@ -7,7 +7,6 @@ import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.floor
 import kotlin.math.ln
-import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
@@ -148,6 +147,9 @@ internal object EpGaussianMath {
         val diffCol = DoubleArray(nItems)
     }
 
+    private val MACHINE_EPSILON: Double = Math.ulp(1.0)
+    private const val ASYMPTOTIC_TAIL_SHORT_CIRCUIT: Double = 1e-15
+
     fun epPairwiseComponent(
         nItems: Int,
         pairs: List<Pair<Int, Int>>,
@@ -156,22 +158,44 @@ internal object EpGaussianMath {
     ): Pair<DoubleArray, DoubleArray>? {
         val state = EpBuffers(nItems, pairs.size, alpha)
         var result: Pair<DoubleArray, DoubleArray>? = null
+        var aborted = false
         var iter = 0
-        while (iter < maxIter && result == null) {
-            val tauOld = state.tau.copyOf()
-            val nuOld = state.nu.copyOf()
-            val sweepOk = runEpSweep(state, pairs, tauOld, nuOld)
-            val nextCov = if (sweepOk) invertSystemMatrix(state.prec, nItems, alpha) else null
-            if (nextCov == null) break
-            state.cov = nextCov
-            matVecMul(state.cov, state.xs, state.mean, nItems)
-            if (maxAbsDiff(state.tau, tauOld, state.nu, nuOld) <= THRESHOLD) {
-                val variances = DoubleArray(nItems) { k -> state.cov[k * nItems + k] }
-                result = state.mean to variances
+        while (iter < maxIter && result == null && !aborted) {
+            val maxDelta = runSingleEpIteration(state, pairs, nItems, alpha)
+            if (maxDelta == null) {
+                aborted = true
+            } else if (maxDelta <= THRESHOLD) {
+                val posterior = extractValidPosterior(state, nItems)
+                result = posterior
+                aborted = posterior == null
             }
             iter += 1
         }
         return result
+    }
+
+    private fun runSingleEpIteration(
+        state: EpBuffers,
+        pairs: List<Pair<Int, Int>>,
+        nItems: Int,
+        alpha: Double,
+    ): Double? {
+        val tauOld = state.tau.copyOf()
+        val nuOld = state.nu.copyOf()
+        if (!runEpSweep(state, pairs, tauOld, nuOld)) return null
+        val nextCov = invertSystemMatrix(state.prec, nItems, alpha) ?: return null
+        state.cov = nextCov
+        matVecMul(state.cov, state.xs, state.mean, nItems)
+        return maxFiniteSiteDelta(state.tau, tauOld, state.nu, nuOld)
+    }
+
+    private fun extractValidPosterior(
+        state: EpBuffers,
+        nItems: Int,
+    ): Pair<DoubleArray, DoubleArray>? {
+        val variances = DoubleArray(nItems) { k -> state.cov[k * nItems + k] }
+        val valid = state.mean.all { it.isFinite() } && variances.all { it.isFinite() && it >= 0.0 }
+        return if (valid) state.mean to variances else null
     }
 
     private fun runEpSweep(
@@ -179,31 +203,53 @@ internal object EpGaussianMath {
         pairs: List<Pair<Int, Int>>,
         tauOld: DoubleArray,
         nuOld: DoubleArray,
+    ): Boolean = pairs.indices.all { i -> updateSingleFactor(state, i, pairs[i], tauOld, nuOld) }
+
+    private fun updateSingleFactor(
+        state: EpBuffers,
+        index: Int,
+        pair: Pair<Int, Int>,
+        tauOld: DoubleArray,
+        nuOld: DoubleArray,
     ): Boolean {
         val n = state.nItems
-        for (i in pairs.indices) {
-            val (a, b) = pairs[i]
-            val fVar = state.cov[a * n + a] + state.cov[b * n + b] - 2.0 * state.cov[a * n + b]
-            val tauCav = if (fVar > 0.0 && fVar.isFinite()) 1.0 / fVar - state.tau[i] else -1.0
-            if (tauCav <= 0.0 || !tauCav.isFinite()) return false
-            val fMean = state.mean[a] - state.mean[b]
-            val nuCav = fMean / fVar - state.nu[i]
-            val covCav = 1.0 / tauCav
-            val (_, dlogpart, d2logpart) = matchMomentsLogit(covCav * nuCav, covCav)
-            val denom = 1.0 + d2logpart / tauCav
-            state.tau[i] = -d2logpart / denom
-            state.nu[i] = (dlogpart - nuCav / tauCav * d2logpart) / denom
+        val (a, b) = pair
+        val fVar = state.cov[a * n + a] + state.cov[b * n + b] - 2.0 * state.cov[a * n + b]
+        val tauCav = if (fVar > 0.0 && fVar.isFinite()) 1.0 / fVar - state.tau[index] else -1.0
+        if (tauCav <= 0.0 || !tauCav.isFinite()) return false
+        val fMean = state.mean[a] - state.mean[b]
+        val nuCav = fMean / fVar - state.nu[index]
+        val covCav = 1.0 / tauCav
+        val (_, dlogpart, d2logpart) = matchMomentsLogit(covCav * nuCav, covCav)
+        val denom = 1.0 + d2logpart / tauCav
+        val validMoments =
+            dlogpart.isFinite() &&
+                d2logpart.isFinite() &&
+                denom.isFinite() &&
+                abs(denom) > MACHINE_EPSILON
+        val nextTau = if (validMoments) -d2logpart / denom else Double.NaN
+        val nextNu =
+            if (validMoments) (dlogpart - nuCav / tauCav * d2logpart) / denom else Double.NaN
+        val deltaTau = nextTau - tauOld[index]
+        val deltaNu = nextNu - nuOld[index]
+        return if (allFinite(nextTau, nextNu, deltaTau, deltaNu)) {
+            state.tau[index] = nextTau
+            state.nu[index] = nextNu
             applyFactorDelta(
                 state = state,
                 a = a,
                 b = b,
                 fVar = fVar,
-                deltaTau = state.tau[i] - tauOld[i],
-                deltaNu = state.nu[i] - nuOld[i],
+                deltaTau = deltaTau,
+                deltaNu = deltaNu,
             )
+        } else {
+            false
         }
-        return true
     }
+
+    private fun allFinite(a: Double, b: Double, c: Double, d: Double): Boolean =
+        a.isFinite() && b.isFinite() && c.isFinite() && d.isFinite()
 
     @Suppress("LongParameterList")
     private fun applyFactorDelta(
@@ -213,7 +259,7 @@ internal object EpGaussianMath {
         fVar: Double,
         deltaTau: Double,
         deltaNu: Double,
-    ) {
+    ): Boolean {
         val n = state.nItems
         state.prec[a * n + a] += deltaTau
         state.prec[a * n + b] -= deltaTau
@@ -222,9 +268,12 @@ internal object EpGaussianMath {
         state.xs[a] += deltaNu
         state.xs[b] -= deltaNu
         if (abs(deltaTau) > 0.0) {
-            rankOneUpdate(state.cov, state.diffCol, a, b, n, -1.0 / (1.0 / deltaTau + fVar))
+            val scaleDenom = 1.0 / deltaTau + fVar
+            if (!scaleDenom.isFinite() || abs(scaleDenom) <= MACHINE_EPSILON) return false
+            rankOneUpdate(state.cov, state.diffCol, a, b, n, -1.0 / scaleDenom)
         }
         matVecMul(state.cov, state.xs, state.mean, n)
+        return true
     }
 
     private fun invertSystemMatrix(prec: DoubleArray, nItems: Int, alpha: Double): DoubleArray? {
@@ -258,18 +307,26 @@ internal object EpGaussianMath {
         }
     }
 
-    private fun maxAbsDiff(
+    internal fun maxFiniteSiteDelta(
         tau: DoubleArray,
         tauOld: DoubleArray,
         nu: DoubleArray,
         nuOld: DoubleArray,
-    ): Double {
+    ): Double? {
         var maxDiff = 0.0
+        var valid = true
         for (i in tau.indices) {
-            maxDiff = max(maxDiff, abs(tau[i] - tauOld[i]))
-            maxDiff = max(maxDiff, abs(nu[i] - nuOld[i]))
+            val dt = abs(tau[i] - tauOld[i])
+            val dn = abs(nu[i] - nuOld[i])
+            val ok = allFinite(tau[i], tauOld[i], nu[i], nuOld[i]) && dt.isFinite() && dn.isFinite()
+            if (!ok) {
+                valid = false
+                break
+            }
+            if (dt > maxDiff) maxDiff = dt
+            if (dn > maxDiff) maxDiff = dn
         }
-        return maxDiff
+        return if (valid) maxDiff else null
     }
 
     private fun matVecMul(mat: DoubleArray, vecX: DoubleArray, out: DoubleArray, n: Int) {
@@ -385,7 +442,7 @@ internal object EpGaussianMath {
     private fun evaluateProbitMixture(
         meanCav: Double,
         covCav: Double,
-    ): Triple<Double, Double, Double> {
+    ): Triple<Double, Double, Double>? {
         val arr1 = DoubleArray(5)
         val arr2 = DoubleArray(5)
         val arr3 = DoubleArray(5)
@@ -408,6 +465,7 @@ internal object EpGaussianMath {
             num1 += w * arr2[i] * lam
             num2 += w * (arr2[i] * arr2[i] + arr3[i]) * lam * lam
         }
+        if (!denom.isFinite() || denom <= 0.0) return null
         val logpart1 = maxA1 + ln(denom)
         val dlogpart1 = num1 / denom
         val d2logpart1 = num2 / denom - dlogpart1 * dlogpart1
@@ -415,7 +473,6 @@ internal object EpGaussianMath {
     }
 
     fun matchMomentsLogit(meanCav: Double, covCav: Double): Triple<Double, Double, Double> {
-        val (logpart1, dlogpart1, d2logpart1) = evaluateProbitMixture(meanCav, covCav)
         val exponent = -10.0 * (abs(meanCav) - 196.0 / 200.0 * covCav - 4.0)
         var lambd = 0.0
         var logpart2 = 0.0
@@ -430,10 +487,29 @@ internal object EpGaussianMath {
                 dlogpart2 = 1.0
             }
         }
-        val logpart = (1.0 - lambd) * logpart1 + lambd * logpart2
-        val dlogpart = (1.0 - lambd) * dlogpart1 + lambd * dlogpart2
-        val d2logpart = (1.0 - lambd) * d2logpart1
-        return Triple(logpart, dlogpart, d2logpart)
+        if (1.0 - lambd < ASYMPTOTIC_TAIL_SHORT_CIRCUIT) {
+            return Triple(logpart2, dlogpart2, 0.0)
+        }
+        val mixture = evaluateProbitMixture(meanCav, covCav)
+        return when {
+            mixture != null -> blendLogitMoments(lambd, mixture, logpart2, dlogpart2)
+            lambd > 0.0 -> Triple(logpart2, dlogpart2, 0.0)
+            else -> Triple(Double.NaN, Double.NaN, Double.NaN)
+        }
+    }
+
+    private fun blendLogitMoments(
+        lambd: Double,
+        mixture: Triple<Double, Double, Double>,
+        logpart2: Double,
+        dlogpart2: Double,
+    ): Triple<Double, Double, Double> {
+        val (logpart1, dlogpart1, d2logpart1) = mixture
+        return Triple(
+            (1.0 - lambd) * logpart1 + lambd * logpart2,
+            (1.0 - lambd) * dlogpart1 + lambd * dlogpart2,
+            (1.0 - lambd) * d2logpart1,
+        )
     }
 
     fun codyErfc(x: Double): Double {

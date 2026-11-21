@@ -47,6 +47,14 @@ private const val WANT_SLUG_PREFIX = "want:"
 private const val DOI_PREFIX = "doi:"
 private const val SCHEME_ARXIV = "arxiv"
 private const val SCHEME_FEED_URL = "feed_url"
+private const val SCHEME_TMDB_MOVIE = "tmdb_movie"
+private const val SCHEME_TMDB_TV = "tmdb_tv"
+private const val SCHEME_ISBN = "isbn"
+private const val SCHEME_OPENLIBRARY = "openlibrary"
+private const val SCHEME_MUSICBRAINZ_RELEASE = "musicbrainz_release"
+private const val SCHEME_MUSICBRAINZ_ARTIST = "musicbrainz_artist"
+private const val SCHEME_MUSICBRAINZ_RECORDING = "musicbrainz_recording"
+private const val SCHEME_IGDB = "igdb"
 private const val ENTITY_ALBUM = "album"
 private const val ENTITY_ARTIST = "artist"
 private const val ENTITY_TRACK = "track"
@@ -68,15 +76,15 @@ internal data class DerivedCollectionId(
 internal val PREFERRED_IDENTIFIER_SCHEMES: List<String> =
     listOf(
         SCHEME_SPOTIFY,
-        "musicbrainz_release",
-        "musicbrainz_recording",
-        "musicbrainz_artist",
+        SCHEME_MUSICBRAINZ_RELEASE,
+        SCHEME_MUSICBRAINZ_RECORDING,
+        SCHEME_MUSICBRAINZ_ARTIST,
         "imdb",
-        "tmdb_movie",
-        "tmdb_tv",
-        "isbn",
-        "openlibrary",
-        "igdb",
+        SCHEME_TMDB_MOVIE,
+        SCHEME_TMDB_TV,
+        SCHEME_ISBN,
+        SCHEME_OPENLIBRARY,
+        SCHEME_IGDB,
         SCHEME_ARXIV,
         SCHEME_WIKIPEDIA,
         SCHEME_FEED_URL,
@@ -89,8 +97,48 @@ private val SPOTIFY_ENTITY_TYPES: Set<String> =
 private val ARXIV_HOSTS: Set<String> =
     setOf("arxiv.org", "www.arxiv.org", "rss.arxiv.org", "export.arxiv.org")
 
-private val HTTP_ONLY_EXTERNAL_SCHEMES: Set<String> =
-    setOf(SCHEME_BANDCAMP, "rym", "url", SCHEME_FEED_URL)
+private val TMDB_HOSTS: Set<String> = setOf("themoviedb.org", "www.themoviedb.org")
+private val OPENLIBRARY_HOSTS: Set<String> = setOf("openlibrary.org", "www.openlibrary.org")
+private val MUSICBRAINZ_HOSTS: Set<String> = setOf("musicbrainz.org", "www.musicbrainz.org")
+
+private val BRANDED_ALLOWED_HOSTS: Map<String, Set<String>> =
+    mapOf(
+        SCHEME_TMDB_MOVIE to TMDB_HOSTS,
+        SCHEME_TMDB_TV to TMDB_HOSTS,
+        "tmdb" to TMDB_HOSTS,
+        "letterboxd" to setOf("letterboxd.com", "www.letterboxd.com"),
+        SCHEME_ISBN to OPENLIBRARY_HOSTS,
+        SCHEME_OPENLIBRARY to OPENLIBRARY_HOSTS,
+        "goodreads" to setOf("goodreads.com", "www.goodreads.com"),
+        "steam" to setOf("store.steampowered.com"),
+        SCHEME_IGDB to setOf("igdb.com", "www.igdb.com"),
+        "discogs" to setOf("discogs.com", "www.discogs.com"),
+        SCHEME_ARXIV to ARXIV_HOSTS,
+        "wikidata" to setOf("wikidata.org", "www.wikidata.org"),
+        SCHEME_MUSICBRAINZ_RELEASE to MUSICBRAINZ_HOSTS,
+        SCHEME_MUSICBRAINZ_ARTIST to MUSICBRAINZ_HOSTS,
+        SCHEME_MUSICBRAINZ_RECORDING to MUSICBRAINZ_HOSTS,
+        "musicbrainz" to MUSICBRAINZ_HOSTS,
+        SCHEME_APPLE_MUSIC to setOf("music.apple.com", "itunes.apple.com"),
+        SCHEME_TIDAL to setOf("tidal.com", "listen.tidal.com", "www.tidal.com"),
+        SCHEME_DEEZER to setOf("deezer.com", "www.deezer.com"),
+        SCHEME_QOBUZ to setOf("open.qobuz.com", "play.qobuz.com", "www.qobuz.com", "qobuz.com"),
+        SCHEME_AMAZON_MUSIC to setOf("music.amazon.com"),
+        SCHEME_SPOTIFY to setOf("open.spotify.com", "play.spotify.com"),
+        SCHEME_YOUTUBE_MUSIC to setOf("music.youtube.com"),
+        SCHEME_YOUTUBE to
+            setOf(
+                "youtube.com",
+                "www.youtube.com",
+                "m.youtube.com",
+                "music.youtube.com",
+                "youtu.be",
+                "www.youtu.be",
+            ),
+        "imdb" to setOf("imdb.com", "www.imdb.com", "m.imdb.com"),
+        "doi" to setOf("doi.org", "dx.doi.org"),
+        "rym" to setOf("rateyourmusic.com", "www.rateyourmusic.com"),
+    )
 
 private val DISALLOWED_URI_SCHEME_PREFIXES: List<String> =
     listOf("javascript:", "data:", "vbscript:", "file:", "ftp:")
@@ -99,20 +147,20 @@ private val NON_SLUG_REGEX = Regex("[^a-z0-9]+")
 
 private val EXTERNAL_ID_URL_PREFIXES: Map<String, String> =
     mapOf(
-        "tmdb_movie" to "https://www.themoviedb.org/movie/",
-        "tmdb_tv" to "https://www.themoviedb.org/tv/",
+        SCHEME_TMDB_MOVIE to "https://www.themoviedb.org/movie/",
+        SCHEME_TMDB_TV to "https://www.themoviedb.org/tv/",
         "letterboxd" to "https://letterboxd.com/film/",
-        "isbn" to "https://openlibrary.org/isbn/",
-        "openlibrary" to "https://openlibrary.org/works/",
+        SCHEME_ISBN to "https://openlibrary.org/isbn/",
+        SCHEME_OPENLIBRARY to "https://openlibrary.org/works/",
         "goodreads" to "https://www.goodreads.com/book/show/",
         "steam" to "https://store.steampowered.com/app/",
-        "igdb" to "https://www.igdb.com/games/",
+        SCHEME_IGDB to "https://www.igdb.com/games/",
         "discogs" to "https://www.discogs.com/release/",
         SCHEME_ARXIV to "https://arxiv.org/abs/",
         "wikidata" to "https://www.wikidata.org/wiki/",
-        "musicbrainz_release" to "https://musicbrainz.org/release/",
-        "musicbrainz_artist" to "https://musicbrainz.org/artist/",
-        "musicbrainz_recording" to "https://musicbrainz.org/recording/",
+        SCHEME_MUSICBRAINZ_RELEASE to "https://musicbrainz.org/release/",
+        SCHEME_MUSICBRAINZ_ARTIST to "https://musicbrainz.org/artist/",
+        SCHEME_MUSICBRAINZ_RECORDING to "https://musicbrainz.org/recording/",
         SCHEME_APPLE_MUSIC to "https://music.apple.com/album/",
         SCHEME_TIDAL to "https://tidal.com/browse/album/",
         SCHEME_DEEZER to "https://www.deezer.com/album/",
@@ -220,10 +268,61 @@ private fun normalizeImdbIdentifier(raw: String): String {
     return if (match != null) "tt${match.substring(IMDB_PREFIX_LENGTH)}" else raw
 }
 
+private const val ARXIV_ID_MAX_LEN = 64
+
+internal fun isWikipediaHost(host: String): Boolean {
+    val clean = host.trim().trimEnd('.').lowercase(Locale.ROOT)
+    return clean == "wikipedia.org" || clean.endsWith(".wikipedia.org")
+}
+
+internal fun isValidArxivId(candidate: String): Boolean =
+    candidate.isNotEmpty() &&
+        candidate.length <= ARXIV_ID_MAX_LEN &&
+        ".." !in candidate &&
+        !candidate.startsWith('/') &&
+        !candidate.endsWith('/') &&
+        !candidate.startsWith('.') &&
+        !candidate.endsWith('.') &&
+        candidate.count { it == '/' } <= 1 &&
+        candidate.all { ch ->
+            ch in 'a'..'z' || ch in 'A'..'Z' || ch in '0'..'9' || ch in "._-/"
+        }
+
+internal fun isSafeBareIdentifier(value: String): Boolean =
+    value.isNotEmpty() &&
+        "://" !in value &&
+        ".." !in value &&
+        '@' !in value &&
+        '\\' !in value &&
+        value.none { it.isWhitespace() || it.isISOControl() }
+
+internal fun validatedBrandedHttpsUrl(
+    raw: String,
+    allowedHost: (String) -> Boolean,
+): String? {
+    val uri = parseLenientUri(raw) ?: return null
+    val scheme = uri.scheme?.lowercase(Locale.ROOT)
+    val host = uri.host?.trim()?.trimEnd('.')?.lowercase(Locale.ROOT)
+    val valid =
+        scheme == SCHEME_HTTPS &&
+            uri.rawUserInfo == null &&
+            uri.rawAuthority?.contains('@') != true &&
+            !host.isNullOrBlank() &&
+            allowedHost(host)
+    return if (valid) raw.trim() else null
+}
+
+internal fun isAllowedHostForScheme(scheme: String, host: String): Boolean =
+    when (scheme) {
+        SCHEME_WIKIPEDIA -> isWikipediaHost(host)
+        SCHEME_BANDCAMP -> host == "bandcamp.com" || host.endsWith(".bandcamp.com")
+        else -> BRANDED_ALLOWED_HOSTS[scheme]?.contains(host) == true
+    }
+
 private fun normalizeWikipediaIdentifier(raw: String): String {
     val wikiSlug =
         parseLenientUri(raw)
-            ?.takeIf { it.host?.lowercase()?.endsWith("wikipedia.org") == true }
+            ?.takeIf { uri -> uri.host?.let(::isWikipediaHost) == true }
             ?.rawPath
             ?.takeIf { it.startsWith("/wiki/") }
             ?.removePrefix("/wiki/")
@@ -252,7 +351,7 @@ internal fun extractArxivIdentifier(urlOrId: String): String? {
         }
     val withoutQuery = afterMarker.substringBefore('?').substringBefore('#')
     val cleaned = withoutQuery.removeSuffix(".pdf").trim('/')
-    return cleaned.takeIf { it.isNotEmpty() }
+    return cleaned.takeIf(::isValidArxivId)
 }
 
 private fun isValidArxivHttpUrl(raw: String): Boolean {
@@ -271,13 +370,21 @@ private fun parseLenientUri(raw: String): URI? = runCatching {
 }
     .getOrNull()
 
-internal fun buildYoutubeMusicAlbumUrl(rawIdOrUrl: String): String {
+internal fun buildYoutubeMusicAlbumUrl(rawIdOrUrl: String): String =
+    resolveYoutubeMusicAlbumUrl(rawIdOrUrl).orEmpty()
+
+internal fun resolveYoutubeMusicAlbumUrl(rawIdOrUrl: String): String? {
     val trimmed = rawIdOrUrl.trim()
     val http = sanitizeHttpUrl(trimmed)
     if (http != null) {
-        return normalizeYoutubeMusicHttpUrl(http)
+        val valid =
+            validatedBrandedHttpsUrl(http) { host ->
+                isAllowedHostForScheme(SCHEME_YOUTUBE_MUSIC, host)
+            } ?: return null
+        return normalizeYoutubeMusicHttpUrl(valid)
     }
     val normalizedId = sanitizeYoutubeMusicToken(trimmed)
+    if (!isSafeBareIdentifier(normalizedId)) return null
     return if (normalizedId.startsWith(YT_MUSIC_BROWSE_PREFIX)) {
         "$YT_MUSIC_ORIGIN/browse/${encodeQueryValue(normalizedId)}"
     } else {
@@ -372,17 +479,41 @@ internal fun externalIdentifierUrl(
     val http = sanitizeHttpUrl(clean)?.takeIf { it.substringAfter("://").isNotBlank() }
     val normalizedScheme = normalizeIdentifierScheme(scheme)
     return when (normalizedScheme) {
-        SCHEME_WIKIPEDIA ->
-            http ?: "https://en.wikipedia.org/wiki/${clean.replace("#", "%23").replace("?", "%3F")}"
+        SCHEME_WIKIPEDIA -> resolveWikipediaExternalUrl(clean, http)
         SCHEME_SPOTIFY -> resolveSpotifyExternalUrl(clean, http, entryKind)
-        SCHEME_YOUTUBE_MUSIC -> buildYoutubeMusicAlbumUrl(clean)
+        SCHEME_YOUTUBE_MUSIC -> resolveYoutubeMusicAlbumUrl(clean)
         SCHEME_YOUTUBE -> resolveYoutubeExternalUrl(clean, http)
-        "imdb" -> http ?: "https://www.imdb.com/title/${encodePathSegmentOrKeep(clean)}/"
+        "imdb" -> resolveImdbExternalUrl(clean, http)
         "doi" -> resolveDoiExternalUrl(clean, http)
-        in HTTP_ONLY_EXTERNAL_SCHEMES -> http
+        SCHEME_BANDCAMP,
+        "rym" ->
+            http?.let { candidate ->
+                validatedBrandedHttpsUrl(candidate) { host ->
+                    isAllowedHostForScheme(normalizedScheme, host)
+                }
+            }
+        "url",
+        SCHEME_FEED_URL -> http?.takeIf(::isSyncablePublicUrl)
         else -> resolvePrefixedExternalUrl(normalizedScheme, clean, http, entryKind)
     }
 }
+
+private fun resolveWikipediaExternalUrl(clean: String, http: String?): String? =
+    when {
+        http != null -> validatedBrandedHttpsUrl(http, ::isWikipediaHost)
+        "://" !in clean && ".." !in clean && clean.none(Char::isISOControl) ->
+            "https://en.wikipedia.org/wiki/${clean.replace("#", "%23").replace("?", "%3F")}"
+        else -> null
+    }
+
+private fun resolveImdbExternalUrl(clean: String, http: String?): String? =
+    when {
+        http != null ->
+            validatedBrandedHttpsUrl(http) { host -> isAllowedHostForScheme("imdb", host) }
+        isSafeBareIdentifier(clean) ->
+            "https://www.imdb.com/title/${encodePathSegmentOrKeep(clean)}/"
+        else -> null
+    }
 
 private fun isDisallowedUriScheme(raw: String): Boolean {
     val lower = raw.lowercase(Locale.ROOT)
@@ -396,16 +527,17 @@ private fun resolveSpotifyExternalUrl(
 ): String? {
     if (clean.startsWith(SPOTIFY_URI_PREFIX)) {
         val parsed = extractSpotifyFromColonUri(clean)
-        return parsed?.let {
-            "https://open.spotify.com/${it.first}/${encodeQueryValue(it.second)}"
-        }
+        return parsed
+            ?.takeIf { isSafeBareIdentifier(it.first) && isSafeBareIdentifier(it.second) }
+            ?.let { "https://open.spotify.com/${it.first}/${encodeQueryValue(it.second)}" }
     }
     val webParsed = extractSpotifyFromWebUrl(clean)
     return when {
         webParsed != null ->
             "https://open.spotify.com/${webParsed.first}/${encodeQueryValue(webParsed.second)}"
-        http != null -> http
-        ':' in clean || '/' in clean || clean.any(Char::isWhitespace) -> null
+        http != null ->
+            validatedBrandedHttpsUrl(http) { host -> isAllowedHostForScheme(SCHEME_SPOTIFY, host) }
+        !isSafeBareIdentifier(clean) || ':' in clean || '/' in clean -> null
         else ->
             "https://open.spotify.com/${spotifyDefaultEntity(entryKind)}/${encodeQueryValue(clean)}"
     }
@@ -421,24 +553,28 @@ private fun spotifyDefaultEntity(entryKind: String?): String =
         else -> ENTITY_ALBUM
     }
 
-private fun resolveYoutubeExternalUrl(clean: String, http: String?): String =
+private fun resolveYoutubeExternalUrl(clean: String, http: String?): String? =
     when {
-        http != null -> http
+        http != null ->
+            validatedBrandedHttpsUrl(http) { host -> isAllowedHostForScheme(SCHEME_YOUTUBE, host) }
         isYoutubeChannelId(clean) -> "https://www.youtube.com/channel/${encodeQueryValue(clean)}"
-        else -> "https://www.youtube.com/watch?v=${encodeQueryValue(clean)}"
+        isSafeBareIdentifier(clean) -> "https://www.youtube.com/watch?v=${encodeQueryValue(clean)}"
+        else -> null
     }
 
 private fun resolveDoiExternalUrl(clean: String, http: String?): String? {
-    if (http != null) return http
+    if (http != null) {
+        return validatedBrandedHttpsUrl(http) { host -> isAllowedHostForScheme("doi", host) }
+    }
     val stripped =
         if (clean.startsWith(DOI_PREFIX, ignoreCase = true)) {
             clean.substring(DOI_PREFIX.length).trim()
         } else {
             clean
         }
-    return stripped
-        .takeIf { it.isNotEmpty() }
-        ?.let { "https://doi.org/${encodePathSegmentOrKeep(it)}" }
+    return stripped.takeIf(::isSafeBareIdentifier)?.let {
+        "https://doi.org/${encodePathSegmentOrKeep(it)}"
+    }
 }
 
 private fun resolvePrefixedExternalUrl(
@@ -453,7 +589,14 @@ private fun resolvePrefixedExternalUrl(
             "musicbrainz" -> musicbrainzPrefixForKind(entryKind)
             else -> EXTERNAL_ID_URL_PREFIXES[normalizedScheme]
         } ?: return null
-    return http ?: "$prefix${encodePathSegmentOrKeep(clean)}"
+    return when {
+        http != null ->
+            validatedBrandedHttpsUrl(http) { host ->
+                isAllowedHostForScheme(normalizedScheme, host)
+            }
+        isSafeBareIdentifier(clean) -> "$prefix${encodePathSegmentOrKeep(clean)}"
+        else -> null
+    }
 }
 
 private fun tmdbPrefixForKind(entryKind: String?): String? =

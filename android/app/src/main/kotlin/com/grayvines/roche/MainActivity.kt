@@ -104,8 +104,11 @@ class MainActivity : ComponentActivity() {
                         onExportOpml = { exportOpmlLauncher.launch("roche-feeds.opml") },
                         onOpenCollectionDraw = ::openCollectionDraw,
                         onPlayMusicTrack = { track ->
-                            launchMusicTrack(this@MainActivity, track, ::openUrlInBrowser)
+                            lifecycleScope.launch {
+                                launchMusicTrack(this@MainActivity, track, ::openUrlInBrowser)
+                            }
                         },
+                        onRevealSavedBearerToken = viewModel::readSavedBearerToken,
                     )
                 }
             }
@@ -130,6 +133,27 @@ class MainActivity : ComponentActivity() {
             currentIntent.removeExtra(PodcastPlaybackService.EXTRA_OPEN_FULLSCREEN_PLAYER)
             currentIntent.action = Intent.ACTION_MAIN
             viewModel.dispatch(MainAction.OpenFullscreenPlayer)
+        }
+        val prefillUrl = currentIntent.getStringExtra(EXTRA_SHARE_PREFILL_URL)?.trim().orEmpty()
+        if (prefillUrl.isNotEmpty()) {
+            val prefillTitle =
+                currentIntent.getStringExtra(EXTRA_SHARE_PREFILL_TITLE)?.trim().orEmpty()
+            val errorMsg = currentIntent.getStringExtra(EXTRA_SHARE_ERROR_MESSAGE)?.trim().orEmpty()
+            val preferFeed = currentIntent.getBooleanExtra(EXTRA_SHARE_PREFILL_IS_FEED, false)
+            currentIntent.removeExtra(EXTRA_SHARE_PREFILL_URL)
+            currentIntent.removeExtra(EXTRA_SHARE_PREFILL_TITLE)
+            currentIntent.removeExtra(EXTRA_SHARE_ERROR_MESSAGE)
+            currentIntent.removeExtra(EXTRA_SHARE_PREFILL_IS_FEED)
+            viewModel.dispatch(
+                MainAction.OpenAddSheet(
+                    prefilledUrl = prefillUrl,
+                    prefilledTitle = prefillTitle,
+                    preferSubscribeFeed = preferFeed,
+                )
+            )
+            if (errorMsg.isNotEmpty()) {
+                viewModel.showStatusMessage(errorMsg)
+            }
         }
     }
 
@@ -262,7 +286,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private companion object {
+    companion object {
+        internal const val EXTRA_SHARE_PREFILL_URL = "com.grayvines.roche.EXTRA_SHARE_PREFILL_URL"
+        internal const val EXTRA_SHARE_PREFILL_TITLE =
+            "com.grayvines.roche.EXTRA_SHARE_PREFILL_TITLE"
+        internal const val EXTRA_SHARE_ERROR_MESSAGE =
+            "com.grayvines.roche.EXTRA_SHARE_ERROR_MESSAGE"
+        internal const val EXTRA_SHARE_PREFILL_IS_FEED =
+            "com.grayvines.roche.EXTRA_SHARE_PREFILL_IS_FEED"
         private const val ALBUM_RESOLVE_TIMEOUT_MS = 5_000L
         private val ALLOWED_EXTERNAL_SCHEMES = setOf("http", "https", "mailto")
         private val OPML_MIME_TYPES = arrayOf("text/xml", "application/xml", "text/x-opml", "*/*")

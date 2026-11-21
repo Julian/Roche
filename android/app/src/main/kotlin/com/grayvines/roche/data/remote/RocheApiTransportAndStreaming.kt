@@ -771,19 +771,14 @@ internal fun exceedsByteBudget(bytesWritten: Long, incoming: Long, maxBytes: Lon
 internal fun validateAndSanitizeRequestUrl(
     request: HttpRequest,
     vpnCheck: VpnTransportCheck,
-): String {
-    val targetUrl =
-        if (request.requirePublicIp) {
-            PublicUrlValidator.upgradePublicHttp(request.url).also {
-                PublicUrlValidator.ensurePublicTarget(it)
-            }
-        } else {
-            PublicUrlValidator.ensureSafeServerEndpoint(request.url, vpnCheck::isActive)
-            PublicUrlValidator.ensureResolvedServerTarget(request.url)
-            request.url
-        }
-    return targetUrl.trim().replace(" ", "%20")
-}
+): String =
+    if (request.requirePublicIp) {
+        val upgraded = PublicUrlValidator.upgradePublicHttp(request.url)
+        PublicUrlValidator.ensurePublicTarget(upgraded)
+    } else {
+        PublicUrlValidator.ensureSafeServerEndpoint(request.url, vpnCheck::isActive)
+        PublicUrlValidator.ensureResolvedServerTarget(request.url)
+    }
 
 internal fun resolveNextRedirectHop(
     effectiveRequest: HttpRequest,

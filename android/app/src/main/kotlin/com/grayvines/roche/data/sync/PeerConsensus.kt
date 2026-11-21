@@ -162,7 +162,7 @@ internal fun computeThroughputWeight(
     itemsProcessed: Int,
     elapsedSeconds: Double,
 ): Double {
-    if (feedsCompleted <= 0) return DEFAULT_ONLINE_PEER_WEIGHT
+    if (feedsCompleted <= 0 || !elapsedSeconds.isFinite()) return DEFAULT_ONLINE_PEER_WEIGHT
     val safeSecs = elapsedSeconds.coerceAtLeast(MIN_MEASURED_ELAPSED_SECS)
     val workUnits = feedsCompleted.toDouble() + itemsProcessed.toDouble() / ITEMS_PER_WORK_UNIT
     val unitsPerSec = workUnits / safeSecs
@@ -204,6 +204,7 @@ internal fun effectivePeerWeight(
     lastError: String?,
     lastErrorBy: String?,
 ): Double {
+    if (!peer.weight.isFinite()) return 0.0
     val base = peer.weight.coerceIn(0.0, MAX_PEER_WEIGHT)
     if (base <= 0.0 || peer.networkTier.equals(NetworkTier.OFFLINE.wireValue, ignoreCase = true)) {
         return 0.0
@@ -248,15 +249,18 @@ internal fun selectFeedPoller(
     var bestPeer: String? = null
     var bestScore = Double.NEGATIVE_INFINITY
     for (peer in activePeers) {
-        var weight =
-            effectivePeerWeight(peer, lastPolledBy, lastError, lastErrorBy) *
-                peerLivenessFactor(peer.lastSeenAt, nowEpochSeconds)
-        if (localBoostPeerId != null && peer.peerId == localBoostPeerId) {
-            weight *= localBoostFactor
-        }
-        if (weight <= 0.0) continue
-        val u = rendezvousUniformUnit(peer.peerId, feedUrl, epoch)
-        val score = -weight / ln(u)
+        val score =
+            scorePeerForFeed(
+                peer = peer,
+                feedUrl = feedUrl,
+                epoch = epoch,
+                nowEpochSeconds = nowEpochSeconds,
+                lastPolledBy = lastPolledBy,
+                lastError = lastError,
+                lastErrorBy = lastErrorBy,
+                localBoostPeerId = localBoostPeerId,
+                localBoostFactor = localBoostFactor,
+            ) ?: continue
         val isBetter =
             bestPeer == null ||
                 score > bestScore ||
@@ -267,6 +271,30 @@ internal fun selectFeedPoller(
         }
     }
     return bestPeer
+}
+
+@Suppress("LongParameterList")
+private fun scorePeerForFeed(
+    peer: PeerNodeDto,
+    feedUrl: String,
+    epoch: Long,
+    nowEpochSeconds: Long,
+    lastPolledBy: String?,
+    lastError: String?,
+    lastErrorBy: String?,
+    localBoostPeerId: String?,
+    localBoostFactor: Double,
+): Double? {
+    var weight =
+        effectivePeerWeight(peer, lastPolledBy, lastError, lastErrorBy) *
+            peerLivenessFactor(peer.lastSeenAt, nowEpochSeconds)
+    if (localBoostPeerId != null && peer.peerId == localBoostPeerId) {
+        weight *= if (localBoostFactor.isFinite()) localBoostFactor else 1.0
+    }
+    if (!weight.isFinite() || weight <= 0.0) return null
+    val u = rendezvousUniformUnit(peer.peerId, feedUrl, epoch)
+    val score = -weight / ln(u)
+    return score.takeIf { it.isFinite() }
 }
 
 private data class FeedPollScheduleState(

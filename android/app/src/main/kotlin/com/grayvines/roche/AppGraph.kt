@@ -104,7 +104,8 @@ class AppGraph(context: Context) : AutoCloseable {
     private val audioPlayerBackendDelegate = lazy {
         ExoPlayerAudioBackend(
             context = appContext,
-            allowedLocalDirs = listOf(offlineCacheDir, appContext.cacheDir),
+            allowedLocalDirs =
+                com.grayvines.roche.playback.defaultAllowedLocalAudioDirs(offlineCacheDir),
             parentScope = appScope,
             httpEngineProvider = { httpTransport.sharedHttpEngine },
         )

@@ -826,6 +826,54 @@ class DataSyncRound2FixesTest {
         }
 
     @Test
+    fun `addUrlToWantToRead preserves existing cached localpdf when re-shared`() = runTest {
+        val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val settings =
+                SettingsRepository(
+                    PreferenceDataStoreFactory.create(
+                        scope = dataStoreScope,
+                        produceFile = { File(tempDir, "pdf_reshare.preferences_pb") },
+                    )
+                )
+            settings.update { it.copy(peerId = "android-peer-pdf-reshare") }
+            val repo =
+                RocheRepository(
+                    database = database,
+                    apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
+                    settings = settings,
+                    cacheDir = tempDir,
+                )
+            val localUrl = "localpdf://existing-doc-456"
+            val firstBytes =
+                listOf("%PDF-1.7", "1 0 obj", "<<>>", "endobj", "").joinToString("\n").toByteArray()
+            val secondBytes =
+                listOf("%PDF-1.7", "2 0 obj", "<<>>", "endobj", "").joinToString("\n").toByteArray()
+            repo.addUrlToWantToRead(
+                inputUrl = localUrl,
+                titleOverride = "Original Paper",
+                forcedContentType = ContentType.PDF,
+                pdfInputStream = ByteArrayInputStream(firstBytes),
+                awaitPdfCacheCopy = true,
+            )
+            // Re-sharing the same localpdf URL must neither overwrite nor evict the cached PDF.
+            repo.addUrlToWantToRead(
+                inputUrl = localUrl,
+                titleOverride = "Tampered Paper",
+                forcedContentType = ContentType.PDF,
+                pdfInputStream = ByteArrayInputStream(secondBytes),
+                awaitPdfCacheCopy = true,
+            )
+            val detId = deterministicItemId(null, localUrl)
+            val cachedFile = com.grayvines.roche.media.findCachedPdfFileForEntry(tempDir, detId)
+            assertNotNull(cachedFile)
+            assertEquals(String(firstBytes), cachedFile?.readText())
+        } finally {
+            dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
+        }
+    }
+
+    @Test
     fun `resolveFeedEffectiveHlc generates fresh peer HLC on dirty feed config update`() = runTest {
         val dao = database.dao()
         val feedUrl = "https://feeds.example.com/show.xml"

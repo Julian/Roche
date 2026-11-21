@@ -1,30 +1,23 @@
 package com.grayvines.roche.data.feeds
 
 import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
-import com.grayvines.roche.core.PDF_MAGIC_BYTES
 import com.grayvines.roche.core.buildYoutubeChannelFeedUrl
+import com.grayvines.roche.core.encodeQueryValue
 import com.grayvines.roche.core.extractArxivIdentifier
 import com.grayvines.roche.core.extractHostTitle
 import com.grayvines.roche.core.extractYoutubeChannelId
-import com.grayvines.roche.core.hasPdfMagicHeader
 import com.grayvines.roche.core.isHttpOrHttpsUrl
 import com.grayvines.roche.core.isLikelyFeedUrl
 import com.grayvines.roche.core.isLocalPdfUrl
+import com.grayvines.roche.core.isValidArxivId
 import com.grayvines.roche.core.isYoutubeChannelId
-import com.grayvines.roche.core.moveFileAtomically
-import com.grayvines.roche.core.resolveSafeChildFile
 import com.grayvines.roche.core.runSuspendCatching
-import com.grayvines.roche.core.sanitizeCacheFileName
 import com.grayvines.roche.data.local.MAX_SQLITE_HTML_CHARS
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.enrichEntryMetadataIfPresent
 import com.grayvines.roche.data.remote.RocheApiClient
-import com.grayvines.roche.media.ITEMS_SUBDIR
-import com.grayvines.roche.media.SHARED_PDF_FILENAME
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.inferContentType
-import java.io.File
-import java.io.InputStream
 import java.net.URI
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
@@ -215,7 +208,8 @@ private suspend fun enrichArxivItemOnDevice(
     hasUserTitleOverride: Boolean,
     nodeId: String,
 ) {
-    val queryUrl = "https://export.arxiv.org/api/query?id_list=$arxivId"
+    if (!isValidArxivId(arxivId)) return
+    val queryUrl = "https://export.arxiv.org/api/query?id_list=${encodeQueryValue(arxivId)}"
     val xml = apiClient.fetchExternalFeedXml(queryUrl).getOrNull() ?: return
     val candidate =
         withContext(Dispatchers.Default) {
@@ -298,102 +292,6 @@ private suspend fun applyWebPageSnapshotToItem(
     )
 }
 
-internal suspend fun copySharedPdfStreamToCache(
-    dao: RocheDao,
-    cacheDir: File?,
-    itemId: String,
-    stream: InputStream,
-): Boolean =
-    withContext(Dispatchers.IO) {
-        val copied =
-            if (cacheDir == null) {
-                runCatching { stream.close() }
-                false
-            } else {
-                writeSharedPdfToItemDir(cacheDir, itemId, stream)
-            }
-        if (copied) {
-            dao.updateItemCachedOffline(itemId, true)
-        }
-        copied
-    }
-
-internal suspend fun writeSharedPdfToItemDir(
-    rootDir: File,
-    itemId: String,
-    stream: InputStream,
-): Boolean = runSuspendCatching {
-    stream.use { input ->
-        val safeItemId = sanitizeCacheFileName(itemId)
-        if (safeItemId != itemId.trim()) {
-            false
-        } else {
-            val itemsRoot = File(rootDir, ITEMS_SUBDIR).apply { mkdirs() }
-            val itemDir = resolveSafeChildFile(itemsRoot, safeItemId).apply { mkdirs() }
-            val targetFile = File(itemDir, SHARED_PDF_FILENAME).canonicalFile
-            check(targetFile.parentFile == itemDir.canonicalFile) {
-                "Resolved PDF path escapes item directory"
-            }
-            val tempFile = File(itemDir, "$SHARED_PDF_FILENAME.${System.nanoTime()}.tmp")
-            try {
-                val totalBytes = copyBoundedStreamToFile(input, tempFile)
-                if (totalBytes <= 0L) {
-                    false
-                } else {
-                    moveFileAtomically(tempFile, targetFile)
-                    true
-                }
-            } finally {
-                if (tempFile.exists()) {
-                    tempFile.delete()
-                }
-            }
-        }
-    }
-}
-    .getOrDefault(false)
-
-private fun copyBoundedStreamToFile(input: InputStream, target: File): Long {
-    var totalBytes = 0L
-    val header = ByteArray(PDF_MAGIC_BYTES.size)
-    var headerRead = 0
-    target.outputStream().use { output ->
-        val buffer = ByteArray(PDF_COPY_BUFFER_BYTES)
-        var read = input.read(buffer)
-        while (read != -1) {
-            if (read > 0) {
-                headerRead = accumulateAndVerifyPdfHeader(buffer, read, header, headerRead)
-                totalBytes += read
-                check(totalBytes <= MAX_SHARED_PDF_BYTES) { "Shared PDF exceeds maximum size" }
-                output.write(buffer, 0, read)
-            }
-            read = input.read(buffer)
-        }
-    }
-    check(hasPdfMagicHeader(header, headerRead)) {
-        "Shared stream is not a valid PDF document"
-    }
-    return totalBytes
-}
-
-private fun accumulateAndVerifyPdfHeader(
-    buffer: ByteArray,
-    read: Int,
-    header: ByteArray,
-    headerRead: Int,
-): Int {
-    if (headerRead >= PDF_MAGIC_BYTES.size) return headerRead
-    val take = minOf(read, PDF_MAGIC_BYTES.size - headerRead)
-    System.arraycopy(buffer, 0, header, headerRead, take)
-    val nextHeaderRead = headerRead + take
-    if (nextHeaderRead == PDF_MAGIC_BYTES.size) {
-        check(hasPdfMagicHeader(header, nextHeaderRead)) {
-            "Shared stream is not a valid PDF document"
-        }
-    }
-    return nextHeaderRead
-}
-
 private fun extractCleanDocumentTitle(doc: Document): String? =
     doc.selectFirst("meta[property=og:title]")?.attr(ATTR_CONTENT)?.trim()?.takeIf {
         it.isNotEmpty()
@@ -401,8 +299,6 @@ private fun extractCleanDocumentTitle(doc: Document): String? =
 
 private const val ATTR_CONTENT = "content"
 private const val MAX_DISCOVERY_PROBES = 6
-private const val PDF_COPY_BUFFER_BYTES = 16 * 1024
-private const val MAX_SHARED_PDF_BYTES = 50L * 1024L * 1024L
 private val HTTP_SCHEMES = setOf("http", "https")
 private val WHITESPACE_SPLIT_REGEX = Regex("""\s+""")
 private val FEED_LINK_MIME_TYPES =

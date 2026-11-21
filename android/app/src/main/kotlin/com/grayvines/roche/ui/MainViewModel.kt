@@ -15,6 +15,7 @@ import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.settings.redactedForUi
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.playback.AudioPlayerBackend
@@ -243,7 +244,8 @@ class MainViewModel(
                     isPlayerSpeedSheetOpen = local.isPlayerSpeedSheetOpen,
                     activePlayerDrawerTab = local.activePlayerDrawerTab,
                     localNetworkTier = local.localNetworkTier,
-                    settings = cachedSettings ?: Settings(),
+                    settings = (cachedSettings ?: Settings()).redactedForUi(),
+                    hasBearerToken = cachedSettings?.bearerToken?.isNotBlank() == true,
                     isInitialLoading = true,
                 )
         return uiStateMemoizer.build(
@@ -253,6 +255,8 @@ class MainViewModel(
             localNetworkTier = local.localNetworkTier,
         )
     }
+
+    internal suspend fun readSavedBearerToken(): String = settingsRepository.readBearerToken()
 
     internal suspend fun awaitBackgroundUiWorkForTest() {
         deepSearchJob?.join()

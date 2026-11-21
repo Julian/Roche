@@ -8,6 +8,7 @@ import java.security.KeyStore
 import java.security.Security
 import java.security.UnrecoverableKeyException
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -28,6 +29,8 @@ internal interface TokenCipher {
     fun encrypt(plaintext: String): String
 
     fun decrypt(stored: String): String
+
+    fun keyGeneration(): Long = 0L
 }
 
 internal class AesGcmSecretKeyTokenCipher(private val keyProvider: () -> SecretKey) : TokenCipher {
@@ -74,6 +77,7 @@ internal class AesGcmSecretKeyTokenCipher(private val keyProvider: () -> SecretK
 internal class AndroidKeystoreTokenCipher(private val keyAlias: String = KEYSTORE_KEY_ALIAS) :
     TokenCipher {
     @Volatile private var cachedSecretKey: SecretKey? = null
+    private val keyGenCounter = AtomicLong(0L)
 
     private val delegate = AesGcmSecretKeyTokenCipher {
         cachedSecretKey
@@ -83,6 +87,8 @@ internal class AndroidKeystoreTokenCipher(private val keyAlias: String = KEYSTOR
             }
     }
 
+    override fun keyGeneration(): Long = keyGenCounter.get()
+
     private fun invalidateCachedKey() {
         synchronized(keystoreLock) { cachedSecretKey = null }
     }
@@ -90,6 +96,7 @@ internal class AndroidKeystoreTokenCipher(private val keyAlias: String = KEYSTOR
     private fun resetCorruptedKeystoreKey() {
         synchronized(keystoreLock) {
             cachedSecretKey = null
+            keyGenCounter.incrementAndGet()
             runCatching {
                 val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER).apply { load(null) }
                 if (keyStore.containsAlias(keyAlias)) {

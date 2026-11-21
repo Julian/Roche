@@ -192,7 +192,9 @@ internal constructor(
     constructor(
         context: Context,
         allowedLocalDirs: List<File> =
-            listOf(File(context.applicationContext.filesDir, "offline_media"), context.cacheDir),
+            defaultAllowedLocalAudioDirs(
+                File(context.applicationContext.filesDir, "offline_media")
+            ),
         parentScope: CoroutineScope? = null,
         httpEngineProvider: (() -> HttpEngine)? = null,
     ) : this(
@@ -566,6 +568,9 @@ internal constructor(
         internal const val MAX_SPEED = 3.50f
     }
 }
+
+internal fun defaultAllowedLocalAudioDirs(offlineMediaRoot: File): List<File> =
+    listOf(File(offlineMediaRoot, "items"))
 
 internal fun defaultPlaybackUri(source: String): Uri =
     if (source.startsWith("/")) {

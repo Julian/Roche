@@ -12,6 +12,7 @@ import com.grayvines.roche.data.catalog.RankClusterCandidate
 import com.grayvines.roche.data.catalog.RankSettlementSummary
 import com.grayvines.roche.data.matchesSearchQuery
 import com.grayvines.roche.data.settings.Settings
+import com.grayvines.roche.data.settings.redactedForUi
 import com.grayvines.roche.data.sync.NetworkTier
 import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.model.AppTab
@@ -92,6 +93,7 @@ data class MainUiState(
     val isAddSheetOpen: Boolean = false,
     val prefilledShareUrl: String = "",
     val prefilledShareTitle: String = "",
+    val prefilledShareIsFeed: Boolean = false,
     val isInitialLoading: Boolean = false,
     val isSyncing: Boolean = false,
     val visibleEntries: List<InboxEntry> = emptyList(),
@@ -102,6 +104,7 @@ data class MainUiState(
     val activePeers: List<PeerNodeDto> = emptyList(),
     val localNetworkTier: NetworkTier = NetworkTier.WIFI,
     val settings: Settings = Settings(),
+    val hasBearerToken: Boolean = settings.bearerToken.isNotBlank(),
     val queueEntries: List<InboxEntry> = computeQueueEntries(allEntries, settings.queueItemIds),
     val listeningHistoryEntries: List<InboxEntry> = computeListeningHistory(allEntries),
     val activeFeeds: List<FeedItem> = computeActiveFeeds(feeds),
@@ -255,6 +258,7 @@ sealed interface MainAction {
     data class OpenAddSheet(
         val prefilledUrl: String = "",
         val prefilledTitle: String = "",
+        val preferSubscribeFeed: Boolean = false,
     ) : OverlayUi
 
     data object CloseAddSheet : OverlayUi
@@ -373,7 +377,7 @@ sealed interface MainAction {
 
     data class SyncWithServerConfig(
         val serverUrl: String,
-        val bearerToken: String,
+        val bearerToken: String? = null,
     ) : FeedSyncAction
 
     data object StartupSyncIfConfigured : FeedSyncAction
@@ -488,9 +492,11 @@ sealed interface MainAction {
 
     data class UpdateServerConfig(
         val serverUrl: String,
-        val bearerToken: String,
+        val bearerToken: String? = null,
         val feedback: ConfigSaveFeedback = ConfigSaveFeedback.SHOW_BANNER,
     ) : SettingsServerAction
+
+    data object DisconnectServer : SettingsServerAction
 
     data class PairWithServer(
         val serverUrl: String,
@@ -521,6 +527,7 @@ internal data class TransientUiState(
     val isAddSheetOpen: Boolean = false,
     val prefilledShareUrl: String = "",
     val prefilledShareTitle: String = "",
+    val prefilledShareIsFeed: Boolean = false,
     val isSyncing: Boolean = false,
     val companionSubTab: CompanionSubTab = CompanionSubTab.LISTS,
     val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
@@ -757,6 +764,7 @@ internal class MainUiStateMemoizer {
             isAddSheetOpen = local.isAddSheetOpen,
             prefilledShareUrl = local.prefilledShareUrl,
             prefilledShareTitle = local.prefilledShareTitle,
+            prefilledShareIsFeed = local.prefilledShareIsFeed,
             isInitialLoading = false,
             isSyncing = local.isSyncing,
             visibleEntries = filtered,
@@ -766,7 +774,8 @@ internal class MainUiStateMemoizer {
             tags = snapshot.tags,
             activePeers = snapshot.activePeers,
             localNetworkTier = localNetworkTier,
-            settings = settings,
+            settings = settings.redactedForUi(),
+            hasBearerToken = settings.bearerToken.isNotBlank(),
             queueEntries = resolveQueue(effectiveEntries, settings.queueItemIds),
             listeningHistoryEntries = lastListeningHistory,
             activeFeeds = lastActiveFeeds,

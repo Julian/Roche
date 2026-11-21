@@ -44,8 +44,13 @@ internal sealed interface InlineImageLoadState {
 
     data class Success(val bitmap: ImageBitmap) : InlineImageLoadState
 
+    data object Suppressed : InlineImageLoadState
+
     data object Error : InlineImageLoadState
 }
+
+internal fun isTrackingPixelSize(widthPx: Int, heightPx: Int): Boolean =
+    widthPx < MIN_TRACKING_PIXEL_DIMENSION_PX || heightPx < MIN_TRACKING_PIXEL_DIMENSION_PX
 
 @Composable
 internal fun RenderImageBlock(
@@ -70,6 +75,7 @@ internal fun RenderImageBlock(
                 baseUrl = baseUrl,
                 onOpenUrl = onOpenUrl,
             )
+        InlineImageLoadState.Suppressed -> Unit
         InlineImageLoadState.Error ->
             RenderErrorInlineImage(
                 block = block,
@@ -249,8 +255,12 @@ private fun rememberInlineImageState(imageUrl: String): InlineImageLoadState {
     val loader = LocalThumbnailLoader.current ?: return InlineImageLoadState.Error
     val initialState =
         remember(cleanUrl, loader) {
-            loader.getCachedInlineImage(cleanUrl)?.let {
-                InlineImageLoadState.Success(it.asImageBitmap())
+            loader.getCachedInlineImage(cleanUrl)?.let { bitmap ->
+                if (isTrackingPixelSize(bitmap.width, bitmap.height)) {
+                    InlineImageLoadState.Suppressed
+                } else {
+                    InlineImageLoadState.Success(bitmap.asImageBitmap())
+                }
             } ?: InlineImageLoadState.Loading
         }
     val state by
@@ -260,19 +270,21 @@ private fun rememberInlineImageState(imageUrl: String): InlineImageLoadState {
             key2 = loader,
         ) {
             value = initialState
-            if (value !is InlineImageLoadState.Success) {
+            if (value is InlineImageLoadState.Loading) {
                 val loaded = loader.loadInlineImage(cleanUrl)
                 value =
-                    if (loaded != null) {
-                        InlineImageLoadState.Success(loaded.asImageBitmap())
-                    } else {
-                        InlineImageLoadState.Error
+                    when {
+                        loaded == null -> InlineImageLoadState.Error
+                        isTrackingPixelSize(loaded.width, loaded.height) ->
+                            InlineImageLoadState.Suppressed
+                        else -> InlineImageLoadState.Success(loaded.asImageBitmap())
                     }
             }
         }
     return state
 }
 
+private const val MIN_TRACKING_PIXEL_DIMENSION_PX = 16
 private const val MIN_INLINE_ASPECT_RATIO = 0.25f
 private const val MAX_INLINE_ASPECT_RATIO = 5.0f
 private const val DEFAULT_INLINE_ASPECT_RATIO = 1.777f

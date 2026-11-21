@@ -1,6 +1,13 @@
+@file:Suppress("TooManyFunctions")
+
 package com.grayvines.roche.ui
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.view.WindowManager
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,31 +20,46 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.grayvines.roche.BuildConfig
 import com.grayvines.roche.core.isLoopbackHost
 import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.data.sync.NetworkTier
@@ -49,75 +71,281 @@ import com.grayvines.roche.ui.components.RocheSectionHeader
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import java.net.URI
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 
 @Composable
 internal fun SettingsServerPage(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     onBack: () -> Unit,
+    onRevealSavedBearerToken: suspend () -> String = { "" },
 ) {
-    var serverUrl by rememberSaveable { mutableStateOf(state.settings.serverUrl) }
-    var bearerToken by remember { mutableStateOf(state.settings.bearerToken) }
-    var lastSavedBearerToken by remember { mutableStateOf(state.settings.bearerToken) }
-    var pairingCode by remember { mutableStateOf("") }
-    var revealToken by remember { mutableStateOf(false) }
+    val isConfigured = state.settings.serverUrl.isNotBlank() && state.hasBearerToken
+    val pageState = rememberServerPageFormState(state, isConfigured)
+    val scope = rememberCoroutineScope()
 
-    LaunchedEffect(state.settings.serverUrl) {
-        if (normalizeServerUrl(serverUrl) != state.settings.serverUrl) {
-            serverUrl = state.settings.serverUrl
-        }
-    }
-    LaunchedEffect(state.settings.bearerToken) {
-        val synced =
-            syncSavedBearerTokenChange(
-                savedBearerToken = state.settings.bearerToken,
-                lastSavedBearerToken = lastSavedBearerToken,
-                currentBearerToken = bearerToken,
-                currentPairingCode = pairingCode,
-            )
-        lastSavedBearerToken = synced.lastSavedBearerToken
-        bearerToken = synced.bearerToken
-        pairingCode = synced.pairingCode
-    }
-    ServerConfigAutoSaveEffect(
-        serverUrl = serverUrl,
-        bearerToken = bearerToken,
-        savedServerUrl = state.settings.serverUrl,
-        savedBearerToken = state.settings.bearerToken,
-        onAction = onAction,
-    )
+    ServerPageEffects(state = state, form = pageState)
 
     Column(modifier = Modifier.fillMaxSize()) {
         SettingsSubPageHeader(title = "Server & Pairing", onBack = onBack)
-
         ServerPageScrollBody(
             state = state,
-            serverUrl = serverUrl,
-            bearerToken = bearerToken,
-            pairingCode = pairingCode,
-            revealToken = revealToken,
-            onServerUrlChange = { serverUrl = it },
-            onBearerTokenChange = { bearerToken = it },
-            onPairingCodeChange = { pairingCode = it },
-            onToggleRevealToken = { revealToken = !revealToken },
+            isConfigured = isConfigured,
+            serverUrl = pageState.serverUrl,
+            bearerToken = pageState.bearerTokenDraft,
+            tokenEdited = pageState.tokenEdited,
+            pairingCode = pageState.pairingCode,
+            revealToken = pageState.revealToken,
+            revealPairingCode = pageState.revealPairingCode,
+            showSetupCards = pageState.showSetupCards,
+            onToggleSetupCards = { pageState.showSetupCards = !pageState.showSetupCards },
+            onRequestDisconnect = { pageState.showDisconnectConfirm = true },
+            onServerUrlChange = { pageState.serverUrl = it },
+            onBearerTokenChange = pageState::updateBearerTokenDraft,
+            onPairingCodeChange = { pageState.pairingCode = it },
+            onToggleRevealPairingCode = {
+                pageState.revealPairingCode = !pageState.revealPairingCode
+            },
+            onToggleRevealToken = {
+                toggleSavedTokenReveal(
+                    form = pageState,
+                    hasSavedBearerToken = state.hasBearerToken,
+                    scope = scope,
+                    onRevealSavedBearerToken = onRevealSavedBearerToken,
+                )
+            },
+            onSaveConfig = {
+                val explicitToken = if (pageState.tokenEdited) pageState.bearerTokenDraft else null
+                onAction(MainAction.UpdateServerConfig(pageState.serverUrl, explicitToken))
+                pageState.resetBearerTokenDraft()
+            },
+            onSyncNow = {
+                val explicitToken = if (pageState.tokenEdited) pageState.bearerTokenDraft else null
+                onAction(MainAction.SyncWithServerConfig(pageState.serverUrl, explicitToken))
+                if (pageState.tokenEdited) {
+                    pageState.resetBearerTokenDraft()
+                }
+            },
             onAction = onAction,
         )
     }
+
+    if (pageState.showDisconnectConfirm) {
+        DisconnectServerConfirmDialog(
+            serverUrl = state.settings.serverUrl,
+            onDismiss = { pageState.showDisconnectConfirm = false },
+            onConfirm = {
+                pageState.confirmDisconnect()
+                onAction(MainAction.DisconnectServer)
+            },
+        )
+    }
+}
+
+private class ServerPageFormState(
+    initialServerUrl: String,
+    initialShowSetupCards: Boolean,
+) {
+    var serverUrl by mutableStateOf(initialServerUrl)
+    var bearerTokenDraft by mutableStateOf("")
+    var tokenEdited by mutableStateOf(false)
+    var pairingCode by mutableStateOf("")
+    var revealToken by mutableStateOf(false)
+    var revealPairingCode by mutableStateOf(false)
+    var showSetupCards by mutableStateOf(initialShowSetupCards)
+    var showDisconnectConfirm by mutableStateOf(false)
+    var revealTokenJob: Job? = null
+
+    fun cancelRevealJob() {
+        revealTokenJob?.cancel()
+        revealTokenJob = null
+    }
+
+    fun updateBearerTokenDraft(next: String) {
+        cancelRevealJob()
+        bearerTokenDraft = next
+        tokenEdited = true
+    }
+
+    fun resetBearerTokenDraft() {
+        cancelRevealJob()
+        tokenEdited = false
+        revealToken = false
+        bearerTokenDraft = ""
+    }
+
+    fun clearSecretsOnPause() {
+        cancelRevealJob()
+        revealToken = false
+        revealPairingCode = false
+        if (!tokenEdited) {
+            bearerTokenDraft = ""
+        }
+    }
+
+    fun confirmDisconnect() {
+        showDisconnectConfirm = false
+        resetBearerTokenDraft()
+        showSetupCards = true
+    }
+}
+
+@Composable
+private fun rememberServerPageFormState(
+    state: MainUiState,
+    isConfigured: Boolean,
+): ServerPageFormState =
+    rememberSaveable(
+        saver =
+            listSaver(
+                save = { listOf(it.serverUrl, it.showSetupCards) },
+                restore = { saved ->
+                    ServerPageFormState(
+                        initialServerUrl = saved[0] as String,
+                        initialShowSetupCards = saved[1] as Boolean,
+                    )
+                },
+            )
+    ) {
+        ServerPageFormState(
+            initialServerUrl = state.settings.serverUrl,
+            initialShowSetupCards = !isConfigured,
+        )
+    }
+
+@Composable
+private fun ServerPageEffects(state: MainUiState, form: ServerPageFormState) {
+    SecureServerWindowEffect(onPauseClearSecrets = form::clearSecretsOnPause)
+    LaunchedEffect(state.settings.serverUrl) {
+        if (normalizeServerUrl(form.serverUrl) != state.settings.serverUrl) {
+            form.serverUrl = state.settings.serverUrl
+        }
+    }
+    LaunchedEffect(state.hasBearerToken, state.settings.serverUrl) {
+        if (state.hasBearerToken) {
+            form.pairingCode = ""
+        }
+        if (!form.tokenEdited) {
+            form.bearerTokenDraft = ""
+            form.revealToken = false
+        }
+    }
+}
+
+private fun toggleSavedTokenReveal(
+    form: ServerPageFormState,
+    hasSavedBearerToken: Boolean,
+    scope: CoroutineScope,
+    onRevealSavedBearerToken: suspend () -> String,
+) {
+    form.cancelRevealJob()
+    if (form.revealToken) {
+        form.revealToken = false
+        if (!form.tokenEdited) {
+            form.bearerTokenDraft = ""
+        }
+    } else {
+        form.revealToken = true
+        if (!form.tokenEdited && hasSavedBearerToken) {
+            form.revealTokenJob = scope.launch {
+                val revealed = onRevealSavedBearerToken()
+                if (form.revealToken && !form.tokenEdited) {
+                    form.bearerTokenDraft = revealed
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SecureServerWindowEffect(onPauseClearSecrets: () -> Unit) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(context) {
+        val window = context.findHostActivity()?.window
+        val hadSecureFlag =
+            window != null &&
+                window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE != 0
+        if (window != null && !hadSecureFlag) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+        onDispose {
+            if (window != null && !hadSecureFlag) {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            }
+        }
+    }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE) {
+                onPauseClearSecrets()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+}
+
+private tailrec fun Context.findHostActivity(): Activity? =
+    when (this) {
+        is Activity -> this
+        is ContextWrapper -> baseContext.findHostActivity()
+        else -> null
+    }
+
+@Composable
+private fun DisconnectServerConfirmDialog(
+    serverUrl: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = colors.surface,
+        titleContentColor = colors.textPrimary,
+        textContentColor = colors.textSecondary,
+        title = { Text("Disconnect Server?") },
+        text = {
+            Text(
+                "This clears your saved server URL ($serverUrl) and bearer token on this device. " +
+                    "Local feeds, inbox items, and catalog data remain on-device."
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm, modifier = Modifier.testTag("confirm_disconnect_btn")) {
+                Text("Disconnect", color = colors.accentIndianRed)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = colors.textSecondary) }
+        },
+    )
 }
 
 @Composable
 @Suppress("LongParameterList")
 internal fun ServerPageScrollBody(
     state: MainUiState,
+    isConfigured: Boolean,
     serverUrl: String,
     bearerToken: String,
+    tokenEdited: Boolean,
     pairingCode: String,
     revealToken: Boolean,
+    revealPairingCode: Boolean,
+    showSetupCards: Boolean,
+    onToggleSetupCards: () -> Unit,
+    onRequestDisconnect: () -> Unit,
     onServerUrlChange: (String) -> Unit,
     onBearerTokenChange: (String) -> Unit,
     onPairingCodeChange: (String) -> Unit,
+    onToggleRevealPairingCode: () -> Unit,
     onToggleRevealToken: () -> Unit,
+    onSaveConfig: () -> Unit,
+    onSyncNow: () -> Unit = {},
     onAction: (MainAction) -> Unit,
 ) {
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -129,35 +357,74 @@ internal fun ServerPageScrollBody(
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         ServerConnectionStatusCard(
-            serverUrl = serverUrl,
-            bearerToken = bearerToken,
-            onAction = onAction,
-            onHideKeyboard = { keyboardController?.hide() },
-        )
-        ServerPairingCard(
-            serverUrl = serverUrl,
-            pairingCode = pairingCode,
-            onPairingCodeChange = onPairingCodeChange,
-            onAction = onAction,
-            onHideKeyboard = { keyboardController?.hide() },
-        )
-        ServerManualCredentialsCard(
-            serverUrl = serverUrl,
-            bearerToken = bearerToken,
-            revealToken = revealToken,
-            onServerUrlChange = onServerUrlChange,
-            onBearerTokenChange = onBearerTokenChange,
-            onToggleRevealToken = onToggleRevealToken,
-            onSaveClick = {
-                keyboardController?.hide()
-                onAction(MainAction.UpdateServerConfig(serverUrl, bearerToken))
-            },
-        )
-        PeerMeshStatusCard(
             state = state,
+            serverUrl = serverUrl,
+            isConfigured = isConfigured,
+            onRequestDisconnect = onRequestDisconnect,
+            onSyncNow = onSyncNow,
             onAction = onAction,
+            onHideKeyboard = { keyboardController?.hide() },
         )
+        if (isConfigured) {
+            SetupDisclosureRow(expanded = showSetupCards, onToggle = onToggleSetupCards)
+        }
+        if (!isConfigured || showSetupCards) {
+            ServerPairingCard(
+                serverUrl = serverUrl,
+                pairingCode = pairingCode,
+                revealPairingCode = revealPairingCode,
+                isSyncing = state.isSyncing,
+                onPairingCodeChange = onPairingCodeChange,
+                onToggleRevealPairingCode = onToggleRevealPairingCode,
+                onAction = onAction,
+                onHideKeyboard = { keyboardController?.hide() },
+            )
+            ServerManualCredentialsCard(
+                serverUrl = serverUrl,
+                bearerToken = bearerToken,
+                hasSavedBearerToken = state.hasBearerToken,
+                tokenEdited = tokenEdited,
+                revealToken = revealToken,
+                onServerUrlChange = onServerUrlChange,
+                onBearerTokenChange = onBearerTokenChange,
+                onToggleRevealToken = onToggleRevealToken,
+                onSaveClick = {
+                    keyboardController?.hide()
+                    onSaveConfig()
+                },
+            )
+        }
+        PeerMeshStatusCard(state = state, onAction = onAction)
         Spacer(modifier = Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun SetupDisclosureRow(expanded: Boolean, onToggle: () -> Unit) {
+    val colors = LocalRocheColors.current
+    RocheSurfaceCard {
+        Row(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .clickable(onClick = onToggle)
+                    .semantics { role = Role.Button }
+                    .padding(horizontal = 14.dp, vertical = 12.dp)
+                    .testTag("server_advanced_disclosure"),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Re-pair / Advanced Credentials",
+                color = colors.textPrimary,
+                fontSize = 13.5.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = if (expanded) "Hide ▴" else "Show ▾",
+                color = colors.accentBlue,
+                fontSize = 12.sp,
+            )
+        }
     }
 }
 
@@ -315,17 +582,18 @@ internal fun buildPeerMeshHealthSummary(
 }
 
 @Composable
+@Suppress("LongParameterList")
 internal fun ServerConnectionStatusCard(
+    state: MainUiState,
     serverUrl: String,
-    bearerToken: String,
+    isConfigured: Boolean,
+    onRequestDisconnect: () -> Unit,
+    onSyncNow: () -> Unit = {},
     onAction: (MainAction) -> Unit,
     onHideKeyboard: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val isConfigured = serverUrl.isNotBlank() && bearerToken.isNotBlank()
-    val dotColor = if (isConfigured) colors.accentVerdigris else colors.accentEcru
-    val statusText = if (isConfigured) "Connected to Tailnet Server" else "Server Not Yet Paired"
-
+    val (dotColor, statusText) = resolveServerStatusBadge(state, isConfigured)
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         RocheSectionHeader(label = "Connection Status")
         RocheSurfaceCard {
@@ -333,45 +601,29 @@ internal fun ServerConnectionStatusCard(
                 modifier = Modifier.padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(dotColor))
-                    Text(
-                        text = statusText,
-                        color = colors.textPrimary,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
+                ServerStatusHeaderRow(dotColor = dotColor, statusText = statusText)
                 Text(
                     text = serverUrl.ifBlank { "No server URL configured" },
                     color = colors.textMuted,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 11.5.sp,
                 )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    HeaderActionButton(
-                        label = "Sync Now",
-                        style = RocheButtonStyle.PRIMARY,
-                        onClick = {
-                            onHideKeyboard()
-                            onAction(MainAction.SyncWithServerConfig(serverUrl, bearerToken))
-                        },
-                        modifier = Modifier.weight(1f),
-                    )
-                    HeaderActionButton(
-                        label = "Discover on Tailnet",
-                        onClick = {
-                            onHideKeyboard()
-                            onAction(MainAction.DiscoverServer)
-                        },
-                        modifier = Modifier.weight(1f),
-                    )
+                ServerConnectionActionRow(
+                    onSyncNow = onSyncNow,
+                    onAction = onAction,
+                    onHideKeyboard = onHideKeyboard,
+                )
+                if (isConfigured || state.settings.serverUrl.isNotBlank()) {
+                    TextButton(
+                        onClick = onRequestDisconnect,
+                        modifier = Modifier.fillMaxWidth().testTag("disconnect_server_btn"),
+                    ) {
+                        Text(
+                            text = "Disconnect Server",
+                            color = colors.accentIndianRed,
+                            fontSize = 13.sp,
+                        )
+                    }
                 }
             }
         }
@@ -379,14 +631,98 @@ internal fun ServerConnectionStatusCard(
 }
 
 @Composable
+private fun resolveServerStatusBadge(
+    state: MainUiState,
+    isConfigured: Boolean,
+): Pair<Color, String> {
+    val colors = LocalRocheColors.current
+    val isOffline = state.localNetworkTier == NetworkTier.OFFLINE
+    val dotColor =
+        when {
+            state.settings.hasUndecryptableToken -> colors.accentIndianRed
+            !isConfigured -> colors.accentEcru
+            isOffline -> colors.accentIndianRed
+            else -> colors.accentVerdigris
+        }
+    val statusText =
+        when {
+            state.settings.hasUndecryptableToken -> "Saved Token Unavailable — Re-pair"
+            !isConfigured -> "Server Not Yet Paired"
+            isOffline -> "Offline · Server Paired"
+            else -> "Paired with Tailnet Server"
+        }
+    return dotColor to statusText
+}
+
+@Composable
+private fun ServerStatusHeaderRow(
+    dotColor: Color,
+    statusText: String,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(dotColor))
+        Text(
+            text = statusText,
+            color = colors.textPrimary,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+@Composable
+private fun ServerConnectionActionRow(
+    onSyncNow: () -> Unit,
+    onAction: (MainAction) -> Unit,
+    onHideKeyboard: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        HeaderActionButton(
+            label = "Sync Now",
+            style = RocheButtonStyle.PRIMARY,
+            onClick = {
+                onHideKeyboard()
+                onSyncNow()
+            },
+            modifier = Modifier.weight(1f),
+        )
+        HeaderActionButton(
+            label = "Discover on Tailnet",
+            onClick = {
+                onHideKeyboard()
+                onAction(MainAction.DiscoverServer)
+            },
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
+@Suppress("LongParameterList")
 internal fun ServerPairingCard(
     serverUrl: String,
     pairingCode: String,
+    revealPairingCode: Boolean,
+    isSyncing: Boolean,
     onPairingCodeChange: (String) -> Unit,
+    onToggleRevealPairingCode: () -> Unit,
     onAction: (MainAction) -> Unit,
     onHideKeyboard: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val submitPair = {
+        if (pairingCode.isNotBlank() && !isSyncing) {
+            onHideKeyboard()
+            onAction(MainAction.PairWithServer(serverUrl, pairingCode))
+        }
+    }
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         RocheSectionHeader(label = "Pair New Device (roche pair)")
         RocheSurfaceCard {
@@ -401,35 +737,66 @@ internal fun ServerPairingCard(
                     fontSize = 12.sp,
                     lineHeight = 17.sp,
                 )
-                Row(
+                PairingCodeInputField(
+                    pairingCode = pairingCode,
+                    revealPairingCode = revealPairingCode,
+                    onPairingCodeChange = onPairingCodeChange,
+                    onToggleRevealPairingCode = onToggleRevealPairingCode,
+                    onSubmitPair = submitPair,
+                )
+                HeaderActionButton(
+                    label = if (isSyncing) "Pairing…" else "Pair Device",
+                    style = RocheButtonStyle.PRIMARY,
+                    enabled = pairingCode.isNotBlank() && !isSyncing,
+                    onClick = submitPair,
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    OutlinedTextField(
-                        value = pairingCode,
-                        onValueChange = onPairingCodeChange,
-                        label = { Text("Pairing Code (from roche pair)") },
-                        singleLine = true,
-                        keyboardOptions =
-                            KeyboardOptions(
-                                keyboardType = KeyboardType.Password,
-                                autoCorrectEnabled = false,
-                            ),
-                        modifier = Modifier.weight(1f).testTag("pairing_code_input"),
-                    )
-                    HeaderActionButton(
-                        label = "Pair Device",
-                        style = RocheButtonStyle.PRIMARY,
-                        onClick = {
-                            onHideKeyboard()
-                            onAction(MainAction.PairWithServer(serverUrl, pairingCode))
-                        },
-                    )
-                }
+                )
             }
         }
     }
+}
+
+@Composable
+private fun PairingCodeInputField(
+    pairingCode: String,
+    revealPairingCode: Boolean,
+    onPairingCodeChange: (String) -> Unit,
+    onToggleRevealPairingCode: () -> Unit,
+    onSubmitPair: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    OutlinedTextField(
+        value = pairingCode,
+        onValueChange = onPairingCodeChange,
+        label = { Text("Pairing Code (from roche pair)") },
+        singleLine = true,
+        keyboardOptions =
+            KeyboardOptions(
+                keyboardType = KeyboardType.Password,
+                autoCorrectEnabled = false,
+                imeAction = ImeAction.Done,
+            ),
+        keyboardActions = KeyboardActions(onDone = { onSubmitPair() }),
+        visualTransformation =
+            if (revealPairingCode) {
+                VisualTransformation.None
+            } else {
+                PasswordVisualTransformation()
+            },
+        trailingIcon = {
+            TextButton(
+                onClick = onToggleRevealPairingCode,
+                modifier = Modifier.testTag("toggle_pairing_code_visibility_btn"),
+            ) {
+                Text(
+                    text = if (revealPairingCode) "Hide" else "Show",
+                    color = colors.accentBlue,
+                    fontSize = 12.sp,
+                )
+            }
+        },
+        modifier = Modifier.fillMaxWidth().testTag("pairing_code_input"),
+    )
 }
 
 @Composable
@@ -437,6 +804,8 @@ internal fun ServerPairingCard(
 internal fun ServerManualCredentialsCard(
     serverUrl: String,
     bearerToken: String,
+    hasSavedBearerToken: Boolean,
+    tokenEdited: Boolean,
     revealToken: Boolean,
     onServerUrlChange: (String) -> Unit,
     onBearerTokenChange: (String) -> Unit,
@@ -461,6 +830,8 @@ internal fun ServerManualCredentialsCard(
                 CleartextServerWarning(serverUrl = serverUrl)
                 BearerTokenInputField(
                     bearerToken = bearerToken,
+                    hasSavedBearerToken = hasSavedBearerToken,
+                    tokenEdited = tokenEdited,
                     revealToken = revealToken,
                     onBearerTokenChange = onBearerTokenChange,
                 )
@@ -477,40 +848,16 @@ internal fun ServerManualCredentialsCard(
                         label = "Save Settings",
                         style = RocheButtonStyle.PRIMARY,
                         onClick = onSaveClick,
+                        modifier = Modifier.testTag("save_server_settings_btn"),
                     )
                 }
                 Text(
-                    text = "Changes auto-save after 350ms.",
+                    text =
+                        "Changing server host automatically clears any previous token unless you enter a new one.",
                     color = colors.textMuted,
                     fontSize = 11.sp,
                 )
             }
-        }
-    }
-}
-
-@Composable
-internal fun ServerConfigAutoSaveEffect(
-    serverUrl: String,
-    bearerToken: String,
-    savedServerUrl: String,
-    savedBearerToken: String,
-    onAction: (MainAction) -> Unit,
-) {
-    LaunchedEffect(serverUrl, bearerToken) {
-        val normalizedUrl = normalizeServerUrl(serverUrl)
-        val isIncompleteUrl = serverUrl.isNotBlank() && normalizedUrl.isEmpty()
-        val trimmedToken = bearerToken.trim()
-        val hasChanges = normalizedUrl != savedServerUrl || trimmedToken != savedBearerToken
-        if (!isIncompleteUrl && hasChanges) {
-            delay(SERVER_CONFIG_AUTOSAVE_DELAY_MS)
-            onAction(
-                MainAction.UpdateServerConfig(
-                    serverUrl = serverUrl,
-                    bearerToken = bearerToken,
-                    feedback = ConfigSaveFeedback.SILENT,
-                )
-            )
         }
     }
 }
@@ -532,13 +879,22 @@ private fun CleartextServerWarning(serverUrl: String) {
 @Composable
 private fun BearerTokenInputField(
     bearerToken: String,
+    hasSavedBearerToken: Boolean,
+    tokenEdited: Boolean,
     revealToken: Boolean,
     onBearerTokenChange: (String) -> Unit,
 ) {
+    val placeholderText =
+        if (hasSavedBearerToken && !tokenEdited && bearerToken.isEmpty()) {
+            "Saved token (tap Reveal to inspect or type to replace)"
+        } else {
+            null
+        }
     OutlinedTextField(
         value = bearerToken,
         onValueChange = onBearerTokenChange,
         label = { Text("Bearer Token") },
+        placeholder = placeholderText?.let { text -> { Text(text, fontSize = 12.sp) } },
         singleLine = true,
         keyboardOptions =
             KeyboardOptions(
@@ -588,11 +944,12 @@ internal fun syncSavedBearerTokenChange(
     )
 }
 
-internal fun isCleartextRemoteServerInput(rawServerUrl: String): Boolean {
+internal fun isCleartextRemoteServerInput(
+    rawServerUrl: String,
+    allowCleartextLoopback: Boolean = BuildConfig.DEBUG,
+): Boolean {
     val normalized = normalizeServerUrl(rawServerUrl)
     if (!normalized.startsWith("http://", ignoreCase = true)) return false
     val host = runCatching { URI(normalized).host?.lowercase() }.getOrNull().orEmpty()
-    return host.isNotEmpty() && !isLoopbackHost(host)
+    return host.isNotEmpty() && !(allowCleartextLoopback && isLoopbackHost(host))
 }
-
-private const val SERVER_CONFIG_AUTOSAVE_DELAY_MS = 350L

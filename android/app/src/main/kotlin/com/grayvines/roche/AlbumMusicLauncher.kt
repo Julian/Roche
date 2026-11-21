@@ -10,6 +10,8 @@ import android.content.pm.verify.domain.DomainVerificationManager
 import android.content.pm.verify.domain.DomainVerificationUserState
 import android.provider.MediaStore
 import androidx.core.net.toUri
+import com.grayvines.roche.core.SCHEME_SPOTIFY
+import com.grayvines.roche.core.externalIdentifierUrl
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.MusicTrackLaunchRequest
 import com.grayvines.roche.data.catalog.candidateStreamingUrls
@@ -22,6 +24,7 @@ internal data class MusicUrlCandidate(
     val activityName: String,
     val url: String,
     val isUserSelectedForHost: Boolean,
+    val isVerifiedForHost: Boolean = false,
 )
 
 internal sealed interface MusicUrlResolution {
@@ -127,21 +130,27 @@ internal fun selectMusicUrlResolution(
             continue
         }
         val existing = uniqueByPackage[pkg]
-        if (
-            existing == null || !existing.isUserSelectedForHost && candidate.isUserSelectedForHost
-        ) {
+        if (existing == null || candidatePriority(candidate) > candidatePriority(existing)) {
             uniqueByPackage[pkg] = candidate
         }
     }
     val deduped = uniqueByPackage.values.toList()
+    val verified = deduped.filter { it.isVerifiedForHost }
     val userSelected = deduped.filter { it.isUserSelectedForHost }
-    val preferred = userSelected.ifEmpty { deduped }
+    val preferred = verified.ifEmpty { userSelected }.ifEmpty { deduped }
     return when (preferred.size) {
         0 -> MusicUrlResolution.None
         1 -> MusicUrlResolution.SingleTarget(preferred.single())
         else -> MusicUrlResolution.ChooserTargets(preferred)
     }
 }
+
+private fun candidatePriority(candidate: MusicUrlCandidate): Int =
+    when {
+        candidate.isVerifiedForHost -> 2
+        candidate.isUserSelectedForHost -> 1
+        else -> 0
+    }
 
 internal fun queryStreamingUrlCandidates(
     context: Context,
@@ -189,6 +198,7 @@ internal fun toMusicUrlCandidate(
         activityName = activityInfo.name.orEmpty(),
         url = url,
         isUserSelectedForHost = isHostUserSelected(userState, host),
+        isVerifiedForHost = isHostDomainVerified(userState?.hostToStateMap.orEmpty(), host),
     )
 }
 
@@ -200,17 +210,29 @@ internal fun isHostUserSelected(
     return isHostDomainSelected(userState.hostToStateMap, host)
 }
 
+internal fun isHostDomainVerified(
+    hostStates: Map<String, Int>,
+    host: String,
+): Boolean = matchesDomainState(hostStates, host, DomainVerificationUserState.DOMAIN_STATE_VERIFIED)
+
 internal fun isHostDomainSelected(
     hostStates: Map<String, Int>,
     host: String,
+): Boolean =
+    matchesDomainState(hostStates, host, DomainVerificationUserState.DOMAIN_STATE_VERIFIED) ||
+        matchesDomainState(hostStates, host, DomainVerificationUserState.DOMAIN_STATE_SELECTED)
+
+private fun matchesDomainState(
+    hostStates: Map<String, Int>,
+    host: String,
+    expectedState: Int,
 ): Boolean {
     if (host.isBlank()) return false
     val parentDomain = host.substringAfter('.', missingDelimiterValue = "")
     val wildcardHost =
         parentDomain.takeIf { it.isNotBlank() && it != SHARED_VIDEO_PARENT_DOMAIN }?.let { "*.$it" }
-    return hostStates[host] == DomainVerificationUserState.DOMAIN_STATE_SELECTED ||
-        wildcardHost != null &&
-            hostStates[wildcardHost] == DomainVerificationUserState.DOMAIN_STATE_SELECTED
+    return hostStates[host] == expectedState ||
+        wildcardHost != null && hostStates[wildcardHost] == expectedState
 }
 
 internal fun isNonMusicVideoPackage(packageName: String): Boolean {
@@ -322,43 +344,120 @@ internal fun buildAlbumSearchIntent(
     }
 }
 
-internal fun launchMusicTrack(
+private sealed interface TrackLaunchPlan {
+    data class Streaming(val resolution: MusicUrlResolution) : TrackLaunchPlan
+
+    data class ExplicitSearch(val intent: Intent) : TrackLaunchPlan
+
+    data object BrowserFallback : TrackLaunchPlan
+}
+
+internal suspend fun launchMusicTrack(
     context: Context,
     track: MusicTrackLaunchRequest,
     onOpenFallbackUrl: (String) -> Unit,
 ) {
+    val plan = withContext(Dispatchers.IO) { resolveTrackLaunchPlan(context, track) }
+    withContext(Dispatchers.Main.immediate) {
+        val launched =
+            when (plan) {
+                is TrackLaunchPlan.Streaming ->
+                    launchTrackStreaming(context, track, plan.resolution)
+                is TrackLaunchPlan.ExplicitSearch ->
+                    runCatching {
+                            context.startActivity(plan.intent)
+                            true
+                        }
+                        .getOrDefault(false)
+                TrackLaunchPlan.BrowserFallback -> false
+            }
+        if (!launched) {
+            val query = "${track.artist} ${track.trackTitle}".trim().ifBlank { track.trackTitle }
+            onOpenFallbackUrl("https://music.youtube.com/search?q=${android.net.Uri.encode(query)}")
+        }
+    }
+}
+
+private fun launchTrackStreaming(
+    context: Context,
+    track: MusicTrackLaunchRequest,
+    resolution: MusicUrlResolution,
+): Boolean =
+    launchStreamingResolution(
+        context,
+        CollectionDrawSnapshot(title = track.trackTitle, creator = track.artist),
+        resolution,
+    )
+
+private fun resolveTrackLaunchPlan(
+    context: Context,
+    track: MusicTrackLaunchRequest,
+): TrackLaunchPlan {
+    val browserPackages = queryBrowserPackages(context.packageManager)
     val trackUrl =
         track.spotifyUri
-            ?.removePrefix("spotify:track:")
-            ?.takeIf { it.isNotBlank() && it != track.spotifyUri }
-            ?.let { "https://open.spotify.com/track/$it" }
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { externalIdentifierUrl(SCHEME_SPOTIFY, it, "song") }
     if (trackUrl != null) {
-        val browserPackages = queryBrowserPackages(context.packageManager)
         val resolution =
             selectMusicUrlResolution(
                 candidates = queryUrlListCandidates(context, listOf(trackUrl)),
                 selfPackageName = context.packageName,
                 browserPackages = browserPackages,
             )
-        val dummy = CollectionDrawSnapshot(title = track.trackTitle, creator = track.artist)
-        if (launchStreamingResolution(context, dummy, resolution)) return
+        if (resolution != MusicUrlResolution.None) {
+            return TrackLaunchPlan.Streaming(resolution)
+        }
     }
-    val launched =
+    val explicitSearch = resolveMusicSearchIntent(context, track, browserPackages)
+    return if (explicitSearch != null) {
+        TrackLaunchPlan.ExplicitSearch(explicitSearch)
+    } else {
+        TrackLaunchPlan.BrowserFallback
+    }
+}
+
+private fun resolveMusicSearchIntent(
+    context: Context,
+    track: MusicTrackLaunchRequest,
+    browserPackages: Set<String>,
+): Intent? {
+    val pm = context.packageManager
+    val flags = PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_ALL.toLong())
+    val actions =
         listOf(
-                MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH,
-                MediaStore.INTENT_ACTION_MEDIA_SEARCH,
-            )
-            .any { action ->
-                runCatching {
-                        context.startActivity(buildTrackSearchIntent(action, track))
-                        true
-                    }
-                    .getOrDefault(false)
+            MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH,
+            MediaStore.INTENT_ACTION_MEDIA_SEARCH,
+        )
+    for (action in actions) {
+        val baseIntent = buildTrackSearchIntent(action, track)
+        val candidates = runCatching {
+            pm.queryIntentActivities(baseIntent, flags)
+        }
+            .getOrDefault(emptyList())
+        val musicTarget = candidates.firstOrNull { info ->
+            val activity = info.activityInfo
+            if (activity == null) {
+                false
+            } else {
+                val pkg = activity.packageName.orEmpty()
+                val isVideoCategory =
+                    activity.applicationInfo?.category == ApplicationInfo.CATEGORY_VIDEO
+                pkg.isNotBlank() &&
+                    pkg != context.packageName &&
+                    pkg !in browserPackages &&
+                    !isVideoCategory &&
+                    !isNonMusicVideoPackage(pkg)
             }
-    if (!launched) {
-        val query = "${track.artist} ${track.trackTitle}".trim().ifBlank { track.trackTitle }
-        onOpenFallbackUrl("https://music.youtube.com/search?q=${android.net.Uri.encode(query)}")
+        }
+        if (musicTarget?.activityInfo != null) {
+            return baseIntent.apply {
+                setClassName(musicTarget.activityInfo.packageName, musicTarget.activityInfo.name)
+            }
+        }
     }
+    return null
 }
 
 internal fun buildTrackSearchIntent(

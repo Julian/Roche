@@ -802,26 +802,19 @@ class RocheRepository(
         forcedContentType: ContentType? = null,
         pdfInputStream: InputStream? = null,
         awaitPdfCacheCopy: Boolean = false,
+        allowOverwriteExistingPdf: Boolean = false,
     ): SaveUrlResult =
         withContext(Dispatchers.Default) {
             val normalizedUrl = normalizeUserSubmittedUrl(inputUrl)
             check(normalizedUrl.isNotBlank()) { "Enter a valid URL" }
-            val tags = parseTagCsv(tagCsv)
             val inferredType = forcedContentType ?: inferContentType(normalizedUrl)
             val isLocalPdf = isLocalPdfUrl(normalizedUrl)
             val hostTitle = if (isLocalPdf) "Local PDF" else extractHostTitle(normalizedUrl)
             val cleanTitleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() }
-            val resolvedTitle =
-                cleanTitleOverride
-                    ?: if (inferredType == ContentType.PDF) {
-                        "$hostTitle — PDF"
-                    } else {
-                        "$hostTitle — Saved Entry"
-                    }
             val localEntity =
                 createSavedItemEntity(
                     url = normalizedUrl,
-                    title = resolvedTitle,
+                    title = resolveSavedItemTitle(cleanTitleOverride, hostTitle, inferredType),
                     hostTitle = hostTitle,
                     type = inferredType,
                     inboxState = "none",
@@ -831,20 +824,16 @@ class RocheRepository(
                     localEntity = localEntity,
                     normalizedUrl = normalizedUrl,
                     cleanTitleOverride = cleanTitleOverride,
-                    tags = tags,
+                    tags = parseTagCsv(tagCsv),
                 )
             val remainingPdfStream =
-                if (awaitPdfCacheCopy && pdfInputStream != null) {
-                    val copied =
-                        copySharedPdfStreamToCache(dao, cacheDir, persisted.row.id, pdfInputStream)
-                    if (!copied && isLocalPdf) {
-                        rollbackFailedLocalPdfSave(persisted)
-                        error("Could not save shared PDF to offline cache")
-                    }
-                    null
-                } else {
-                    pdfInputStream
-                }
+                handleSharedPdfCacheAttachment(
+                    persisted = persisted,
+                    isLocalPdf = isLocalPdf,
+                    pdfInputStream = pdfInputStream,
+                    awaitPdfCacheCopy = awaitPdfCacheCopy,
+                    allowOverwriteExistingPdf = allowOverwriteExistingPdf,
+                )
             launchWantToReadEnrichment(
                 itemId = persisted.row.id,
                 url = normalizedUrl,
@@ -854,19 +843,66 @@ class RocheRepository(
             SaveUrlResult(title = persisted.row.title, kind = SavedResourceKind.ITEM)
         }
 
+    private fun resolveSavedItemTitle(
+        cleanTitleOverride: String?,
+        hostTitle: String,
+        inferredType: ContentType,
+    ): String =
+        cleanTitleOverride
+            ?: if (inferredType == ContentType.PDF) {
+                "$hostTitle — PDF"
+            } else {
+                "$hostTitle — Saved Entry"
+            }
+
+    private suspend fun handleSharedPdfCacheAttachment(
+        persisted: PersistedWantItem,
+        isLocalPdf: Boolean,
+        pdfInputStream: InputStream?,
+        awaitPdfCacheCopy: Boolean,
+        allowOverwriteExistingPdf: Boolean,
+    ): InputStream? {
+        if (pdfInputStream == null) return null
+        val existingCachedPdfPresent =
+            isLocalPdf &&
+                cacheDir != null &&
+                com.grayvines.roche.media.findCachedPdfFileForEntry(cacheDir, persisted.row.id) !=
+                    null
+        val targetAlreadyProtected = !isLocalPdf || existingCachedPdfPresent
+        val refuseOverwrite =
+            !persisted.wasNewlyInserted && !allowOverwriteExistingPdf && targetAlreadyProtected
+        if (refuseOverwrite) {
+            runCatching { pdfInputStream.close() }
+            return null
+        }
+        if (!awaitPdfCacheCopy) return pdfInputStream
+        val copied =
+            copySharedPdfStreamToCache(
+                dao = dao,
+                cacheDir = cacheDir,
+                itemId = persisted.row.id,
+                stream = pdfInputStream,
+                allowOverwriteExisting = allowOverwriteExistingPdf,
+            )
+        if (!copied && isLocalPdf) {
+            rollbackFailedLocalPdfSave(persisted)
+            error("Could not save shared PDF to offline cache (limit reached or already exists)")
+        }
+        return null
+    }
+
     private suspend fun rollbackFailedLocalPdfSave(persisted: PersistedWantItem) {
-        if (persisted.wasNewlyInserted) {
-            itemMutationMutex.withLock {
-                catalog.withMutationLock {
-                    val nodeId = currentLocalPeerId()
-                    dao.executeInTransaction {
-                        dao.deleteItemPreservingHistory(
-                            itemId = persisted.row.id,
-                            recordTombstones = false,
-                            detachWantQueues = true,
-                            nodeId = nodeId,
-                        )
-                    }
+        if (!persisted.wasNewlyInserted) return
+        itemMutationMutex.withLock {
+            catalog.withMutationLock {
+                val nodeId = currentLocalPeerId()
+                dao.executeInTransaction {
+                    dao.deleteItemPreservingHistory(
+                        itemId = persisted.row.id,
+                        recordTombstones = false,
+                        detachWantQueues = true,
+                        nodeId = nodeId,
+                    )
                 }
             }
         }

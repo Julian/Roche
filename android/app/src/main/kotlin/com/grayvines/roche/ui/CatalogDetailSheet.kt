@@ -76,6 +76,7 @@ import com.grayvines.roche.ui.components.WikipediaIcon
 import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
 import com.grayvines.roche.ui.components.rememberHighResImageBitmap
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.RochePalette
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -161,6 +162,7 @@ internal fun CatalogDetailBottomSheet(
                             model = model,
                             isWide = isWide,
                             onAction = onAction,
+                            onPlayMusicTrack = onPlayMusicTrack,
                             onOpenExternalUrl = onOpenExternalUrl,
                         )
                 }
@@ -322,7 +324,7 @@ private fun AlbumHeroCoverButton(
                         lineTo(w * 0.26f, h * 0.86f)
                         close()
                     }
-                drawPath(path = tri, color = colors.textPrimary)
+                drawPath(path = tri, color = RochePalette.Timberwolf)
             }
         }
     }
@@ -1173,6 +1175,7 @@ private fun GenericCatalogDetailBody(
     model: CatalogDetailModel,
     isWide: Boolean,
     onAction: (MainAction) -> Unit,
+    onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -1180,7 +1183,8 @@ private fun GenericCatalogDetailBody(
     val openList: (String) -> Unit = { colId ->
         onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS, colId))
     }
-    GenericCatalogDetailHero(model = model, onAction = onAction)
+    val onPlaySong = buildSongPlayCallback(entry, onPlayMusicTrack)
+    GenericCatalogDetailHero(model = model, onAction = onAction, onPlaySong = onPlaySong)
     if (!entry.summary.isNullOrBlank()) {
         RocheSurfaceCard {
             Text(
@@ -1223,10 +1227,30 @@ private fun GenericCatalogDetailBody(
     }
 }
 
+private fun buildSongPlayCallback(
+    entry: CatalogEntryItem,
+    onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
+): (() -> Unit)? {
+    if (entry.kind != EntryKind.SONG) return null
+    val spotifyId =
+        entry.identifiers.firstOrNull { it.scheme.equals("spotify", ignoreCase = true) }?.value
+    return {
+        onPlayMusicTrack(
+            MusicTrackLaunchRequest(
+                trackTitle = entry.title,
+                albumTitle = "",
+                artist = entry.primaryCreator,
+                spotifyUri = spotifyId,
+            )
+        )
+    }
+}
+
 @Composable
 private fun GenericCatalogDetailHero(
     model: CatalogDetailModel,
     onAction: (MainAction) -> Unit,
+    onPlaySong: (() -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
     val entry = model.entry
@@ -1236,7 +1260,15 @@ private fun GenericCatalogDetailHero(
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        CatalogCoverThumbnail(thumbnailUrl = entry.thumbnailUrl, kind = entry.kind, size = 72.dp)
+        if (onPlaySong != null) {
+            AlbumHeroCoverButton(entry = entry, onClick = onPlaySong)
+        } else {
+            CatalogCoverThumbnail(
+                thumbnailUrl = entry.thumbnailUrl,
+                kind = entry.kind,
+                size = 72.dp,
+            )
+        }
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(
                 text = entry.kind.displayLabel.uppercase(),
@@ -1245,7 +1277,12 @@ private fun GenericCatalogDetailHero(
                 fontSize = 10.sp,
                 letterSpacing = 0.8.sp,
             )
-            HeroTitleWithYear(title = entry.title, releaseYear = entry.releaseYear)
+            HeroTitleWithYear(
+                title = entry.title,
+                releaseYear = entry.releaseYear,
+                onClick = onPlaySong,
+                testTag = onPlaySong?.let { "catalog_detail_play_title" },
+            )
             if (entry.creators.isNotEmpty()) {
                 Text(
                     text = entry.creators.joinToString(", "),

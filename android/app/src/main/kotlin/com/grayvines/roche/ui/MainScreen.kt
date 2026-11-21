@@ -96,6 +96,7 @@ fun MainScreen(
         openCollectionDrawFallback(draw, onOpenExternalUrl)
     },
     onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit = {},
+    onRevealSavedBearerToken: suspend () -> String = { "" },
 ) {
     val colors = LocalRocheColors.current
     val scrollStates = rememberMainScrollStates()
@@ -122,6 +123,7 @@ fun MainScreen(
     val currentOnImportOpml by rememberUpdatedState(onImportOpml)
     val currentOnExportOpml by rememberUpdatedState(onExportOpml)
     val currentOnOpenCollectionDraw by rememberUpdatedState(onOpenCollectionDraw)
+    val currentOnRevealSavedBearerToken by rememberUpdatedState(onRevealSavedBearerToken)
     val activeFullscreenPlayerEntryId =
         activePlayerEntry?.id?.takeIf { state.isPlayerFullscreenOpen }
     val desiredBackStack =
@@ -184,6 +186,7 @@ fun MainScreen(
                                 onOpenCollectionDraw = currentOnOpenCollectionDraw,
                                 onImportOpml = currentOnImportOpml,
                                 onExportOpml = currentOnExportOpml,
+                                onRevealSavedBearerToken = currentOnRevealSavedBearerToken,
                             )
                         }
 
@@ -559,7 +562,7 @@ internal fun MainOverlaySheets(
 
     if (state.isAddSheetOpen) {
         val defaultMode =
-            if (state.activeTab == AppTab.FEEDS) {
+            if (state.prefilledShareIsFeed || state.activeTab == AppTab.FEEDS) {
                 AddSheetMode.SUBSCRIBE_FEED
             } else {
                 AddSheetMode.WANT_TO_READ
@@ -881,6 +884,7 @@ internal fun MainTabDestinationContent(
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
     onImportOpml: () -> Unit,
     onExportOpml: () -> Unit,
+    onRevealSavedBearerToken: suspend () -> String,
 ) {
     when (tab) {
         AppTab.HOME ->
@@ -950,6 +954,7 @@ internal fun MainTabDestinationContent(
                 onAction = onAction,
                 onImportOpml = onImportOpml,
                 onExportOpml = onExportOpml,
+                onRevealSavedBearerToken = onRevealSavedBearerToken,
             )
     }
 }

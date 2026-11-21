@@ -422,11 +422,10 @@ internal fun resolveSafeHttpPlaybackUrl(
         } else {
             PublicUrlValidator.upgradePublicHttp(trimmed)
         }
-    PublicUrlValidator.ensurePublicTarget(
+    return PublicUrlValidator.ensurePublicTarget(
         rawUrl = upgradedUrl,
         resolveAddresses = resolveAddresses,
     )
-    return upgradedUrl
 }
 
 internal const val ROCHE_AUDIO_USER_AGENT = ROCHE_USER_AGENT

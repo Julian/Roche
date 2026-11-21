@@ -8,7 +8,8 @@ import android.util.LruCache
 import androidx.core.graphics.createBitmap
 import com.grayvines.roche.core.PDF_MAGIC_BYTES
 import com.grayvines.roche.core.hasPdfMagicHeader
-import com.grayvines.roche.core.isCanonicalFileWithinDir
+import com.grayvines.roche.core.resolveSafeChildFile
+import com.grayvines.roche.core.sanitizeCacheFileName
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -139,10 +140,13 @@ internal suspend fun <T : AutoCloseable> openSessionCancellably(
 }
 
 internal fun findCachedPdfFileForEntry(cacheRoot: File?, entryId: String): File? {
-    if (cacheRoot == null || entryId.isBlank()) return null
+    val trimmedId = entryId.trim()
+    if (cacheRoot == null || trimmedId.isEmpty()) return null
+    val safeId = runCatching { sanitizeCacheFileName(trimmedId) }.getOrNull() ?: return null
+    if (safeId != trimmedId) return null
     val itemsDir = File(cacheRoot, ITEMS_SUBDIR)
-    val itemDir = File(itemsDir, entryId)
-    if (!isCanonicalFileWithinDir(itemDir, itemsDir) || !itemDir.isDirectory) return null
+    val itemDir = runCatching { resolveSafeChildFile(itemsDir, safeId) }.getOrNull() ?: return null
+    if (!itemDir.isDirectory) return null
     val sharedPdf = File(itemDir, SHARED_PDF_FILENAME)
     return if (isValidPdfFile(sharedPdf)) {
         sharedPdf

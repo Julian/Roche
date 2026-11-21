@@ -2,6 +2,7 @@
 
 package com.grayvines.roche.core
 
+import com.grayvines.roche.BuildConfig
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.util.Locale
@@ -102,10 +103,11 @@ internal fun isPublicHost(rawHost: String): Boolean {
     }
     val normalized = lower.trimEnd('.')
     val labels = normalized.split('.')
+    val tldFirstChar = labels.lastOrNull()?.firstOrNull()
     return when {
         normalized.isEmpty() || '.' !in normalized || labels.any { it.isEmpty() } -> false
         normalized.all { it.isDigit() || it == '.' } -> isPublicIpv4Literal(normalized)
-        labels.last().all { it.isDigit() } -> false
+        tldFirstChar == null || tldFirstChar !in 'a'..'z' -> false
         else ->
             normalized != HOME_ARPA_DOMAIN &&
                 DISALLOWED_DOMAIN_SUFFIXES.none { normalized.endsWith(it) }
@@ -129,25 +131,24 @@ internal fun isPublicInetAddress(addr: InetAddress): Boolean =
         isPublicIpv6Address(addr)
     }
 
-internal fun isLoopbackHost(rawHost: String): Boolean {
+internal fun isLoopbackHost(
+    rawHost: String,
+    allowEmulatorLoopback: Boolean = BuildConfig.DEBUG,
+): Boolean {
     val lower = rawHost.trim().lowercase(Locale.ROOT).trimEnd('.')
     return lower == "localhost" ||
-        lower == "10.0.2.2" ||
+        allowEmulatorLoopback && lower == "10.0.2.2" ||
         lower == "[::1]" ||
         lower == "::1" ||
         lower.startsWith("127.") &&
             lower.split('.').let { parts ->
-                parts.size == IPV4_OCTET_COUNT &&
-                    parts.all { it.toIntOrNull() in 0..IPV4_OCTET_MAX }
+                parts.size == IPV4_OCTET_COUNT && parts.all { parseStrictDecimalOctet(it) != null }
             }
 }
 
 internal fun isTailscaleCgnatIpv4(rawHost: String): Boolean {
     val lower = rawHost.trim().lowercase(Locale.ROOT).trimEnd('.')
-    val octets =
-        lower.split('.').mapNotNull { part ->
-            part.toIntOrNull()?.takeIf { it in 0..IPV4_OCTET_MAX }
-        }
+    val octets = lower.split('.').mapNotNull(::parseStrictDecimalOctet)
     return octets.size == IPV4_OCTET_COUNT &&
         octets[0] == IPV4_CGNAT_100 &&
         octets[1] in IPV4_CGNAT_MIN..IPV4_CGNAT_MAX
@@ -182,11 +183,15 @@ internal fun isTailscaleInetAddress(addr: InetAddress): Boolean {
     }
 }
 
+private fun parseStrictDecimalOctet(part: String): Int? =
+    if (part.isEmpty() || part.length > 1 && part.startsWith('0')) {
+        null
+    } else {
+        part.toIntOrNull()?.takeIf { it in 0..IPV4_OCTET_MAX }
+    }
+
 private fun isPublicIpv4Literal(host: String): Boolean {
-    val octets =
-        host.split('.').mapNotNull { part ->
-            part.toIntOrNull()?.takeIf { it in 0..IPV4_OCTET_MAX }
-        }
+    val octets = host.split('.').mapNotNull(::parseStrictDecimalOctet)
     return octets.size == IPV4_OCTET_COUNT && isPublicIpv4Octets(octets[0], octets[1], octets[2])
 }
 

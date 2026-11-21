@@ -4,6 +4,8 @@ import com.grayvines.roche.core.formatArticleMinutes
 import com.grayvines.roche.core.formatAudioDurationEstimate
 import com.grayvines.roche.core.inferContentTypeWireValue
 import com.grayvines.roche.core.isHttpOrHttpsUrl
+import com.grayvines.roche.core.isPublicHost
+import com.grayvines.roche.core.isPublicIpAddress
 import com.grayvines.roche.core.parseIsoInstant
 import java.net.URI
 import java.time.Duration
@@ -310,9 +312,15 @@ internal fun resolveOriginFaviconUrl(rawUrl: String): String? {
 
 internal fun resolveFallbackFaviconUrl(rawUrl: String): String? {
     val host =
-        extractOriginUri(rawUrl)?.host?.lowercase(Locale.US)?.removePrefix("www.") ?: return null
-    if (host.isBlank() || !host.contains('.')) return null
-    return "https://icons.duckduckgo.com/ip3/$host.ico"
+        extractOriginUri(rawUrl)?.host?.lowercase(Locale.US)?.trimEnd('.')?.removePrefix("www.")
+            ?: return null
+    val isPublicDomain =
+        host.isNotBlank() &&
+            host.contains('.') &&
+            isPublicHost(host) &&
+            !isPublicIpAddress(host) &&
+            !host.startsWith("[")
+    return if (isPublicDomain) "https://icons.duckduckgo.com/ip3/$host.ico" else null
 }
 
 private fun extractOriginUri(rawUrl: String): URI? {

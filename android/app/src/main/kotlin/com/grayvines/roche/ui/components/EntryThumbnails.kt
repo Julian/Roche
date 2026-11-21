@@ -274,7 +274,7 @@ private fun PodcastEpisodeThumbnail(entry: InboxEntry, modifier: Modifier = Modi
                     .padding(3.dp)
                     .size(18.dp)
                     .clip(RoundedCornerShape(9.dp))
-                    .background(colors.accentBlue),
+                    .background(colors.accentBlueFilled),
         ) {
             PlayPauseIcon(isPlaying = false, tint = Color.White, size = 10.dp)
         }

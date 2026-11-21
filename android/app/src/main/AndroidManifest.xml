@@ -96,7 +96,7 @@
         <activity-alias
             android:name=".ShareWantToReadAlias"
             android:targetActivity=".ShareReceiveActivity"
-            android:label="Want to Read"
+            android:label="Roche — Want to Read"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
@@ -110,7 +110,7 @@
         <activity-alias
             android:name=".ShareSubscribeFeedAlias"
             android:targetActivity=".ShareReceiveActivity"
-            android:label="Subscribe Feed"
+            android:label="Roche — Subscribe Feed"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />

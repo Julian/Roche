@@ -45,6 +45,8 @@ import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.data.settings.Settings
+import com.grayvines.roche.data.sync.NetworkTier
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
@@ -59,6 +61,8 @@ import com.grayvines.roche.ui.components.ServerRackIcon
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
+import java.util.Locale
+import kotlin.math.roundToInt
 
 @Composable
 fun SettingsTabContent(
@@ -66,6 +70,7 @@ fun SettingsTabContent(
     onAction: (MainAction) -> Unit,
     onImportOpml: () -> Unit = {},
     onExportOpml: () -> Unit = {},
+    onRevealSavedBearerToken: suspend () -> String = { "" },
 ) {
     val settingsBackStack = rememberNavBackStack(SettingsNavKey.Hub)
     val popSubpage: () -> Unit = {
@@ -92,7 +97,12 @@ fun SettingsTabContent(
                     )
                 }
                 entry<SettingsNavKey.Server> {
-                    SettingsServerPage(state = state, onAction = onAction, onBack = popSubpage)
+                    SettingsServerPage(
+                        state = state,
+                        onAction = onAction,
+                        onBack = popSubpage,
+                        onRevealSavedBearerToken = onRevealSavedBearerToken,
+                    )
                 }
                 entry<SettingsNavKey.Appearance> {
                     SettingsAppearancePage(state = state, onAction = onAction, onBack = popSubpage)
@@ -212,12 +222,18 @@ private fun SettingsServerHubRow(
     onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val isConfigured =
-        state.settings.serverUrl.isNotBlank() && state.settings.bearerToken.isNotBlank()
+    val isConfigured = state.settings.serverUrl.isNotBlank() && state.hasBearerToken
+    val isOffline = state.localNetworkTier == NetworkTier.OFFLINE
     val hostLabel =
         extractCleanDomain(state.settings.serverUrl).ifBlank { "Configure Self-Hosted Server" }
     val subtitle = resolveServerSummarySubtitle(state = state, isConfigured = isConfigured)
-    val dotColor = if (isConfigured) colors.accentVerdigris else colors.accentEcru
+    val dotColor =
+        when {
+            state.settings.hasUndecryptableToken -> colors.accentIndianRed
+            !isConfigured -> colors.accentEcru
+            isOffline -> colors.accentIndianRed
+            else -> colors.accentVerdigris
+        }
 
     Row(
         modifier =
@@ -326,6 +342,12 @@ internal fun SettingsAppearancePage(
                 RocheSectionHeader(label = "Inbox & Home")
                 RocheSurfaceCard {
                     InboxAndHomeSettingsContent(state = state, onAction = onAction)
+                }
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                RocheSectionHeader(label = "Podcast Playback")
+                RocheSurfaceCard {
+                    PodcastPlaybackSettingsContent(state = state, onAction = onAction)
                 }
             }
             Spacer(modifier = Modifier.height(24.dp))
@@ -514,7 +536,100 @@ internal fun ThemeAndFontPickers(
             modifier = Modifier.testTag("font_sans_btn"),
         )
     }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+    ReaderFontScaleSettingRow(scale = state.settings.readerFontScale, onAction = onAction)
 }
+
+@Composable
+private fun ReaderFontScaleSettingRow(
+    scale: Float,
+    onAction: (MainAction) -> Unit,
+) {
+    val pct = (scale * 100f).roundToInt()
+    val canDecrease = scale > Settings.MIN_READER_FONT_SCALE + 0.001f
+    val canIncrease = scale < Settings.MAX_READER_FONT_SCALE - 0.001f
+    SegmentedSettingBlock(title = "Default Reader Text Size", currentLabel = "$pct%") {
+        SegmentedOptionButton(
+            label = "A−",
+            selected = false,
+            onClick = {
+                if (canDecrease) {
+                    onAction(
+                        MainAction.SetReaderFontScale(
+                            (scale - 0.10f).coerceAtLeast(Settings.MIN_READER_FONT_SCALE)
+                        )
+                    )
+                }
+            },
+            modifier = Modifier.testTag("settings_reader_scale_dec"),
+        )
+        SegmentedOptionButton(
+            label = "100%",
+            selected = pct == 100,
+            onClick = {
+                onAction(MainAction.SetReaderFontScale(Settings.DEFAULT_READER_FONT_SCALE))
+            },
+            modifier = Modifier.testTag("settings_reader_scale_reset"),
+        )
+        SegmentedOptionButton(
+            label = "A+",
+            selected = false,
+            onClick = {
+                if (canIncrease) {
+                    onAction(
+                        MainAction.SetReaderFontScale(
+                            (scale + 0.10f).coerceAtMost(Settings.MAX_READER_FONT_SCALE)
+                        )
+                    )
+                }
+            },
+            modifier = Modifier.testTag("settings_reader_scale_inc"),
+        )
+    }
+}
+
+@Composable
+private fun PodcastPlaybackSettingsContent(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val currentSpeed = state.settings.defaultPlaybackSpeed
+    val speedLabel = formatPlaybackSpeedLabel(currentSpeed)
+    SegmentedSettingBlock(title = "Default Playback Speed", currentLabel = speedLabel) {
+        SETTINGS_SPEED_PRESETS.forEach { preset ->
+            SegmentedOptionButton(
+                label = formatPlaybackSpeedLabel(preset),
+                selected = kotlin.math.abs(currentSpeed - preset) < 0.01f,
+                onClick = {
+                    onAction(MainAction.SetPlaybackSpeed(preset, applyToCurrentPodcast = false))
+                },
+            )
+        }
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+    Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
+        SettingToggleRow(
+            title = "Smart Rewind",
+            subtitle = "Rewind a few seconds automatically after pausing",
+            checked = state.settings.smartRewindEnabled,
+            onCheckedChange = { onAction(MainAction.SetSmartRewind(it)) },
+            modifier = Modifier.testTag("settings_smart_rewind_toggle"),
+        )
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+    Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
+        SettingToggleRow(
+            title = "Skip Silence",
+            subtitle = "Shorten long silent pauses during podcast playback",
+            checked = state.settings.skipSilenceEnabled,
+            onCheckedChange = { onAction(MainAction.SetSkipSilence(it)) },
+            modifier = Modifier.testTag("settings_skip_silence_toggle"),
+        )
+    }
+}
+
+private val SETTINGS_SPEED_PRESETS: List<Float> = listOf(1.0f, 1.25f, 1.5f, 2.0f)
 
 @Composable
 internal fun HomeDrawsStatusLines(state: MainUiState) {
@@ -692,11 +807,18 @@ private fun buildAppearanceSummary(state: MainUiState): String {
 private fun resolveServerSummarySubtitle(
     state: MainUiState,
     isConfigured: Boolean,
-): String {
-    if (!isConfigured) return "Tap to pair device or set Server URL"
-    if (state.activePeers.isEmpty()) return "Paired via Tailscale · Tap to configure"
-    val peerNoun = if (state.activePeers.size == 1) "peer" else "peers"
-    return "${state.activePeers.size} active $peerNoun · Cooperative sync"
+): String =
+    when {
+        state.settings.hasUndecryptableToken -> "Token unavailable · Tap to re-pair"
+        !isConfigured -> "Tap to pair device or set Server URL"
+        state.localNetworkTier == NetworkTier.OFFLINE -> "Offline · Local changes queued to sync"
+        state.activePeers.isEmpty() -> "Paired · Tap to configure"
+        else -> formatActivePeersSummary(state.activePeers.size)
+    }
+
+private fun formatActivePeersSummary(peerCount: Int): String {
+    val peerNoun = if (peerCount == 1) "peer" else "peers"
+    return "$peerCount active $peerNoun · Cooperative sync"
 }
 
 private fun resolveUnpinnedTabSubtitle(
@@ -714,6 +836,9 @@ private fun resolveUnpinnedTabSubtitle(
         AppTab.LISTS -> "Ranked collections & custom lists"
         else -> "Open ${tab.label}"
     }
+
+internal fun formatPlaybackSpeedLabel(speed: Float): String =
+    String.format(Locale.US, "%.2f", speed).trimEnd('0').trimEnd('.') + "x"
 
 private const val DARK_INK_SWATCH = 0xFF141413
 private const val PAPER_LIGHT_SWATCH = 0xFFE4DFDA

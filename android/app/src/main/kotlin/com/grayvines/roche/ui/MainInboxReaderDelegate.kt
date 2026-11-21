@@ -378,6 +378,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                     isAddSheetOpen = false,
                     prefilledShareUrl = "",
                     prefilledShareTitle = "",
+                    prefilledShareIsFeed = false,
                     selectedReaderEntryId = null,
                     readerContent = null,
                     undoEvent = null,

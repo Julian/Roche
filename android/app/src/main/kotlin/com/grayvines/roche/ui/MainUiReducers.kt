@@ -108,6 +108,7 @@ private fun reduceOverlayUiAction(
                 isAddSheetOpen = true,
                 prefilledShareUrl = action.prefilledUrl,
                 prefilledShareTitle = action.prefilledTitle,
+                prefilledShareIsFeed = action.preferSubscribeFeed,
                 contextSheetEntryId = null,
                 feedContextSheetId = null,
             )
@@ -116,6 +117,7 @@ private fun reduceOverlayUiAction(
                 isAddSheetOpen = false,
                 prefilledShareUrl = "",
                 prefilledShareTitle = "",
+                prefilledShareIsFeed = false,
             )
         MainAction.DismissMessages -> state.copy(undoEvent = null, statusBanner = null)
     }

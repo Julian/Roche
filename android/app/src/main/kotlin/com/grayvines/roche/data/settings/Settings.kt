@@ -1,5 +1,6 @@
 package com.grayvines.roche.data.settings
 
+import com.grayvines.roche.BuildConfig
 import com.grayvines.roche.core.HTTPS_URL_PREFIX
 import com.grayvines.roche.core.HTTP_URL_PREFIX
 import com.grayvines.roche.core.isHttpOrHttpsUrl
@@ -29,6 +30,19 @@ data class Settings(
     val showCollectionDrawsOnHome: Boolean = true,
     val hasUndecryptableToken: Boolean = false,
 ) {
+    override fun toString(): String {
+        val redactedToken = if (bearerToken.isBlank()) "" else "<redacted>"
+        return "Settings(serverUrl=$serverUrl, bearerToken=$redactedToken, peerId=$peerId, " +
+            "deviceName=$deviceName, swipeToArchive=$swipeToArchive, themeMode=$themeMode, " +
+            "headlineFont=$headlineFont, ultraDenseRows=$ultraDenseRows, " +
+            "readerFontScale=$readerFontScale, bottomNavTabs=$bottomNavTabs, " +
+            "lastPeerSyncCursor=$lastPeerSyncCursor, queueItemIds=${queueItemIds.size}, " +
+            "defaultPlaybackSpeed=$defaultPlaybackSpeed, skipSilenceEnabled=$skipSilenceEnabled, " +
+            "smartRewindEnabled=$smartRewindEnabled, " +
+            "showCollectionDrawsOnHome=$showCollectionDrawsOnHome, " +
+            "hasUndecryptableToken=$hasUndecryptableToken)"
+    }
+
     companion object {
         const val DEFAULT_SERVER_URL = ""
         const val DEFAULT_PEER_ID = "android-peer"
@@ -75,6 +89,14 @@ fun Settings.clamped(): Settings =
         defaultPlaybackSpeed = clampPlaybackSpeed(defaultPlaybackSpeed),
     )
 
+fun Settings.redactedForUi(): Settings = copy(bearerToken = "")
+
+internal fun extractNormalizedServerHost(rawUrl: String): String {
+    val normalized = normalizeServerUrl(rawUrl)
+    if (normalized.isBlank()) return ""
+    return runCatching { URI(normalized).host?.lowercase().orEmpty() }.getOrDefault("")
+}
+
 internal fun normalizeServerUrl(rawUrl: String): String {
     val trimmedUrl = rawUrl.trim().trimEnd('/')
     if (trimmedUrl.isBlank()) return ""
@@ -92,7 +114,7 @@ private fun resolveCandidateWithScheme(trimmedUrl: String): String? {
     }
     val hostPart = extractHostWithoutPort(trimmedUrl).lowercase()
     val prefix =
-        if (isLoopbackHost(hostPart)) {
+        if (BuildConfig.DEBUG && isLoopbackHost(hostPart)) {
             HTTP_URL_PREFIX
         } else {
             HTTPS_URL_PREFIX
@@ -263,8 +285,14 @@ private const val HOST_EMULATOR = "10.0.2.2"
 private const val SCHEME_HTTP_PREFIX = HTTP_URL_PREFIX
 private const val SCHEME_HTTPS_PREFIX = HTTPS_URL_PREFIX
 private const val TS_NET_SUFFIX = ".ts.net"
-private val LOCAL_HTTP_PROBE_HOSTS =
-    setOf(HOST_LOOPBACK_V4, HOST_LOCALHOST, HOST_EMULATOR, HOST_LOOPBACK_V6)
+private val LOCAL_HTTP_PROBE_HOSTS = buildSet {
+    add(HOST_LOOPBACK_V4)
+    add(HOST_LOCALHOST)
+    add(HOST_LOOPBACK_V6)
+    if (BuildConfig.DEBUG) {
+        add(HOST_EMULATOR)
+    }
+}
 private val TRUSTED_LOCAL_PROBE_HOSTS = setOf(HOST_ROCHE, HOST_LOOPBACK_V4, HOST_LOCALHOST)
 private const val MAX_TCP_PORT = 65_535
 private const val MAX_DNS_NAME_LEN = 253

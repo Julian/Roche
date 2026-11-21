@@ -4,6 +4,8 @@ import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.data.remote.ProblemDetailsException
 import com.grayvines.roche.data.remote.RocheProblemTypes
 import com.grayvines.roche.data.remote.formatProblemDetailsMessage
+import com.grayvines.roche.data.settings.Settings
+import com.grayvines.roche.data.settings.extractNormalizedServerHost
 import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.model.AppTab
 import kotlinx.coroutines.flow.first
@@ -58,6 +60,7 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
             MainAction.ResetBottomNavTabs ->
                 host.settingsRepository.update { it.copy(bottomNavTabs = AppTab.defaultSideTabs) }
             is MainAction.UpdateServerConfig -> performUpdateServerConfig(action)
+            MainAction.DisconnectServer -> performDisconnectServer()
             is MainAction.PairWithServer -> performPairWithServer(action)
             MainAction.DiscoverServer -> performDiscoverServer()
         }
@@ -237,19 +240,37 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
 
     private suspend fun performUpdateServerConfig(action: MainAction.UpdateServerConfig) {
         val normalizedTargetUrl = normalizeServerUrl(action.serverUrl)
+        val nextHost = extractNormalizedServerHost(normalizedTargetUrl)
+        var clearedTokenOnHostChange = false
         host.settingsRepository.update { current ->
-            val preserveToken =
-                current.hasUndecryptableToken &&
-                    action.bearerToken.trim().isEmpty() &&
-                    normalizedTargetUrl.isNotEmpty()
-            current.copy(
-                serverUrl = action.serverUrl,
-                bearerToken = if (preserveToken) current.bearerToken else action.bearerToken,
-            )
+            val currentHost = extractNormalizedServerHost(current.serverUrl)
+            val hostChanged = currentHost.isNotEmpty() && nextHost != currentHost
+            val nextToken =
+                resolveNextBearerToken(
+                    current = current,
+                    requestedToken = action.bearerToken,
+                    normalizedTargetUrl = normalizedTargetUrl,
+                    hostChanged = hostChanged,
+                )
+            if (hostChanged && current.bearerToken.isNotBlank() && nextToken.isBlank()) {
+                clearedTokenOnHostChange = true
+            }
+            current.copy(serverUrl = action.serverUrl, bearerToken = nextToken)
         }
         if (action.feedback == ConfigSaveFeedback.SHOW_BANNER) {
-            host.showStatusMessage("Saved server settings")
+            val msg =
+                if (clearedTokenOnHostChange) {
+                    "Saved new server URL · Previous token cleared"
+                } else {
+                    "Saved server settings"
+                }
+            host.showStatusMessage(msg)
         }
+    }
+
+    private suspend fun performDisconnectServer() {
+        host.settingsRepository.update { current -> current.copy(serverUrl = "", bearerToken = "") }
+        host.showStatusMessage("Disconnected from server")
     }
 
     private suspend fun performDiscoverServer() {
@@ -371,4 +392,31 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
         } else {
             error.message?.takeIf { it.isNotBlank() } ?: fallback
         }
+}
+
+internal fun resolveNextBearerToken(
+    current: Settings,
+    requestedToken: String?,
+    normalizedTargetUrl: String,
+    hostChanged: Boolean,
+): String {
+    val trimmedRequested = requestedToken?.trim()
+    return when {
+        requestedToken == null ->
+            if (hostChanged || normalizedTargetUrl.isEmpty()) "" else current.bearerToken
+        trimmedRequested.isNullOrEmpty() ->
+            resolveBlankTokenFallback(current, normalizedTargetUrl, hostChanged)
+        hostChanged && trimmedRequested == current.bearerToken.trim() -> ""
+        else -> trimmedRequested
+    }
+}
+
+private fun resolveBlankTokenFallback(
+    current: Settings,
+    normalizedTargetUrl: String,
+    hostChanged: Boolean,
+): String {
+    val preserveUndecryptable =
+        !hostChanged && current.hasUndecryptableToken && normalizedTargetUrl.isNotEmpty()
+    return if (preserveUndecryptable) current.bearerToken else ""
 }

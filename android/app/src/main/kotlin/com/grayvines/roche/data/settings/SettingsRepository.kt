@@ -32,15 +32,19 @@ internal constructor(
 ) {
     private val fallbackPeerId = "android-${UUID.randomUUID()}"
     private val peerIdPersistAttempted = AtomicBoolean(false)
+    private val plaintextTokenMigrateAttempted = AtomicBoolean(false)
     private val persistedEditCount = AtomicLong(0L)
-    @Volatile private var cachedDecodedToken: Pair<String, String>? = null
+    @Volatile private var cachedDecodedToken: CachedTokenEntry? = null
     @Volatile
     internal var latestSettings: Settings? = null
         private set
 
     val settings: Flow<Settings> =
         dataStore.data
-            .onEach { prefs -> ensurePeerIdPersistedOnce(prefs) }
+            .onEach { prefs ->
+                ensurePeerIdPersistedOnce(prefs)
+                migratePlaintextTokenOnce(prefs)
+            }
             .catch { exception ->
                 if (exception is IOException) {
                     emit(emptyPreferences())
@@ -62,6 +66,29 @@ internal constructor(
     ) : this(dataStore = dataStore, tokenCipher = createDefaultTokenCipher())
 
     suspend fun prewarm(): Settings = settings.first()
+
+    suspend fun readBearerToken(): String =
+        latestSettings?.bearerToken ?: settings.first().bearerToken
+
+    private suspend fun migratePlaintextTokenOnce(prefs: Preferences) {
+        val raw = prefs[KEY_BEARER_TOKEN]?.trim().orEmpty()
+        if (raw.isEmpty() || raw.startsWith(ENCRYPTED_TOKEN_PREFIX)) {
+            return
+        }
+        if (!plaintextTokenMigrateAttempted.compareAndSet(false, true)) return
+        runSuspendCatching {
+            dataStore.edit { mutablePrefs ->
+                val currentRaw = mutablePrefs[KEY_BEARER_TOKEN]?.trim().orEmpty()
+                if (currentRaw.isNotEmpty() && !currentRaw.startsWith(ENCRYPTED_TOKEN_PREFIX)) {
+                    val encrypted = encodeBearerToken(currentRaw)
+                    if (encrypted.startsWith(ENCRYPTED_TOKEN_PREFIX)) {
+                        mutablePrefs[KEY_BEARER_TOKEN] = encrypted
+                    }
+                }
+            }
+        }
+            .onFailure { plaintextTokenMigrateAttempted.set(false) }
+    }
 
     private suspend fun ensurePeerIdPersistedOnce(prefs: Preferences) {
         if (!prefs[KEY_PEER_ID].isNullOrBlank()) {
@@ -141,20 +168,23 @@ internal constructor(
             cachedDecodedToken = null
             return ""
         }
-        val existing = cachedDecodedToken
-        if (
-            existing != null &&
-                existing.second == trimmed &&
-                existing.first.startsWith(ENCRYPTED_TOKEN_PREFIX)
-        ) {
-            return existing.first
-        }
-        return tokenCipher.encrypt(trimmed).also { encrypted ->
-            if (encrypted.isNotEmpty()) {
-                cachedDecodedToken = encrypted to trimmed
+        val currentKeyGen = tokenCipher.keyGeneration()
+        return reusableCachedCiphertext(currentKeyGen, trimmed)
+            ?: tokenCipher.encrypt(trimmed).also { encrypted ->
+                val postEncryptGen = tokenCipher.keyGeneration()
+                cachedDecodedToken =
+                    if (encrypted.isNotEmpty()) {
+                        CachedTokenEntry(encrypted, trimmed, postEncryptGen)
+                    } else {
+                        null
+                    }
             }
-        }
     }
+
+    private fun reusableCachedCiphertext(currentKeyGen: Long, plaintext: String): String? =
+        cachedDecodedToken
+            ?.takeIf { it.keyGeneration == currentKeyGen && it.plaintext == plaintext }
+            ?.ciphertext
 
     private fun decodeBearerToken(stored: String?): String {
         val trimmed = stored?.trim().orEmpty()
@@ -166,14 +196,23 @@ internal constructor(
     }
 
     private fun decryptWithCache(encrypted: String): String {
+        val currentKeyGen = tokenCipher.keyGeneration()
         val cached = cachedDecodedToken
-        if (cached != null && cached.first == encrypted) {
-            return cached.second
+        if (
+            cached != null &&
+                cached.keyGeneration == currentKeyGen &&
+                cached.ciphertext == encrypted
+        ) {
+            return cached.plaintext
         }
         return tokenCipher.decrypt(encrypted).also { decrypted ->
-            if (decrypted.isNotEmpty()) {
-                cachedDecodedToken = encrypted to decrypted
-            }
+            val postDecryptGen = tokenCipher.keyGeneration()
+            cachedDecodedToken =
+                if (decrypted.isNotEmpty()) {
+                    CachedTokenEntry(encrypted, decrypted, postDecryptGen)
+                } else {
+                    null
+                }
         }
     }
 
@@ -254,6 +293,12 @@ internal constructor(
         }
     }
 }
+
+private data class CachedTokenEntry(
+    val ciphertext: String,
+    val plaintext: String,
+    val keyGeneration: Long,
+)
 
 private const val LEGACY_SEARCH_TAB_NAME = "SEARCH"
 private const val TOKEN_PRESERVE_PROBE = "\u0000__preserve_token_probe__"
