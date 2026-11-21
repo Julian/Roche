@@ -8,10 +8,10 @@ use axum::{
 };
 use serde::Deserialize;
 
+use super::error::{ApiError, ProblemJson, ProblemPath, ProblemQuery, ProblemString};
 use crate::{
     db::{Feed, ItemFilter, ItemPage},
     domain::FeedType,
-    error::{ApiError, ProblemJson, ProblemPath, ProblemQuery, ProblemString},
     service::{ExportBundle, FeedService, RocheService},
 };
 
@@ -130,7 +130,7 @@ pub(super) async fn import_opml(
         }
     })
     .await
-    .map_err(|e| anyhow::anyhow!("OPML request decode task failed: {e}"))??;
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("OPML request decode task failed: {e}")))??;
 
     let imported = service.feeds().import_opml(opml_str).await?;
     Ok(Json(serde_json::json!({

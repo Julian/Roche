@@ -877,7 +877,8 @@ async fn test_sync_seq_pagination_and_pruned_cursor_reset() {
     let del_id = expected_ids.iter().next().unwrap().clone();
     assert!(db.items().delete(&del_id).await.unwrap());
     let old_del = Utc::now() - chrono::Duration::days(40);
-    sqlx::query("UPDATE sync_tombstones SET deleted_at = ?")
+    sqlx::query("UPDATE sync_tombstones SET deleted_at = ?, recorded_at = ?")
+        .bind(old_del)
         .bind(old_del)
         .execute(db.pool())
         .await
@@ -3816,4 +3817,504 @@ async fn test_graph_tombstones_resolve_remapped_ids_in_same_sync_batch() {
         gen_still_present.is_none(),
         "CollectionGenerator tombstone using remapped list ID must delete canonical generator"
     );
+}
+
+#[tokio::test]
+async fn test_wave_2a_hlc_sanitization_timestamp_clamping_and_recorded_at_pruning() {
+    // 1. HlcTimestamp::parse rejects invalid node_id characters and >64-char node IDs
+    let valid = HlcTimestamp::new(1_700_000_000_000, 3, "peer-alpha_01").encode();
+    assert!(HlcTimestamp::parse(&valid).is_some());
+    for bad_node in ["", "bad space", "bad/slash", "bad\nline", &"x".repeat(65)] {
+        let raw = format!("001700000000000-0001-{bad_node}");
+        assert!(HlcTimestamp::parse(&raw).is_none(), "must reject node_id '{bad_node}'");
+    }
+
+    // 2. HlcClock::witness clamps u16::MAX rollover at the drift ceiling
+    let mut clock = HlcClock::new("server", None);
+    let now_ms = 1_700_000_000_000i64;
+    let drift_ceiling = now_ms + hlc::MAX_CLOCK_DRIFT_MS;
+    let overflow_remote = HlcTimestamp::new(drift_ceiling, u16::MAX, "rogue");
+    let witnessed = clock.witness(&overflow_remote, now_ms);
+    assert_eq!(witnessed.wall_ms, drift_ceiling, "rollover must not exceed max_allowed_wall");
+    assert_eq!(witnessed.counter, u16::MAX);
+
+    // 3. PeerSync clamps future timestamps and keeps tombstones with ancient deleted_at alive via recorded_at
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let now = Utc::now();
+    let far_future = now + chrono::Duration::days(3650);
+    let ancient =
+        chrono::DateTime::parse_from_rfc3339("1970-01-02T00:00:00Z").unwrap().with_timezone(&Utc);
+    let hlc = HlcTimestamp::new(now.timestamp_millis(), 1, "peer-a").encode();
+
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-a".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            weight: Some(f64::NAN),
+            entries: vec![SyncEntryRecord {
+                id: "future-work-1".to_owned(),
+                kind: EntryKind::Movie,
+                title: "Future Timestamp Movie".to_owned(),
+                creators: Vec::new(),
+                url: None,
+                published_at: Some(far_future),
+                release_year: None,
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(far_future),
+                updated_at: Some(far_future),
+                hlc: hlc.clone(),
+                content: None,
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+            }],
+            tombstones: vec![SyncTombstone {
+                entity_type: ActivityEntityType::Entry,
+                natural_key: "phantom-deleted-entry".to_owned(),
+                deleted_at: ancient,
+                hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let (created_at, updated_at, published_at): (
+        DateTime<Utc>,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT created_at, updated_at, published_at FROM entries WHERE id = 'future-work-1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let max_allowed = Utc::now() + chrono::Duration::milliseconds(hlc::MAX_CLOCK_DRIFT_MS + 5_000);
+    assert!(created_at <= max_allowed);
+    assert!(updated_at <= max_allowed);
+    assert!(published_at.unwrap() <= max_allowed);
+
+    // Pruning 30-day-old tombstones MUST NOT delete the freshly recorded tombstone whose deleted_at was 1970
+    db.sync().prune_activity_older_than_days(30).await.unwrap();
+    let tomb_exists: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sync_tombstones WHERE entity_type = 'entry' AND natural_key = 'phantom-deleted-entry'",
+    )
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        tomb_exists.is_some(),
+        "Freshly recorded tombstone must not be prematurely pruned by backdated deleted_at"
+    );
+}
+
+#[tokio::test]
+async fn test_wave_2a_protected_collections_history_tombstone_and_peer_pruning() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let now = Utc::now();
+    let movie = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Stalker".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(&movie.id, ConsumptionStatus::Consumed, Some("Great"), None)
+        .await
+        .unwrap();
+
+    let movies_col_id = deterministic_system_collection_id("movies");
+    let tomb_hlc =
+        HlcTimestamp::new((now + chrono::Duration::seconds(30)).timestamp_millis(), 1, "peer-b")
+            .encode();
+
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-b".to_owned(),
+            network_tier: NetworkTier::Cellular,
+            weight: Some(999.0),
+            entries: vec![SyncEntryRecord {
+                id: STARRED_COLLECTION_ID.to_owned(),
+                kind: EntryKind::Article,
+                title: "Hijacked Starred".to_owned(),
+                creators: Vec::new(),
+                url: None,
+                published_at: None,
+                release_year: None,
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: None,
+                updated_at: None,
+                hlc: tomb_hlc.clone(),
+                content: None,
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+            }],
+            tombstones: vec![
+                SyncTombstone {
+                    entity_type: ActivityEntityType::Entry,
+                    natural_key: movies_col_id.clone(),
+                    deleted_at: now,
+                    hlc: tomb_hlc.clone(),
+                },
+                SyncTombstone {
+                    entity_type: ActivityEntityType::Entry,
+                    natural_key: movie.id.clone(),
+                    deleted_at: now,
+                    hlc: tomb_hlc,
+                },
+            ],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    // Protected Starred & dynamic Movies collection remain intact
+    let starred_title: String = sqlx::query_scalar("SELECT title FROM entries WHERE id = ?")
+        .bind(STARRED_COLLECTION_ID)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_ne!(starred_title, "Hijacked Starred");
+    let movies_still_exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM collection_specs WHERE collection_id = ?")
+            .bind(&movies_col_id)
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+    assert!(movies_still_exists.is_some());
+
+    // Movie with consumption history was preserved AND no Entry tombstone was persisted for it
+    assert!(db.catalog().get_entry(&movie.id).await.unwrap().is_some());
+    let movie_tomb: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sync_tombstones WHERE entity_type = 'entry' AND natural_key = ?",
+    )
+    .bind(&movie.id)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert!(movie_tomb.is_none());
+
+    // Cellular weight was bounded to <= 2.0 and stale peers prune cleanly while preserving SERVER_PEER_ID
+    let peer_b_weight = db.sync().get_peer_weight("peer-b").await.unwrap().unwrap();
+    assert!((0.2..=2.0).contains(&peer_b_weight));
+
+    let stale_ts = now - chrono::Duration::days(45);
+    sqlx::query("UPDATE peer_nodes SET last_seen_at = ? WHERE peer_id IN ('peer-b', ?)")
+        .bind(stale_ts)
+        .bind(SERVER_PEER_ID)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let pruned = db.sync().prune_stale_peer_nodes(30).await.unwrap();
+    assert_eq!(pruned, 1);
+    assert!(db.sync().get_peer_weight("peer-b").await.unwrap().is_none());
+    assert!(db.sync().get_peer_weight(SERVER_PEER_ID).await.unwrap().is_some());
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_wave_2a_audit_fixes_sync_hlc_monotonicity_reserved_schemes_and_page_budget() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let now = Utc::now();
+
+    // 1. Incoming new work carrying reserved schemes (`slug`, `tag`, `feed_url`) must not abort sync,
+    //    and headless `kind = 'collection'` entries without `collection_spec` must be skipped.
+    let newer_hlc = HlcTimestamp::from_datetime(now, "peer-c").encode();
+    let resp = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-c".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![
+                crate::db::SyncEntryRecord {
+                    id: "work-with-reserved-scheme".to_owned(),
+                    kind: EntryKind::Book,
+                    title: "Clean Book".to_owned(),
+                    creators: vec!["Author".to_owned()],
+                    url: None,
+                    published_at: None,
+                    release_year: Some(2020),
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: None,
+                    merged_into_id: None,
+                    identifiers: vec![
+                        crate::db::EntryIdentifier {
+                            scheme: "slug".to_owned(),
+                            value: "movies".to_owned(),
+                        },
+                        crate::db::EntryIdentifier {
+                            scheme: "isbn".to_owned(),
+                            value: "9780143127550".to_owned(),
+                        },
+                    ],
+                    content: None,
+                    state: None,
+                    collection_spec: None,
+                    feed_source: None,
+                    created_at: Some(now),
+                    updated_at: Some(now),
+                    hlc: newer_hlc.clone(),
+                },
+                crate::db::SyncEntryRecord {
+                    id: "headless-col-entry".to_owned(),
+                    kind: EntryKind::Collection,
+                    title: "Headless Collection".to_owned(),
+                    creators: vec![],
+                    url: None,
+                    published_at: None,
+                    release_year: None,
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: None,
+                    merged_into_id: None,
+                    identifiers: vec![],
+                    content: None,
+                    state: None,
+                    collection_spec: None,
+                    feed_source: None,
+                    created_at: Some(now),
+                    updated_at: Some(now),
+                    hlc: newer_hlc.clone(),
+                },
+            ],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(resp.0.sync_seq > 0);
+    let saved_book = db.catalog().get_entry("work-with-reserved-scheme").await.unwrap().unwrap();
+    assert!(saved_book.identifiers.iter().any(|i| i.scheme == "isbn"));
+    assert!(!saved_book.identifiers.iter().any(|i| i.scheme == "slug"));
+    assert!(db.catalog().get_entry("headless-col-entry").await.unwrap().is_none());
+
+    // 2. Album edition-variant dedup with older HLC must NOT regress `entries.hlc` or `created_at`
+    let album = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "OK Computer".to_owned(),
+            creators: vec!["Radiohead".to_owned()],
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let high_hlc = HlcTimestamp::from_datetime(now + chrono::Duration::seconds(30), "srv").encode();
+    sqlx::query("UPDATE entries SET hlc = ? WHERE id = ?")
+        .bind(&high_hlc)
+        .bind(&album.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let orig_created: DateTime<Utc> =
+        sqlx::query_scalar("SELECT created_at FROM entries WHERE id = ?")
+            .bind(&album.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+    let older_ts = now - chrono::Duration::hours(5);
+    let older_hlc = HlcTimestamp::from_datetime(older_ts, "peer-old").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-old".to_owned(),
+            entries: vec![crate::db::SyncEntryRecord {
+                id: "dup-ok-computer-deluxe".to_owned(),
+                kind: EntryKind::Album,
+                title: "OK Computer (Deluxe Edition)".to_owned(),
+                creators: vec!["Radiohead".to_owned()],
+                url: None,
+                published_at: None,
+                release_year: Some(1997),
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                merged_into_id: None,
+                identifiers: vec![],
+                content: None,
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+                created_at: Some(older_ts),
+                updated_at: Some(older_ts),
+                hlc: older_hlc.clone(),
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let (after_hlc, after_created): (String, DateTime<Utc>) =
+        sqlx::query_as("SELECT hlc, created_at FROM entries WHERE id = ?")
+            .bind(&album.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(
+        after_hlc >= high_hlc && after_hlc > older_hlc,
+        "deduplicated insert must never regress entries.hlc (got {after_hlc}, expected >= {high_hlc})"
+    );
+    assert_eq!(after_created, orig_created, "deduplicated insert must never overwrite created_at");
+
+    // 3. Auto-log dedup onto an existing manual consumed log must NOT regress `consumption_log.hlc`
+    let manual_log = db
+        .catalog()
+        .log_consumption(&album.id, ConsumptionStatus::Consumed, Some("Great album"), Some(now))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE consumption_log SET hlc = ? WHERE id = ?")
+        .bind(&high_hlc)
+        .bind(&manual_log.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let auto_id = crate::db::sync::deterministic_auto_consumption_log_id(&album.id);
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-old".to_owned(),
+            consumption_log: vec![crate::db::SyncConsumptionLogRecord {
+                id: auto_id,
+                entry_id: album.id.clone(),
+                ts: older_ts,
+                status: ConsumptionStatus::Consumed,
+                notes: None,
+                created_at: Some(older_ts),
+                hlc: older_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let manual_hlc_after: String =
+        sqlx::query_scalar("SELECT hlc FROM consumption_log WHERE id = ?")
+            .bind(&manual_log.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(manual_hlc_after, high_hlc, "auto-log dedup must never regress manual log HLC");
+
+    // 4. HRW `NaN` weight guard + Cellular cap on existing Wifi peer without explicit weight
+    let nan_peer = PeerNode {
+        peer_id: "nan-peer".to_owned(),
+        device_name: "Bad".to_owned(),
+        network_tier: NetworkTier::Wifi,
+        weight: f64::NAN,
+        last_seen_at: now,
+    };
+    let good_peer = PeerNode {
+        peer_id: "good-peer".to_owned(),
+        device_name: "Good".to_owned(),
+        network_tier: NetworkTier::Wifi,
+        weight: 1.0,
+        last_seen_at: now,
+    };
+    assert_eq!(effective_peer_weight(&nan_peer, None, None, None), 0.0);
+    assert_eq!(
+        select_feed_poller(
+            &[nan_peer, good_peer],
+            "https://example.com/rss",
+            60,
+            now,
+            None,
+            None,
+            None,
+            None
+        ),
+        Some("good-peer")
+    );
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "mobile-1".to_owned(),
+            device_name: Some("Phone".to_owned()),
+            network_tier: NetworkTier::Wifi,
+            weight: Some(8.0),
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "mobile-1".to_owned(),
+            device_name: Some("Phone".to_owned()),
+            network_tier: NetworkTier::Cellular,
+            weight: None,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let capped_w = db.sync().get_peer_weight("mobile-1").await.unwrap().unwrap();
+    assert!(
+        capped_w <= crate::db::sync::hrw::MAX_CELLULAR_PEER_WEIGHT,
+        "Cellular switch must cap prior Wifi weight"
+    );
+
+    // 5. Referential integrity under tight `page_budget`: child rows referencing future entries
+    //    must trigger cutoff shrinking rather than omitting referenced entries!
+    let list = db
+        .catalog()
+        .create_manual_collection(
+            "Budget List",
+            Some("budget-list"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut member_ids = Vec::new();
+    for i in 0..4 {
+        let e = db
+            .catalog()
+            .upsert_entry(&crate::db::UpsertEntryInput {
+                kind: Some(EntryKind::Book),
+                title: format!("Budget Book {i} {}", "x".repeat(400)),
+                summary: Some("s".repeat(400)),
+                ..crate::db::UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        db.catalog().add_collection_entry(&list.id, &e.id, None).await.unwrap();
+        member_ids.push(e.id);
+    }
+    // Bump the entries' sync_seq past their collection_entries so they become future-referenced!
+    for id in &member_ids {
+        sqlx::query("UPDATE entries SET title = title || '!' WHERE id = ?")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    let tight_page = db
+        .sync()
+        .collect_peer_sync_response_with_budget(
+            0,
+            200,
+            2_048,
+            HlcTimestamp::from_datetime(now, SERVER_PEER_ID).encode(),
+            now,
+        )
+        .await
+        .unwrap();
+    let returned_entry_ids: std::collections::HashSet<&str> =
+        tight_page.entries.iter().map(|e| e.id.as_str()).collect();
+    for ce in &tight_page.collection_entries {
+        if member_ids.contains(&ce.entry_id) {
+            assert!(
+                returned_entry_ids.contains(ce.entry_id.as_str()),
+                "every emitted collection_entry must have its future-referenced entry included"
+            );
+        }
+    }
+    assert!(tight_page.has_more, "tight budget must paginate via cutoff shrinking");
 }

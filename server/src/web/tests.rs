@@ -17,7 +17,7 @@ use crate::{
     auth::pairing::PairingManager,
     config::Config,
     db::{ConsumptionStatus, ContentType, Db, EntryKind, FeedType, NewItem},
-    scheduler::FeedFetcher,
+    ingest::FeedFetcher,
     service::RocheService,
 };
 
@@ -1406,7 +1406,7 @@ async fn test_artist_detail_enrichment_persists_links_portrait_and_bio() {
 
 struct DiscoveryWebFetcher;
 
-impl crate::scheduler::FeedFetcher for DiscoveryWebFetcher {
+impl crate::ingest::FeedFetcher for DiscoveryWebFetcher {
     fn fetch_feed(&self, url: &Url) -> impl std::future::Future<Output = anyhow::Result<String>> {
         let res = match url.as_str() {
             "https://danluu.com/" => Ok(r#"<!doctype html><html><head><title>Dan Luu</title>

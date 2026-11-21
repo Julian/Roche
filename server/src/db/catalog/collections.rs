@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
@@ -7,7 +7,8 @@ use super::{
     CatalogRepo,
     models::{
         CatalogEntry, CatalogError, CatalogResult, CollectionSummary, DynamicCollectionRule,
-        RawCollectionRow, RawEntryRow, UpsertEntryInput, raw_collection_columns, raw_entry_columns,
+        RawCollectionRow, RawEntryRow, UpsertEntryInput, WantSearchMatch, raw_collection_columns,
+        raw_entry_columns,
     },
 };
 use crate::db::{
@@ -578,30 +579,30 @@ impl CatalogRepo<'_> {
         parent_col_id: &str,
         child_entry_id: &str,
     ) -> std::result::Result<bool, sqlx::Error> {
+        const MAX_ANCESTOR_DEPTH: i64 = 128;
         if parent_col_id == child_entry_id {
             return Ok(true);
         }
-        let mut visited: HashSet<String> = HashSet::from([parent_col_id.to_owned()]);
-        let mut queue: VecDeque<String> = VecDeque::from([parent_col_id.to_owned()]);
-
-        while let Some(cur) = queue.pop_front() {
-            let ancestors = sqlx::query_scalar!(
-                r#"SELECT collection_id as "collection_id!" FROM collection_entries WHERE entry_id = ?"#,
-                &cur,
-            )
-            .fetch_all(&mut *conn)
-            .await?;
-
-            for anc in ancestors {
-                if anc == child_entry_id {
-                    return Ok(true);
-                }
-                if visited.len() < 1_024 && visited.insert(anc.clone()) {
-                    queue.push_back(anc);
-                }
-            }
-        }
-        Ok(false)
+        let blocked: i64 = sqlx::query_scalar(
+            "WITH RECURSIVE ancestors(id, depth) AS (
+                 SELECT ?, 0
+                 UNION
+                 SELECT ce.collection_id, a.depth + 1
+                 FROM collection_entries ce
+                 JOIN ancestors a ON ce.entry_id = a.id
+                 WHERE a.depth < ?
+             )
+             SELECT EXISTS(
+                 SELECT 1 FROM ancestors WHERE id = ? OR depth >= ?
+             )",
+        )
+        .bind(parent_col_id)
+        .bind(MAX_ANCESTOR_DEPTH)
+        .bind(child_entry_id)
+        .bind(MAX_ANCESTOR_DEPTH)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(blocked != 0)
     }
 
     pub(super) async fn lookup_collection_row(
@@ -1136,4 +1137,65 @@ fn slugify_title(title: &str) -> String {
         out.pop();
     }
     out
+}
+
+impl CatalogRepo<'_> {
+    /// Searches entries across all Want queues using `entries_fts` (`title`/`creators`/`summary`)
+    /// or `want_notes` in `metadata_json`, returning queue metadata alongside each matched entry.
+    pub async fn search_want_entries(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> CatalogResult<Vec<WantSearchMatch>> {
+        let trimmed = query.trim();
+        let terms = crate::db::ItemFilter::tokenize_search_terms(trimmed);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cap = i64::try_from(limit.clamp(1, 200)).unwrap_or(20);
+        let fts_query = terms
+            .iter()
+            .map(|t| format!("{{title creators summary}}: {}", t.fts_clause))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let bounded_q: String = trimmed.chars().take(256).collect();
+        let notes_pattern = format!("%{}%", crate::db::escape_like_literal(&bounded_q));
+
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT qc.id, COALESCE(cs.slug, qc.id), qc.title, e.id
+             FROM collection_specs cs
+             JOIN entries qc ON qc.id = cs.collection_id
+             JOIN collection_entries ce ON ce.collection_id = cs.collection_id
+             JOIN entries e ON e.id = ce.entry_id
+             WHERE cs.collection_role = 'want'
+               AND qc.merged_into_id IS NULL
+               AND e.merged_into_id IS NULL
+               AND (
+                   e.rowid IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?)
+                   OR COALESCE(json_extract(e.metadata_json, '$.want_notes'), '') LIKE ? ESCAPE '\\'
+               )
+             ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ce.added_at) DESC, LOWER(e.title) ASC
+             LIMIT ?",
+        )
+        .bind(&fts_query)
+        .bind(&notes_pattern)
+        .bind(cap)
+        .fetch_all(self.pool)
+        .await?;
+
+        let entry_ids: Vec<String> = rows.iter().map(|(_, _, _, eid)| eid.clone()).collect();
+        let entry_map = self.load_entries_by_ids(&entry_ids).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (queue_id, queue_slug, queue_title, entry_id) in rows {
+            if let Some(entry) = entry_map.get(&entry_id) {
+                out.push(WantSearchMatch {
+                    queue_id,
+                    queue_slug,
+                    queue_title,
+                    entry: entry.clone(),
+                });
+            }
+        }
+        Ok(out)
+    }
 }

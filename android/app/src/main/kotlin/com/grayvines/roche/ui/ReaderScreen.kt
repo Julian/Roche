@@ -236,7 +236,7 @@ fun ReaderView(
         ReaderScrollProgressBar(listState = listState, fallbackProgress = entry.readProgress)
         ReaderTypographySection(
             visible = showTypographyDrawer,
-            isPdf = pdfSession != null || entry.contentType == ContentType.PDF,
+            isPdf = pdfSession != null,
             onDismiss = { showTypographyDrawer = false },
             blocks = parsedState.blocks,
             settings = settings,

@@ -10,7 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::{service::AppError, util::url_guard::SsrfBlockedError};
+use crate::service::AppError;
 
 /// RFC 9457 §4.2.1 blank problem type URI for generic HTTP status responses.
 pub const PROBLEM_TYPE_BLANK: &str = "about:blank";
@@ -107,6 +107,9 @@ pub enum ApiError {
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     #[error("Invalid bearer token: {0}")]
     TokenInvalid(String),
 
@@ -140,14 +143,20 @@ pub enum ApiError {
     #[error("Unsupported media type: {0}")]
     UnsupportedMediaType(String),
 
+    #[error("Request timeout: {0}")]
+    RequestTimeout(String),
+
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error("Upstream fetch failed: {0}")]
     BadGateway(String),
 
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(sqlx::Error),
 
     #[error("Internal error: {0}")]
-    Internal(#[from] anyhow::Error),
+    Internal(anyhow::Error),
 }
 
 impl ApiError {
@@ -157,6 +166,10 @@ impl ApiError {
 
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self::Unauthorized(message.into())
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::Forbidden(message.into())
     }
 
     pub fn token_invalid(message: impl Into<String>) -> Self {
@@ -203,6 +216,14 @@ impl ApiError {
         Self::PayloadTooLarge { detail: detail.into(), max_bytes: Some(max_bytes) }
     }
 
+    pub fn request_timeout(message: impl Into<String>) -> Self {
+        Self::RequestTimeout(message.into())
+    }
+
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self::ServiceUnavailable(message.into())
+    }
+
     pub fn bad_gateway(message: impl Into<String>) -> Self {
         Self::BadGateway(message.into())
     }
@@ -217,6 +238,7 @@ impl ApiError {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn to_problem_details(&self) -> (StatusCode, ProblemDetails) {
         match self {
             Self::BadRequest(d) => {
@@ -228,6 +250,9 @@ impl ApiError {
                 "Unauthorized",
                 d.clone(),
             ),
+            Self::Forbidden(d) => {
+                Self::problem(StatusCode::FORBIDDEN, PROBLEM_TYPE_BLANK, "Forbidden", d.clone())
+            }
             Self::TokenInvalid(d) => Self::problem(
                 StatusCode::UNAUTHORIZED,
                 PROBLEM_TYPE_TOKEN_INVALID,
@@ -300,83 +325,40 @@ impl ApiError {
                 "Unsupported Media Type",
                 d.clone(),
             ),
+            Self::RequestTimeout(d) => Self::problem(
+                StatusCode::REQUEST_TIMEOUT,
+                PROBLEM_TYPE_BLANK,
+                "Request Timeout",
+                d.clone(),
+            ),
+            Self::ServiceUnavailable(d) => Self::problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                PROBLEM_TYPE_BLANK,
+                "Service Unavailable",
+                d.clone(),
+            ),
             Self::BadGateway(d) => {
                 Self::problem(StatusCode::BAD_GATEWAY, PROBLEM_TYPE_BLANK, "Bad Gateway", d.clone())
             }
-            Self::Database(sqlx_err) => Self::classify_sqlx_error(sqlx_err),
-            Self::Internal(err) => Self::classify_internal_error(err),
-        }
-    }
-
-    fn classify_internal_error(err: &anyhow::Error) -> (StatusCode, ProblemDetails) {
-        if let Some(conflict) = err.downcast_ref::<crate::db::ConflictError>() {
-            return Self::conflict(conflict.0.clone()).to_problem_details();
-        }
-        if let Some(cat_err) = err.downcast_ref::<crate::db::CatalogError>() {
-            return Self::classify_catalog_error(cat_err);
-        }
-        if let Some(ssrf_err) = err.downcast_ref::<SsrfBlockedError>() {
-            return Self::ssrf_blocked(ssrf_err.0.clone()).to_problem_details();
-        }
-        if let Some(sqlx_err) = err.downcast_ref::<sqlx::Error>() {
-            return Self::classify_sqlx_error(sqlx_err);
-        }
-        tracing::error!(error = %err, "Internal server error");
-        Self::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            PROBLEM_TYPE_BLANK,
-            "Internal Server Error",
-            "An unexpected internal error occurred",
-        )
-    }
-
-    fn map_non_db_catalog_error(err: &crate::db::CatalogError) -> Option<Self> {
-        match err {
-            crate::db::CatalogError::Db(_) => None,
-            crate::db::CatalogError::NotFound(msg) => Some(Self::not_found(msg.clone())),
-            crate::db::CatalogError::Conflict(msg) => Some(Self::conflict(msg.clone())),
-            crate::db::CatalogError::AmbiguousLookup { candidates, .. } => {
-                Some(Self::ambiguous_lookup(err.to_string(), candidates.clone()))
+            Self::Database(sqlx_err) => {
+                tracing::error!(error = %sqlx_err, "Database error");
+                Self::problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    PROBLEM_TYPE_BLANK,
+                    "Internal Server Error",
+                    "An unexpected database error occurred",
+                )
             }
-            crate::db::CatalogError::ImmutableCollection { .. } => {
-                Some(Self::immutable_collection(err.to_string()))
-            }
-            crate::db::CatalogError::InvalidInput(_) => Some(Self::bad_request(err.to_string())),
-            crate::db::CatalogError::Internal(msg) => {
-                Some(Self::Internal(anyhow::anyhow!("{msg}")))
+            Self::Internal(err) => {
+                tracing::error!(error = %err, "Internal server error");
+                Self::problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    PROBLEM_TYPE_BLANK,
+                    "Internal Server Error",
+                    "An unexpected internal error occurred",
+                )
             }
         }
-    }
-
-    fn classify_catalog_error(err: &crate::db::CatalogError) -> (StatusCode, ProblemDetails) {
-        if let Some(mapped) = Self::map_non_db_catalog_error(err) {
-            return mapped.to_problem_details();
-        }
-        match err {
-            crate::db::CatalogError::Db(db_err) => Self::classify_sqlx_error(db_err),
-            _ => unreachable!("handled by map_non_db_catalog_error"),
-        }
-    }
-
-    fn classify_sqlx_error(sqlx_err: &sqlx::Error) -> (StatusCode, ProblemDetails) {
-        if let sqlx::Error::Database(db_err) = sqlx_err
-            && (db_err.is_unique_violation()
-                || db_err.message().contains("UNIQUE constraint failed"))
-        {
-            return Self::problem(
-                StatusCode::CONFLICT,
-                PROBLEM_TYPE_CONFLICT,
-                "Conflict",
-                "A resource with the same unique identifier already exists",
-            );
-        }
-        tracing::error!(error = %sqlx_err, "Database error");
-        Self::problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            PROBLEM_TYPE_BLANK,
-            "Internal Server Error",
-            "An unexpected database error occurred",
-        )
     }
 
     fn from_json_rejection(rejection: JsonRejection, max_bytes: Option<u64>) -> Self {
@@ -434,7 +416,7 @@ impl From<AppError> for ApiError {
     fn from(err: AppError) -> Self {
         match err {
             AppError::BadRequest(msg) => Self::bad_request(msg),
-            AppError::Unauthorized(msg) => Self::unauthorized(msg),
+            AppError::Forbidden(msg) => Self::forbidden(msg),
             AppError::TokenInvalid(msg) => Self::token_invalid(msg),
             AppError::PairingCodeInvalid(msg) => Self::pairing_code_invalid(msg),
             AppError::PairingRateLimited { detail, retry_after_seconds } => {
@@ -453,18 +435,6 @@ impl From<AppError> for ApiError {
             AppError::BadGateway(msg) => Self::bad_gateway(msg),
             AppError::Database(err) => Self::Database(err),
             AppError::Internal(err) => Self::Internal(err),
-        }
-    }
-}
-
-impl From<crate::db::CatalogError> for ApiError {
-    fn from(err: crate::db::CatalogError) -> Self {
-        if let Some(mapped) = Self::map_non_db_catalog_error(&err) {
-            return mapped;
-        }
-        match err {
-            crate::db::CatalogError::Db(db_err) => Self::Database(db_err),
-            _ => unreachable!("handled by map_non_db_catalog_error"),
         }
     }
 }
@@ -554,12 +524,16 @@ mod tests {
         PROBLEM_TYPE_PAIRING_RATE_LIMITED, PROBLEM_TYPE_PAYLOAD_TOO_LARGE,
         PROBLEM_TYPE_SSRF_BLOCKED, PROBLEM_TYPE_TOKEN_INVALID,
     };
-    use crate::db::{CatalogError, CollectionMode};
+    use crate::{
+        db::{CatalogError, CollectionMode},
+        service::AppError,
+    };
 
     #[test]
     fn test_catalog_internal_error_maps_to_http_500() {
         let direct: ApiError =
-            CatalogError::Internal("EP ranking worker failed: panicked".to_owned()).into();
+            AppError::from(CatalogError::Internal("EP ranking worker failed: panicked".to_owned()))
+                .into();
         let (status, problem) = direct.to_problem_details();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(problem.problem_type, PROBLEM_TYPE_BLANK);
@@ -567,9 +541,10 @@ mod tests {
         assert_eq!(problem.title, "Internal Server Error");
         assert_eq!(problem.detail.as_deref(), Some("An unexpected internal error occurred"));
 
-        let wrapped = ApiError::Internal(anyhow::Error::from(CatalogError::Internal(
+        let wrapped: ApiError = AppError::from(anyhow::Error::from(CatalogError::Internal(
             "EP ranking worker failed: cancelled".to_owned(),
-        )));
+        )))
+        .into();
         let (wrapped_status, wrapped_problem) = wrapped.to_problem_details();
         assert_eq!(wrapped_status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(wrapped_problem.problem_type, PROBLEM_TYPE_BLANK);
@@ -582,7 +557,6 @@ mod tests {
 
     #[test]
     fn test_rfc9457_typed_variants_headers_and_extension_members() {
-        // Generic HTTP errors use about:blank and omit absent extension fields + instance
         let (_, blank) = ApiError::bad_request("Bad input").to_problem_details();
         let blank_json = serde_json::to_value(&blank).unwrap();
         assert_eq!(blank_json["type"], PROBLEM_TYPE_BLANK);
@@ -591,7 +565,6 @@ mod tests {
         assert!(blank_json.get("max_bytes").is_none());
         assert!(blank_json.get("candidates").is_none());
 
-        // TokenInvalid & PairingCodeInvalid emit 401 + WWW-Authenticate: Bearer + distinct URNs
         let tok_err = ApiError::token_invalid("Invalid or revoked bearer token");
         let (tok_status, tok_problem) = tok_err.to_problem_details();
         assert_eq!(tok_status, StatusCode::UNAUTHORIZED);
@@ -610,7 +583,6 @@ mod tests {
         let code_resp = code_err.into_response();
         assert_eq!(code_resp.headers().get(header::WWW_AUTHENTICATE).unwrap(), "Bearer");
 
-        // PairingRateLimited emits 429 + Retry-After header + retry_after_seconds member
         let rl_err = ApiError::pairing_rate_limited("Too many attempts", 42);
         let (rl_status, rl_problem) = rl_err.to_problem_details();
         assert_eq!(rl_status, StatusCode::TOO_MANY_REQUESTS);
@@ -623,20 +595,18 @@ mod tests {
         );
         assert_eq!(rl_resp.headers().get(header::RETRY_AFTER).unwrap(), "42");
 
-        // PayloadTooLarge with limit includes max_bytes
         let (_, ptl) =
             ApiError::payload_too_large_with_limit("Too big", 65_536).to_problem_details();
         assert_eq!(ptl.problem_type, PROBLEM_TYPE_PAYLOAD_TOO_LARGE);
         assert_eq!(ptl.max_bytes, Some(65_536));
 
-        // CatalogError::AmbiguousLookup maps to 409 + candidates array
-        let ambig: ApiError = CatalogError::AmbiguousLookup {
+        let ambig: ApiError = AppError::from(CatalogError::AmbiguousLookup {
             query: "Solaris".to_owned(),
             candidates: vec![
                 "'Solaris' (kind=movie, id=a)".to_owned(),
                 "'Solaris' (kind=movie, id=b)".to_owned(),
             ],
-        }
+        })
         .into();
         let (ambig_status, ambig_problem) = ambig.to_problem_details();
         assert_eq!(ambig_status, StatusCode::CONFLICT);
@@ -651,17 +621,15 @@ mod tests {
             )
         );
 
-        // CatalogError::ImmutableCollection maps to 400 + immutable-collection URN
-        let immut: ApiError = CatalogError::ImmutableCollection {
+        let immut: ApiError = AppError::from(CatalogError::ImmutableCollection {
             title: "Movies".to_owned(),
             mode: CollectionMode::Dynamic,
-        }
+        })
         .into();
         let (immut_status, immut_problem) = immut.to_problem_details();
         assert_eq!(immut_status, StatusCode::BAD_REQUEST);
         assert_eq!(immut_problem.problem_type, PROBLEM_TYPE_IMMUTABLE_COLLECTION);
 
-        // SsrfBlocked maps to 400 + ssrf-blocked URN
         let (ssrf_status, ssrf_problem) =
             ApiError::ssrf_blocked("Loopback blocked").to_problem_details();
         assert_eq!(ssrf_status, StatusCode::BAD_REQUEST);

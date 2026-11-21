@@ -1,5 +1,6 @@
 mod auth;
 mod catalog;
+mod error;
 mod feeds;
 mod items;
 mod media;
@@ -8,19 +9,19 @@ mod tags;
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json, Router,
     extract::{DefaultBodyLimit, Request, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
 use axum_extra::{TypedHeader, typed_header::TypedHeaderRejection};
 use headers::{Authorization, authorization::Bearer};
-pub use media::serve_media_stream;
+use tokio::sync::Semaphore;
 use tower_http::{
     compression::{
         CompressionLayer,
@@ -29,17 +30,24 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+use self::error::{ApiError, RouteBodyLimit};
 #[cfg(test)]
-use crate::scheduler::FeedFetcher;
-use crate::{
-    error::{ApiError, RouteBodyLimit},
-    service::RocheService,
-};
+use crate::ingest::FeedFetcher;
+use crate::service::RocheService;
 
 const API_PAIR_BODY_LIMIT: usize = 16 * 1024;
 const API_STANDARD_BODY_LIMIT: usize = 64 * 1024;
 const API_OPML_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const API_LARGE_BODY_LIMIT: usize = 64 * 1024 * 1024;
+const MAX_CONCURRENT_REQUESTS: usize = 256;
+const STANDARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const LONG_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Request extension populated by `ApiRoutes::require_auth` with the authenticated device token ID.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedDevice {
+    pub token_id: String,
+}
 
 pub struct ApiRoutes;
 
@@ -134,6 +142,8 @@ impl ApiRoutes {
                 .and(NotForContentType::new("application/pdf")),
         );
 
+        let request_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
+
         Router::new()
             .route("/health", get(Self::health))
             .merge(public_pair)
@@ -141,6 +151,10 @@ impl ApiRoutes {
             .merge(crate::web::router(Arc::clone(&service)))
             .fallback(Self::handle_not_found)
             .method_not_allowed_fallback(Self::handle_method_not_allowed)
+            .layer(middleware::from_fn_with_state(
+                request_permits,
+                Self::enforce_concurrency_and_timeout,
+            ))
             .layer(TraceLayer::new_for_http())
             .layer(compression)
             .with_state(service)
@@ -148,6 +162,7 @@ impl ApiRoutes {
 
     fn catalog_routes() -> Router<Arc<RocheService>> {
         Router::new()
+            .route("/api/v1/search", get(catalog::workspace_search))
             .route(
                 "/api/v1/catalog/lists",
                 get(catalog::catalog_lists).post(catalog::catalog_lists_create),
@@ -166,8 +181,13 @@ impl ApiRoutes {
                 get(catalog::catalog_entries_search).post(catalog::catalog_entries_upsert),
             )
             .route("/api/v1/catalog/entries/{id}", get(catalog::catalog_entry_get))
+            .route("/api/v1/catalog/entries/{id}/enrich", post(catalog::catalog_entry_enrich))
             .route("/api/v1/catalog/entries/{id}/merge", post(catalog::catalog_entry_merge))
             .route("/api/v1/catalog/diary", get(catalog::catalog_diary_list))
+            .route(
+                "/api/v1/catalog/diary/{id}",
+                patch(catalog::catalog_diary_update).delete(catalog::catalog_diary_delete),
+            )
             .route("/api/v1/catalog/log", post(catalog::catalog_log_create))
             .route("/api/v1/catalog/want", post(catalog::catalog_want_add))
             .route("/api/v1/catalog/want/{queue}/{entry_id}", delete(catalog::catalog_want_remove))
@@ -228,16 +248,92 @@ impl ApiRoutes {
         ))
     }
 
+    fn request_timeout_for_path(method: &axum::http::Method, path: &str) -> Option<Duration> {
+        let is_read_stream = matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD);
+        if is_read_stream
+            && (path.starts_with("/api/v1/media/")
+                || path.starts_with("/web/media/")
+                || (path.starts_with("/web/items/") && path.ends_with("/audio")))
+        {
+            return None;
+        }
+        if matches!(
+            path,
+            "/api/v1/sync/peer"
+                | "/api/v1/catalog/batch"
+                | "/api/v1/import/opml"
+                | "/web/feeds/opml"
+                | "/web/feeds/refresh-all"
+                | "/api/v1/export/data"
+                | "/api/v1/export/feeds"
+                | "/web/feeds/export.opml"
+        ) || path.ends_with("/refresh")
+            || path.ends_with("/enrich")
+        {
+            return Some(LONG_REQUEST_TIMEOUT);
+        }
+        Some(STANDARD_REQUEST_TIMEOUT)
+    }
+
+    async fn enforce_concurrency_and_timeout(
+        State(permits): State<Arc<Semaphore>>,
+        req: Request,
+        next: Next,
+    ) -> Response {
+        let method = req.method().clone();
+        let path = req.uri().path().to_owned();
+        let headers = req.headers().clone();
+        let is_html_browser =
+            !(path == "/api" || path.starts_with("/api/")) && Self::accepts_html(&headers);
+
+        let Ok(_permit) = permits.try_acquire_owned() else {
+            let mut resp = if is_html_browser {
+                crate::web::render_status_html(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Server Busy",
+                    "Too many concurrent requests are in flight. Please retry in a moment.",
+                    &headers,
+                )
+            } else {
+                ApiError::service_unavailable(
+                    "Too many concurrent requests in flight; please retry shortly",
+                )
+                .into_response()
+            };
+            resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            return resp;
+        };
+
+        let Some(timeout_dur) = Self::request_timeout_for_path(&method, &path) else {
+            return next.run(req).await;
+        };
+
+        tokio::time::timeout(timeout_dur, next.run(req)).await.unwrap_or_else(|_| {
+            if is_html_browser {
+                crate::web::render_status_html(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "Request Timed Out",
+                    "The server took too long to complete this request. Please try again.",
+                    &headers,
+                )
+            } else {
+                ApiError::request_timeout("The request exceeded the server execution timeout")
+                    .into_response()
+            }
+        })
+    }
+
     async fn require_auth(
         State(service): State<Arc<RocheService>>,
         auth: Result<TypedHeader<Authorization<Bearer>>, TypedHeaderRejection>,
-        req: Request,
+        mut req: Request,
         next: Next,
     ) -> Result<Response, ApiError> {
         let TypedHeader(Authorization(bearer)) =
             auth.map_err(|_| ApiError::unauthorized("Missing or invalid Authorization header"))?;
 
-        service.auth().authenticate(bearer.token()).await?;
+        let token_id = service.auth().authenticate_device(bearer.token()).await?;
+        req.extensions_mut().insert(AuthenticatedDevice { token_id });
         Ok(next.run(req).await)
     }
 

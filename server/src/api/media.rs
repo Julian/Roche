@@ -1,37 +1,13 @@
-use std::{io::SeekFrom, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
-    body::Body,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
-};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
-
-use crate::{
-    error::{ApiError, ProblemPath},
-    service::{AppError, RocheService},
+    http::{HeaderMap, StatusCode},
+    response::Response,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ByteRangeParse {
-    IgnoreUnit,
-    Satisfiable { start: u64, end: u64 },
-    Unsatisfiable,
-}
-
-const MEDIA_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'sameorigin'; base-uri 'none'; form-action 'none'";
-const PDF_MEDIA_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; object-src 'self' blob:; frame-src 'self' blob:; img-src 'self' data: blob:; style-src 'unsafe-inline'; frame-ancestors 'sameorigin'; base-uri 'none'; form-action 'none'";
-
-#[must_use]
-const fn media_csp_for_content_type(content_type: &str) -> &'static str {
-    if content_type.eq_ignore_ascii_case("application/pdf") {
-        PDF_MEDIA_CONTENT_SECURITY_POLICY
-    } else {
-        MEDIA_CONTENT_SECURITY_POLICY
-    }
-}
+use super::error::{ApiError, ProblemPath};
+use crate::{service::RocheService, util::http_media::serve_media_stream};
 
 pub(super) async fn media_get(
     State(service): State<Arc<RocheService>>,
@@ -39,134 +15,6 @@ pub(super) async fn media_get(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     Ok(serve_media_stream(&service, &id, &headers).await?)
-}
-
-pub async fn serve_media_stream(
-    service: &RocheService,
-    id: &str,
-    headers: &HeaderMap,
-) -> Result<Response, AppError> {
-    let stream = service.media().open_stream(id).await?;
-    let disposition = format!("inline; filename=\"{}\"", stream.filename);
-
-    if let Some(range_val) = headers.get(header::RANGE) {
-        let parsed = range_val
-            .to_str()
-            .ok()
-            .map_or(ByteRangeParse::Unsatisfiable, |s| parse_byte_range(s, stream.total_len));
-        match parsed {
-            ByteRangeParse::IgnoreUnit => {}
-            ByteRangeParse::Unsatisfiable => {
-                return Ok((
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    [
-                        (header::ACCEPT_RANGES, "bytes".to_string()),
-                        (header::CONTENT_RANGE, format!("bytes */{}", stream.total_len)),
-                    ],
-                    Body::empty(),
-                )
-                    .into_response());
-            }
-            ByteRangeParse::Satisfiable { start, end } => {
-                let len = end - start + 1;
-                let mut file = stream.file;
-                file.seek(SeekFrom::Start(start))
-                    .await
-                    .map_err(|e| AppError::Internal(e.into()))?;
-                let body = Body::from_stream(ReaderStream::new(file.take(len)));
-
-                return Ok((
-                    StatusCode::PARTIAL_CONTENT,
-                    [
-                        (header::CONTENT_TYPE, stream.content_type.to_string()),
-                        (header::CONTENT_LENGTH, len.to_string()),
-                        (header::ACCEPT_RANGES, "bytes".to_string()),
-                        (
-                            header::CONTENT_RANGE,
-                            format!("bytes {start}-{end}/{}", stream.total_len),
-                        ),
-                        (header::CONTENT_DISPOSITION, disposition),
-                        (header::CACHE_CONTROL, "private, max-age=86400".to_string()),
-                        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-                        (header::REFERRER_POLICY, "no-referrer".to_string()),
-                        (
-                            header::CONTENT_SECURITY_POLICY,
-                            media_csp_for_content_type(stream.content_type).to_string(),
-                        ),
-                    ],
-                    body,
-                )
-                    .into_response());
-            }
-        }
-    }
-
-    let csp = media_csp_for_content_type(stream.content_type).to_string();
-    let body = Body::from_stream(ReaderStream::new(stream.file));
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, stream.content_type.to_string()),
-            (header::CONTENT_LENGTH, stream.total_len.to_string()),
-            (header::ACCEPT_RANGES, "bytes".to_string()),
-            (header::CONTENT_DISPOSITION, disposition),
-            (header::CACHE_CONTROL, "private, max-age=86400".to_string()),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-            (header::REFERRER_POLICY, "no-referrer".to_string()),
-            (header::CONTENT_SECURITY_POLICY, csp),
-        ],
-        body,
-    )
-        .into_response())
-}
-
-pub(super) fn parse_byte_range(range_header: &str, total_len: u64) -> ByteRangeParse {
-    let trimmed = range_header.trim();
-    let Some(spec) = trimmed
-        .get(..6)
-        .filter(|prefix| prefix.eq_ignore_ascii_case("bytes="))
-        .and_then(|_| trimmed.get(6..))
-    else {
-        return ByteRangeParse::IgnoreUnit;
-    };
-
-    if total_len == 0 || spec.contains(',') {
-        return ByteRangeParse::Unsatisfiable;
-    }
-    let Some((start_str, end_str)) = spec.trim().split_once('-') else {
-        return ByteRangeParse::Unsatisfiable;
-    };
-    if start_str.is_empty() {
-        if end_str.is_empty() {
-            return ByteRangeParse::Unsatisfiable;
-        }
-        let Ok(suffix) = end_str.parse::<u64>() else {
-            return ByteRangeParse::Unsatisfiable;
-        };
-        if suffix == 0 {
-            return ByteRangeParse::Unsatisfiable;
-        }
-        let start = total_len.saturating_sub(suffix);
-        ByteRangeParse::Satisfiable { start, end: total_len - 1 }
-    } else {
-        let Ok(start) = start_str.parse::<u64>() else {
-            return ByteRangeParse::Unsatisfiable;
-        };
-        if start >= total_len {
-            return ByteRangeParse::Unsatisfiable;
-        }
-        if end_str.is_empty() {
-            ByteRangeParse::Satisfiable { start, end: total_len - 1 }
-        } else {
-            let Ok(end) = end_str.parse::<u64>() else {
-                return ByteRangeParse::Unsatisfiable;
-            };
-            if start > end {
-                return ByteRangeParse::Unsatisfiable;
-            }
-            ByteRangeParse::Satisfiable { start, end: end.min(total_len - 1) }
-        }
-    }
 }
 
 pub(super) async fn media_delete(

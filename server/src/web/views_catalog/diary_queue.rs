@@ -16,7 +16,9 @@ use super::{
     parse_consumption_status, parse_optional_year, render_kind_options,
 };
 use crate::{
-    db::{CollectionSummary, ConsumptionLogView, RankedCollectionView, UpsertEntryInput},
+    db::{
+        CatalogEntry, CollectionSummary, ConsumptionLogView, RankedCollectionView, UpsertEntryInput,
+    },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     service::{CatalogService, RocheService},
     web::{
@@ -38,15 +40,22 @@ struct DiaryStats {
 }
 
 impl DiaryStats {
-    fn from_entries(all_entries: &[ConsumptionLogView], selected_year: Option<i32>) -> Self {
+    fn from_sql_years_and_entries(
+        sql_year_counts: &[(i32, i64)],
+        visible_entries: &[ConsumptionLogView],
+        selected_year: Option<i32>,
+    ) -> Self {
         let mut year_counts: BTreeMap<i32, usize> = BTreeMap::new();
-        for item in all_entries {
-            *year_counts.entry(item.ts.year()).or_insert(0) += 1;
+        let mut total_all_years = 0usize;
+        for &(yr, cnt) in sql_year_counts {
+            let n = usize::try_from(cnt).unwrap_or(0);
+            year_counts.insert(yr, n);
+            total_all_years = total_all_years.saturating_add(n);
         }
         let cadence_year = selected_year.or_else(|| year_counts.keys().next_back().copied());
         let mut by_month: BTreeMap<u32, (String, usize)> = BTreeMap::new();
         if let Some(target_yr) = cadence_year {
-            for item in all_entries {
+            for item in visible_entries {
                 if item.ts.year() == target_yr {
                     let m = item.ts.month();
                     let label = item.ts.format("%b").to_string();
@@ -55,7 +64,7 @@ impl DiaryStats {
             }
         }
         let cadence_months: Vec<(String, usize)> = by_month.into_values().rev().take(8).collect();
-        Self { total_all_years: all_entries.len(), year_counts, cadence_year, cadence_months }
+        Self { total_all_years, year_counts, cadence_year, cadence_months }
     }
 }
 
@@ -70,18 +79,14 @@ pub(in crate::web) async fn diary_get(
         Some("abandoned") => Some(ConsumptionStatus::Abandoned),
         _ => None,
     };
-    let (filtered_res, all_for_stats_res) = tokio::join!(
-        async { service.catalog().list_diary(q.year, status_filter, 500).await },
-        async {
-            if q.year.is_some() || status_filter.is_some() {
-                service.catalog().list_diary(None, status_filter, 2_000).await.ok()
-            } else {
-                None
-            }
-        },
+    let catalog = service.catalog();
+    let (filtered_res, year_counts_res) = tokio::join!(
+        catalog.list_diary(q.year, status_filter, 500),
+        catalog.list_diary_year_counts(status_filter),
     );
     let entries = filtered_res.web_err(&session)?;
-    let stats = DiaryStats::from_entries(all_for_stats_res.as_deref().unwrap_or(&entries), q.year);
+    let sql_year_counts = year_counts_res.web_err(&session)?;
+    let stats = DiaryStats::from_sql_years_and_entries(&sql_year_counts, &entries, q.year);
 
     let diary_creators: Vec<String> =
         entries.iter().flat_map(|e| e.entry.creators.iter().cloned()).collect();
@@ -140,25 +145,12 @@ async fn load_diary_entry_tiers(
     service: &RocheService,
     entries: &[ConsumptionLogView],
 ) -> HashMap<String, char> {
-    let mut slugs: Vec<&'static str> = entries
+    let consumed: Vec<CatalogEntry> = entries
         .iter()
         .filter(|d| d.status == ConsumptionStatus::Consumed)
-        .filter_map(|d| d.entry.kind.default_list_slug())
+        .map(|d| d.entry.clone())
         .collect();
-    slugs.sort_unstable();
-    slugs.dedup();
-
-    let mut tiers = HashMap::new();
-    for slug in slugs {
-        if let Ok(ranked) = service.catalog().get_ranked_collection(slug, false).await {
-            for row in ranked.rows {
-                if let Some(t) = row.tier {
-                    tiers.entry(row.entry.id).or_insert(t);
-                }
-            }
-        }
-    }
-    tiers
+    service.catalog().load_tiers_for_entries(&consumed).await
 }
 
 fn build_diary_href(year: Option<i32>, status: &str) -> String {

@@ -12,6 +12,38 @@ const fn advance_on_counter_overflow(wall_ms: i64) -> (i64, u16) {
     if wall_ms < MAX_HLC_WALL_MS { (wall_ms + 1, 0) } else { (MAX_HLC_WALL_MS, u16::MAX) }
 }
 
+const fn is_valid_hlc_node_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
+}
+
+/// Clamps an incoming peer wall-clock timestamp into `[1970-01-01T00:00:00Z, now + MAX_CLOCK_DRIFT_MS]`.
+#[must_use]
+pub fn clamp_incoming_timestamp(ts: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+    let max_ts =
+        (now + chrono::Duration::milliseconds(MAX_CLOCK_DRIFT_MS)).max(DateTime::<Utc>::UNIX_EPOCH);
+    ts.clamp(DateTime::<Utc>::UNIX_EPOCH, max_ts)
+}
+
+#[must_use]
+pub fn clamp_incoming_timestamp_opt(
+    ts: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    ts.map(|t| clamp_incoming_timestamp(t, now))
+}
+
+/// Clamps historical domain dates (e.g., diary logs or release/comparison dates) into
+/// `[0001-01-01T00:00:00Z, now + MAX_CLOCK_DRIFT_MS]` so peers preserve historical dates while
+/// never injecting BCE dates (which SQLite `strftime` rejects as `NULL`) or far-future timestamps.
+#[must_use]
+pub fn clamp_incoming_upper_timestamp(ts: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+    let min_ts = chrono::NaiveDate::from_ymd_opt(1, 1, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map_or(DateTime::<Utc>::UNIX_EPOCH, |dt| dt.and_utc());
+    let max_ts = (now + chrono::Duration::milliseconds(MAX_CLOCK_DRIFT_MS)).max(min_ts);
+    ts.clamp(min_ts, max_ts)
+}
+
 /// Hybrid Logical Clock timestamp formatted as `<15-digit-utc-ms>-<4-hex-counter>-<node_id>`.
 ///
 /// The canonical string representation is strictly order-preserving under standard ASCII / UTF-8
@@ -60,7 +92,8 @@ impl HlcTimestamp {
         }
         let counter = u16::from_str_radix(counter_str, 16).ok()?;
         let node_id = trimmed.get(WALL_WIDTH + 1 + COUNTER_WIDTH + 1..)?.trim();
-        if node_id.is_empty() {
+        if node_id.is_empty() || node_id.len() > 64 || !node_id.chars().all(is_valid_hlc_node_char)
+        {
             return None;
         }
         Some(Self { wall_ms, counter, node_id: node_id.to_owned() })
@@ -80,12 +113,8 @@ impl fmt::Display for HlcTimestamp {
 
 #[must_use]
 pub fn sanitize_hlc_node_id(raw: &str) -> String {
-    let filtered: String = raw
-        .trim()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
-        .take(64)
-        .collect();
+    let filtered: String =
+        raw.trim().chars().filter(|&c| is_valid_hlc_node_char(c)).take(64).collect();
     if filtered.is_empty() { "peer".to_owned() } else { filtered }
 }
 
@@ -146,15 +175,19 @@ impl HlcClock {
                     HlcTimestamp::new(rem_ms, c, self.node_id.clone())
                 } else {
                     let (w, c) = advance_on_counter_overflow(rem_ms);
-                    HlcTimestamp::new(w, c, self.node_id.clone())
+                    let (cw, cc) =
+                        if w > max_allowed_wall { (max_allowed_wall, u16::MAX) } else { (w, c) };
+                    HlcTimestamp::new(cw, cc, self.node_id.clone())
                 }
             }
             Some(prev) => {
-                let max_wall = phys.max(prev.wall_ms).max(rem_ms);
-                let next_counter = if max_wall == prev.wall_ms && max_wall == rem_ms {
-                    prev.counter.max(rem_counter).checked_add(1)
-                } else if max_wall == prev.wall_ms {
-                    prev.counter.checked_add(1)
+                let prev_wall = prev.wall_ms.min(max_allowed_wall);
+                let prev_counter = if prev.wall_ms > max_allowed_wall { 0 } else { prev.counter };
+                let max_wall = phys.max(prev_wall).max(rem_ms);
+                let next_counter = if max_wall == prev_wall && max_wall == rem_ms {
+                    prev_counter.max(rem_counter).checked_add(1)
+                } else if max_wall == prev_wall {
+                    prev_counter.checked_add(1)
                 } else if max_wall == rem_ms {
                     rem_counter.checked_add(1)
                 } else {
@@ -164,7 +197,9 @@ impl HlcClock {
                     HlcTimestamp::new(max_wall, c, self.node_id.clone())
                 } else {
                     let (w, c) = advance_on_counter_overflow(max_wall);
-                    HlcTimestamp::new(w, c, self.node_id.clone())
+                    let (cw, cc) =
+                        if w > max_allowed_wall { (max_allowed_wall, u16::MAX) } else { (w, c) };
+                    HlcTimestamp::new(cw, cc, self.node_id.clone())
                 }
             }
         };

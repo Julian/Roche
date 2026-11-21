@@ -3,12 +3,8 @@ use std::sync::Arc;
 use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
 
-use crate::{
-    db::Tag,
-    domain::HexColor,
-    error::{ApiError, ProblemJson, ProblemPath},
-    service::RocheService,
-};
+use super::error::{ApiError, ProblemJson, ProblemPath};
+use crate::{db::Tag, domain::HexColor, service::RocheService};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CreateTagRequest {

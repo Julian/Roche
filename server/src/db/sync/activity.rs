@@ -51,19 +51,22 @@ impl SyncRepo<'_> {
         natural_key: &str,
         deleted_at: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        sqlx::query!(
-            "INSERT INTO sync_tombstones (entity_type, natural_key, deleted_at)
-             VALUES (?, ?, ?)
+        let recorded_at = Self::now_utc();
+        sqlx::query(
+            "INSERT INTO sync_tombstones (entity_type, natural_key, deleted_at, recorded_at)
+             VALUES (?, ?, ?, ?)
              ON CONFLICT(entity_type, natural_key) DO UPDATE SET
                  deleted_at = CASE
                      WHEN strftime('%Y-%m-%dT%H:%M:%fZ', excluded.deleted_at) > strftime('%Y-%m-%dT%H:%M:%fZ', sync_tombstones.deleted_at)
                      THEN excluded.deleted_at
                      ELSE sync_tombstones.deleted_at
-                 END",
-            entity_type as _,
-            natural_key,
-            deleted_at as _,
+                 END,
+                 recorded_at = excluded.recorded_at",
         )
+        .bind(entity_type)
+        .bind(natural_key)
+        .bind(deleted_at)
+        .bind(recorded_at)
         .execute(conn)
         .await?;
         Ok(())
@@ -76,9 +79,10 @@ impl SyncRepo<'_> {
         deleted_at: DateTime<Utc>,
         hlc: &str,
     ) -> std::result::Result<(), sqlx::Error> {
+        let recorded_at = Self::now_utc();
         sqlx::query(
-            "INSERT INTO sync_tombstones (entity_type, natural_key, deleted_at, hlc)
-             VALUES (?, ?, ?, ?)
+            "INSERT INTO sync_tombstones (entity_type, natural_key, deleted_at, hlc, recorded_at)
+             VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(entity_type, natural_key) DO UPDATE SET
                  deleted_at = CASE
                      WHEN excluded.hlc > sync_tombstones.hlc THEN excluded.deleted_at
@@ -87,12 +91,17 @@ impl SyncRepo<'_> {
                  hlc = CASE
                      WHEN excluded.hlc > sync_tombstones.hlc THEN excluded.hlc
                      ELSE sync_tombstones.hlc
+                 END,
+                 recorded_at = CASE
+                     WHEN excluded.hlc > sync_tombstones.hlc THEN excluded.recorded_at
+                     ELSE COALESCE(sync_tombstones.recorded_at, excluded.recorded_at)
                  END",
         )
         .bind(entity_type)
         .bind(natural_key)
         .bind(deleted_at)
         .bind(hlc)
+        .bind(recorded_at)
         .execute(conn)
         .await?;
         Ok(())
@@ -167,7 +176,8 @@ impl SyncRepo<'_> {
         let mut tx = crate::db::begin_write(self.pool).await?;
         let pruned_max_seq: Option<i64> = sqlx::query_scalar(
             "SELECT MAX(sync_seq) FROM sync_tombstones
-             WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
+             WHERE strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(recorded_at, deleted_at))
+                 < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
         )
         .bind(cutoff)
         .fetch_optional(&mut *tx)
@@ -190,11 +200,12 @@ impl SyncRepo<'_> {
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query!(
+        sqlx::query(
             "DELETE FROM sync_tombstones
-             WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
-            cutoff as _,
+             WHERE strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(recorded_at, deleted_at))
+                 < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
         )
+        .bind(cutoff)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

@@ -365,9 +365,9 @@ pub(super) async fn login_post(
                 AppError::PairingRateLimited { detail, retry_after_seconds } => {
                     (StatusCode::TOO_MANY_REQUESTS, detail.as_str(), Some(*retry_after_seconds))
                 }
-                AppError::Unauthorized(m)
-                | AppError::TokenInvalid(m)
-                | AppError::PairingCodeInvalid(m) => (StatusCode::UNAUTHORIZED, m.as_str(), None),
+                AppError::TokenInvalid(m) | AppError::PairingCodeInvalid(m) => {
+                    (StatusCode::UNAUTHORIZED, m.as_str(), None)
+                }
                 AppError::BadRequest(m) | AppError::SsrfBlocked(m) => {
                     (StatusCode::BAD_REQUEST, m.as_str(), None)
                 }

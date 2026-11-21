@@ -11,15 +11,13 @@ use axum::{
 use tower::ServiceExt;
 use url::Url;
 
-use super::{
-    ApiRoutes,
-    media::{ByteRangeParse, parse_byte_range},
-};
+use super::ApiRoutes;
 use crate::{
     auth::{pairing::PairingManager, tokens::TokenManager},
     db::{Db, ReadAtPatch},
-    scheduler::FeedFetcher,
+    ingest::FeedFetcher,
     service::RocheService,
+    util::http_media::{ByteRangeParse, parse_byte_range},
 };
 
 #[derive(Clone)]
@@ -2244,4 +2242,193 @@ async fn test_export_data_includes_legacy_and_unified_catalog_fields_backward_co
     assert_eq!(legacy_bundle.consumption_log.len(), 0);
     assert_eq!(legacy_bundle.comparisons.len(), 0);
     assert_eq!(legacy_bundle.collection_generators.len(), 0);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_wave_2a_sync_peer_binding_diary_crud_enrich_and_workspace_search() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let app = ApiRoutes::router_with_fetcher(&db, FakeFeedFetcher);
+    let token_a = TokenManager::new(db.auth()).create("Pixel A", 32).await.unwrap();
+    let token_b = TokenManager::new(db.auth()).create("Pixel B", 32).await.unwrap();
+    let auth_a = format!("Bearer {token_a}");
+    let auth_b = format!("Bearer {token_b}");
+
+    // 1. TOFU peer_id binding: token A binds to "android-a", cannot spoof "android-b" or "server",
+    //    and token B cannot hijack "android-a".
+    let sync_post = |auth: &str, peer_id: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/sync/peer")
+            .header(header::AUTHORIZATION, auth)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "peer_id": peer_id }).to_string()))
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(sync_post(&auth_a, "android-a")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone().oneshot(sync_post(&auth_a, "android-a")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone().oneshot(sync_post(&auth_a, "android-b")).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone().oneshot(sync_post(&auth_b, "android-a")).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone().oneshot(sync_post(&auth_b, "server")).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // 2. Diary PATCH / DELETE, POST /entries/{id}/enrich, and GET /api/v1/search
+    let entry = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(crate::db::EntryKind::Artist),
+            title: "Broadcast".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let logged = db
+        .catalog()
+        .log_consumption(&entry.id, crate::db::ConsumptionStatus::Started, Some("Initial"), None)
+        .await
+        .unwrap();
+
+    let enrich_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/catalog/entries/{}/enrich", entry.id))
+                .header(header::AUTHORIZATION, &auth_a)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enrich_resp.status(), StatusCode::OK);
+
+    let patch_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/catalog/diary/{}", logged.id))
+                .header(header::AUTHORIZATION, &auth_a)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "status": "consumed", "notes": "Updated note" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patch_resp.status(), StatusCode::OK);
+    let patched_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(patch_resp.into_body(), 64 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(patched_json["status"], "consumed");
+    assert_eq!(patched_json["notes"], "Updated note");
+
+    let search_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/search?q=Broadcast")
+                .header(header::AUTHORIZATION, &auth_a)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(search_resp.status(), StatusCode::OK);
+    let search_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(search_resp.into_body(), 64 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(search_json["catalog_entries"].as_array().unwrap().len(), 1);
+
+    let del_resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/catalog/diary/{}", logged.id))
+                .header(header::AUTHORIZATION, &auth_a)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn test_wave_2a_concurrency_503_and_timeout_408_json_vs_html() {
+    use axum::{Router, middleware, routing::get};
+
+    let zero_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let busy_app = Router::new()
+        .route("/api/v1/ping", get(|| async { "ok" }))
+        .route("/home", get(|| async { "ok" }))
+        .layer(middleware::from_fn_with_state(
+            zero_permits,
+            ApiRoutes::enforce_concurrency_and_timeout,
+        ));
+
+    let api_503 = busy_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ping")
+                .header(header::ACCEPT, "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(api_503.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(api_503.headers().get(header::RETRY_AFTER).unwrap(), "5");
+    assert_eq!(api_503.headers().get(header::CONTENT_TYPE).unwrap(), "application/problem+json");
+
+    let html_503 = busy_app
+        .oneshot(
+            Request::builder()
+                .uri("/home")
+                .header(header::ACCEPT, "text/html")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(html_503.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(html_503.headers().get(header::RETRY_AFTER).unwrap(), "5");
+    assert!(
+        html_503
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+
+    // Media streaming is timeout-exempt only on GET/HEAD, never on DELETE
+    assert!(
+        ApiRoutes::request_timeout_for_path(&axum::http::Method::GET, "/api/v1/media/1").is_none()
+    );
+    assert!(
+        ApiRoutes::request_timeout_for_path(&axum::http::Method::HEAD, "/api/v1/media/1").is_none()
+    );
+    assert!(
+        ApiRoutes::request_timeout_for_path(&axum::http::Method::DELETE, "/api/v1/media/1")
+            .is_some()
+    );
 }

@@ -98,9 +98,23 @@ impl CatalogRepo<'_> {
         let sql = if only_enabled { LIST_ENABLED_GENERATORS_SQL } else { LIST_ALL_GENERATORS_SQL };
         let rows: Vec<RawGeneratorRow> =
             sqlx::query_as(sql).bind(crate::db::STARRED_COLLECTION_ID).fetch_all(self.pool).await?;
+        let current_ids: Vec<String> =
+            rows.iter().filter_map(|r| r.current_entry_id.clone()).collect();
+        let entries_by_id = if current_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            self.load_entries_by_ids(&current_ids).await?
+        };
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            out.push(self.hydrate_generator_state(row).await?);
+            let current_entry = match row.current_entry_id.as_deref() {
+                Some(cid) => match entries_by_id.get(cid) {
+                    Some(found) => Some(found.clone()),
+                    None => self.get_entry(cid).await?,
+                },
+                None => None,
+            };
+            out.push(Self::build_generator_state(row, current_entry));
         }
         Ok(out)
     }
@@ -327,13 +341,19 @@ impl CatalogRepo<'_> {
             Some(cid) => self.get_entry(cid).await?,
             None => None,
         };
+        Ok(Self::build_generator_state(raw, current_entry))
+    }
 
+    fn build_generator_state(
+        raw: RawGeneratorRow,
+        current_entry: Option<CatalogEntry>,
+    ) -> CollectionGeneratorState {
         let total = usize::try_from(raw.total_pool).unwrap_or(0);
         let consumed = usize::try_from(raw.consumed_count).unwrap_or(0);
         let abandoned = usize::try_from(raw.abandoned_count).unwrap_or(0);
         let remaining = total.saturating_sub(consumed + abandoned);
 
-        Ok(CollectionGeneratorState {
+        CollectionGeneratorState {
             collection_id: raw.collection_id,
             collection_slug: raw.collection_slug,
             collection_title: raw.collection_title,
@@ -345,7 +365,7 @@ impl CatalogRepo<'_> {
             consumed_count: consumed,
             abandoned_count: abandoned,
             remaining_count: remaining,
-        })
+        }
     }
 
     pub(super) async fn update_collection_generator_in_tx(

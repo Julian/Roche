@@ -13,10 +13,9 @@ use crate::{
     db::WANT_TO_READ_COLLECTION_ID,
     domain::{
         ConsumptionStatus, ContentType, EntryKind, ItemStatus, MediaType,
-        READER_AUTO_READ_THRESHOLD, ReadAtPatch,
+        READER_AUTO_READ_THRESHOLD,
     },
     service::{AppError, ItemDetail, RocheService},
-    util::clock::now_utc,
     web::{
         auth::WebSession,
         html::{
@@ -553,7 +552,8 @@ pub(in crate::web) async fn item_audio_get(
 ) -> Result<Response, WebError> {
     let detail = service.items().get(&id).await.web_err(&session)?;
     if let Some(local_audio) = detail.media.iter().find(|m| m.media_type == MediaType::Audio)
-        && let Ok(resp) = crate::api::serve_media_stream(&service, &local_audio.id, &headers).await
+        && let Ok(resp) =
+            crate::util::http_media::serve_media_stream(&service, &local_audio.id, &headers).await
     {
         return Ok(resp);
     }
@@ -579,7 +579,7 @@ pub(in crate::web) async fn web_media_get(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, WebError> {
-    crate::api::serve_media_stream(&service, &id, &headers).await.web_err(&session)
+    crate::util::http_media::serve_media_stream(&service, &id, &headers).await.web_err(&session)
 }
 
 pub(in crate::web) async fn post_item_progress(
@@ -588,13 +588,11 @@ pub(in crate::web) async fn post_item_progress(
     Path(id): Path<String>,
     Form(form): Form<ProgressForm>,
 ) -> Result<Response, WebError> {
-    let p = if form.progress.is_finite() { form.progress.clamp(0.0, 1.0) } else { 0.0 };
-    let patch = if p >= READER_AUTO_READ_THRESHOLD {
-        ReadAtPatch::MarkRead(now_utc())
-    } else {
-        ReadAtPatch::Unchanged
-    };
-    let _ = service.items().update(&id, None, None, Some(p), patch).await.web_err(&session)?;
+    let _ = service
+        .items()
+        .update_progress_with_auto_read(&id, form.progress)
+        .await
+        .web_err(&session)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -633,16 +631,7 @@ pub(in crate::web) async fn post_item_unfinish(
     Path(id): Path<String>,
     Form(form): Form<ItemReturnForm>,
 ) -> Result<Response, WebError> {
-    let existing = service.items().get(&id).await.web_err(&session)?;
-    let _ = service.catalog().delete_consumed_logs_for_entry(&id).await.web_err(&session)?;
-    let _ = service
-        .items()
-        .update(&id, Some(ItemStatus::Unread), None, Some(0.0), ReadAtPatch::MarkUnread)
-        .await
-        .web_err(&session)?;
-    if existing.item.feed_id.is_none() {
-        let _ = service.catalog().add_collection_entry(WANT_TO_READ_COLLECTION_ID, &id, None).await;
-    }
+    service.items().unfinish_reader_item(&id).await.web_err(&session)?;
     let fallback = format!("/reader/{}", urlencode(&id));
     let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
     Ok(redirect_with_flash(&dest, "notice", "Marked unfinished"))

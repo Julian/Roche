@@ -23,7 +23,8 @@ use super::{
 };
 use crate::{
     db::{
-        CollectionGeneratorState, ConsumptionLogView, Item, ItemFilter, WANT_TO_READ_COLLECTION_ID,
+        CatalogEntry, CollectionGeneratorState, ConsumptionLogView, Item, ItemFilter,
+        WANT_TO_READ_COLLECTION_ID,
     },
     domain::{CollectionRole, ConsumptionStatus, ContentType, ItemStatusFilter},
     service::{AppError, RocheService},
@@ -626,25 +627,12 @@ async fn load_diary_tiers(
     service: &RocheService,
     diary: &[ConsumptionLogView],
 ) -> HashMap<String, char> {
-    let mut slugs: Vec<&'static str> = diary
+    let consumed: Vec<CatalogEntry> = diary
         .iter()
         .filter(|d| d.status == ConsumptionStatus::Consumed)
-        .filter_map(|d| d.entry.kind.default_list_slug())
+        .map(|d| d.entry.clone())
         .collect();
-    slugs.sort_unstable();
-    slugs.dedup();
-
-    let mut tiers = HashMap::new();
-    for slug in slugs {
-        if let Ok(ranked) = service.catalog().get_ranked_collection(slug, false).await {
-            for row in ranked.rows {
-                if let Some(t) = row.tier {
-                    tiers.entry(row.entry.id).or_insert(t);
-                }
-            }
-        }
-    }
-    tiers
+    service.catalog().load_tiers_for_entries(&consumed).await
 }
 
 fn render_recent_diary_section(

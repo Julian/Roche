@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
-use axum::{Json, extract::State};
+use axum::{Extension, Json, extract::State};
 use serde::Deserialize;
 
+use super::{
+    AuthenticatedDevice,
+    error::{ApiError, ProblemJson, ProblemQuery},
+};
 use crate::{
     db::{PeerSyncRequest, PeerSyncResponse},
-    error::{ApiError, ProblemJson, ProblemQuery},
     service::{RocheService, SyncChanges, SyncStatus},
 };
 
@@ -32,8 +35,10 @@ pub(super) async fn sync_changes(
 
 pub(super) async fn sync_peer(
     State(service): State<Arc<RocheService>>,
+    Extension(device): Extension<AuthenticatedDevice>,
     ProblemJson(req): ProblemJson<PeerSyncRequest>,
 ) -> Result<Json<PeerSyncResponse>, ApiError> {
+    service.auth().verify_sync_peer_binding(&device.token_id, &req.peer_id).await?;
     let res = service.sync().peer_sync(req).await?;
     Ok(Json(res))
 }

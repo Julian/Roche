@@ -13,7 +13,7 @@ use crate::{
     },
     domain::ItemStatus,
     feeds::FeedSource,
-    scheduler::FeedIngester,
+    ingest::FeedIngester,
     util::{
         clock::now_utc,
         url_guard::{parse_public_url, validate_public_url},
@@ -120,7 +120,7 @@ impl SyncService<'_> {
 
         if !inserted_candidates.is_empty() {
             let service_clone = self.service.clone();
-            tokio::spawn(async move {
+            self.service.spawn_background(async move {
                 let ctx = service_clone.media_ingest_context();
                 FeedIngester::ingest_items_concurrently(&ctx, &inserted_candidates).await;
             });

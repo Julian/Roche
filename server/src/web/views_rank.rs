@@ -94,12 +94,11 @@ pub(super) async fn rank_session_get(
         };
         service
             .catalog()
-            .select_next_uncovered_cluster(&slug, q.want, &filter, |cand| {
+            .select_uncovered_cluster_from_ranked_view(&ranked_view, &filter, |cand| {
                 is_cluster_covered(cand, &covered_sets)
             })
             .await
             .web_err(&session)?
-            .1
     };
 
     let effective_want = q.want || ranked_view.is_priority_scope;
@@ -541,8 +540,7 @@ pub(super) async fn rank_session_post(
         let col = service.catalog().get_or_create_want_collection(&slug).await.web_err(&session)?;
         (true, Some(col.id))
     } else {
-        let view = service.catalog().get_ranked_collection(&slug, false).await.web_err(&session)?;
-        if view.is_priority_scope { (true, Some(view.collection.id)) } else { (false, None) }
+        service.catalog().resolve_ranking_scope(&slug, false).await.web_err(&session)?
     };
 
     service

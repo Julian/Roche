@@ -7,10 +7,8 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::{
-    error::{ApiError, ProblemJson, ProblemPath},
-    service::RocheService,
-};
+use super::error::{ApiError, ProblemJson, ProblemPath};
+use crate::service::RocheService;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct PairRequest {

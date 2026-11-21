@@ -11,7 +11,7 @@ use url::Url;
 use super::{ArchiveBatchForm, InboxQuery, ItemReturnForm, SaveUrlForm, render_audio_play_button};
 use crate::{
     db::{Feed, Item, ItemFilter, WANT_TO_READ_COLLECTION_ID},
-    domain::{ContentType, ItemStatus, ItemStatusFilter, ReadAtPatch},
+    domain::{ContentType, ItemStatus, ItemStatusFilter},
     service::RocheService,
     web::{
         auth::WebSession,
@@ -892,12 +892,7 @@ pub(in crate::web) async fn post_item_star(
     Path(id): Path<String>,
     Form(form): Form<ItemReturnForm>,
 ) -> Result<Response, WebError> {
-    let cur = service.items().get(&id).await.web_err(&session)?.item.is_favorite;
-    let _ = service
-        .items()
-        .update(&id, None, Some(!cur), None, ReadAtPatch::Unchanged)
-        .await
-        .web_err(&session)?;
+    let _ = service.items().toggle_star(&id).await.web_err(&session)?;
     Ok(redirect_see_other(&safe_local_redirect(form.return_to.as_deref(), "/inbox")))
 }
 
@@ -907,24 +902,8 @@ pub(in crate::web) async fn post_item_archive(
     Path(id): Path<String>,
     Form(form): Form<ItemReturnForm>,
 ) -> Result<Response, WebError> {
-    let submitted_prog = form.progress.filter(|p| p.is_finite()).map(|p| p.clamp(0.0, 1.0));
-    let merged_prog = if let Some(sub) = submitted_prog {
-        let existing = service
-            .items()
-            .get(&id)
-            .await
-            .ok()
-            .filter(|d| d.item.read_progress.is_finite())
-            .map_or(0.0, |d| d.item.read_progress.clamp(0.0, 1.0));
-        Some(existing.max(sub))
-    } else {
-        None
-    };
-    let _ = service
-        .items()
-        .update(&id, Some(ItemStatus::Archived), None, merged_prog, ReadAtPatch::Unchanged)
-        .await
-        .web_err(&session)?;
+    let _ =
+        service.items().archive_with_min_progress(&id, form.progress).await.web_err(&session)?;
     Ok(redirect_see_other(&safe_local_redirect(form.return_to.as_deref(), "/inbox")))
 }
 

@@ -151,6 +151,24 @@ impl SyncRepo<'_> {
         server_hlc: String,
         now: DateTime<Utc>,
     ) -> Result<PeerSyncResponse> {
+        self.collect_peer_sync_response_with_budget(
+            requested_since_seq,
+            max_page_changes,
+            MAX_PEER_SYNC_PAGE_BYTES,
+            server_hlc,
+            now,
+        )
+        .await
+    }
+
+    pub(crate) async fn collect_peer_sync_response_with_budget(
+        &self,
+        requested_since_seq: i64,
+        max_page_changes: usize,
+        page_budget: usize,
+        server_hlc: String,
+        now: DateTime<Utc>,
+    ) -> Result<PeerSyncResponse> {
         let mut tx = crate::db::begin_read(self.pool).await?;
 
         let clock: SyncClockRow =
@@ -190,13 +208,31 @@ impl SyncRepo<'_> {
             ));
         }
 
-        let (cutoff_seq, has_more) = compute_sync_page_cutoff(
+        let (mut cutoff_seq, mut has_more, mut used_bytes) = compute_sync_page_cutoff(
             &candidates,
             effective_since,
             clock.current_seq,
             max_page_changes,
+            page_budget,
         );
-        let delta = Self::load_sync_page_delta_in_tx(&mut tx, effective_since, cutoff_seq).await?;
+        let mut distinct_seqs = distinct_candidate_seqs_up_to(&candidates, cutoff_seq);
+
+        let delta = loop {
+            let can_shrink = distinct_seqs.len() > 1;
+            let stub_budget =
+                if can_shrink { Some(page_budget.saturating_sub(used_bytes)) } else { None };
+            if let Some(page) =
+                Self::load_sync_page_delta_in_tx(&mut tx, effective_since, cutoff_seq, stub_budget)
+                    .await?
+            {
+                break page;
+            }
+            let next_len = (distinct_seqs.len() / 2).max(1);
+            distinct_seqs.truncate(next_len);
+            cutoff_seq = *distinct_seqs.last().unwrap_or(&cutoff_seq);
+            has_more = true;
+            used_bytes = sum_candidate_bytes_up_to(&candidates, cutoff_seq);
+        };
         tx.commit().await?;
 
         Ok(PeerSyncResponse {
@@ -264,7 +300,8 @@ impl SyncRepo<'_> {
         conn: &mut SqliteConnection,
         effective_since: i64,
         cutoff_seq: i64,
-    ) -> Result<SyncPageDelta> {
+        stub_budget: Option<usize>,
+    ) -> Result<Option<SyncPageDelta>> {
         let collection_entries: Vec<SyncCollectionEntryRecord> = sqlx::query_as(
             "SELECT ce.collection_id, ce.entry_id, ce.position, ce.added_at, ce.hlc
              FROM collection_entries ce
@@ -326,7 +363,10 @@ impl SyncRepo<'_> {
         .fetch_all(&mut *conn)
         .await?;
 
-        // Ensure every outgoing child record on this page has its referenced `entries` present
+        // Ensure EVERY outgoing child record on this page has its referenced `entries` present
+        // (future-referenced stubs omit large `content_html` bodies since their full payload
+        // arrives on their own `sync_seq` page). If required stubs overflow `stub_budget`, return
+        // `Ok(None)` so the caller shrinks `cutoff_seq` rather than silently breaking FK integrity.
         let present_ids: HashSet<String> = raw_entries.iter().map(|r| r.id.clone()).collect();
         let missing_refs = collect_missing_referenced_entry_ids(
             &present_ids,
@@ -335,21 +375,29 @@ impl SyncRepo<'_> {
             &consumption_log,
             &comparisons,
         );
+        let mut future_ref_ids = HashSet::new();
         if !missing_refs.is_empty() {
-            let extra =
-                Self::fetch_future_referenced_entries(conn, &missing_refs, cutoff_seq).await?;
+            let Some(extra) =
+                Self::fetch_future_referenced_entries(conn, &missing_refs, cutoff_seq, stub_budget)
+                    .await?
+            else {
+                return Ok(None);
+            };
+            for row in &extra {
+                future_ref_ids.insert(row.id.clone());
+            }
             raw_entries.extend(extra);
         }
 
-        let entries = Self::hydrate_outgoing_entries(conn, raw_entries).await?;
-        Ok(SyncPageDelta {
+        let entries = Self::hydrate_outgoing_entries(conn, raw_entries, &future_ref_ids).await?;
+        Ok(Some(SyncPageDelta {
             entries,
             collection_entries,
             collection_generators,
             consumption_log,
             comparisons,
             tombstones,
-        })
+        }))
     }
 
     async fn load_comparisons_in_tx(
@@ -384,12 +432,18 @@ impl SyncRepo<'_> {
             .collect())
     }
 
+    /// Fetches all entries in `candidate_ids` with `sync_seq > cutoff_seq`.
+    /// When `stub_budget` is `Some(max_bytes)` and the required stubs exceed `max_bytes`, returns
+    /// `Ok(None)` immediately so the caller can shrink `cutoff_seq` and retry without omitting
+    /// referenced entries.
     async fn fetch_future_referenced_entries(
         conn: &mut SqliteConnection,
         candidate_ids: &[String],
         cutoff_seq: i64,
-    ) -> Result<Vec<RawSyncEntryRow>> {
+        stub_budget: Option<usize>,
+    ) -> Result<Option<Vec<RawSyncEntryRow>>> {
         let mut out = Vec::new();
+        let mut used = 0usize;
         for chunk in candidate_ids.chunks(SQLITE_BIND_CHUNK) {
             let mut qb = QueryBuilder::<Sqlite>::new(concat!(
                 "SELECT ",
@@ -400,22 +454,40 @@ impl SyncRepo<'_> {
             push_bound_id_list(&mut qb, chunk);
             qb.push(concat!(") AND ", exclude_dynamic_or_system_collection_sql!()));
             let rows: Vec<RawSyncEntryRow> = qb.build_query_as().fetch_all(&mut *conn).await?;
-            out.extend(rows);
+            for row in rows {
+                let est = 256usize
+                    .saturating_add(row.title.len())
+                    .saturating_add(row.summary.as_deref().map_or(0, str::len))
+                    .saturating_add(row.creators_json.len())
+                    .saturating_add(row.metadata_json.len());
+                used = used.saturating_add(est);
+                if stub_budget.is_some_and(|budget| used > budget) {
+                    return Ok(None);
+                }
+                out.push(row);
+            }
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     async fn hydrate_outgoing_entries(
         conn: &mut SqliteConnection,
         raw_entries: Vec<RawSyncEntryRow>,
+        future_ref_ids: &HashSet<String>,
     ) -> Result<Vec<SyncEntryRecord>> {
         if raw_entries.is_empty() {
             return Ok(Vec::new());
         }
         let ids: Vec<String> = raw_entries.iter().map(|r| r.id.clone()).collect();
+        let content_ids: Vec<String> =
+            ids.iter().filter(|id| !future_ref_ids.contains(*id)).cloned().collect();
 
         let mut idents_map = load_entry_identifiers_map(conn, &ids).await?;
-        let mut content_map = load_entry_content_map(conn, &ids).await?;
+        let mut content_map = if content_ids.is_empty() {
+            HashMap::new()
+        } else {
+            load_entry_content_map(conn, &content_ids).await?
+        };
         let mut state_map = load_entry_state_map(conn, &ids).await?;
         let mut spec_map = load_collection_spec_map(conn, &ids).await?;
         let mut feed_map = load_feed_source_map(conn, &ids).await?;
@@ -655,7 +727,8 @@ fn compute_sync_page_cutoff(
     effective_since: i64,
     current_seq: i64,
     max_page_changes: usize,
-) -> (i64, bool) {
+    page_budget: usize,
+) -> (i64, bool, usize) {
     let mut used_bytes: usize = 0;
     let mut last_seq = effective_since;
     let mut byte_truncated = false;
@@ -664,7 +737,7 @@ fn compute_sync_page_cutoff(
             break;
         }
         let row_bytes = usize::try_from(cand.est_bytes.max(0)).unwrap_or(0);
-        if accepted_count > 0 && used_bytes.saturating_add(row_bytes) > MAX_PEER_SYNC_PAGE_BYTES {
+        if accepted_count > 0 && used_bytes.saturating_add(row_bytes) > page_budget {
             byte_truncated = true;
             break;
         }
@@ -673,7 +746,31 @@ fn compute_sync_page_cutoff(
     }
     let has_more = byte_truncated || candidates.len() > max_page_changes;
     let cutoff_seq = if has_more { last_seq } else { current_seq };
-    (cutoff_seq, has_more)
+    (cutoff_seq, has_more, used_bytes)
+}
+
+fn distinct_candidate_seqs_up_to(candidates: &[SyncCandidateRow], cutoff_seq: i64) -> Vec<i64> {
+    let mut seqs = Vec::new();
+    for cand in candidates {
+        if cand.sync_seq > cutoff_seq {
+            break;
+        }
+        if seqs.last().copied() != Some(cand.sync_seq) {
+            seqs.push(cand.sync_seq);
+        }
+    }
+    seqs
+}
+
+fn sum_candidate_bytes_up_to(candidates: &[SyncCandidateRow], cutoff_seq: i64) -> usize {
+    let mut total = 0usize;
+    for cand in candidates {
+        if cand.sync_seq > cutoff_seq {
+            break;
+        }
+        total = total.saturating_add(usize::try_from(cand.est_bytes.max(0)).unwrap_or(0));
+    }
+    total
 }
 
 fn push_bound_id_list(qb: &mut QueryBuilder<Sqlite>, ids: &[String]) {

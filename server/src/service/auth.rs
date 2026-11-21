@@ -229,9 +229,36 @@ impl AuthService<'_> {
     }
 
     pub async fn authenticate(&self, bearer_token: &str) -> Result<(), AppError> {
+        let _ = self.authenticate_device(bearer_token).await?;
+        Ok(())
+    }
+
+    pub async fn authenticate_device(&self, bearer_token: &str) -> Result<String, AppError> {
         let tokens = TokenManager::new(self.service.db.auth());
-        if !tokens.validate(bearer_token).await? {
-            return Err(AppError::token_invalid("Invalid or revoked bearer token"));
+        tokens
+            .validate_token_id(bearer_token)
+            .await?
+            .ok_or_else(|| AppError::token_invalid("Invalid or revoked bearer token"))
+    }
+
+    pub async fn verify_sync_peer_binding(
+        &self,
+        token_id: &str,
+        raw_peer_id: &str,
+    ) -> Result<(), AppError> {
+        let peer_id = raw_peer_id.trim();
+        if peer_id.is_empty() || peer_id.len() > 64 {
+            return Err(AppError::bad_request("peer_id must be 1..=64 characters"));
+        }
+        if peer_id.eq_ignore_ascii_case(crate::db::SERVER_PEER_ID) {
+            return Err(AppError::forbidden(
+                "Client devices cannot use the reserved server peer_id",
+            ));
+        }
+        if !self.service.db.auth().bind_or_verify_peer_id(token_id, peer_id).await? {
+            return Err(AppError::forbidden(
+                "This device token is bound to a different peer_id or the peer_id is claimed by another device",
+            ));
         }
         Ok(())
     }

@@ -116,30 +116,70 @@ impl<'a> AuthRepo<'a> {
     }
 
     pub async fn validate_device_token(&self, token_hash: &str) -> Result<bool> {
-        let needs_touch = sqlx::query_scalar!(
-            "SELECT (last_used_at IS NULL OR datetime(last_used_at) <= datetime('now', '-60 seconds')) AS \"needs_touch!: bool\"
+        Ok(self.validate_device_token_id(token_hash).await?.is_some())
+    }
+
+    pub async fn validate_device_token_id(&self, token_hash: &str) -> Result<Option<String>> {
+        let row: Option<(String, bool)> = sqlx::query_as(
+            "SELECT id,
+                    (last_used_at IS NULL OR datetime(last_used_at) <= datetime('now', '-60 seconds'))
              FROM device_tokens
              WHERE token = ?",
-            token_hash,
         )
+        .bind(token_hash)
         .fetch_optional(self.pool)
         .await?;
 
-        let Some(should_update) = needs_touch else {
-            return Ok(false);
+        let Some((id, should_update)) = row else {
+            return Ok(None);
         };
 
         if should_update {
             let now = now_utc();
-            sqlx::query!(
-                "UPDATE device_tokens SET last_used_at = ? WHERE token = ?",
-                now as _,
-                token_hash,
-            )
-            .execute(self.pool)
-            .await?;
+            sqlx::query("UPDATE device_tokens SET last_used_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(&id)
+                .execute(self.pool)
+                .await?;
         }
 
+        Ok(Some(id))
+    }
+
+    /// Binds `token_id` to `peer_id` on first sync (TOFU) or verifies an existing binding.
+    /// Returns `Ok(false)` if this token is bound to a different `peer_id` or another token
+    /// already owns `peer_id`.
+    pub async fn bind_or_verify_peer_id(&self, token_id: &str, peer_id: &str) -> Result<bool> {
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        let current: Option<Option<String>> =
+            sqlx::query_scalar("SELECT bound_peer_id FROM device_tokens WHERE id = ?")
+                .bind(token_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(existing_bound) = current else {
+            return Ok(false);
+        };
+        if let Some(bound) = existing_bound {
+            return Ok(bound == peer_id);
+        }
+        let claimed_by_other: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM device_tokens WHERE bound_peer_id = ? AND id != ? LIMIT 1",
+        )
+        .bind(peer_id)
+        .bind(token_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if claimed_by_other.is_some() {
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE device_tokens SET bound_peer_id = ? WHERE id = ? AND bound_peer_id IS NULL",
+        )
+        .bind(peer_id)
+        .bind(token_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(true)
     }
 

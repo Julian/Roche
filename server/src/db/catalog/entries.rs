@@ -120,14 +120,22 @@ impl CatalogRepo<'_> {
             qb.push(" AND e.kind = ").push_bind(k);
         }
         if let Some(q) = trimmed {
-            let escaped = crate::db::escape_like_literal(q);
-            let pattern = format!("%{escaped}%");
-            qb.push(" AND (e.title LIKE ")
-                .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR e.creators_json LIKE ")
-                .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM entry_identifiers ei WHERE ei.entry_id = e.id AND ei.value LIKE ")
-                .push_bind(pattern)
+            let terms = crate::db::ItemFilter::tokenize_search_terms(q);
+            if terms.is_empty() {
+                return Ok(Vec::new());
+            }
+            let fts_query = terms
+                .iter()
+                .map(|t| format!("{{title creators summary}}: {}", t.fts_clause))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let bounded_q: String = q.chars().take(256).collect();
+            let escaped = crate::db::escape_like_literal(&bounded_q);
+            let ident_pattern = format!("%{escaped}%");
+            qb.push(" AND (e.rowid IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ")
+                .push_bind(fts_query)
+                .push(") OR EXISTS (SELECT 1 FROM entry_identifiers ei WHERE ei.entry_id = e.id AND ei.value LIKE ")
+                .push_bind(ident_pattern)
                 .push(" ESCAPE '\\'))");
         }
         qb.push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', e.updated_at) DESC, LOWER(e.title) ASC LIMIT ")
@@ -319,7 +327,6 @@ impl CatalogRepo<'_> {
             .ok_or_else(|| CatalogError::NotFound(format!("Entry '{entry_id}'")))
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn upsert_entry_in_tx(
         tx: &mut SqliteConnection,
         input: &UpsertEntryInput,
@@ -327,6 +334,23 @@ impl CatalogRepo<'_> {
         title: &str,
         now: DateTime<Utc>,
     ) -> CatalogResult<String> {
+        let (id, _) = Self::upsert_entry_with_created_in_tx(tx, input, kind, title, now).await?;
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn upsert_entry_with_created_in_tx(
+        tx: &mut SqliteConnection,
+        input: &UpsertEntryInput,
+        kind: EntryKind,
+        title: &str,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<(String, bool)> {
+        if kind == EntryKind::Collection {
+            return Err(CatalogError::InvalidInput(
+                "Collections must be created via collection endpoints".to_owned(),
+            ));
+        }
         let clean_creators: Vec<String> = input
             .creators
             .iter()
@@ -356,6 +380,11 @@ impl CatalogRepo<'_> {
         }
         for ident in &input.identifiers {
             let scheme = normalize_identifier_scheme(&ident.scheme);
+            if matches!(scheme.as_str(), "slug" | "tag" | "feed_url") {
+                return Err(CatalogError::InvalidInput(format!(
+                    "Identifier scheme '{scheme}' is reserved for internal collections and feeds"
+                )));
+            }
             let val = normalize_identifier_value(kind, &scheme, &ident.value);
             if !scheme.is_empty()
                 && !val.is_empty()
@@ -369,6 +398,11 @@ impl CatalogRepo<'_> {
         let mut matched_id = if let Some(explicit_id) =
             input.id.as_deref().map(str::trim).filter(|s| !s.is_empty())
         {
+            if crate::db::is_protected_system_collection_id(explicit_id) {
+                return Err(CatalogError::Conflict(format!(
+                    "Protected system collection '{explicit_id}' cannot be modified via entry upsert"
+                )));
+            }
             Self::follow_merged_id_in_tx(tx, explicit_id).await?
         } else {
             None
@@ -386,6 +420,9 @@ impl CatalogRepo<'_> {
                 if let Some(owner_id) = raw_owner
                     && let Some(canon_owner) = Self::follow_merged_id_in_tx(tx, &owner_id).await?
                 {
+                    if crate::db::is_protected_system_collection_id(&canon_owner) {
+                        continue;
+                    }
                     // Avoid colliding a podcast episode with a podcast/feed when both mention feed_url
                     let owner_kind = sqlx::query_scalar!(
                         r#"SELECT kind as "kind!: EntryKind" FROM entries WHERE id = ?"#,
@@ -394,8 +431,9 @@ impl CatalogRepo<'_> {
                     .fetch_optional(&mut *tx)
                     .await?;
                     let compatible = match owner_kind {
+                        Some(EntryKind::Collection) => kind == EntryKind::Collection,
                         Some(ok) if ident.scheme == "feed_url" => ok == kind,
-                        Some(_) => true,
+                        Some(_) => kind != EntryKind::Collection,
                         None => false,
                     };
                     if compatible {
@@ -403,6 +441,29 @@ impl CatalogRepo<'_> {
                         break;
                     }
                 }
+            }
+        }
+
+        if let Some(ref existing_id) = matched_id {
+            if crate::db::is_protected_system_collection_id(existing_id) {
+                return Err(CatalogError::Conflict(format!(
+                    "Protected system collection '{existing_id}' cannot be modified via entry upsert"
+                )));
+            }
+            let existing_spec: Option<(String, String)> = sqlx::query_as(
+                "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
+            )
+            .bind(existing_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((mode, role)) = existing_spec
+                && (mode != "manual"
+                    || matches!(role.as_str(), "system" | "feed" | "tag")
+                    || kind != EntryKind::Collection)
+            {
+                return Err(CatalogError::Conflict(format!(
+                    "Collection '{existing_id}' cannot be modified via entry upsert"
+                )));
             }
         }
 
@@ -639,7 +700,7 @@ impl CatalogRepo<'_> {
         SyncRepo::record_activity(tx, ActivityEntityType::Entry, &final_id, activity_action, now)
             .await?;
 
-        Ok(final_id)
+        Ok((final_id, activity_action == ActivityAction::Create))
     }
 
     pub(crate) async fn ensure_artist_entry_in_tx(

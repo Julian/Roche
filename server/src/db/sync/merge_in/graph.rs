@@ -6,7 +6,10 @@ use sqlx::SqliteConnection;
 
 use super::super::{
     STARRED_COLLECTION_ID, SyncRepo, WANT_TO_READ_COLLECTION_ID, WANT_TO_READ_SLUG,
-    hlc::{HlcClock, resolve_or_synthesize_hlc},
+    hlc::{
+        HlcClock, clamp_incoming_timestamp, clamp_incoming_timestamp_opt,
+        clamp_incoming_upper_timestamp, resolve_or_synthesize_hlc,
+    },
     identity::{
         canonical_ordering_json, collection_entry_natural_key,
         deterministic_auto_consumption_log_id, deterministic_comparison_id,
@@ -22,7 +25,7 @@ use super::MergeContext;
 use crate::{
     db::{
         ActivityAction, ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole,
-        ConsumptionStatus, HexColor,
+        ConsumptionStatus, EntryKind, HexColor,
         entries_core::{self, EntryInsertParams},
     },
     ranking::validate_ordering,
@@ -67,6 +70,7 @@ struct GeneratorTargetState {
 }
 
 impl SyncRepo<'_> {
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn merge_single_collection_entry_in_tx(
         tx: &mut SqliteConnection,
         prep: &PreparedSyncEntry,
@@ -91,7 +95,7 @@ impl SyncRepo<'_> {
             return Ok(());
         };
 
-        let created = rec.created_at.unwrap_or(ctx.now);
+        let created = clamp_incoming_timestamp(rec.created_at.unwrap_or(ctx.now), ctx.now);
         let entry_hlc = resolve_or_synthesize_hlc(
             &rec.hlc,
             rec.updated_at.or(rec.created_at),
@@ -99,8 +103,23 @@ impl SyncRepo<'_> {
             ctx.peer_id,
         );
 
+        let existing_entry: Option<(EntryKind, Option<String>, String)> =
+            sqlx::query_as("SELECT kind, merged_into_id, hlc FROM entries WHERE id = ?")
+                .bind(&target_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some((ex_kind, ex_merged, _)) = &existing_entry
+            && (*ex_kind != EntryKind::Collection || ex_merged.is_some())
+        {
+            return Ok(());
+        }
+        let is_protected = is_protected_system_collection_id(&target_id);
+        let incoming_wins = existing_entry
+            .as_ref()
+            .is_none_or(|(_, _, ex_hlc)| entry_hlc.as_str() >= ex_hlc.as_str());
+
         // Check `'entry'` tombstone before upserting manual collection
-        if !is_protected_system_collection_id(&target_id)
+        if !is_protected
             && Self::check_and_clear_tombstone_in_tx(
                 tx,
                 ActivityEntityType::Entry,
@@ -115,23 +134,42 @@ impl SyncRepo<'_> {
         let validated_color = HexColor::from_stored_tolerant(cs.color.as_deref());
         let clean_color = validated_color.as_ref().map(HexColor::as_str);
 
-        sqlx::query(
-            "INSERT INTO entries (id, kind, title, summary, created_at, updated_at, hlc)
-             VALUES (?, 'collection', ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-                 title = CASE WHEN excluded.hlc >= entries.hlc THEN excluded.title ELSE entries.title END,
-                 summary = COALESCE(excluded.summary, entries.summary),
-                 updated_at = CASE WHEN excluded.hlc >= entries.hlc THEN excluded.updated_at ELSE entries.updated_at END,
-                 hlc = CASE WHEN excluded.hlc >= entries.hlc THEN excluded.hlc ELSE entries.hlc END",
-        )
-        .bind(&target_id)
-        .bind(title)
-        .bind(prep.clean_summary.as_deref())
-        .bind(created)
-        .bind(ctx.now)
-        .bind(&entry_hlc)
-        .execute(&mut *tx)
-        .await?;
+        if is_protected {
+            // Protected collections (`Starred`, `Want to Read`, `Up Next`) keep immutable
+            // title/slug/role/visibility; only allow updating optional summary/color if empty.
+            if existing_entry.is_none() {
+                sqlx::query(
+                    "INSERT INTO entries (id, kind, title, summary, created_at, updated_at, hlc)
+                     VALUES (?, 'collection', ?, ?, ?, ?, ?)",
+                )
+                .bind(&target_id)
+                .bind(title)
+                .bind(prep.clean_summary.as_deref())
+                .bind(created)
+                .bind(ctx.now)
+                .bind(&entry_hlc)
+                .execute(&mut *tx)
+                .await?;
+            }
+        } else {
+            sqlx::query(
+                "INSERT INTO entries (id, kind, title, summary, created_at, updated_at, hlc)
+                 VALUES (?, 'collection', ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     title = CASE WHEN excluded.hlc >= entries.hlc THEN excluded.title ELSE entries.title END,
+                     summary = COALESCE(excluded.summary, entries.summary),
+                     updated_at = CASE WHEN excluded.hlc >= entries.hlc THEN excluded.updated_at ELSE entries.updated_at END,
+                     hlc = CASE WHEN excluded.hlc >= entries.hlc THEN excluded.hlc ELSE entries.hlc END",
+            )
+            .bind(&target_id)
+            .bind(title)
+            .bind(prep.clean_summary.as_deref())
+            .bind(created)
+            .bind(ctx.now)
+            .bind(&entry_hlc)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         let (effective_slug, effective_role, effective_show_in_lists) =
             if target_id == STARRED_COLLECTION_ID {
@@ -142,25 +180,27 @@ impl SyncRepo<'_> {
                 (slug_opt, cs.role, cs.show_in_lists)
             };
 
-        sqlx::query(
-            "INSERT INTO collection_specs
-             (collection_id, slug, mode, collection_role, rule_json, show_in_lists, color)
-             VALUES (?, ?, 'manual', ?, NULL, ?, ?)
-             ON CONFLICT(collection_id) DO UPDATE SET
-                 collection_role = excluded.collection_role,
-                 show_in_lists = excluded.show_in_lists,
-                 color = COALESCE(excluded.color, collection_specs.color)",
-        )
-        .bind(&target_id)
-        .bind(&effective_slug)
-        .bind(effective_role)
-        .bind(effective_show_in_lists)
-        .bind(clean_color)
-        .execute(&mut *tx)
-        .await?;
+        if existing_entry.is_none() || (!is_protected && incoming_wins) {
+            sqlx::query(
+                "INSERT INTO collection_specs
+                 (collection_id, slug, mode, collection_role, rule_json, show_in_lists, color)
+                 VALUES (?, ?, 'manual', ?, NULL, ?, ?)
+                 ON CONFLICT(collection_id) DO UPDATE SET
+                     collection_role = excluded.collection_role,
+                     show_in_lists = excluded.show_in_lists,
+                     color = COALESCE(excluded.color, collection_specs.color)",
+            )
+            .bind(&target_id)
+            .bind(&effective_slug)
+            .bind(effective_role)
+            .bind(effective_show_in_lists)
+            .bind(clean_color)
+            .execute(&mut *tx)
+            .await?;
 
-        if let Some(slug) = effective_slug {
-            entries_core::upsert_entry_identifier_in_tx(tx, &target_id, "slug", &slug).await?;
+            if let Some(slug) = effective_slug {
+                entries_core::upsert_entry_identifier_in_tx(tx, &target_id, "slug", &slug).await?;
+            }
         }
         Ok(())
     }
@@ -231,21 +271,34 @@ impl SyncRepo<'_> {
             else {
                 continue;
             };
-            if raw_dup == canon_resolved {
+            if raw_dup == canon_resolved || is_protected_system_collection_id(raw_dup) {
                 continue;
             }
             let entry_hlc =
                 resolve_or_synthesize_hlc(&rec.hlc, rec.updated_at, ctx.now, ctx.peer_id);
-            let existing_dup: Option<Option<String>> =
-                sqlx::query_scalar("SELECT merged_into_id FROM entries WHERE id = ?")
+            let existing_dup: Option<(Option<String>, EntryKind, String)> =
+                sqlx::query_as("SELECT merged_into_id, kind, hlc FROM entries WHERE id = ?")
                     .bind(raw_dup)
                     .fetch_optional(&mut *tx)
                     .await?;
+            let canon_kind: Option<EntryKind> =
+                sqlx::query_scalar("SELECT kind FROM entries WHERE id = ?")
+                    .bind(&canon_resolved)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(canon_kind) = canon_kind else {
+                continue;
+            };
             match existing_dup {
                 None => {
+                    if (rec.kind == EntryKind::Collection) != (canon_kind == EntryKind::Collection)
+                    {
+                        continue;
+                    }
                     let clean_title = rec.title.trim();
                     let title = if clean_title.is_empty() { raw_dup } else { clean_title };
-                    let created = rec.created_at.unwrap_or(ctx.now);
+                    let created =
+                        clamp_incoming_timestamp(rec.created_at.unwrap_or(ctx.now), ctx.now);
                     entries_core::insert_entry_row_in_tx(
                         tx,
                         &EntryInsertParams {
@@ -256,7 +309,12 @@ impl SyncRepo<'_> {
                     )
                     .await?;
                 }
-                Some(None) => {
+                Some((None, dup_kind, dup_hlc)) => {
+                    if (dup_kind == EntryKind::Collection) != (canon_kind == EntryKind::Collection)
+                        || entry_hlc.as_str() < dup_hlc.as_str()
+                    {
+                        continue;
+                    }
                     if CatalogRepo::validate_mergeable_specs_in_tx(tx, raw_dup, &canon_resolved)
                         .await
                         .is_ok()
@@ -270,7 +328,7 @@ impl SyncRepo<'_> {
                         .await?;
                     }
                 }
-                Some(Some(_)) => {}
+                Some((Some(_), _, _)) => {}
             }
             ctx.id_resolver.record_alias(raw_dup, &canon_resolved);
         }
@@ -307,8 +365,9 @@ impl SyncRepo<'_> {
                 continue;
             }
 
+            let safe_added_at = clamp_incoming_timestamp(ce.added_at, ctx.now);
             let ce_hlc =
-                resolve_or_synthesize_hlc(&ce.hlc, Some(ce.added_at), ctx.now, ctx.peer_id);
+                resolve_or_synthesize_hlc(&ce.hlc, Some(safe_added_at), ctx.now, ctx.peer_id);
             let nat_key = collection_entry_natural_key(&col_id, &entry_id);
             if Self::check_and_clear_tombstone_in_tx(
                 tx,
@@ -344,7 +403,7 @@ impl SyncRepo<'_> {
             .bind(&col_id)
             .bind(&entry_id)
             .bind(ce.position)
-            .bind(ce.added_at)
+            .bind(safe_added_at)
             .bind(&ce_hlc)
             .execute(&mut *tx)
             .await?;
@@ -398,80 +457,155 @@ impl SyncRepo<'_> {
         ctx: &MergeContext<'_>,
     ) -> Result<()> {
         for log in logs {
-            let raw_ent = log.entry_id.trim();
-            let Some(entry_id) = ctx.id_resolver.resolve_live_in_tx(tx, raw_ent).await? else {
-                continue;
-            };
-            let log_hlc = resolve_or_synthesize_hlc(
-                &log.hlc,
-                log.created_at.or(Some(log.ts)),
-                ctx.now,
-                ctx.peer_id,
-            );
+            Self::merge_single_consumption_log_in_tx(tx, log, ctx).await?;
+        }
+        Ok(())
+    }
 
-            let trimmed_id = log.id.trim();
-            if !trimmed_id.is_empty()
-                && Self::check_and_clear_tombstone_in_tx(
-                    tx,
-                    ActivityEntityType::ConsumptionLog,
-                    trimmed_id,
-                    &log_hlc,
-                )
-                .await?
-            {
-                continue;
-            }
-            let is_auto_id = log.status == ConsumptionStatus::Consumed
-                && (trimmed_id == deterministic_auto_consumption_log_id(raw_ent)
-                    || trimmed_id == deterministic_auto_consumption_log_id(&entry_id));
-            let resolved_log_id = if is_auto_id {
-                deterministic_auto_consumption_log_id(&entry_id)
-            } else if trimmed_id.is_empty()
-                || (raw_ent != entry_id
-                    && trimmed_id
-                        == deterministic_consumption_log_id(
-                            raw_ent,
-                            log.ts.timestamp_millis(),
-                            log.status.as_str(),
-                        ))
-            {
-                deterministic_consumption_log_id(
-                    &entry_id,
-                    log.ts.timestamp_millis(),
-                    log.status.as_str(),
-                )
-            } else {
-                trimmed_id.to_owned()
-            };
-            if resolved_log_id != trimmed_id
-                && Self::check_and_clear_tombstone_in_tx(
-                    tx,
-                    ActivityEntityType::ConsumptionLog,
-                    &resolved_log_id,
-                    &log_hlc,
-                )
-                .await?
-            {
-                continue;
-            }
+    async fn merge_single_consumption_log_in_tx(
+        tx: &mut SqliteConnection,
+        log: &SyncConsumptionLogRecord,
+        ctx: &MergeContext<'_>,
+    ) -> Result<()> {
+        let raw_ent = log.entry_id.trim();
+        let Some(entry_id) = ctx.id_resolver.resolve_live_in_tx(tx, raw_ent).await? else {
+            return Ok(());
+        };
+        let log_hlc = resolve_or_synthesize_hlc(
+            &log.hlc,
+            log.created_at.or(Some(log.ts)),
+            ctx.now,
+            ctx.peer_id,
+        );
 
-            let saved = CatalogRepo::log_consumption_with_id_in_tx(
+        let trimmed_id = log.id.trim();
+        if !trimmed_id.is_empty()
+            && Self::check_and_clear_tombstone_in_tx(
                 tx,
-                &resolved_log_id,
+                ActivityEntityType::ConsumptionLog,
+                trimmed_id,
+                &log_hlc,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        let is_auto_id = log.status == ConsumptionStatus::Consumed
+            && (trimmed_id == deterministic_auto_consumption_log_id(raw_ent)
+                || trimmed_id == deterministic_auto_consumption_log_id(&entry_id));
+        let resolved_log_id = if is_auto_id {
+            deterministic_auto_consumption_log_id(&entry_id)
+        } else if trimmed_id.is_empty()
+            || (raw_ent != entry_id
+                && trimmed_id
+                    == deterministic_consumption_log_id(
+                        raw_ent,
+                        log.ts.timestamp_millis(),
+                        log.status.as_str(),
+                    ))
+        {
+            deterministic_consumption_log_id(
                 &entry_id,
-                log.status,
-                log.notes.as_deref(),
-                log.ts,
-                ctx.now,
+                log.ts.timestamp_millis(),
+                log.status.as_str(),
             )
-            .await?;
+        } else {
+            trimmed_id.to_owned()
+        };
+        if resolved_log_id != trimmed_id
+            && Self::check_and_clear_tombstone_in_tx(
+                tx,
+                ActivityEntityType::ConsumptionLog,
+                &resolved_log_id,
+                &log_hlc,
+            )
+            .await?
+        {
+            return Ok(());
+        }
 
+        let safe_log_ts = clamp_incoming_upper_timestamp(log.ts, ctx.now);
+        Self::upsert_synced_consumption_log_in_tx(
+            tx,
+            &resolved_log_id,
+            &entry_id,
+            log,
+            safe_log_ts,
+            &log_hlc,
+            ctx.now,
+        )
+        .await
+    }
+
+    async fn upsert_synced_consumption_log_in_tx(
+        tx: &mut SqliteConnection,
+        resolved_log_id: &str,
+        entry_id: &str,
+        log: &SyncConsumptionLogRecord,
+        safe_log_ts: DateTime<Utc>,
+        log_hlc: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let existing_row: Option<(String, ConsumptionStatus)> =
+            sqlx::query_as("SELECT hlc, status FROM consumption_log WHERE id = ?")
+                .bind(resolved_log_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some((ex_hlc, ex_status)) = existing_row {
+            if log_hlc > ex_hlc.as_str() {
+                let clean_notes = log.notes.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                sqlx::query(
+                    "UPDATE consumption_log
+                     SET status = ?, notes = ?, ts = ?, hlc = ?
+                     WHERE id = ?",
+                )
+                .bind(log.status)
+                .bind(clean_notes)
+                .bind(safe_log_ts)
+                .bind(log_hlc)
+                .bind(resolved_log_id)
+                .execute(&mut *tx)
+                .await?;
+                if ex_status != ConsumptionStatus::Consumed
+                    && log.status == ConsumptionStatus::Consumed
+                {
+                    CatalogRepo::promote_entry_consumed_side_effects_in_tx(
+                        tx,
+                        entry_id,
+                        safe_log_ts,
+                        now,
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
+
+        let (saved_id, _, inserted_new) = CatalogRepo::log_consumption_with_id_in_tx(
+            tx,
+            resolved_log_id,
+            entry_id,
+            log.status,
+            log.notes.as_deref(),
+            safe_log_ts,
+            now,
+        )
+        .await?;
+        if inserted_new {
+            sqlx::query("UPDATE consumption_log SET hlc = ? WHERE id = ?")
+                .bind(log_hlc)
+                .bind(&saved_id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
             sqlx::query(
-                "UPDATE consumption_log SET hlc = CASE WHEN ? > hlc THEN ? ELSE hlc END WHERE id = ?",
+                "UPDATE consumption_log
+                 SET hlc = CASE WHEN ? > hlc THEN ? ELSE hlc END
+                 WHERE id = ?",
             )
-            .bind(&log_hlc)
-            .bind(&log_hlc)
-            .bind(&saved.0)
+            .bind(log_hlc)
+            .bind(log_hlc)
+            .bind(&saved_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -541,15 +675,18 @@ impl SyncRepo<'_> {
                 ctx.peer_id,
             );
 
+            let safe_comp_ts = clamp_incoming_upper_timestamp(comp.ts, ctx.now);
+            let safe_comp_created =
+                clamp_incoming_timestamp(comp.created_at.unwrap_or(ctx.now), ctx.now);
             let res = sqlx::query(
                 "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at, hlc)
                  VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(&comp_id)
-            .bind(comp.ts)
+            .bind(safe_comp_ts)
             .bind(scope_id)
             .bind(&ord_json)
-            .bind(comp.created_at.unwrap_or(ctx.now))
+            .bind(safe_comp_created)
             .bind(&comp_hlc)
             .execute(&mut *tx)
             .await?;
@@ -628,8 +765,13 @@ impl SyncRepo<'_> {
             .filter(|s| !s.is_empty())
             .map(|eid| ctx.id_resolver.mapped(eid).to_owned());
 
-        let mut target =
-            choose_winning_generator_state(local_gen.as_ref(), inc, mapped_inc_entry, inc_hlc);
+        let mut target = choose_winning_generator_state(
+            local_gen.as_ref(),
+            inc,
+            mapped_inc_entry,
+            inc_hlc,
+            ctx.now,
+        );
         Self::reconcile_generator_target_in_tx(tx, &col_id, &mut target, clock, ctx.now).await?;
 
         let needs_upsert = local_gen.as_ref().is_none_or(|local| {
@@ -784,21 +926,24 @@ fn choose_winning_generator_state(
     inc: &SyncCollectionGeneratorRecord,
     mapped_inc_entry: Option<String>,
     inc_hlc: String,
+    now: DateTime<Utc>,
 ) -> GeneratorTargetState {
+    let safe_drawn_at = clamp_incoming_timestamp_opt(inc.drawn_at, now);
+    let safe_updated_at = clamp_incoming_timestamp(inc.updated_at, now);
     match local_gen {
         None => GeneratorTargetState {
             enabled: inc.enabled,
             current_entry_id: mapped_inc_entry,
-            drawn_at: inc.drawn_at,
-            updated_at: inc.updated_at,
+            drawn_at: safe_drawn_at,
+            updated_at: safe_updated_at,
             hlc: inc_hlc,
             local_won_conflict: false,
         },
         Some(local) if inc_hlc.as_str() >= local.hlc.as_str() => GeneratorTargetState {
             enabled: inc.enabled,
             current_entry_id: mapped_inc_entry,
-            drawn_at: inc.drawn_at,
-            updated_at: inc.updated_at,
+            drawn_at: safe_drawn_at,
+            updated_at: safe_updated_at,
             hlc: inc_hlc,
             local_won_conflict: false,
         },

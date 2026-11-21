@@ -11,7 +11,7 @@ use sqlx::SqliteConnection;
 use super::{
     SyncRepo,
     hlc::HlcClock,
-    hrw::{NetworkTier, SERVER_PEER_ID},
+    hrw::{NetworkTier, SERVER_PEER_ID, bound_peer_weight},
     models::{
         InsertedItemCandidate, MAX_PEER_SYNC_PAGE_CHANGES, PeerSyncRequest, PeerSyncResponse,
         PreparedSyncEntry,
@@ -24,7 +24,7 @@ pub(super) struct MergeContext<'a> {
     pub now: DateTime<Utc>,
     pub id_resolver: IdResolver,
     pub tag_index: TagIndex,
-    pub deferred_entry_deletes: Vec<(String, String)>,
+    pub deferred_entry_deletes: Vec<(String, DateTime<Utc>, String)>,
 }
 
 impl<'a> MergeContext<'a> {
@@ -256,7 +256,7 @@ impl SyncRepo<'_> {
         let measured_weight = if req.network_tier == NetworkTier::Offline {
             Some(0.0)
         } else {
-            req.weight.map(|w| w.clamp(0.2, 10.0))
+            req.weight.map(|w| bound_peer_weight(req.network_tier, Some(w)))
         };
 
         let mut tx = crate::db::begin_write(self.pool).await?;

@@ -1,6 +1,5 @@
 use std::{sync::Arc, time::Duration};
 
-use tokio::sync::Semaphore;
 use url::Url;
 
 use super::{ActiveRefreshGuard, AppError, RocheService};
@@ -9,7 +8,7 @@ use crate::{
     db::Feed,
     domain::{FeedType, OpmlOutline},
     feeds::{FeedSource, OpmlDocument},
-    scheduler::{FeedFetcher, FeedIngester, PollError},
+    ingest::{FeedFetcher, FeedIngester, PollError},
     util::{
         media_urls::{is_arxiv_host, is_youtube_feed_url},
         url_guard::{SsrfBlockedError, validate_public_url},
@@ -76,6 +75,23 @@ impl FeedService<'_> {
     }
 
     async fn discover_feed_url_if_needed(
+        &self,
+        initial_type: FeedType,
+        validated_url: Url,
+    ) -> Result<(FeedType, Url), AppError> {
+        let fallback_url = validated_url.clone();
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            self.discover_feed_url_inner(initial_type, validated_url),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(url = %fallback_url, "Feed discovery timed out after 15s; using submitted URL");
+            Ok((initial_type, fallback_url))
+        })
+    }
+
+    async fn discover_feed_url_inner(
         &self,
         initial_type: FeedType,
         validated_url: Url,
@@ -271,7 +287,7 @@ impl FeedService<'_> {
         let count = active_feeds.len();
         if !active_feeds.is_empty() {
             let service_bg = self.service.clone();
-            tokio::spawn(async move {
+            self.service.spawn_background(async move {
                 service_bg.feeds().poll_feeds_concurrently(active_feeds).await;
             });
         }
@@ -290,7 +306,7 @@ impl FeedService<'_> {
         if feeds.is_empty() {
             return;
         }
-        let poll_sem = Arc::new(Semaphore::new(8));
+        let poll_sem = Arc::clone(&self.service.poll_semaphore);
         let mut join_set = tokio::task::JoinSet::new();
 
         for feed in feeds {

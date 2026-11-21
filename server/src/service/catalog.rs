@@ -1,6 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use chrono::{DateTime, Utc};
+use tokio::sync::Semaphore;
 
 use super::AppError;
 use crate::{
@@ -8,7 +16,7 @@ use crate::{
         CatalogBatchInput, CatalogBatchResult, CatalogEntry, CatalogRepo, ClusterSelectFilter,
         CollectionGeneratorState, CollectionRankingInputs, CollectionSummary, ComparisonRecord,
         ConsumptionLogView, Db, EntryDetailView, EntryIdentifier, RankedCollectionView,
-        RankedEntryRow, UpsertEntryInput,
+        RankedEntryRow, UpsertEntryInput, WantSearchMatch,
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::{
@@ -19,6 +27,110 @@ use crate::{
 
 const MAX_COVERED_CLUSTER_RETRIES: usize = 4;
 const SPAWN_BLOCKING_EP_THRESHOLD: usize = 150;
+const MAX_CACHED_EP_SCOPES: usize = 64;
+const MAX_CONCURRENT_EP_RUNS: usize = 4;
+
+type ScopeRevision = (i64, i64, i64);
+type OrderingsArc = Arc<Vec<Vec<Vec<String>>>>;
+type ScoresArc = Arc<HashMap<String, Score>>;
+
+#[derive(Debug, Clone)]
+struct CachedScopeEp {
+    revision: ScopeRevision,
+    generation: u64,
+    orderings: OrderingsArc,
+    scores: ScoresArc,
+    last_used: Instant,
+}
+
+/// Bounded in-memory cache of scope-level Expectation Propagation scores keyed by
+/// `(scope_collection_id, (count, max_sync_seq, sum_sync_seq))` behind a concurrency semaphore.
+#[derive(Debug, Clone)]
+pub struct EpScoreCache {
+    entries: Arc<Mutex<HashMap<Option<String>, CachedScopeEp>>>,
+    semaphore: Arc<Semaphore>,
+    next_gen: Arc<AtomicU64>,
+}
+
+impl Default for EpScoreCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EpScoreCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EP_RUNS)),
+            next_gen: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn allocate_generation(&self) -> u64 {
+        self.next_gen.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn get(
+        &self,
+        scope: Option<&str>,
+        revision: ScopeRevision,
+    ) -> Option<(OrderingsArc, ScoresArc)> {
+        let key = scope.map(ToOwned::to_owned);
+        let mut guard = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hit = guard.get_mut(&key).filter(|e| e.revision == revision).map(|entry| {
+            entry.last_used = Instant::now();
+            (Arc::clone(&entry.orderings), Arc::clone(&entry.scores))
+        });
+        drop(guard);
+        hit
+    }
+
+    fn insert(
+        &self,
+        scope: Option<&str>,
+        revision: ScopeRevision,
+        generation: u64,
+        orderings: OrderingsArc,
+        scores: ScoresArc,
+    ) {
+        let mut guard = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = scope.map(ToOwned::to_owned);
+        if let Some(existing) = guard.get(&key)
+            && existing.generation > generation
+        {
+            return;
+        }
+        if !guard.contains_key(&key)
+            && guard.len() >= MAX_CACHED_EP_SCOPES
+            && let Some(oldest_key) =
+                guard.iter().min_by_key(|(_, v)| v.last_used).map(|(k, _)| k.clone())
+        {
+            guard.remove(&oldest_key);
+        }
+        guard.insert(
+            key,
+            CachedScopeEp { revision, generation, orderings, scores, last_used: Instant::now() },
+        );
+    }
+}
+
+/// Filter parameters for server-side tier & search filtering over a ranked collection.
+#[derive(Debug, Clone, Default)]
+pub struct RankedCollectionFilter<'a> {
+    pub tier: Option<char>,
+    pub query: Option<&'a str>,
+}
+
+/// Ranked collection view together with full-collection totals & S/A/B/C/D tier counts
+/// computed before applying `RankedCollectionFilter` or pagination slices.
+#[derive(Debug, Clone)]
+pub struct FilteredRankedCollection {
+    pub view: RankedCollectionView,
+    pub full_total: usize,
+    pub full_tier_counts: [usize; 5],
+}
 
 /// Summary of an entry's rank, list size, and optional quality tier on a global list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,12 +147,18 @@ pub struct EntryListAppearance {
 #[derive(Clone, Copy)]
 pub struct CatalogService<'a> {
     repo: CatalogRepo<'a>,
+    ep_cache: Option<&'a EpScoreCache>,
 }
 
 impl<'a> CatalogService<'a> {
     #[must_use]
     pub const fn new(db: &'a Db) -> Self {
-        Self { repo: db.catalog() }
+        Self { repo: db.catalog(), ep_cache: None }
+    }
+
+    #[must_use]
+    pub const fn with_cache(db: &'a Db, ep_cache: &'a EpScoreCache) -> Self {
+        Self { repo: db.catalog(), ep_cache: Some(ep_cache) }
     }
 
     /// Returns `true` when `input` carries explicit identifying or descriptive metadata beyond
@@ -159,6 +277,29 @@ impl<'a> CatalogService<'a> {
         Ok(self.repo.list_diary(year, status, limit).await?)
     }
 
+    pub async fn list_diary_year_counts(
+        &self,
+        status: Option<ConsumptionStatus>,
+    ) -> Result<Vec<(i32, i64)>, AppError> {
+        Ok(self.repo.list_diary_year_counts(status).await?)
+    }
+
+    pub async fn search_diary_logs(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ConsumptionLogView>, AppError> {
+        Ok(self.repo.search_diary_logs(query, limit).await?)
+    }
+
+    pub async fn search_want_entries(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<WantSearchMatch>, AppError> {
+        Ok(self.repo.search_want_entries(query, limit).await?)
+    }
+
     pub async fn log_consumption(
         &self,
         entry_id: &str,
@@ -169,8 +310,19 @@ impl<'a> CatalogService<'a> {
         Ok(self.repo.log_consumption(entry_id, status, notes, ts).await?)
     }
 
-    pub async fn delete_consumed_logs_for_entry(&self, entry_id: &str) -> Result<usize, AppError> {
-        Ok(self.repo.delete_consumed_logs_for_entry(entry_id).await?)
+    #[allow(clippy::option_option)]
+    pub async fn update_consumption_log(
+        &self,
+        log_id: &str,
+        status: Option<ConsumptionStatus>,
+        notes: Option<Option<&str>>,
+        ts: Option<DateTime<Utc>>,
+    ) -> Result<ConsumptionLogView, AppError> {
+        Ok(self.repo.update_consumption_log(log_id, status, notes, ts).await?)
+    }
+
+    pub async fn delete_consumption_log(&self, log_id: &str) -> Result<bool, AppError> {
+        Ok(self.repo.delete_consumption_log(log_id).await?)
     }
 
     /// Logs a consumption event for either an existing `entry_id` or an inline `UpsertEntryInput`.
@@ -271,8 +423,74 @@ impl<'a> CatalogService<'a> {
         self.rank_target_after_consumption(completed_entry).await
     }
 
-    /// Loads a collection's rankable members, runs EP inference (offloading large graphs to
-    /// `spawn_blocking`), assigns S-D quantile tiers for global lists, and computes bar widths.
+    /// Lightweight lookup resolving whether `slug_or_id` ranks in priority (want) scope or global
+    /// scope without running EP inference.
+    pub async fn resolve_ranking_scope(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+    ) -> Result<(bool, Option<String>), AppError> {
+        Ok(self.repo.resolve_ranking_scope(slug_or_id, want).await?)
+    }
+
+    async fn load_scope_orderings_and_scores(
+        &self,
+        scope_collection_id: Option<&str>,
+    ) -> Result<(OrderingsArc, ScoresArc), AppError> {
+        if let Some(cache) = self.ep_cache {
+            let rev = self.repo.comparison_scope_revision(scope_collection_id).await?;
+            if let Some(hit) = cache.get(scope_collection_id, rev) {
+                return Ok(hit);
+            }
+        }
+
+        let _permit =
+            match self.ep_cache {
+                Some(cache) => Some(cache.semaphore.acquire().await.map_err(|e| {
+                    AppError::Internal(anyhow::anyhow!("EP semaphore closed: {e}"))
+                })?),
+                None => None,
+            };
+
+        // Read `(revision, orderings)` atomically inside one read snapshot and re-check the cache
+        // in case another caller populated it while we waited for the semaphore.
+        let generation = self.ep_cache.map_or(0, EpScoreCache::allocate_generation);
+        let (fresh_rev, orderings) =
+            self.repo.load_revision_and_orderings_for_scope(scope_collection_id).await?;
+        if let Some(cache) = self.ep_cache
+            && let Some(hit) = cache.get(scope_collection_id, fresh_rev)
+        {
+            return Ok(hit);
+        }
+
+        let mut compared_ids: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for ord in &orderings {
+            for group in ord {
+                for id in group {
+                    if seen.insert(id.as_str()) {
+                        compared_ids.push(id.clone());
+                    }
+                }
+            }
+        }
+        let scores = run_infer_scores(compared_ids, orderings.clone()).await?;
+        let orderings_arc = Arc::new(orderings);
+        let scores_arc = Arc::new(scores);
+        if let Some(cache) = self.ep_cache {
+            cache.insert(
+                scope_collection_id,
+                fresh_rev,
+                generation,
+                Arc::clone(&orderings_arc),
+                Arc::clone(&scores_arc),
+            );
+        }
+        Ok((orderings_arc, scores_arc))
+    }
+
+    /// Loads a collection's rankable members, runs (or reuses cached) EP inference, assigns S-D
+    /// quantile tiers for global lists, and computes bar widths.
     pub async fn get_ranked_collection(
         &self,
         slug_or_id: &str,
@@ -282,14 +500,15 @@ impl<'a> CatalogService<'a> {
         let is_priority = inputs.is_priority_scope;
         let member_ids: Vec<String> = inputs.members.iter().map(|m| m.id.clone()).collect();
 
-        let orderings = self
-            .repo
-            .load_orderings_for_scope(is_priority.then_some(inputs.collection.id.as_str()))
-            .await?;
+        let scope_id = is_priority.then_some(inputs.collection.id.as_str());
+        let (orderings, scope_scores) = self.load_scope_orderings_and_scores(scope_id).await?;
         let relevant_comparison_count = count_relevant_comparisons(&member_ids, &orderings);
         inputs.collection.comparison_count = relevant_comparison_count;
 
-        let scores = run_infer_scores(member_ids, orderings).await?;
+        let scores: HashMap<String, Score> = member_ids
+            .iter()
+            .map(|id| (id.clone(), scope_scores.get(id).copied().unwrap_or_default()))
+            .collect();
         let tiers_by_id = if !is_priority && relevant_comparison_count > 0 {
             rescale_to_quantiles(&scores, N_QUANTILES)
                 .into_iter()
@@ -330,6 +549,116 @@ impl<'a> CatalogService<'a> {
             comparison_count: relevant_comparison_count,
             rows,
         })
+    }
+
+    /// Loads a ranked collection, computes full-list S/A/B/C/D tier counts across ALL rows, and
+    /// applies optional server-side tier (`S`/`A`/`B`/`C`/`D`) and text filters before pagination.
+    pub async fn get_filtered_ranked_collection(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+        filter: &RankedCollectionFilter<'_>,
+    ) -> Result<FilteredRankedCollection, AppError> {
+        let mut view = self.get_ranked_collection(slug_or_id, want).await?;
+        let full_total = view.rows.len();
+        let full_tier_counts = count_row_tiers(&view.rows);
+
+        let target_tier = filter
+            .tier
+            .map(|t| t.to_ascii_uppercase())
+            .filter(|t| matches!(t, 'S' | 'A' | 'B' | 'C' | 'D'));
+        let needle = filter.query.map(str::trim).filter(|q| !q.is_empty()).map(str::to_lowercase);
+
+        if target_tier.is_some() || needle.is_some() {
+            view.rows.retain(|row| {
+                if let Some(t) = target_tier
+                    && row.tier != Some(t)
+                {
+                    return false;
+                }
+                if let Some(ref q) = needle {
+                    let title_hit = row.entry.title.to_lowercase().contains(q);
+                    let creator_hit =
+                        row.entry.creators.iter().any(|c| c.to_lowercase().contains(q));
+                    let year_hit =
+                        row.entry.release_year.is_some_and(|y| y.to_string().contains(q));
+                    if !title_hit && !creator_hit && !year_hit {
+                        return false;
+                    }
+                }
+                true
+            });
+        }
+
+        Ok(FilteredRankedCollection { view, full_total, full_tier_counts })
+    }
+
+    /// Selects the next uncovered cluster directly from an already-computed
+    /// [`RankedCollectionView`] without re-querying collection members or re-running EP inference.
+    pub async fn select_uncovered_cluster_from_ranked_view<F>(
+        &self,
+        ranked: &RankedCollectionView,
+        filter: &ClusterSelectFilter,
+        is_covered: F,
+    ) -> Result<Vec<CatalogEntry>, AppError>
+    where
+        F: Fn(&[CatalogEntry]) -> bool,
+    {
+        let raw_members: Vec<CatalogEntry> = ranked.rows.iter().map(|r| r.entry.clone()).collect();
+        let members = self.filter_cluster_members(raw_members, filter).await?;
+        let scores: HashMap<String, Score> =
+            ranked.rows.iter().map(|r| (r.entry.id.clone(), r.score)).collect();
+        let seed_pool = self.resolve_cluster_seed_pool(filter).await?;
+        Ok(pick_uncovered_cluster(
+            members,
+            &scores,
+            filter,
+            seed_pool.as_deref(),
+            MAX_COVERED_CLUSTER_RETRIES,
+            is_covered,
+        ))
+    }
+
+    /// Computes quality tier letters (`S`..`D`) for a heterogeneous set of entries across their
+    /// default kind lists using a single cached global EP pass.
+    pub async fn load_tiers_for_entries(&self, entries: &[CatalogEntry]) -> HashMap<String, char> {
+        let mut slugs: Vec<&'static str> = entries
+            .iter()
+            .filter(|e| e.kind != EntryKind::Song)
+            .filter_map(|e| e.kind.default_list_slug())
+            .collect();
+        slugs.sort_unstable();
+        slugs.dedup();
+        if slugs.is_empty() {
+            return HashMap::new();
+        }
+        let Ok((orderings, scope_scores)) = self.load_scope_orderings_and_scores(None).await else {
+            return HashMap::new();
+        };
+        let mut tiers = HashMap::new();
+        for slug in slugs {
+            let Ok(inputs) = self.repo.load_collection_ranking_inputs(slug, false).await else {
+                continue;
+            };
+            if inputs.is_priority_scope {
+                continue;
+            }
+            let member_ids: Vec<String> = inputs.members.iter().map(|m| m.id.clone()).collect();
+            if count_relevant_comparisons(&member_ids, &orderings) == 0 {
+                continue;
+            }
+            let list_scores: HashMap<String, Score> = member_ids
+                .into_iter()
+                .map(|id| {
+                    let s = scope_scores.get(&id).copied().unwrap_or_default();
+                    (id, s)
+                })
+                .collect();
+            for (id, q) in rescale_to_quantiles(&list_scores, N_QUANTILES) {
+                tiers.entry(id).or_insert_with(|| tier_label(q));
+            }
+        }
+        tiers
     }
 
     pub async fn select_next_cluster(
@@ -379,63 +708,25 @@ impl<'a> CatalogService<'a> {
         let is_priority = inputs.is_priority_scope;
         let all_member_ids: Vec<String> = inputs.members.iter().map(|m| m.id.clone()).collect();
 
-        let orderings = self
-            .repo
-            .load_orderings_for_scope(is_priority.then_some(inputs.collection.id.as_str()))
-            .await?;
+        let scope_id = is_priority.then_some(inputs.collection.id.as_str());
+        let (orderings, scope_scores) = self.load_scope_orderings_and_scores(scope_id).await?;
         inputs.collection.comparison_count =
             count_relevant_comparisons(&all_member_ids, &orderings);
 
         let members = self.filter_cluster_members(inputs.members, filter).await?;
-        let member_ids: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
-        let scores = run_infer_scores(member_ids.clone(), orderings).await?;
+        let scores: HashMap<String, Score> = members
+            .iter()
+            .map(|m| (m.id.clone(), scope_scores.get(&m.id).copied().unwrap_or_default()))
+            .collect();
         let seed_pool = self.resolve_cluster_seed_pool(filter).await?;
-
-        let by_id: HashMap<String, CatalogEntry> =
-            members.into_iter().map(|e| (e.id.clone(), e)).collect();
-
-        let max_k = if filter.max_k == 0 { MAX_K_DEFAULT } else { filter.max_k };
-        let force_random = seed_pool.is_none()
-            && filter.iteration > 0
-            && filter.iteration.is_multiple_of(RANDOM_SEED_EVERY);
-
-        let mut cluster_entries: Vec<CatalogEntry> = {
-            let mut rng = rand::rng();
-            let cluster_ids = select_cluster(
-                &scores,
-                &member_ids,
-                max_k,
-                force_random,
-                seed_pool.as_deref(),
-                &mut rng,
-            );
-            cluster_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect()
-        };
-
-        if cluster_entries.len() >= 2 && is_covered(&cluster_entries) {
-            if filter.focus_ids.is_empty() && max_covered_retries > 0 {
-                let mut rng = rand::rng();
-                for _ in 0..max_covered_retries {
-                    let cand_ids = select_cluster(
-                        &scores,
-                        &member_ids,
-                        max_k,
-                        true,
-                        seed_pool.as_deref(),
-                        &mut rng,
-                    );
-                    let cand: Vec<CatalogEntry> =
-                        cand_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect();
-                    if cand.len() >= 2 && !is_covered(&cand) {
-                        cluster_entries = cand;
-                        break;
-                    }
-                }
-            }
-            if is_covered(&cluster_entries) {
-                cluster_entries.clear();
-            }
-        }
+        let cluster_entries = pick_uncovered_cluster(
+            members,
+            &scores,
+            filter,
+            seed_pool.as_deref(),
+            max_covered_retries,
+            is_covered,
+        );
 
         Ok((inputs.collection, cluster_entries, scores))
     }
@@ -508,33 +799,21 @@ impl<'a> CatalogService<'a> {
             return Vec::new();
         }
 
-        let Ok(orderings) = self.repo.load_orderings_for_scope(None).await else {
+        let Ok((orderings, global_scores)) = self.load_scope_orderings_and_scores(None).await
+        else {
             return Vec::new();
         };
 
-        let (union_member_ids, list_has_relevant_comp) = {
-            let mut union_ids = Vec::new();
-            let mut seen_member_ids: HashSet<&str> = HashSet::new();
-            let mut has_rel_flags = Vec::with_capacity(eligible_lists.len());
-            for inputs in &eligible_lists {
+        let list_has_relevant_comp: Vec<bool> = eligible_lists
+            .iter()
+            .map(|inputs| {
                 let member_set: HashSet<&str> =
                     inputs.members.iter().map(|m| m.id.as_str()).collect();
-                let has_rel = orderings.iter().any(|ord| {
+                orderings.iter().any(|ord| {
                     ord.iter().flat_map(|g| g.iter()).any(|id| member_set.contains(id.as_str()))
-                });
-                has_rel_flags.push(has_rel);
-                for member in &inputs.members {
-                    if seen_member_ids.insert(member.id.as_str()) {
-                        union_ids.push(member.id.clone());
-                    }
-                }
-            }
-            (union_ids, has_rel_flags)
-        };
-
-        let Ok(global_scores) = run_infer_scores(union_member_ids, orderings).await else {
-            return Vec::new();
-        };
+                })
+            })
+            .collect();
 
         let mut out = Vec::with_capacity(eligible_lists.len());
         for (inputs, has_relevant_comp) in eligible_lists.into_iter().zip(list_has_relevant_comp) {
@@ -738,6 +1017,70 @@ fn is_spotify_web_url(raw: &str) -> bool {
     })
 }
 
+fn count_row_tiers(rows: &[RankedEntryRow]) -> [usize; 5] {
+    let mut counts = [0usize; 5];
+    for row in rows {
+        match row.tier {
+            Some('S') => counts[0] += 1,
+            Some('A') => counts[1] += 1,
+            Some('B') => counts[2] += 1,
+            Some('C') => counts[3] += 1,
+            Some('D') => counts[4] += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn pick_uncovered_cluster<F>(
+    members: Vec<CatalogEntry>,
+    scores: &HashMap<String, Score>,
+    filter: &ClusterSelectFilter,
+    seed_pool: Option<&[String]>,
+    max_covered_retries: usize,
+    is_covered: F,
+) -> Vec<CatalogEntry>
+where
+    F: Fn(&[CatalogEntry]) -> bool,
+{
+    let member_ids: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
+    let by_id: HashMap<String, CatalogEntry> =
+        members.into_iter().map(|e| (e.id.clone(), e)).collect();
+
+    let max_k = if filter.max_k == 0 { MAX_K_DEFAULT } else { filter.max_k };
+    let force_random = seed_pool.is_none()
+        && filter.iteration > 0
+        && filter.iteration.is_multiple_of(RANDOM_SEED_EVERY);
+
+    let mut cluster_entries: Vec<CatalogEntry> = {
+        let mut rng = rand::rng();
+        let cluster_ids =
+            select_cluster(scores, &member_ids, max_k, force_random, seed_pool, &mut rng);
+        cluster_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect()
+    };
+
+    if cluster_entries.len() >= 2 && is_covered(&cluster_entries) {
+        if filter.focus_ids.is_empty() && max_covered_retries > 0 {
+            let mut rng = rand::rng();
+            for _ in 0..max_covered_retries {
+                let cand_ids =
+                    select_cluster(scores, &member_ids, max_k, true, seed_pool, &mut rng);
+                let cand: Vec<CatalogEntry> =
+                    cand_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect();
+                if cand.len() >= 2 && !is_covered(&cand) {
+                    cluster_entries = cand;
+                    break;
+                }
+            }
+        }
+        if is_covered(&cluster_entries) {
+            cluster_entries.clear();
+        }
+    }
+
+    cluster_entries
+}
+
 fn count_relevant_comparisons(member_ids: &[String], orderings: &[Vec<Vec<String>>]) -> usize {
     let member_set: HashSet<&str> = member_ids.iter().map(String::as_str).collect();
     orderings
@@ -939,5 +1282,57 @@ mod tests {
         assert_eq!(appearances[1].rank, scifi_row.rank);
         assert_eq!(appearances[1].total, scifi_view.rows.len());
         assert_eq!(appearances[1].tier, scifi_row.tier);
+    }
+
+    #[tokio::test]
+    async fn test_ep_score_cache_reuses_and_invalidates_and_filtered_collection_counts() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let cache = EpScoreCache::new();
+        let svc = CatalogService::with_cache(&db, &cache);
+
+        let a = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Movie),
+                title: "Stalker".to_owned(),
+                creators: vec!["Andrei Tarkovsky".to_owned()],
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        let b = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Movie),
+                title: "Solaris".to_owned(),
+                creators: vec!["Andrei Tarkovsky".to_owned()],
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        svc.log_consumption(&a.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+        svc.log_consumption(&b.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+        svc.append_comparison(None, &[vec![a.id.clone()], vec![b.id.clone()]], None).await.unwrap();
+
+        let first = svc
+            .get_filtered_ranked_collection(
+                "movies",
+                false,
+                &RankedCollectionFilter { tier: Some('S'), query: None },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.full_total, 2);
+        assert_eq!(first.full_tier_counts.iter().sum::<usize>(), 2);
+        assert_eq!(first.view.rows.len(), 1);
+        assert_eq!(first.view.rows[0].entry.id, a.id);
+
+        // Cached hit produces consistent tiers via load_tiers_for_entries
+        let tiers = svc.load_tiers_for_entries(&[a.clone(), b.clone()]).await;
+        assert_eq!(tiers.get(&a.id), Some(&'S'));
+
+        // Appending a new comparison invalidates the cache immediately
+        svc.append_comparison(None, &[vec![b.id.clone()], vec![a.id.clone()]], None).await.unwrap();
+        svc.append_comparison(None, &[vec![b.id.clone()], vec![a.id.clone()]], None).await.unwrap();
+        let after = svc.get_ranked_collection("movies", false).await.unwrap();
+        assert_eq!(after.rows[0].entry.id, b.id);
     }
 }

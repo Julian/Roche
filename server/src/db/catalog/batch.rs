@@ -23,6 +23,65 @@ use crate::{
     ranking::validate_ordering,
 };
 
+const MAX_BATCH_ENTRIES: usize = 5_000;
+const MAX_BATCH_COLLECTIONS: usize = 500;
+const MAX_BATCH_MEMBERS_PER_COLLECTION: usize = 5_000;
+const MAX_BATCH_TOTAL_MEMBERS: usize = 50_000;
+const MAX_BATCH_LOGS: usize = 5_000;
+const MAX_BATCH_COMPARISONS: usize = 2_000;
+const MAX_BATCH_GENERATORS: usize = 200;
+const MAX_BATCH_IDENTIFIERS_PER_ENTRY: usize = 32;
+
+fn validate_batch_limits(batch: &CatalogBatchInput) -> CatalogResult<()> {
+    if batch.entries.len() > MAX_BATCH_ENTRIES {
+        return Err(CatalogError::InvalidInput(format!(
+            "Batch exceeds maximum of {MAX_BATCH_ENTRIES} entries"
+        )));
+    }
+    if batch.collections.len() > MAX_BATCH_COLLECTIONS {
+        return Err(CatalogError::InvalidInput(format!(
+            "Batch exceeds maximum of {MAX_BATCH_COLLECTIONS} collections"
+        )));
+    }
+    if batch.logs.len() > MAX_BATCH_LOGS {
+        return Err(CatalogError::InvalidInput(format!(
+            "Batch exceeds maximum of {MAX_BATCH_LOGS} consumption logs"
+        )));
+    }
+    if batch.comparisons.len() > MAX_BATCH_COMPARISONS {
+        return Err(CatalogError::InvalidInput(format!(
+            "Batch exceeds maximum of {MAX_BATCH_COMPARISONS} comparisons"
+        )));
+    }
+    if batch.generators.len() > MAX_BATCH_GENERATORS {
+        return Err(CatalogError::InvalidInput(format!(
+            "Batch exceeds maximum of {MAX_BATCH_GENERATORS} generators"
+        )));
+    }
+    for item in &batch.entries {
+        if item.entry.identifiers.len() > MAX_BATCH_IDENTIFIERS_PER_ENTRY {
+            return Err(CatalogError::InvalidInput(format!(
+                "Batch entry exceeds maximum of {MAX_BATCH_IDENTIFIERS_PER_ENTRY} identifiers"
+            )));
+        }
+    }
+    let mut total_members = 0usize;
+    for col in &batch.collections {
+        if col.members.len() > MAX_BATCH_MEMBERS_PER_COLLECTION {
+            return Err(CatalogError::InvalidInput(format!(
+                "Batch collection exceeds maximum of {MAX_BATCH_MEMBERS_PER_COLLECTION} members"
+            )));
+        }
+        total_members = total_members.saturating_add(col.members.len());
+        if total_members > MAX_BATCH_TOTAL_MEMBERS {
+            return Err(CatalogError::InvalidInput(format!(
+                "Batch exceeds maximum of {MAX_BATCH_TOTAL_MEMBERS} total collection members"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl CatalogRepo<'_> {
     /// Applies a declarative batch of entries, manual collections, consumption logs, comparisons,
     /// and collection generator updates inside a single atomic SQLite transaction.
@@ -33,6 +92,7 @@ impl CatalogRepo<'_> {
         &self,
         batch: &CatalogBatchInput,
     ) -> CatalogResult<CatalogBatchResult> {
+        validate_batch_limits(batch)?;
         let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let mut ref_map: HashMap<String, String> =
@@ -150,7 +210,8 @@ impl CatalogRepo<'_> {
         .await?;
 
         let target_id = if let Some((ex_id, ex_mode, ex_role)) = existing {
-            if ex_mode != CollectionMode::Manual
+            if crate::db::is_protected_system_collection_id(&ex_id)
+                || ex_mode != CollectionMode::Manual
                 || matches!(
                     ex_role,
                     CollectionRole::Feed | CollectionRole::Tag | CollectionRole::System
@@ -162,8 +223,26 @@ impl CatalogRepo<'_> {
             }
             ex_id
         } else {
+            if crate::db::is_protected_system_collection_id(&requested_id) {
+                return Err(CatalogError::Conflict(format!(
+                    "Collection '{derived_slug}' conflicts with a protected system collection"
+                )));
+            }
             requested_id
         };
+
+        let existing_entry: Option<(EntryKind, Option<String>)> =
+            sqlx::query_as("SELECT kind, merged_into_id FROM entries WHERE id = ?")
+                .bind(&target_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some((ex_kind, ex_merged)) = existing_entry
+            && (ex_kind != EntryKind::Collection || ex_merged.is_some())
+        {
+            return Err(CatalogError::Conflict(format!(
+                "Collection '{derived_slug}' targets an existing non-collection or merged entry"
+            )));
+        }
 
         let show_in_lists = col.role == CollectionRole::List;
         let clean_summary = col.summary.as_deref().map(str::trim).filter(|s| !s.is_empty());

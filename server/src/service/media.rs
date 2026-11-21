@@ -52,16 +52,50 @@ impl MediaService<'_> {
         Ok(())
     }
 
-    /// Deletes any remaining DB rows for `media_list` and removes their underlying files
-    /// from [`MediaStore`], keeping filesystem orchestration out of `db::MediaRepo`.
+    /// Unlinks underlying media files from [`MediaStore`] before deleting their DB rows so an
+    /// I/O error never strands an untracked orphan file on disk.
     pub(super) async fn remove_media_files_and_rows(
         &self,
         media_list: Vec<Media>,
     ) -> Result<(), AppError> {
-        let deleted = self.service.db.media().delete_rows_returning(media_list).await?;
-        for media in deleted {
-            self.service.media_store.remove(&media.path).await?;
+        if let Some(err) =
+            unlink_and_delete_media_rows(&self.service.db, &self.service.media_store, media_list)
+                .await?
+        {
+            return Err(AppError::Internal(err));
         }
         Ok(())
     }
+}
+
+/// Unlinks each media file on disk first and deletes only the DB rows whose files were cleanly
+/// unlinked (or already missing), returning the first unlink error (if any) after flushing all
+/// successful row deletes.
+pub async fn unlink_and_delete_media_rows(
+    db: &crate::db::Db,
+    media_store: &MediaStore,
+    media_list: Vec<Media>,
+) -> anyhow::Result<Option<anyhow::Error>> {
+    let mut unlinked = Vec::with_capacity(media_list.len());
+    let mut first_err = None;
+    for media in media_list {
+        match media_store.remove(&media.path).await {
+            Ok(()) => unlinked.push(media),
+            Err(e) => {
+                tracing::warn!(
+                    media_id = %media.id,
+                    path = %media.path,
+                    error = %e,
+                    "Failed to unlink media file; retaining DB row for cleanup retry"
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if !unlinked.is_empty() {
+        let _ = db.media().delete_rows_returning(unlinked).await?;
+    }
+    Ok(first_err)
 }

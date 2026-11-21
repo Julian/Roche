@@ -415,7 +415,7 @@ pub(in crate::web) async fn post_feed_create(
         .web_err(&session)?;
     let service_bg = Arc::clone(&service);
     let feed_id = feed.id;
-    tokio::spawn(async move {
+    service.spawn_background(async move {
         let _ = service_bg.feeds().refresh(&feed_id).await;
     });
     Ok(redirect_with_flash("/feeds", "notice", "Subscribed to feed (refreshing in background)"))
@@ -430,7 +430,7 @@ pub(in crate::web) async fn post_feed_opml(
     let count = imported.len();
     if !imported.is_empty() {
         let service_bg = Arc::clone(&service);
-        tokio::spawn(async move {
+        service.spawn_background(async move {
             service_bg.feeds().poll_feeds_concurrently(imported).await;
         });
     }
@@ -460,7 +460,7 @@ pub(in crate::web) async fn post_feed_refresh(
 ) -> Result<Response, WebError> {
     let _ = service.feeds().get(&id).await.web_err(&session)?;
     let service_bg = Arc::clone(&service);
-    tokio::spawn(async move {
+    service.spawn_background(async move {
         let _ = service_bg.feeds().refresh(&id).await;
     });
     Ok(redirect_with_flash("/feeds", "notice", "Refreshing feed in background…"))

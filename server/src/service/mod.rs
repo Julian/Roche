@@ -10,10 +10,12 @@ mod tags;
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -29,10 +31,11 @@ use self::{
     tags::TagService,
 };
 pub use self::{
-    catalog::{CatalogService, EntryListAppearance},
+    catalog::{CatalogService, EntryListAppearance, EpScoreCache, RankedCollectionFilter},
     error::AppError,
     feeds::FeedService,
     items::ItemDetail,
+    media::unlink_and_delete_media_rows,
     sync::{SyncChanges, SyncStatus},
 };
 use crate::{
@@ -40,13 +43,28 @@ use crate::{
     content::{HtmlSanitizer, MAX_SUMMARY_CHARS},
     db::{
         ActivityEntry, CatalogEntry, CatalogRepo, CollectionSummary, ComparisonRecord,
-        ConsumptionLogRow, Db, ExportCollectionEntry, ExportCollectionGenerator, Feed, Item,
-        ItemTag, SyncRepo, Tag,
+        ConsumptionLogRow, ConsumptionLogView, Db, ExportCollectionEntry,
+        ExportCollectionGenerator, Feed, Item, ItemFilter, ItemStatusFilter, ItemTag, SyncRepo,
+        Tag, WantSearchMatch,
+    },
+    domain::EntryKind,
+    ingest::{
+        DynFeedFetcher, FeedFetcher, FeedPollLocks, MAX_CONCURRENT_POLLS, MediaIngestContext,
     },
     media::{MediaStore, ytdlp::YtDlpWorker},
-    scheduler::{DynFeedFetcher, FeedFetcher, FeedPollLocks, MediaIngestContext},
-    util::{clock::now_utc, media_urls::youtube_thumbnail_url},
+    util::{clock::now_utc, media_urls::youtube_thumbnail_url, task_tracker::TaskTracker},
 };
+
+/// Grouped workspace-wide search results across Catalog, Lists, Want Queues, Inbox, and Diary.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WorkspaceSearchResults {
+    pub query: String,
+    pub catalog_entries: Vec<CatalogEntry>,
+    pub collections: Vec<CollectionSummary>,
+    pub want_entries: Vec<WantSearchMatch>,
+    pub inbox_items: Vec<Item>,
+    pub diary_logs: Vec<ConsumptionLogView>,
+}
 
 /// Runs one-time content-layer database maintenance tasks (`normalize_legacy_html_summaries` and
 /// `backfill_missing_thumbnails`) using `HtmlSanitizer` outside the `db` module.
@@ -137,8 +155,11 @@ pub struct RocheService {
     media_store: MediaStore,
     ytdlp_worker: YtDlpWorker,
     download_semaphore: Arc<Semaphore>,
+    poll_semaphore: Arc<Semaphore>,
     active_refreshes: Arc<AtomicUsize>,
     feed_poll_locks: FeedPollLocks,
+    task_tracker: TaskTracker,
+    ep_cache: EpScoreCache,
     pairing_limiter: Arc<PairingRateLimiter>,
     tailscale_web_sessions: Arc<Mutex<HashMap<String, String>>>,
     artist_enricher: Arc<ArtistEnricher>,
@@ -159,13 +180,34 @@ impl RocheService {
             media_store,
             ytdlp_worker,
             download_semaphore,
+            poll_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_POLLS)),
             active_refreshes: Arc::new(AtomicUsize::new(0)),
             feed_poll_locks: FeedPollLocks::new(),
+            task_tracker: TaskTracker::new(),
+            ep_cache: EpScoreCache::new(),
             pairing_limiter: Arc::new(PairingRateLimiter::default()),
             tailscale_web_sessions: Arc::new(Mutex::new(HashMap::new())),
             artist_enricher: Arc::new(ArtistEnricher::default_for_runtime()),
             node_identity: None,
         }
+    }
+
+    /// Spawns a tracked background task tied to this service's shutdown lifecycle.
+    pub fn spawn_background<F>(&self, fut: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.task_tracker.spawn(fut)
+    }
+
+    #[must_use]
+    pub fn background_task_count(&self) -> usize {
+        self.task_tracker.active_count()
+    }
+
+    /// Stops accepting new background tasks and waits up to `timeout` for in-flight tasks to finish.
+    pub async fn shutdown_background_tasks(&self, timeout: Duration) -> bool {
+        self.task_tracker.close_and_wait(timeout).await
     }
 
     #[must_use]
@@ -242,7 +284,63 @@ impl RocheService {
 
     #[must_use]
     pub const fn catalog(&self) -> CatalogService<'_> {
-        CatalogService::new(&self.db)
+        CatalogService::with_cache(&self.db, &self.ep_cache)
+    }
+
+    /// Unified workspace-wide search across Catalog entries (`entries_fts`), Lists, Want queues,
+    /// Inbox/Reader items (`entries_fts`), and Diary logs (`entries_fts` + notes).
+    pub async fn search_workspace(
+        &self,
+        raw_query: &str,
+        limit_per_group: usize,
+    ) -> Result<WorkspaceSearchResults, AppError> {
+        let trimmed_raw = raw_query.trim();
+        let cap = limit_per_group.clamp(1, 100);
+        if trimmed_raw.is_empty() {
+            return Ok(WorkspaceSearchResults::default());
+        }
+        let trimmed: String = trimmed_raw.chars().take(256).collect();
+        let trimmed = trimmed.trim();
+        if trimmed.is_empty() {
+            return Ok(WorkspaceSearchResults::default());
+        }
+        let lower_q = trimmed.to_lowercase();
+        let item_filter = ItemFilter {
+            status: Some(ItemStatusFilter::All),
+            search: Some(trimmed.to_owned()),
+            include_content: Some(false),
+            per_page: Some(cap),
+            ..ItemFilter::default()
+        };
+        let catalog = self.catalog();
+        let (raw_entries, all_collections, want_entries, item_page, diary_logs) = tokio::try_join!(
+            catalog.search_entries(Some(trimmed), None, cap.saturating_mul(2).min(200)),
+            catalog.list_collections(false, false),
+            catalog.search_want_entries(trimmed, cap),
+            self.items().query().with_filter(item_filter).list_page(),
+            catalog.search_diary_logs(trimmed, cap),
+        )?;
+
+        let catalog_entries: Vec<CatalogEntry> =
+            raw_entries.into_iter().filter(|e| e.kind != EntryKind::Collection).take(cap).collect();
+        let collections: Vec<CollectionSummary> = all_collections
+            .into_iter()
+            .filter(|c| {
+                c.title.to_lowercase().contains(&lower_q)
+                    || c.slug.as_deref().is_some_and(|s| s.to_lowercase().contains(&lower_q))
+                    || c.summary.as_deref().is_some_and(|s| s.to_lowercase().contains(&lower_q))
+            })
+            .take(cap)
+            .collect();
+
+        Ok(WorkspaceSearchResults {
+            query: trimmed.to_owned(),
+            catalog_entries,
+            collections,
+            want_entries,
+            inbox_items: item_page.items,
+            diary_logs,
+        })
     }
 
     #[must_use]
@@ -251,17 +349,33 @@ impl RocheService {
     }
 
     #[must_use]
-    pub fn poll_scheduler(&self) -> crate::scheduler::PollScheduler<DynFeedFetcher> {
-        crate::scheduler::PollScheduler::with_arc_fetcher(
-            self.db.clone(),
-            Arc::new(self.fetcher.clone()),
-        )
-        .with_feed_poll_locks(self.feed_poll_locks.clone())
-        .with_media(
-            self.media_store.clone(),
-            self.ytdlp_worker.clone(),
-            Arc::clone(&self.download_semaphore),
-        )
+    pub fn fetcher(&self) -> DynFeedFetcher {
+        self.fetcher.clone()
+    }
+
+    #[must_use]
+    pub fn feed_poll_locks(&self) -> FeedPollLocks {
+        self.feed_poll_locks.clone()
+    }
+
+    #[must_use]
+    pub fn poll_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.poll_semaphore)
+    }
+
+    #[must_use]
+    pub fn media_store(&self) -> MediaStore {
+        self.media_store.clone()
+    }
+
+    #[must_use]
+    pub fn ytdlp_worker(&self) -> YtDlpWorker {
+        self.ytdlp_worker.clone()
+    }
+
+    #[must_use]
+    pub fn download_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.download_semaphore)
     }
 
     const fn media_ingest_context(&self) -> MediaIngestContext<'_, DynFeedFetcher> {

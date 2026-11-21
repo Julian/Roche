@@ -1,19 +1,22 @@
 use thiserror::Error;
 
-use crate::{db::CatalogError, util::url_guard::SsrfBlockedError};
+use crate::{
+    db::{CatalogError, ConflictError},
+    util::url_guard::SsrfBlockedError,
+};
 
 /// Transport-agnostic application error returned by all `service::*` operations.
 ///
-/// Mapped to RFC 9457 Problem Details by `error::ApiError` (for JSON API routes) and to
-/// HTML error pages by `web::html::WebError` (for browser views).
+/// Normalizes `ConflictError`, `SsrfBlockedError`, `CatalogError`, and `sqlx` unique-constraint
+/// violations in one place so both `api::error::ApiError` and `web::html::WebError` can map
+/// directly without re-downcasting inner error chains.
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
-    #[allow(dead_code)]
-    #[error("Unauthorized: {0}")]
-    Unauthorized(String),
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
 
     #[error("Invalid bearer token: {0}")]
     TokenInvalid(String),
@@ -46,15 +49,19 @@ pub enum AppError {
     BadGateway(String),
 
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(sqlx::Error),
 
     #[error("Internal error: {0}")]
-    Internal(#[from] anyhow::Error),
+    Internal(anyhow::Error),
 }
 
 impl AppError {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::BadRequest(message.into())
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::Forbidden(message.into())
     }
 
     pub fn token_invalid(message: impl Into<String>) -> Self {
@@ -96,12 +103,55 @@ impl AppError {
     pub fn bad_gateway(message: impl Into<String>) -> Self {
         Self::BadGateway(message.into())
     }
+
+    fn is_unique_sqlx_error(err: &sqlx::Error) -> bool {
+        matches!(
+            err,
+            sqlx::Error::Database(db_err)
+                if db_err.is_unique_violation()
+                    || db_err.message().contains("UNIQUE constraint failed")
+        )
+    }
+
+    fn from_catalog_error_ref(err: &CatalogError) -> Option<Self> {
+        match err {
+            CatalogError::Db(db_err) => {
+                if Self::is_unique_sqlx_error(db_err) {
+                    Some(Self::conflict(
+                        "A resource with the same unique identifier already exists",
+                    ))
+                } else {
+                    None
+                }
+            }
+            CatalogError::NotFound(msg) => Some(Self::not_found(msg.clone())),
+            CatalogError::Conflict(msg) => Some(Self::conflict(msg.clone())),
+            CatalogError::AmbiguousLookup { candidates, .. } => {
+                Some(Self::ambiguous_lookup(err.to_string(), candidates.clone()))
+            }
+            CatalogError::ImmutableCollection { .. } => {
+                Some(Self::immutable_collection(err.to_string()))
+            }
+            CatalogError::InvalidInput(_) => Some(Self::bad_request(err.to_string())),
+            CatalogError::Internal(_) => None,
+        }
+    }
+}
+
+impl From<sqlx::Error> for AppError {
+    fn from(err: sqlx::Error) -> Self {
+        if Self::is_unique_sqlx_error(&err) {
+            Self::conflict("A resource with the same unique identifier already exists")
+        } else {
+            Self::Database(err)
+        }
+    }
 }
 
 impl From<CatalogError> for AppError {
     fn from(err: CatalogError) -> Self {
         match err {
-            CatalogError::Db(db_err) => Self::Database(db_err),
+            CatalogError::Db(db_err) => Self::from(db_err),
             CatalogError::NotFound(msg) => Self::not_found(msg),
             CatalogError::Conflict(msg) => Self::conflict(msg),
             CatalogError::AmbiguousLookup { ref candidates, .. } => {
@@ -117,5 +167,33 @@ impl From<CatalogError> for AppError {
 impl From<SsrfBlockedError> for AppError {
     fn from(err: SsrfBlockedError) -> Self {
         Self::ssrf_blocked(err.0)
+    }
+}
+
+impl From<ConflictError> for AppError {
+    fn from(err: ConflictError) -> Self {
+        Self::conflict(err.0)
+    }
+}
+
+impl From<anyhow::Error> for AppError {
+    fn from(err: anyhow::Error) -> Self {
+        if let Some(conflict) = err.downcast_ref::<ConflictError>() {
+            return Self::conflict(conflict.0.clone());
+        }
+        if let Some(ssrf) = err.downcast_ref::<SsrfBlockedError>() {
+            return Self::ssrf_blocked(ssrf.0.clone());
+        }
+        if let Some(cat_err) = err.downcast_ref::<CatalogError>()
+            && let Some(mapped) = Self::from_catalog_error_ref(cat_err)
+        {
+            return mapped;
+        }
+        if let Some(sqlx_err) = err.downcast_ref::<sqlx::Error>()
+            && Self::is_unique_sqlx_error(sqlx_err)
+        {
+            return Self::conflict("A resource with the same unique identifier already exists");
+        }
+        Self::Internal(err)
     }
 }

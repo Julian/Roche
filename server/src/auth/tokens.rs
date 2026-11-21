@@ -36,9 +36,15 @@ impl<'a> TokenManager<'a> {
         Ok(token)
     }
 
+    #[cfg(test)]
     pub async fn validate(&self, token: &str) -> Result<bool> {
         let token_hash = Self::hash_token(token);
         self.repo.validate_device_token(&token_hash).await
+    }
+
+    pub async fn validate_token_id(&self, token: &str) -> Result<Option<String>> {
+        let token_hash = Self::hash_token(token);
+        self.repo.validate_device_token_id(&token_hash).await
     }
 }
 

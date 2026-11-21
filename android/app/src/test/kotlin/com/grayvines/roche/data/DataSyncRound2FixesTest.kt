@@ -14,6 +14,7 @@ import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.core.HlcTimestamp
 import com.grayvines.roche.core.MAX_CLOCK_DRIFT_MS
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_CONSUMPTION_LOG
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_ENTRY
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.deterministicFeedId
@@ -1448,4 +1449,60 @@ class DataSyncRound2FixesTest {
             canonicalizeEntryUrl("http://export.arxiv.org/abs/2603.11842v1", "rss"),
         )
     }
+
+    @Test
+    fun `entry tombstones protect dynamic system feed tag collections and catalog history`() =
+        runTest {
+            val dao = database.dao()
+            val catalog = CatalogStore(dao = dao, localPeerIdProvider = { "android-peer-1" })
+            catalog.ensureSystemSeeded()
+            val nowMs = System.currentTimeMillis()
+            val nowIso = formatUtcMillisIso(java.time.Instant.ofEpochMilli(nowMs))
+            val futureHlc = HlcTimestamp.create(nowMs + 30_000L, 1, "server").encode()
+
+            val bookId =
+                catalog.upsertEntry(UpsertCatalogEntryInput(kind = EntryKind.BOOK, title = "Dune"))
+            dao.upsertConsumptionLog(
+                ConsumptionLogEntity(
+                    id = "log-dune-1",
+                    entryId = bookId,
+                    ts = nowIso,
+                    status = "consumed",
+                    createdAt = nowIso,
+                    hlc = HlcTimestamp.create(nowMs, 1, "android-peer-1").encode(),
+                )
+            )
+            val moviesColId = checkNotNull(dao.getCollectionSpecBySlug("movies")).collectionId
+
+            reconcilePeerSyncResponse(
+                dao = dao,
+                response =
+                    PeerSyncResponseDto(
+                        serverPeerId = "server",
+                        serverHlc = futureHlc,
+                        syncTimestamp = nowIso,
+                        tombstones =
+                            listOf(
+                                SyncTombstoneDto(
+                                    entityType = TOMBSTONE_ENTITY_ENTRY,
+                                    naturalKey = moviesColId,
+                                    deletedAt = nowIso,
+                                    hlc = futureHlc,
+                                ),
+                                SyncTombstoneDto(
+                                    entityType = TOMBSTONE_ENTITY_ENTRY,
+                                    naturalKey = bookId,
+                                    deletedAt = nowIso,
+                                    hlc = futureHlc,
+                                ),
+                            ),
+                    ),
+                localPeerId = "android-peer-1",
+            )
+
+            assertNotNull(dao.getCollectionSpecById(moviesColId))
+            assertNull(dao.getTombstone(TOMBSTONE_ENTITY_ENTRY, moviesColId))
+            assertNotNull(dao.getEntryById(bookId))
+            assertNull(dao.getTombstone(TOMBSTONE_ENTITY_ENTRY, bookId))
+        }
 }

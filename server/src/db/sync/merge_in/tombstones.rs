@@ -5,7 +5,7 @@ use sqlx::SqliteConnection;
 use super::super::{
     SyncRepo,
     activity::SyncTombstone,
-    hlc::resolve_or_synthesize_hlc,
+    hlc::{clamp_incoming_timestamp, resolve_or_synthesize_hlc},
     identity::{
         canonicalize_sync_url, collection_entry_natural_key, deterministic_feed_id,
         deterministic_item_id, feed_natural_key, is_protected_system_collection_id,
@@ -41,15 +41,16 @@ impl SyncRepo<'_> {
             if key.is_empty() {
                 continue;
             }
+            let safe_deleted_at = clamp_incoming_timestamp(tomb.deleted_at, ctx.now);
             let tomb_hlc =
-                resolve_or_synthesize_hlc(&tomb.hlc, Some(tomb.deleted_at), ctx.now, ctx.peer_id);
+                resolve_or_synthesize_hlc(&tomb.hlc, Some(safe_deleted_at), ctx.now, ctx.peer_id);
 
             match tomb.entity_type {
                 ActivityEntityType::Feed => {
                     Self::apply_feed_tombstone_in_tx(
                         conn,
                         key,
-                        tomb.deleted_at,
+                        safe_deleted_at,
                         &tomb_hlc,
                         ctx.now,
                     )
@@ -59,18 +60,18 @@ impl SyncRepo<'_> {
                     Self::apply_item_tombstone_in_tx(
                         conn,
                         key,
-                        tomb.deleted_at,
+                        safe_deleted_at,
                         &tomb_hlc,
                         ctx.now,
                     )
                     .await?;
                 }
                 ActivityEntityType::Tag => {
-                    Self::apply_tag_tombstone_in_tx(conn, key, tomb.deleted_at, &tomb_hlc, ctx)
+                    Self::apply_tag_tombstone_in_tx(conn, key, safe_deleted_at, &tomb_hlc, ctx)
                         .await?;
                 }
                 ActivityEntityType::Entry => {
-                    Self::apply_entry_tombstone_in_tx(conn, key, tomb.deleted_at, &tomb_hlc, ctx)
+                    Self::apply_entry_tombstone_in_tx(conn, key, safe_deleted_at, &tomb_hlc, ctx)
                         .await?;
                 }
                 ActivityEntityType::CollectionEntry
@@ -98,15 +99,16 @@ impl SyncRepo<'_> {
             if key.is_empty() {
                 continue;
             }
+            let safe_deleted_at = clamp_incoming_timestamp(tomb.deleted_at, ctx.now);
             let tomb_hlc =
-                resolve_or_synthesize_hlc(&tomb.hlc, Some(tomb.deleted_at), ctx.now, ctx.peer_id);
+                resolve_or_synthesize_hlc(&tomb.hlc, Some(safe_deleted_at), ctx.now, ctx.peer_id);
 
             match tomb.entity_type {
                 ActivityEntityType::CollectionEntry => {
                     Self::apply_collection_entry_tombstone_in_tx(
                         conn,
                         key,
-                        tomb.deleted_at,
+                        safe_deleted_at,
                         &tomb_hlc,
                         ctx,
                     )
@@ -116,7 +118,7 @@ impl SyncRepo<'_> {
                     Self::apply_collection_generator_tombstone_in_tx(
                         conn,
                         key,
-                        tomb.deleted_at,
+                        safe_deleted_at,
                         &tomb_hlc,
                         ctx,
                     )
@@ -126,7 +128,7 @@ impl SyncRepo<'_> {
                     Self::apply_consumption_log_tombstone_in_tx(
                         conn,
                         key,
-                        tomb.deleted_at,
+                        safe_deleted_at,
                         &tomb_hlc,
                     )
                     .await?;
@@ -149,8 +151,13 @@ impl SyncRepo<'_> {
         ctx: &mut MergeContext<'_>,
     ) -> Result<()> {
         let deferred = std::mem::take(&mut ctx.deferred_entry_deletes);
-        for (raw_key, tomb_hlc) in deferred {
+        for (raw_key, deleted_at, tomb_hlc) in deferred {
             let key = ctx.id_resolver.resolve_or_fallback_in_tx(&mut *conn, &raw_key).await?;
+            if is_protected_system_collection_id(&key)
+                || Self::is_protected_collection_spec_in_tx(&mut *conn, &key).await?
+            {
+                continue;
+            }
             let existing_hlc: Option<String> =
                 sqlx::query_scalar("SELECT hlc FROM entries WHERE id = ?")
                     .bind(&key)
@@ -167,6 +174,14 @@ impl SyncRepo<'_> {
                 if ctx.tag_index.is_loaded() {
                     ctx.tag_index.remove(&key);
                 }
+                Self::record_tombstone_with_hlc(
+                    &mut *conn,
+                    ActivityEntityType::Entry,
+                    &key,
+                    deleted_at,
+                    &tomb_hlc,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -402,6 +417,21 @@ impl SyncRepo<'_> {
         Ok(())
     }
 
+    async fn is_protected_collection_spec_in_tx(
+        conn: &mut SqliteConnection,
+        key: &str,
+    ) -> Result<bool> {
+        let protected_spec: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM collection_specs
+             WHERE collection_id = ?
+               AND (mode = 'dynamic' OR collection_role IN ('system', 'feed', 'tag'))",
+        )
+        .bind(key)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(protected_spec.is_some())
+    }
+
     async fn apply_entry_tombstone_in_tx(
         conn: &mut SqliteConnection,
         key: &str,
@@ -409,17 +439,9 @@ impl SyncRepo<'_> {
         tomb_hlc: &str,
         ctx: &mut MergeContext<'_>,
     ) -> Result<()> {
-        if is_protected_system_collection_id(key) {
-            return Ok(());
-        }
-        let protected_spec: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM collection_specs
-             WHERE collection_id = ? AND (mode = 'dynamic' OR collection_role = 'system')",
-        )
-        .bind(key)
-        .fetch_optional(&mut *conn)
-        .await?;
-        if protected_spec.is_some() {
+        if is_protected_system_collection_id(key)
+            || Self::is_protected_collection_spec_in_tx(&mut *conn, key).await?
+        {
             return Ok(());
         }
         let existing_hlc: Option<String> =
@@ -431,12 +453,12 @@ impl SyncRepo<'_> {
             return Ok(());
         }
         if ItemRepo::entry_has_catalog_history_in_tx(&mut *conn, key).await? {
-            ctx.deferred_entry_deletes.push((key.to_owned(), tomb_hlc.to_owned()));
-        } else {
-            sqlx::query("DELETE FROM entries WHERE id = ?").bind(key).execute(&mut *conn).await?;
-            if ctx.tag_index.is_loaded() {
-                ctx.tag_index.remove(key);
-            }
+            ctx.deferred_entry_deletes.push((key.to_owned(), deleted_at, tomb_hlc.to_owned()));
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM entries WHERE id = ?").bind(key).execute(&mut *conn).await?;
+        if ctx.tag_index.is_loaded() {
+            ctx.tag_index.remove(key);
         }
         Self::record_tombstone_with_hlc(
             &mut *conn,

@@ -5,8 +5,8 @@ pub mod config;
 mod content;
 pub mod db;
 pub mod domain;
-mod error;
 mod feeds;
+mod ingest;
 mod media;
 pub mod ranking;
 mod scheduler;
@@ -23,7 +23,7 @@ impl RocheServer {
     pub async fn run(cfg: config::Config) -> anyhow::Result<()> {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
         service::run_content_startup_maintenance(&db).await;
-        let fetcher = scheduler::HttpFeedFetcher::new()?;
+        let fetcher = ingest::HttpFeedFetcher::new()?;
         let (listen_cfg, mut ts_identity) = Self::resolve_listen_config(&cfg).await?;
 
         let addr = listen_cfg.listen_addr();
@@ -54,7 +54,17 @@ impl RocheServer {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let poll_scheduler = roche_service.poll_scheduler();
+        let poll_scheduler = scheduler::PollScheduler::with_arc_fetcher(
+            db.clone(),
+            std::sync::Arc::new(roche_service.fetcher()),
+        )
+        .with_feed_poll_locks(roche_service.feed_poll_locks())
+        .with_poll_semaphore(roche_service.poll_semaphore())
+        .with_media(
+            roche_service.media_store(),
+            roche_service.ytdlp_worker(),
+            roche_service.download_semaphore(),
+        );
         let sched_shutdown = shutdown_rx.clone();
         let scheduler_handle = tokio::spawn(async move {
             if let Err(e) = poll_scheduler.run_until_shutdown(sched_shutdown).await {
@@ -75,6 +85,7 @@ impl RocheServer {
             }
         });
 
+        let bg_service = roche_service.clone();
         let app = api::ApiRoutes::router_with_service(roche_service);
 
         tracing::info!(addr = %addr, "Roche server listening");
@@ -93,6 +104,14 @@ impl RocheServer {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let _ = scheduler_handle.await;
             let _ = worker_handle.await;
+            let drained =
+                bg_service.shutdown_background_tasks(std::time::Duration::from_secs(10)).await;
+            if !drained {
+                tracing::warn!(
+                    active = bg_service.background_task_count(),
+                    "Timed out waiting for background service tasks during shutdown"
+                );
+            }
         })
         .await;
         serve_res?;
@@ -254,7 +273,7 @@ impl RocheServer {
 
     async fn connect_service(cfg: &config::Config) -> anyhow::Result<service::RocheService> {
         let db = Self::connect_db(cfg).await?;
-        let fetcher = scheduler::HttpFeedFetcher::new()?;
+        let fetcher = ingest::HttpFeedFetcher::new()?;
         Ok(service::RocheService::new(db, fetcher, cfg.clone()))
     }
 
@@ -327,7 +346,7 @@ mod tests {
 
     struct NoopFetcher;
 
-    impl scheduler::FeedFetcher for NoopFetcher {
+    impl ingest::FeedFetcher for NoopFetcher {
         fn fetch_feed(
             &self,
             _url: &url::Url,

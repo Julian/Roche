@@ -172,6 +172,9 @@ impl CatalogRepo<'_> {
     /// Replays a peer-synced `consumption_log` record while preserving custom/timestamped log IDs,
     /// canonicalizing merged entry IDs, and deduplicating auto-completion log IDs across devices.
     ///
+    /// Returns `(saved_log_id, canonical_entry_id, inserted_new)` so callers know whether a new
+    /// log row was created or an existing row was deduplicated onto.
+    ///
     /// Intentionally defers generator advancement so `merge_incoming_generators_in_tx` can first
     /// merge the peer's own generator state (with its HLC) before advancing any remaining terminal
     /// local draws.
@@ -183,7 +186,7 @@ impl CatalogRepo<'_> {
         notes: Option<&str>,
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> CatalogResult<(String, String)> {
+    ) -> CatalogResult<(String, String, bool)> {
         let canon_id = Self::follow_merged_id_in_tx(tx, raw_entry_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Entry '{raw_entry_id}'")))?;
@@ -193,12 +196,13 @@ impl CatalogRepo<'_> {
             && (trimmed_incoming == deterministic_auto_consumption_log_id(raw_entry_id.trim())
                 || trimmed_incoming == deterministic_auto_consumption_log_id(&canon_id));
         if is_auto_id
-            && let Some(auto_id) = Self::ensure_auto_consumed_with_parents_inner_in_tx(
-                tx, &canon_id, notes, event_ts, now, false,
-            )
-            .await?
+            && let Some((auto_id, inserted_new)) =
+                Self::ensure_auto_consumed_with_parents_inner_in_tx(
+                    tx, &canon_id, notes, event_ts, now, false,
+                )
+                .await?
         {
-            return Ok((auto_id, canon_id));
+            return Ok((auto_id, canon_id, inserted_new));
         }
 
         let clean_notes = notes.map(str::trim).filter(|s| !s.is_empty());
@@ -220,7 +224,7 @@ impl CatalogRepo<'_> {
             trimmed_incoming.to_owned()
         };
 
-        Self::insert_consumption_and_engage_in_tx(
+        let inserted_new = Self::insert_consumption_and_engage_in_tx(
             tx,
             &final_log_id,
             &canon_id,
@@ -231,7 +235,20 @@ impl CatalogRepo<'_> {
             false,
         )
         .await?;
-        Ok((final_log_id, canon_id))
+        Ok((final_log_id, canon_id, inserted_new))
+    }
+
+    /// Runs Want-queue cleanup and parent engagement side effects when an existing log transitions
+    /// to `Consumed` (e.g., via synced LWW update).
+    pub(crate) async fn promote_entry_consumed_side_effects_in_tx(
+        tx: &mut SqliteConnection,
+        entry_id: &str,
+        event_ts: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<()> {
+        remove_from_want_queues_in_tx(tx, entry_id, now).await?;
+        Self::engage_consumed_parents_in_tx(tx, entry_id, event_ts, now).await?;
+        Ok(())
     }
 
     /// Idempotently ensures `entry_id` has a `'consumed'` log using `deterministic_auto_consumption_log_id`
@@ -244,10 +261,11 @@ impl CatalogRepo<'_> {
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> CatalogResult<Option<String>> {
-        Self::ensure_auto_consumed_with_parents_inner_in_tx(
+        Ok(Self::ensure_auto_consumed_with_parents_inner_in_tx(
             tx, entry_id, notes, event_ts, now, true,
         )
-        .await
+        .await?
+        .map(|(id, _)| id))
     }
 
     async fn ensure_auto_consumed_with_parents_inner_in_tx(
@@ -257,7 +275,7 @@ impl CatalogRepo<'_> {
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
         advance_generators: bool,
-    ) -> CatalogResult<Option<String>> {
+    ) -> CatalogResult<Option<(String, bool)>> {
         let Some(canon_id) = Self::follow_merged_id_in_tx(tx, entry_id).await? else {
             return Ok(None);
         };
@@ -282,11 +300,11 @@ impl CatalogRepo<'_> {
             }
             remove_from_want_queues_in_tx(tx, &canon_id, now).await?;
             Self::engage_consumed_parents_in_tx(tx, &canon_id, event_ts, now).await?;
-            return Ok(Some(existing_id));
+            return Ok(Some((existing_id, false)));
         }
 
         let auto_id = deterministic_auto_consumption_log_id(&canon_id);
-        Self::insert_consumption_and_engage_in_tx(
+        let inserted_new = Self::insert_consumption_and_engage_in_tx(
             tx,
             &auto_id,
             &canon_id,
@@ -297,7 +315,7 @@ impl CatalogRepo<'_> {
             advance_generators,
         )
         .await?;
-        Ok(Some(auto_id))
+        Ok(Some((auto_id, inserted_new)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -310,8 +328,14 @@ impl CatalogRepo<'_> {
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
         advance_generators: bool,
-    ) -> CatalogResult<()> {
+    ) -> CatalogResult<bool> {
         SyncRepo::clear_tombstone(tx, ActivityEntityType::ConsumptionLog, log_id).await?;
+
+        let existed_before: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM consumption_log WHERE id = ?")
+                .bind(log_id)
+                .fetch_optional(&mut *tx)
+                .await?;
 
         sqlx::query!(
             "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at)
@@ -346,7 +370,7 @@ impl CatalogRepo<'_> {
         {
             Self::advance_generators_for_entry_in_tx(tx, canon_id, now).await?;
         }
-        Ok(())
+        Ok(existed_before.is_none())
     }
 
     async fn engage_consumed_parents_in_tx(
@@ -458,6 +482,11 @@ impl CatalogRepo<'_> {
                AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')",
         );
         if let Some(y) = year {
+            if !(1..=9998).contains(&y) {
+                return Err(CatalogError::InvalidInput(
+                    "Year filter must be between 1 and 9998".to_owned(),
+                ));
+            }
             qb.push(" AND strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) >= ")
                 .push_bind(format!("{y:04}-01-01T00:00:00.000Z"))
                 .push(" AND strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) < ")
@@ -494,14 +523,184 @@ impl CatalogRepo<'_> {
         Ok(out)
     }
 
-    /// Removes all `consumed` diary entries for `entry_id` (recording sync tombstones + activity)
-    /// so unfinishing an item in Reader cleanly undoes completion across peers.
-    pub async fn delete_consumed_logs_for_entry(&self, entry_id: &str) -> CatalogResult<usize> {
-        let Some(canon_id) = self.follow_merged_id(entry_id).await? else {
-            return Ok(0);
-        };
+    /// Searches diary logs matching `query` via `entries_fts` (`title`/`creators`/`summary`)
+    /// or `consumption_log.notes`, returning newest entries first up to `limit`.
+    pub async fn search_diary_logs(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> CatalogResult<Vec<ConsumptionLogView>> {
+        let trimmed = query.trim();
+        let terms = crate::db::ItemFilter::tokenize_search_terms(trimmed);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cap = i64::try_from(limit.clamp(1, 200)).unwrap_or(20);
+        let fts_query = terms
+            .iter()
+            .map(|t| format!("{{title creators summary}}: {}", t.fts_clause))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let bounded_q: String = trimmed.chars().take(256).collect();
+        let notes_pattern = format!("%{}%", crate::db::escape_like_literal(&bounded_q));
+
+        let log_rows: Vec<ConsumptionLogRow> = sqlx::query_as(
+            "SELECT cl.id, cl.entry_id, cl.ts, cl.status, cl.notes, cl.created_at
+             FROM consumption_log cl
+             JOIN entries e ON e.id = cl.entry_id
+             WHERE e.merged_into_id IS NULL
+               AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')
+               AND (
+                   e.rowid IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?)
+                   OR COALESCE(cl.notes, '') LIKE ? ESCAPE '\\'
+               )
+             ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) DESC, cl.id DESC
+             LIMIT ?",
+        )
+        .bind(&fts_query)
+        .bind(&notes_pattern)
+        .bind(cap)
+        .fetch_all(self.pool)
+        .await?;
+
+        let unique_entry_ids: Vec<String> = log_rows
+            .iter()
+            .map(|r| r.entry_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let entry_map = self.load_entries_by_ids(&unique_entry_ids).await?;
+
+        let mut out = Vec::with_capacity(log_rows.len());
+        for row in log_rows {
+            if let Some(entry) = entry_map.get(&row.entry_id) {
+                out.push(ConsumptionLogView {
+                    id: row.id,
+                    entry: entry.clone(),
+                    ts: row.ts,
+                    status: row.status,
+                    notes: row.notes,
+                    created_at: row.created_at,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Returns exact `(year, count)` totals across the full diary history (excluding parent
+    /// container kinds `artist`/`podcast`/`publication`/`channel`), optionally filtered by status.
+    pub async fn list_diary_year_counts(
+        &self,
+        status: Option<ConsumptionStatus>,
+    ) -> CatalogResult<Vec<(i32, i64)>> {
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT CAST(strftime('%Y', cl.ts) AS INTEGER) AS yr, COUNT(*) AS cnt
+             FROM consumption_log cl
+             JOIN entries e ON e.id = cl.entry_id
+             WHERE e.merged_into_id IS NULL
+               AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')
+               AND strftime('%Y', cl.ts) IS NOT NULL",
+        );
+        if let Some(st) = status {
+            qb.push(" AND cl.status = ").push_bind(st);
+        }
+        qb.push(" GROUP BY yr ORDER BY yr DESC");
+        let rows: Vec<(i32, i64)> = qb.build_query_as().fetch_all(self.pool).await?;
+        Ok(rows)
+    }
+
+    /// Updates an existing diary log's status, notes, and/or timestamp in a single transaction,
+    /// recording an update activity event so `PeerSync` propagates the edit via LWW HLC.
+    #[allow(clippy::option_option)]
+    pub async fn update_consumption_log(
+        &self,
+        log_id: &str,
+        status: Option<ConsumptionStatus>,
+        notes: Option<Option<&str>>,
+        ts: Option<DateTime<Utc>>,
+    ) -> CatalogResult<ConsumptionLogView> {
         let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
+        let existing: Option<ConsumptionLogRow> = sqlx::query_as(
+            "SELECT id, entry_id, ts, status, notes, created_at
+             FROM consumption_log WHERE id = ?",
+        )
+        .bind(log_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = existing else {
+            return Err(CatalogError::NotFound(format!("Consumption log '{log_id}'")));
+        };
+        let next_status = status.unwrap_or(row.status);
+        let next_notes = match notes {
+            Some(Some(raw)) => {
+                let trimmed = raw.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            }
+            Some(None) => None,
+            None => row.notes,
+        };
+        let next_ts = ts.unwrap_or(row.ts);
+        sqlx::query(
+            "UPDATE consumption_log
+             SET status = ?, notes = ?, ts = ?
+             WHERE id = ?",
+        )
+        .bind(next_status)
+        .bind(next_notes.as_deref())
+        .bind(next_ts)
+        .bind(&row.id)
+        .execute(&mut *tx)
+        .await?;
+        if next_status == ConsumptionStatus::Consumed && row.status != ConsumptionStatus::Consumed {
+            remove_from_want_queues_in_tx(&mut tx, &row.entry_id, now).await?;
+            Self::engage_consumed_parents_in_tx(&mut tx, &row.entry_id, next_ts, now).await?;
+        }
+        SyncRepo::record_activity(
+            &mut tx,
+            ActivityEntityType::ConsumptionLog,
+            &row.id,
+            ActivityAction::Update,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+        self.load_consumption_log_view(&row.id, &row.entry_id).await
+    }
+
+    /// Deletes a single diary log by ID, recording a sync tombstone and delete activity event.
+    pub async fn delete_consumption_log(&self, log_id: &str) -> CatalogResult<bool> {
+        let now = crate::util::clock::now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        let res = sqlx::query("DELETE FROM consumption_log WHERE id = ?")
+            .bind(log_id)
+            .execute(&mut *tx)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Ok(false);
+        }
+        SyncRepo::record_tombstone(&mut tx, ActivityEntityType::ConsumptionLog, log_id, now)
+            .await?;
+        SyncRepo::record_activity(
+            &mut tx,
+            ActivityEntityType::ConsumptionLog,
+            log_id,
+            ActivityAction::Delete,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn delete_consumed_logs_for_entry_in_tx(
+        tx: &mut SqliteConnection,
+        entry_id: &str,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<usize> {
+        let Some(canon_id) = Self::follow_merged_id_in_tx(tx, entry_id).await? else {
+            return Ok(0);
+        };
         let log_ids: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM consumption_log WHERE entry_id = ? AND status = 'consumed'",
         )
@@ -513,10 +712,9 @@ impl CatalogRepo<'_> {
                 .bind(log_id)
                 .execute(&mut *tx)
                 .await?;
-            SyncRepo::record_tombstone(&mut tx, ActivityEntityType::ConsumptionLog, log_id, now)
-                .await?;
+            SyncRepo::record_tombstone(tx, ActivityEntityType::ConsumptionLog, log_id, now).await?;
             SyncRepo::record_activity(
-                &mut tx,
+                tx,
                 ActivityEntityType::ConsumptionLog,
                 log_id,
                 ActivityAction::Delete,
@@ -524,7 +722,6 @@ impl CatalogRepo<'_> {
             )
             .await?;
         }
-        tx.commit().await?;
         Ok(log_ids.len())
     }
 }

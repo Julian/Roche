@@ -6,7 +6,10 @@ use sqlx::SqliteConnection;
 
 use super::super::{
     STARRED_COLLECTION_ID, SyncRepo,
-    hlc::resolve_or_synthesize_hlc,
+    hlc::{
+        clamp_incoming_timestamp, clamp_incoming_timestamp_opt, clamp_incoming_upper_timestamp,
+        resolve_or_synthesize_hlc,
+    },
     hrw::normalize_consecutive_failures,
     identity::{
         deterministic_entity_uuid, deterministic_feed_id, deterministic_item_id,
@@ -153,6 +156,7 @@ impl SyncRepo<'_> {
             if rec.merged_into_id.as_deref().is_some_and(|s| !s.trim().is_empty())
                 || rec.feed_source.is_some()
                 || rec.collection_spec.is_some()
+                || rec.kind == EntryKind::Collection
             {
                 continue;
             }
@@ -305,7 +309,8 @@ impl SyncRepo<'_> {
         fields: &NormalizedFeedFields<'_>,
         now: DateTime<Utc>,
     ) -> Result<(String, String)> {
-        let poll_newer = match (fs.last_polled_at, existing.last_polled_at) {
+        let clamped_polled_at = clamp_incoming_timestamp_opt(fs.last_polled_at, now);
+        let poll_newer = match (clamped_polled_at, existing.last_polled_at) {
             (Some(inc_p), Some(loc_p)) => inc_p > loc_p,
             (Some(_), None) => true,
             _ => false,
@@ -324,7 +329,7 @@ impl SyncRepo<'_> {
                      consecutive_failures = ?
                  WHERE collection_id = ?",
             )
-            .bind(fs.last_polled_at)
+            .bind(clamped_polled_at)
             .bind(fields.clean_polled_by)
             .bind(fields.clean_err)
             .bind(fields.clean_err_by)
@@ -433,7 +438,8 @@ impl SyncRepo<'_> {
         now: DateTime<Utc>,
     ) -> Result<(String, String)> {
         let local_id = fields.det_id.clone();
-        let created_at = rec_created_at.unwrap_or(now);
+        let created_at = clamp_incoming_timestamp(rec_created_at.unwrap_or(now), now);
+        let clamped_polled_at = clamp_incoming_timestamp_opt(fs.last_polled_at, now);
         FeedRepo::insert_feed_in_tx(
             tx,
             &NewFeedRow {
@@ -445,7 +451,7 @@ impl SyncRepo<'_> {
                 language: fields.clean_lang,
                 poll_interval: fields.interval,
                 is_active: fs.is_active,
-                last_polled: fs.last_polled_at,
+                last_polled: clamped_polled_at,
                 last_polled_by: fields.clean_polled_by,
                 last_error: fields.clean_err,
                 last_error_by: fields.clean_err_by,
@@ -589,6 +595,7 @@ impl SyncRepo<'_> {
         created_at: DateTime<Utc>,
         ctx: &mut MergeContext<'_>,
     ) -> Result<String> {
+        let safe_created_at = clamp_incoming_timestamp(created_at, ctx.now);
         sqlx::query(
             "INSERT INTO entries (id, kind, title, created_at, updated_at, hlc)
              VALUES (?, 'collection', ?, ?, ?, ?)
@@ -599,7 +606,7 @@ impl SyncRepo<'_> {
         )
         .bind(&det_id)
         .bind(input.clean_name)
-        .bind(created_at)
+        .bind(safe_created_at)
         .bind(ctx.now)
         .bind(&input.entry_hlc)
         .execute(&mut *tx)
@@ -707,7 +714,7 @@ impl SyncRepo<'_> {
             entry_hlc: &entry_hlc,
             now: ctx.now,
         };
-        let (target_id, was_created_new) = Self::upsert_or_merge_work_entry_in_tx(
+        let Some((target_id, was_created_new)) = Self::upsert_or_merge_work_entry_in_tx(
             tx,
             prep,
             &target,
@@ -715,7 +722,10 @@ impl SyncRepo<'_> {
             det_inbox_id,
             is_active_inbox,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(None);
+        };
         ctx.id_resolver.record(&rec.id, &target_id);
 
         if !suppress_payload {
@@ -745,7 +755,7 @@ impl SyncRepo<'_> {
         idents: Vec<EntryIdentifier>,
         det_inbox_id: Option<String>,
         is_active_inbox: bool,
-    ) -> Result<(String, bool)> {
+    ) -> Result<Option<(String, bool)>> {
         let pre_matched_id = Self::resolve_existing_work_or_item_id_in_tx(
             tx,
             prep,
@@ -755,9 +765,12 @@ impl SyncRepo<'_> {
         )
         .await?;
         if let Some(existing_id) = pre_matched_id {
+            if Self::is_immutable_or_collection_target_in_tx(tx, &existing_id).await? {
+                return Ok(None);
+            }
             Self::merge_into_existing_entry_row_in_tx(tx, &existing_id, prep, target, &idents)
                 .await?;
-            Ok((existing_id, false))
+            Ok(Some((existing_id, false)))
         } else {
             let rec_id = prep.record.id.trim();
             let preferred_id = if (is_active_inbox && det_inbox_id.is_some()) || rec_id.is_empty() {
@@ -765,10 +778,38 @@ impl SyncRepo<'_> {
             } else {
                 Some(rec_id.to_owned())
             };
+            if let Some(ref pid) = preferred_id
+                && Self::is_immutable_or_collection_target_in_tx(tx, pid).await?
+            {
+                return Ok(None);
+            }
             let created_id =
                 Self::insert_new_work_or_item_in_tx(tx, prep, preferred_id, target, idents).await?;
-            Ok((created_id, true))
+            Ok(Some((created_id, true)))
         }
+    }
+
+    async fn is_immutable_or_collection_target_in_tx(
+        tx: &mut SqliteConnection,
+        entry_id: &str,
+    ) -> Result<bool> {
+        if is_protected_system_collection_id(entry_id) {
+            return Ok(true);
+        }
+        let existing_kind: Option<EntryKind> =
+            sqlx::query_scalar("SELECT kind FROM entries WHERE id = ?")
+                .bind(entry_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if existing_kind == Some(EntryKind::Collection) {
+            return Ok(true);
+        }
+        let has_spec: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM collection_specs WHERE collection_id = ? LIMIT 1")
+                .bind(entry_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        Ok(has_spec.is_some())
     }
 
     async fn resolve_parent_feed_url_in_tx(
@@ -903,13 +944,17 @@ impl SyncRepo<'_> {
         idents: Vec<EntryIdentifier>,
     ) -> Result<String> {
         let rec = &prep.record;
+        let clamped_updated =
+            clamp_incoming_timestamp(rec.updated_at.unwrap_or(target.now), target.now);
+        let clamped_published =
+            rec.published_at.map(|ts| clamp_incoming_upper_timestamp(ts, target.now));
         let upsert_input = UpsertEntryInput {
             id: preferred_id,
             kind: Some(target.target_kind),
             title: target.final_title.to_owned(),
             creators: rec.creators.clone(),
             url: rec.url.clone(),
-            published_at: rec.published_at,
+            published_at: clamped_published,
             release_year: rec.release_year,
             summary: prep.clean_summary.clone(),
             thumbnail_url: prep.clean_thumb.clone(),
@@ -918,21 +963,29 @@ impl SyncRepo<'_> {
             parent_collection_id: None,
             parent_position: None,
         };
-        let created_id = CatalogRepo::upsert_entry_in_tx(
+        let (created_id, inserted_new) = CatalogRepo::upsert_entry_with_created_in_tx(
             tx,
             &upsert_input,
             target.target_kind,
             target.final_title,
-            rec.updated_at.unwrap_or(target.now),
+            clamped_updated,
         )
         .await?;
-        if let Some(c_at) = rec.created_at {
-            sqlx::query("UPDATE entries SET created_at = ?, hlc = ? WHERE id = ?")
-                .bind(c_at)
-                .bind(target.entry_hlc)
-                .bind(&created_id)
-                .execute(&mut *tx)
-                .await?;
+        if inserted_new {
+            if let Some(c_at) = clamp_incoming_timestamp_opt(rec.created_at, target.now) {
+                sqlx::query("UPDATE entries SET created_at = ?, hlc = ? WHERE id = ?")
+                    .bind(c_at)
+                    .bind(target.entry_hlc)
+                    .bind(&created_id)
+                    .execute(&mut *tx)
+                    .await?;
+            } else {
+                sqlx::query("UPDATE entries SET hlc = ? WHERE id = ?")
+                    .bind(target.entry_hlc)
+                    .bind(&created_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         } else {
             sqlx::query(
                 "UPDATE entries SET hlc = CASE WHEN ? > hlc THEN ? ELSE hlc END WHERE id = ?",
@@ -1000,12 +1053,13 @@ impl SyncRepo<'_> {
         }
 
         if prep.clean_audio_url.is_some() || prep.clean_duration.is_some() {
+            let safe_created = clamp_incoming_timestamp(rec.created_at.unwrap_or(now), now);
             MediaRepo::upsert_audio_enclosure_in_tx(
                 tx,
                 target_id,
                 prep.clean_audio_url.as_deref(),
                 prep.clean_duration,
-                rec.created_at.unwrap_or(now),
+                safe_created,
             )
             .await?;
         }
@@ -1061,11 +1115,13 @@ impl SyncRepo<'_> {
 
         let was_new_inbox_item =
             matches!(st.inbox_state, InboxState::Unread | InboxState::Dismissed);
-        let inter_ts = st.interaction_updated_at.map(|ts| ts.trunc_subsecs(3));
+        let inter_ts = clamp_incoming_timestamp_opt(st.interaction_updated_at, now)
+            .map(|ts| ts.trunc_subsecs(3));
+        let inc_read_at = clamp_incoming_timestamp_opt(st.read_at, now);
         let read_at = if st.inbox_state == InboxState::Dismissed {
-            st.read_at.or(inter_ts).or(Some(now))
+            inc_read_at.or(inter_ts).or(Some(now))
         } else {
-            st.read_at
+            inc_read_at
         };
         sqlx::query(
             "INSERT INTO entry_state
@@ -1162,6 +1218,9 @@ impl SyncRepo<'_> {
 
         for ident in idents {
             let scheme = crate::db::normalize_identifier_scheme(&ident.scheme);
+            if matches!(scheme.as_str(), "slug" | "tag" | "feed_url") {
+                continue;
+            }
             let val = crate::db::normalize_identifier_value(merged.kind, &scheme, &ident.value);
             if scheme.is_empty() || val.is_empty() {
                 continue;
@@ -1239,7 +1298,9 @@ fn compute_merged_entry_row(
     } else {
         existing.url.clone().or_else(|| clean_inc_url.map(str::to_owned))
     };
-    let published_at = existing.published_at.or(rec.published_at);
+    let clamped_published =
+        rec.published_at.map(|ts| clamp_incoming_upper_timestamp(ts, target.now));
+    let published_at = existing.published_at.or(clamped_published);
     let release_year = if inc_newer && rec.release_year.is_some() {
         rec.release_year
     } else {
@@ -1329,14 +1390,25 @@ const fn resolve_work_target_kind(prep: &PreparedSyncEntry) -> EntryKind {
 }
 
 fn build_work_identifiers(prep: &PreparedSyncEntry) -> Vec<EntryIdentifier> {
-    let mut idents = prep.record.identifiers.clone();
+    let mut idents: Vec<EntryIdentifier> = prep
+        .record
+        .identifiers
+        .iter()
+        .filter(|i| {
+            !matches!(
+                crate::db::normalize_identifier_scheme(&i.scheme).as_str(),
+                "slug" | "tag" | "feed_url"
+            )
+        })
+        .cloned()
+        .collect();
     if let Some(ref c_url) = prep.canon_url
-        && !idents.iter().any(|i| i.scheme == "url")
+        && !idents.iter().any(|i| crate::db::normalize_identifier_scheme(&i.scheme) == "url")
     {
         idents.push(EntryIdentifier { scheme: "url".to_owned(), value: c_url.clone() });
     }
     if let Some(ref aid) = prep.arxiv_id
-        && !idents.iter().any(|i| i.scheme == "arxiv")
+        && !idents.iter().any(|i| crate::db::normalize_identifier_scheme(&i.scheme) == "arxiv")
     {
         idents.push(EntryIdentifier { scheme: "arxiv".to_owned(), value: aid.clone() });
     }
@@ -1418,48 +1490,45 @@ fn resolve_merged_entry_state(
     inc_hlc: &str,
     now: DateTime<Utc>,
 ) -> EntryStateRow {
-    let inc_inter = incoming.interaction_updated_at.map(|ts| ts.trunc_subsecs(3));
-    let (inbox_state, raw_read_at, progress, interaction_updated_at, hlc) = match inc_hlc
-        .cmp(existing.hlc.as_str())
-    {
-        std::cmp::Ordering::Greater => {
-            (incoming.inbox_state, incoming.read_at, inc_progress, inc_inter, inc_hlc.to_owned())
-        }
-        std::cmp::Ordering::Equal => {
-            let merged_inbox = if existing.inbox_state == InboxState::Dismissed
-                || incoming.inbox_state == InboxState::Dismissed
-            {
-                InboxState::Dismissed
-            } else if existing.inbox_state == InboxState::Unread
-                || incoming.inbox_state == InboxState::Unread
-            {
-                InboxState::Unread
-            } else {
-                InboxState::None
-            };
-            (
-                merged_inbox,
-                existing.read_at.max(incoming.read_at),
-                existing.progress.max(inc_progress),
-                existing.interaction_updated_at.max(inc_inter),
+    let inc_inter = clamp_incoming_timestamp_opt(incoming.interaction_updated_at, now)
+        .map(|ts| ts.trunc_subsecs(3));
+    let inc_read_at = clamp_incoming_timestamp_opt(incoming.read_at, now);
+    let (inbox_state, raw_read_at, progress, interaction_updated_at, hlc) =
+        match inc_hlc.cmp(existing.hlc.as_str()) {
+            std::cmp::Ordering::Greater => {
+                (incoming.inbox_state, inc_read_at, inc_progress, inc_inter, inc_hlc.to_owned())
+            }
+            std::cmp::Ordering::Equal => {
+                let merged_inbox = if existing.inbox_state == InboxState::Dismissed
+                    || incoming.inbox_state == InboxState::Dismissed
+                {
+                    InboxState::Dismissed
+                } else if existing.inbox_state == InboxState::Unread
+                    || incoming.inbox_state == InboxState::Unread
+                {
+                    InboxState::Unread
+                } else {
+                    InboxState::None
+                };
+                (
+                    merged_inbox,
+                    existing.read_at.max(inc_read_at),
+                    existing.progress.max(inc_progress),
+                    existing.interaction_updated_at.max(inc_inter),
+                    existing.hlc.clone(),
+                )
+            }
+            std::cmp::Ordering::Less => (
+                existing.inbox_state,
+                existing.read_at,
+                existing.progress,
+                existing.interaction_updated_at,
                 existing.hlc.clone(),
-            )
-        }
-        std::cmp::Ordering::Less => (
-            existing.inbox_state,
-            existing.read_at,
-            existing.progress,
-            existing.interaction_updated_at,
-            existing.hlc.clone(),
-        ),
-    };
+            ),
+        };
 
     let read_at = if inbox_state == InboxState::Dismissed {
-        raw_read_at
-            .or(existing.read_at)
-            .or(incoming.read_at)
-            .or(interaction_updated_at)
-            .or(Some(now))
+        raw_read_at.or(existing.read_at).or(inc_read_at).or(interaction_updated_at).or(Some(now))
     } else {
         raw_read_at
     };

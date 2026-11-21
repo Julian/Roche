@@ -7,10 +7,11 @@ use super::{ActiveRefreshGuard, AppError, RocheService};
 use crate::{
     content::{HtmlSanitizer, MAX_SUMMARY_CHARS, classify_url},
     db::{ConsumptionLogView, Db, Item, ItemFilter, ItemPage, ManualItemInput, Media, Tag},
-    domain::{ArchiveBatchScope, ContentType, ItemStatus, ReadAtPatch},
+    domain::{ArchiveBatchScope, ContentType, ItemStatus, READER_AUTO_READ_THRESHOLD, ReadAtPatch},
     feeds::ArxivParser,
-    scheduler::{FeedFetcher, FeedIngester},
+    ingest::{FeedFetcher, FeedIngester},
     util::{
+        clock::now_utc,
         media_urls::{extract_arxiv_id, is_valid_arxiv_id, youtube_thumbnail_url},
         url_guard::validate_public_url,
     },
@@ -98,7 +99,7 @@ impl<'a> ItemService<'a> {
         let item_url = url.clone();
         let refresh_guard = ActiveRefreshGuard::acquire(&self.service.active_refreshes);
 
-        tokio::spawn(async move {
+        self.service.spawn_background(async move {
             let _guard = refresh_guard;
             Self::enrich_and_ingest_saved_item(
                 &service_clone,
@@ -234,6 +235,54 @@ impl<'a> ItemService<'a> {
             return Err(AppError::not_found("Item not found"));
         };
         Ok(FinishedReaderItem { has_feed, logged })
+    }
+
+    /// Atomically unfinishes a reader item (deleting `consumed` logs, resetting progress/status,
+    /// and restoring non-feed items to `Want to Read`).
+    pub async fn unfinish_reader_item(&self, id: &str) -> Result<(), AppError> {
+        if !self.service.db.items().unfinish_reader_item(id).await? {
+            return Err(AppError::not_found("Item not found"));
+        }
+        Ok(())
+    }
+
+    /// Atomically toggles Starred status for an item and returns the new `is_favorite` value.
+    pub async fn toggle_star(&self, id: &str) -> Result<bool, AppError> {
+        self.service
+            .db
+            .items()
+            .toggle_star(id)
+            .await?
+            .ok_or_else(|| AppError::not_found("Item not found"))
+    }
+
+    /// Persists clamped reading progress and marks `read_at` once progress reaches
+    /// `READER_AUTO_READ_THRESHOLD`.
+    pub async fn update_progress_with_auto_read(
+        &self,
+        id: &str,
+        raw_progress: f64,
+    ) -> Result<ItemDetail, AppError> {
+        let p = if raw_progress.is_finite() { raw_progress.clamp(0.0, 1.0) } else { 0.0 };
+        let patch = if p >= READER_AUTO_READ_THRESHOLD {
+            ReadAtPatch::MarkRead(now_utc())
+        } else {
+            ReadAtPatch::Unchanged
+        };
+        self.update(id, None, None, Some(p), patch).await
+    }
+
+    /// Archives an item atomically while retaining at least `max(existing_progress, submitted_progress)`
+    /// when a finite progress value is supplied.
+    pub async fn archive_with_min_progress(
+        &self,
+        id: &str,
+        submitted_progress: Option<f64>,
+    ) -> Result<ItemDetail, AppError> {
+        if !self.service.db.items().archive_with_min_progress(id, submitted_progress).await? {
+            return Err(AppError::not_found("Item not found"));
+        }
+        self.get(id).await
     }
 
     pub async fn archive(&self, id: &str) -> Result<ItemDetail, AppError> {

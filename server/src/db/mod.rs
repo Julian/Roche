@@ -24,10 +24,10 @@ pub use catalog::{
     ConsumptionLogRow, ConsumptionLogView, DynamicCollectionRule, EntryDetailView, EntryIdentifier,
     ExportCatalogEntry, ExportCollectionEntry, ExportCollectionGenerator, ExportComparison,
     ExportConsumptionLog, PREFERRED_IDENTIFIER_SCHEMES, RankedCollectionView, RankedEntryRow,
-    UpsertEntryInput, choose_deterministic_entry_id, derive_manual_collection_slug_and_id,
-    external_identifier_label, external_identifier_url, external_identifier_url_for_kind,
-    matches_dynamic_collection_rule, normalize_identifier_scheme, normalize_identifier_value,
-    parse_dynamic_collection_rule, strip_album_edition_suffix,
+    UpsertEntryInput, WantSearchMatch, choose_deterministic_entry_id,
+    derive_manual_collection_slug_and_id, external_identifier_label, external_identifier_url,
+    external_identifier_url_for_kind, matches_dynamic_collection_rule, normalize_identifier_scheme,
+    normalize_identifier_value, parse_dynamic_collection_rule, strip_album_edition_suffix,
 };
 pub use feeds::{Feed, FeedRepo, PollBatch, PollItemCandidate};
 #[cfg(test)]

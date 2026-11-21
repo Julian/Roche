@@ -157,19 +157,29 @@ fn apply_web_security_headers(resp: &mut Response) {
     }
 }
 
+/// Renders a browser-friendly HTML error page with full web security headers.
+#[must_use]
+pub fn render_status_html(
+    status: StatusCode,
+    heading: &str,
+    detail: &str,
+    headers: &axum::http::HeaderMap,
+) -> Response {
+    let theme = auth::extract_theme_cookie(headers);
+    let mut resp = html::render_error_page(status, heading, detail, None, theme);
+    apply_web_security_headers(&mut resp);
+    resp
+}
+
 /// Renders a browser-friendly HTML 404 page with full web security headers.
 #[must_use]
 pub fn render_not_found_html(headers: &axum::http::HeaderMap) -> Response {
-    let theme = auth::extract_theme_cookie(headers);
-    let mut resp = html::render_error_page(
+    render_status_html(
         StatusCode::NOT_FOUND,
         "Not Found",
         "The requested page could not be found.",
-        None,
-        theme,
-    );
-    apply_web_security_headers(&mut resp);
-    resp
+        headers,
+    )
 }
 
 async fn attach_web_security_headers(req: Request, next: Next) -> Response {

@@ -12,10 +12,9 @@ use serde::Deserialize;
 
 use super::{auth::WebSession, links::render_creator_links};
 use crate::{
-    db::{CatalogError, ConflictError, ConsumptionLogView},
+    db::ConsumptionLogView,
     domain::{ConsumptionStatus, ContentType},
     service::AppError,
-    util::url_guard::SsrfBlockedError,
 };
 
 /// HTML-escapes interpolated text (`&`, `<`, `>`, `"`, `'`) with zero intermediate heap allocation.
@@ -790,9 +789,8 @@ fn classify_web_app_error(err: &AppError) -> (StatusCode, &'static str, String, 
         | AppError::SsrfBlocked(msg) => {
             (StatusCode::BAD_REQUEST, "Invalid Request", msg.clone(), None)
         }
-        AppError::Unauthorized(msg)
-        | AppError::TokenInvalid(msg)
-        | AppError::PairingCodeInvalid(msg) => {
+        AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, "Forbidden", msg.clone(), None),
+        AppError::TokenInvalid(msg) | AppError::PairingCodeInvalid(msg) => {
             (StatusCode::UNAUTHORIZED, "Unauthorized", msg.clone(), None)
         }
         AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "Not Found", msg.clone(), None),
@@ -810,74 +808,25 @@ fn classify_web_app_error(err: &AppError) -> (StatusCode, &'static str, String, 
         AppError::PayloadTooLarge { detail, .. } => {
             (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large", detail.clone(), None)
         }
-        AppError::Database(sqlx_err) => classify_web_sqlx_error(sqlx_err),
-        AppError::Internal(inner) => classify_web_internal_error(inner),
+        AppError::Database(sqlx_err) => {
+            tracing::error!(error = %sqlx_err, "Web database error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Server Error",
+                "An internal error occurred while processing your request.".to_owned(),
+                None,
+            )
+        }
+        AppError::Internal(inner) => {
+            tracing::error!(error = %inner, "Web internal server error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Server Error",
+                "An internal error occurred while processing your request.".to_owned(),
+                None,
+            )
+        }
     }
-}
-
-fn classify_web_sqlx_error(
-    sqlx_err: &sqlx::Error,
-) -> (StatusCode, &'static str, String, Option<u64>) {
-    if let sqlx::Error::Database(db_err) = sqlx_err
-        && (db_err.is_unique_violation() || db_err.message().contains("UNIQUE constraint failed"))
-    {
-        return (
-            StatusCode::CONFLICT,
-            "Conflict",
-            "A resource with the same unique identifier already exists.".to_owned(),
-            None,
-        );
-    }
-    tracing::error!(error = %sqlx_err, "Web database error");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Server Error",
-        "An internal error occurred while processing your request.".to_owned(),
-        None,
-    )
-}
-
-fn classify_web_internal_error(
-    inner: &anyhow::Error,
-) -> (StatusCode, &'static str, String, Option<u64>) {
-    if let Some(conflict) = inner.downcast_ref::<ConflictError>() {
-        return (StatusCode::CONFLICT, "Conflict", conflict.0.clone(), None);
-    }
-    if let Some(ssrf) = inner.downcast_ref::<SsrfBlockedError>() {
-        return (StatusCode::BAD_REQUEST, "Invalid Request", ssrf.0.clone(), None);
-    }
-    if let Some(cat) = inner.downcast_ref::<CatalogError>() {
-        return match cat {
-            CatalogError::Db(db_err) => classify_web_sqlx_error(db_err),
-            CatalogError::NotFound(msg) => (StatusCode::NOT_FOUND, "Not Found", msg.clone(), None),
-            CatalogError::Conflict(msg) => (StatusCode::CONFLICT, "Conflict", msg.clone(), None),
-            CatalogError::AmbiguousLookup { .. } => {
-                (StatusCode::CONFLICT, "Ambiguous Lookup", cat.to_string(), None)
-            }
-            CatalogError::ImmutableCollection { .. } | CatalogError::InvalidInput(_) => {
-                (StatusCode::BAD_REQUEST, "Invalid Request", cat.to_string(), None)
-            }
-            CatalogError::Internal(_) => {
-                tracing::error!(error = %cat, "Web catalog internal error");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Server Error",
-                    "An internal error occurred while processing your request.".to_owned(),
-                    None,
-                )
-            }
-        };
-    }
-    if let Some(sqlx_err) = inner.downcast_ref::<sqlx::Error>() {
-        return classify_web_sqlx_error(sqlx_err);
-    }
-    tracing::error!(error = %inner, "Web internal server error");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Server Error",
-        "An internal error occurred while processing your request.".to_owned(),
-        None,
-    )
 }
 
 impl IntoResponse for WebError {

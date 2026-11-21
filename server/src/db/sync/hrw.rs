@@ -15,6 +15,7 @@ pub const DEFAULT_MAX_BACKOFF_SECS: i64 = 24 * 3600;
 pub const ABSOLUTE_MAX_BACKOFF_SECS: i64 = 7 * 24 * 3600;
 pub const THROUGHPUT_EWMA_ALPHA: f64 = 0.2;
 pub const MIN_PEER_WEIGHT: f64 = 0.2;
+pub const MAX_CELLULAR_PEER_WEIGHT: f64 = 2.0;
 pub const MAX_PEER_WEIGHT: f64 = 10.0;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
@@ -208,7 +209,7 @@ pub fn effective_peer_weight(
     last_error: Option<&str>,
     last_error_by: Option<&str>,
 ) -> f64 {
-    if peer.network_tier == NetworkTier::Offline {
+    if peer.network_tier == NetworkTier::Offline || !peer.weight.is_finite() {
         return 0.0;
     }
     let base = peer.weight.clamp(0.0, MAX_PEER_WEIGHT);
@@ -254,7 +255,7 @@ pub fn select_feed_poller<'a>(
         {
             weight *= factor;
         }
-        if weight <= 0.0 {
+        if !weight.is_finite() || weight <= 0.0 {
             continue;
         }
         let u = rendezvous_uniform_unit(&peer.peer_id, feed_url, epoch);
@@ -352,12 +353,41 @@ pub fn should_peer_poll_feed(
     ) == Some(local_peer_id)
 }
 
+#[must_use]
+pub fn bound_peer_weight(network_tier: NetworkTier, raw_weight: Option<f64>) -> f64 {
+    let finite = raw_weight.filter(|w| w.is_finite());
+    match network_tier {
+        NetworkTier::Offline => 0.0,
+        NetworkTier::Cellular => {
+            finite.unwrap_or(0.5).clamp(MIN_PEER_WEIGHT, MAX_CELLULAR_PEER_WEIGHT)
+        }
+        NetworkTier::Wifi | NetworkTier::Wired => {
+            finite.unwrap_or(DEFAULT_ONLINE_PEER_WEIGHT).clamp(MIN_PEER_WEIGHT, MAX_PEER_WEIGHT)
+        }
+    }
+}
+
 impl SyncRepo<'_> {
     pub async fn get_peer_weight(&self, peer_id: &str) -> Result<Option<f64>> {
         Ok(sqlx::query_scalar("SELECT weight FROM peer_nodes WHERE peer_id = ?")
             .bind(peer_id)
             .fetch_optional(self.pool)
             .await?)
+    }
+
+    pub async fn prune_stale_peer_nodes(&self, older_than_days: i64) -> Result<u64> {
+        let cutoff = Self::now_utc() - chrono::Duration::days(older_than_days.max(1));
+        let res = sqlx::query(
+            "DELETE FROM peer_nodes
+             WHERE peer_id != ?
+               AND strftime('%Y-%m-%dT%H:%M:%fZ', last_seen_at)
+                 < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
+        )
+        .bind(SERVER_PEER_ID)
+        .bind(cutoff)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     pub async fn upsert_peer_node(
@@ -368,8 +398,7 @@ impl SyncRepo<'_> {
         weight: f64,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let clamped_weight =
-            if network_tier == NetworkTier::Offline { 0.0 } else { weight.clamp(0.0, 10.0) };
+        let clamped_weight = bound_peer_weight(network_tier, Some(weight));
         sqlx::query!(
             "INSERT INTO peer_nodes (peer_id, device_name, network_tier, weight, last_seen_at)
              VALUES (?, ?, ?, ?, ?)
@@ -445,8 +474,14 @@ impl SyncRepo<'_> {
         measured_weight: Option<f64>,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        let initial_weight = measured_weight.unwrap_or_else(|| network_tier.default_weight());
-        sqlx::query!(
+        let initial_weight = bound_peer_weight(network_tier, measured_weight);
+        let bounded_measured = measured_weight.map(|w| bound_peer_weight(network_tier, Some(w)));
+        let max_tier_weight = match network_tier {
+            NetworkTier::Offline => 0.0,
+            NetworkTier::Cellular => MAX_CELLULAR_PEER_WEIGHT,
+            NetworkTier::Wifi | NetworkTier::Wired => MAX_PEER_WEIGHT,
+        };
+        sqlx::query(
             "INSERT INTO peer_nodes (peer_id, device_name, network_tier, weight, last_seen_at)
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
@@ -455,18 +490,19 @@ impl SyncRepo<'_> {
                  weight = CASE
                      WHEN excluded.network_tier = 'offline' THEN 0.0
                      WHEN ? IS NOT NULL THEN ?
-                     WHEN peer_nodes.weight > 0.0 THEN peer_nodes.weight
+                     WHEN peer_nodes.weight > 0.0 THEN MIN(peer_nodes.weight, ?)
                      ELSE excluded.weight
                  END,
                  last_seen_at = excluded.last_seen_at",
-            peer_id,
-            device_name,
-            network_tier as _,
-            initial_weight,
-            now as _,
-            measured_weight as _,
-            measured_weight as _,
         )
+        .bind(peer_id)
+        .bind(device_name)
+        .bind(network_tier)
+        .bind(initial_weight)
+        .bind(now)
+        .bind(bounded_measured)
+        .bind(bounded_measured)
+        .bind(max_tier_weight)
         .execute(conn)
         .await?;
         Ok(())

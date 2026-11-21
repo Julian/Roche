@@ -145,24 +145,7 @@ async fn load_child_entry_tiers(
     service: &RocheService,
     children: &[CatalogEntry],
 ) -> HashMap<String, char> {
-    let mut slugs: Vec<&'static str> = children
-        .iter()
-        .filter(|c| c.kind != EntryKind::Song)
-        .filter_map(|c| c.kind.default_list_slug())
-        .collect();
-    slugs.sort_unstable();
-    slugs.dedup();
-    let mut tiers = HashMap::new();
-    for slug in slugs {
-        if let Ok(ranked) = service.catalog().get_ranked_collection(slug, false).await {
-            for row in ranked.rows {
-                if let Some(t) = row.tier {
-                    tiers.entry(row.entry.id).or_insert(t);
-                }
-            }
-        }
-    }
-    tiers
+    service.catalog().load_tiers_for_entries(children).await
 }
 
 fn render_entry_detail_body(out: &mut String, ctx: &EntryRenderCtx<'_>) {

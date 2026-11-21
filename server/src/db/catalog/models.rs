@@ -327,6 +327,14 @@ pub struct EntryDetailView {
     pub log_history: Vec<ConsumptionLogRow>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WantSearchMatch {
+    pub queue_id: String,
+    pub queue_slug: String,
+    pub queue_title: String,
+    pub entry: CatalogEntry,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(super) struct RawCollectionRow {
     pub id: String,

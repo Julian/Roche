@@ -224,6 +224,106 @@ impl CatalogRepo<'_> {
         Ok(recent_ids)
     }
 
+    /// Lightweight revision tuple `(count, max_sync_seq, sum_sync_seq)` for comparisons in
+    /// `scope_collection_id` (`None` = global scope) used to invalidate cached EP scores cleanly
+    /// across inserts, deletes, and entry-merge rewrites.
+    pub async fn comparison_scope_revision(
+        &self,
+        scope_collection_id: Option<&str>,
+    ) -> CatalogResult<(i64, i64, i64)> {
+        let rev: (i64, i64, i64) = if let Some(scope_id) = scope_collection_id {
+            sqlx::query_as(
+                "SELECT COUNT(*), COALESCE(MAX(sync_seq), 0), COALESCE(SUM(sync_seq), 0)
+                 FROM comparisons
+                 WHERE scope_collection_id = ?",
+            )
+            .bind(scope_id)
+            .fetch_one(self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT COUNT(*), COALESCE(MAX(sync_seq), 0), COALESCE(SUM(sync_seq), 0)
+                 FROM comparisons
+                 WHERE scope_collection_id IS NULL",
+            )
+            .fetch_one(self.pool)
+            .await?
+        };
+        Ok(rev)
+    }
+
+    /// Lightweight lookup resolving whether `slug_or_id` ranks in priority (want) scope or global
+    /// scope without hydrating collection members or running EP inference.
+    pub async fn resolve_ranking_scope(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+    ) -> CatalogResult<(bool, Option<String>)> {
+        let raw_col = if want {
+            self.lookup_want_collection_row(slug_or_id).await?.ok_or_else(|| {
+                CatalogError::NotFound(format!("Want collection '{slug_or_id}' not found"))
+            })?
+        } else {
+            self.lookup_collection_row(slug_or_id, true).await?
+        };
+        if raw_col.collection_role == CollectionRole::Want {
+            Ok((true, Some(raw_col.id)))
+        } else {
+            Ok((false, None))
+        }
+    }
+
+    /// Loads `(revision, orderings)` for `scope_collection_id` inside a single read snapshot so
+    /// cached EP scores can never pair newer orderings with an older revision (or vice versa).
+    pub async fn load_revision_and_orderings_for_scope(
+        &self,
+        scope_collection_id: Option<&str>,
+    ) -> CatalogResult<((i64, i64, i64), Vec<Vec<Vec<String>>>)> {
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let rev: (i64, i64, i64) = if let Some(scope_id) = scope_collection_id {
+            sqlx::query_as(
+                "SELECT COUNT(*), COALESCE(MAX(sync_seq), 0), COALESCE(SUM(sync_seq), 0)
+                 FROM comparisons
+                 WHERE scope_collection_id = ?",
+            )
+            .bind(scope_id)
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT COUNT(*), COALESCE(MAX(sync_seq), 0), COALESCE(SUM(sync_seq), 0)
+                 FROM comparisons
+                 WHERE scope_collection_id IS NULL",
+            )
+            .fetch_one(&mut *tx)
+            .await?
+        };
+        let json_rows: Vec<String> = if let Some(scope_id) = scope_collection_id {
+            sqlx::query_scalar(
+                "SELECT ordering_json FROM comparisons
+                 WHERE scope_collection_id = ?
+                 ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) ASC, id ASC",
+            )
+            .bind(scope_id)
+            .fetch_all(&mut *tx)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT ordering_json FROM comparisons
+                 WHERE scope_collection_id IS NULL
+                 ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) ASC, id ASC",
+            )
+            .fetch_all(&mut *tx)
+            .await?
+        };
+        tx.commit().await?;
+        let orderings = json_rows
+            .into_iter()
+            .filter_map(|j| serde_json::from_str::<Vec<Vec<String>>>(&j).ok())
+            .collect();
+        Ok((rev, orderings))
+    }
+
     /// Loads comparison orderings for a priority collection scope (`Some(id)`) or global scope (`None`).
     pub async fn load_orderings_for_scope(
         &self,

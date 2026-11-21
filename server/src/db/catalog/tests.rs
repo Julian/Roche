@@ -1161,3 +1161,168 @@ async fn test_load_collection_preview_thumbnails_honors_dynamic_creator_filter()
     let thumbs = previews.get(dyn_id).unwrap();
     assert_eq!(thumbs, &vec![("Dune".to_owned(), "https://example.com/dune.jpg".to_owned())]);
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_wave_2a_internal_schemes_batch_caps_diary_crud_and_fts_search() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    // 1. Internal identifier schemes (`slug`, `tag`, `feed_url`) are rejected in external upserts
+    for bad_scheme in ["slug", "tag", "feed_url"] {
+        let err = catalog
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Book),
+                title: "Reserved Scheme Book".to_owned(),
+                identifiers: vec![EntryIdentifier {
+                    scheme: bad_scheme.to_owned(),
+                    value: "movies".to_owned(),
+                }],
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::InvalidInput(_)), "must reject scheme '{bad_scheme}'");
+    }
+
+    // 2. Protected system collections cannot be mutated via upsert_entry or batch
+    let sys_err = catalog
+        .upsert_entry(&UpsertEntryInput {
+            id: Some(crate::db::STARRED_COLLECTION_ID.to_owned()),
+            kind: Some(EntryKind::Movie),
+            title: "Overwrite Starred".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(sys_err, CatalogError::Conflict(_)));
+
+    // 3. Batch limits reject oversized entry arrays cleanly
+    let oversized = CatalogBatchInput {
+        entries: (0..5_001)
+            .map(|i| BatchEntryInput {
+                ref_key: None,
+                entry: UpsertEntryInput {
+                    kind: Some(EntryKind::Book),
+                    title: format!("Book {i}"),
+                    ..UpsertEntryInput::default()
+                },
+            })
+            .collect(),
+        ..CatalogBatchInput::default()
+    };
+    assert!(matches!(catalog.apply_batch(&oversized).await, Err(CatalogError::InvalidInput(_))));
+
+    // 4. Invalid diary year returns InvalidInput instead of panicking on i32::MAX + 1
+    assert!(matches!(
+        catalog.list_diary(Some(i32::MAX), None, 20).await,
+        Err(CatalogError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        catalog.list_diary(Some(0), None, 20).await,
+        Err(CatalogError::InvalidInput(_))
+    ));
+
+    // 5. Diary year counts, edit note, delete log (with tombstone), and FTS search
+    let book = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "The Left Hand of Darkness".to_owned(),
+            creators: vec!["Ursula K. Le Guin".to_owned()],
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let ts_2024 = chrono::DateTime::parse_from_rfc3339("2024-06-15T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let log = catalog
+        .log_consumption(&book.id, ConsumptionStatus::Started, Some("Chapter one"), Some(ts_2024))
+        .await
+        .unwrap();
+    assert_eq!(catalog.list_diary_year_counts(None).await.unwrap(), vec![(2024, 1)]);
+
+    let updated = catalog
+        .update_consumption_log(
+            &log.id,
+            Some(ConsumptionStatus::Consumed),
+            Some(Some("Masterpiece sci-fi")),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status, ConsumptionStatus::Consumed);
+    assert_eq!(updated.notes.as_deref(), Some("Masterpiece sci-fi"));
+
+    // FTS search matches title/creator and returns empty cleanly on punctuation-only queries
+    assert_eq!(catalog.search_entries(Some("Guin"), None, 10).await.unwrap().len(), 1);
+    assert_eq!(
+        catalog.search_entries(Some("!!! --- ???"), None, 10).await.unwrap(),
+        Vec::<CatalogEntry>::new()
+    );
+    assert_eq!(catalog.search_diary_logs("Masterpiece", 10).await.unwrap().len(), 1);
+
+    // Deleting log removes row and records sync tombstone
+    assert!(catalog.delete_consumption_log(&log.id).await.unwrap());
+    assert_eq!(catalog.list_diary_year_counts(None).await.unwrap(), Vec::<(i32, i64)>::new());
+    let tomb_found: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sync_tombstones WHERE entity_type = 'consumption_log' AND natural_key = ?",
+    )
+    .bind(&log.id)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert!(tomb_found.is_some());
+
+    // 6. Headless `EntryKind::Collection` rejected in `upsert_entry`
+    let col_err = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Collection),
+            title: "Headless Collection".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(col_err, CatalogError::InvalidInput(_)));
+
+    // 7. Fail-closed recursive CTE collection cycle detection (direct + transitive)
+    let col_a = catalog
+        .create_manual_collection("Cycle A", Some("cycle-a"), CollectionRole::List, None, None)
+        .await
+        .unwrap();
+    let col_b = catalog
+        .create_manual_collection("Cycle B", Some("cycle-b"), CollectionRole::List, None, None)
+        .await
+        .unwrap();
+    let col_c = catalog
+        .create_manual_collection("Cycle C", Some("cycle-c"), CollectionRole::List, None, None)
+        .await
+        .unwrap();
+    catalog.add_collection_entry(&col_a.id, &col_b.id, None).await.unwrap();
+    catalog.add_collection_entry(&col_b.id, &col_c.id, None).await.unwrap();
+    assert!(matches!(
+        catalog.add_collection_entry(&col_c.id, &col_a.id, None).await,
+        Err(CatalogError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        catalog.add_collection_entry(&col_a.id, &col_a.id, None).await,
+        Err(CatalogError::InvalidInput(_))
+    ));
+
+    // 8. `ItemRepo::toggle_star` works on unhydrated Want-to-Read reader items (3rd branch of IS_LIVE_ITEM_SQL)
+    let want_article = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Article),
+            title: "Unhydrated Want Article".to_owned(),
+            url: Some("https://example.com/unhydrated-want".to_owned()),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    catalog
+        .add_collection_entry(crate::db::WANT_TO_READ_COLLECTION_ID, &want_article.id, None)
+        .await
+        .unwrap();
+    assert_eq!(db.items().toggle_star(&want_article.id).await.unwrap(), Some(true));
+    assert_eq!(db.items().toggle_star(&want_article.id).await.unwrap(), Some(false));
+}

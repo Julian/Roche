@@ -4,6 +4,7 @@ use axum::{Json, extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::error::{ApiError, ProblemJson, ProblemPath, ProblemQuery};
 use crate::{
     db::{
         CatalogBatchInput, CatalogBatchResult, CatalogEntry, ClusterSelectFilter,
@@ -11,10 +12,16 @@ use crate::{
         EntryDetailView, RankedCollectionView, UpsertEntryInput,
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
-    error::{ApiError, ProblemJson, ProblemPath, ProblemQuery},
     ranking::Score,
-    service::RocheService,
+    service::{RocheService, WorkspaceSearchResults},
 };
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct WorkspaceSearchQuery {
+    #[serde(default)]
+    q: String,
+    limit: Option<usize>,
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ListsQuery {
@@ -204,6 +211,14 @@ pub(super) async fn catalog_list_remove_entry(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(super) async fn workspace_search(
+    State(service): State<Arc<RocheService>>,
+    ProblemQuery(q): ProblemQuery<WorkspaceSearchQuery>,
+) -> Result<Json<WorkspaceSearchResults>, ApiError> {
+    let results = service.search_workspace(&q.q, q.limit.unwrap_or(20)).await?;
+    Ok(Json(results))
+}
+
 pub(super) async fn catalog_entries_search(
     State(service): State<Arc<RocheService>>,
     ProblemQuery(q): ProblemQuery<SearchEntriesQuery>,
@@ -239,6 +254,33 @@ pub(super) async fn catalog_entry_get(
     Ok(Json(detail))
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct UpdateDiaryLogRequest {
+    status: Option<ConsumptionStatus>,
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_string")]
+    notes: Option<Option<String>>,
+    ts: Option<DateTime<Utc>>,
+}
+
+#[allow(clippy::option_option)]
+fn deserialize_optional_nullable_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+pub(super) async fn catalog_entry_enrich(
+    State(service): State<Arc<RocheService>>,
+    ProblemPath(id): ProblemPath<String>,
+) -> Result<Json<EntryDetailView>, ApiError> {
+    let detail = service.enrich().enrich_entry_now(&id).await?;
+    Ok(Json(detail))
+}
+
 pub(super) async fn catalog_entry_merge(
     State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
@@ -254,6 +296,27 @@ pub(super) async fn catalog_diary_list(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let entries = service.catalog().list_diary(q.year, q.status, q.limit.unwrap_or(100)).await?;
     Ok(Json(serde_json::json!({ "entries": entries })))
+}
+
+pub(super) async fn catalog_diary_update(
+    State(service): State<Arc<RocheService>>,
+    ProblemPath(id): ProblemPath<String>,
+    ProblemJson(req): ProblemJson<UpdateDiaryLogRequest>,
+) -> Result<Json<ConsumptionLogView>, ApiError> {
+    let notes_patch = req.notes.as_ref().map(|opt| opt.as_deref());
+    let updated =
+        service.catalog().update_consumption_log(&id, req.status, notes_patch, req.ts).await?;
+    Ok(Json(updated))
+}
+
+pub(super) async fn catalog_diary_delete(
+    State(service): State<Arc<RocheService>>,
+    ProblemPath(id): ProblemPath<String>,
+) -> Result<StatusCode, ApiError> {
+    if !service.catalog().delete_consumption_log(&id).await? {
+        return Err(ApiError::not_found(format!("Consumption log '{id}' not found")));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(super) async fn catalog_log_create(

@@ -67,7 +67,22 @@ impl WorkerManager {
     }
 
     pub async fn run_once(&self) -> Result<()> {
-        tokio::try_join!(self.run_op_pruner(), self.run_media_cleaner())?;
+        let (op_res, peer_res, media_res) =
+            tokio::join!(self.run_op_pruner(), self.run_peer_pruner(), self.run_media_cleaner());
+        let mut first_err: Option<anyhow::Error> = None;
+        for (worker, res) in
+            [("op_pruner", op_res), ("peer_pruner", peer_res), ("media_cleaner", media_res)]
+        {
+            if let Err(e) = res {
+                tracing::error!(worker = worker, error = %e, "WorkerManager task failed");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -76,20 +91,17 @@ impl WorkerManager {
         Ok(())
     }
 
+    async fn run_peer_pruner(&self) -> Result<()> {
+        let _ = self.db.sync().prune_stale_peer_nodes(self.op_log_prune_after_days.max(30)).await?;
+        Ok(())
+    }
+
     async fn run_media_cleaner(&self) -> Result<()> {
         let _ = self.media_store.cleanup_stale_temp_files(Duration::from_secs(600)).await;
         let media_repo = self.db.media();
         let orphans = media_repo.find_orphaned().await?;
-        let to_unlink = media_repo.delete_rows_returning(orphans).await?;
-        for media in to_unlink {
-            if let Err(e) = self.media_store.remove(&media.path).await {
-                tracing::warn!(
-                    path = %media.path,
-                    error = %e,
-                    "Skipped removing media outside media_dir or failed I/O"
-                );
-            }
-        }
+        let _ = crate::service::unlink_and_delete_media_rows(&self.db, &self.media_store, orphans)
+            .await?;
         if let Ok(registered) = media_repo.list_registered_item_ids().await {
             let _ = self
                 .media_store
@@ -196,5 +208,50 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_worker_manager_retains_db_row_on_unlink_failure_and_prunes_stale_peers() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let item_url = Url::parse("https://example.com/escape-media").unwrap();
+        let item = db
+            .items()
+            .create(&NewItem {
+                feed_id: None,
+                title: "Escape Media",
+                url: &item_url,
+                author: None,
+                published_at: None,
+                summary: None,
+                content_type: ContentType::Video,
+            })
+            .await
+            .unwrap();
+        let bad_media = db
+            .media()
+            .create(&item.id, MediaType::Video, "../outside-media-dir.mp4", Some(512), None)
+            .await
+            .unwrap();
+        db.items().delete(&item.id).await.unwrap();
+
+        let old_ts = chrono::Utc::now() - chrono::Duration::days(45);
+        db.sync()
+            .upsert_peer_node(
+                "stale-peer-99",
+                "Old Phone",
+                crate::db::NetworkTier::Wifi,
+                1.0,
+                old_ts,
+            )
+            .await
+            .unwrap();
+
+        let workers = WorkerManager::new(db.clone(), 30, "/tmp/roche-test-media-m16");
+        workers.run_once().await.unwrap();
+
+        // Failed unlink retains the DB row so future passes can retry rather than stranding files
+        assert!(db.media().get(&bad_media.id).await.unwrap().is_some());
+        // Stale peer was pruned independently in the same pass
+        assert!(db.sync().get_peer_weight("stale-peer-99").await.unwrap().is_none());
     }
 }

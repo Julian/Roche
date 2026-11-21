@@ -21,7 +21,7 @@ use crate::{
         RankedEntryRow, UpsertEntryInput,
     },
     domain::{CollectionMode, CollectionRole, EntryKind},
-    service::{AppError, RocheService},
+    service::{AppError, RankedCollectionFilter, RocheService},
     web::{
         auth::WebSession,
         html::{
@@ -141,15 +141,17 @@ async fn load_overview_generators(
     service: &RocheService,
     collections: &[CollectionSummary],
 ) -> HashMap<String, CollectionGeneratorState> {
-    let mut out = HashMap::new();
-    for col in collections {
-        if col.has_generator
-            && let Ok(state) = service.catalog().get_collection_generator(&col.id).await
-        {
-            out.insert(col.id.clone(), state);
-        }
+    if !collections.iter().any(|c| c.has_generator) {
+        return HashMap::new();
     }
-    out
+    service
+        .catalog()
+        .list_collection_generators(false)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|state| (state.collection_id.clone(), state))
+        .collect()
 }
 
 fn render_lists_main(
@@ -563,8 +565,14 @@ pub(in crate::web) async fn list_detail_get(
     Path(slug): Path<String>,
     Query(q): Query<ListPageQuery>,
 ) -> Result<Response, WebError> {
-    let view = service.catalog().get_ranked_collection(&slug, false).await.web_err(&session)?;
-    let total_rows = view.rows.len();
+    let filtered = service
+        .catalog()
+        .get_filtered_ranked_collection(&slug, false, &RankedCollectionFilter::default())
+        .await
+        .web_err(&session)?;
+    let view = filtered.view;
+    let full_tier_counts = filtered.full_tier_counts;
+    let total_rows = filtered.full_total.min(view.rows.len());
     let total_pages = total_rows.max(1).div_ceil(LIST_PAGE_SIZE);
     let page_num = q.page.unwrap_or(1).clamp(1, total_pages);
     let start_idx = (page_num - 1) * LIST_PAGE_SIZE;
@@ -596,6 +604,7 @@ pub(in crate::web) async fn list_detail_get(
     render_ranked_list_body(
         &mut body,
         &view,
+        full_tier_counts,
         gen_state.as_ref(),
         page_num,
         total_pages,
@@ -640,6 +649,7 @@ fn count_tiers(rows: &[RankedEntryRow]) -> [usize; 5] {
 fn render_ranked_list_body(
     out: &mut String,
     view: &RankedCollectionView,
+    full_tier_counts: [usize; 5],
     gen_state: Option<&CollectionGeneratorState>,
     page_num: usize,
     total_pages: usize,
@@ -715,7 +725,7 @@ fn render_ranked_list_body(
         slug,
         gen_state,
         ranked_mode,
-        page_tiers,
+        full_tier_counts,
         is_editable_manual,
         artist_links,
         csrf,

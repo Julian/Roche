@@ -495,29 +495,43 @@ private suspend fun applyConsumptionLogTombstone(
     upsertCleanTombstone(dao, TOMBSTONE_ENTITY_CONSUMPTION_LOG, logId, deletedAt, tombHlc)
 }
 
+private suspend fun isProtectedTombstoneTarget(dao: RocheDao, entryId: String): Boolean {
+    if (entryId in PROTECTED_SYSTEM_COLLECTION_IDS) return true
+    val spec = dao.getCollectionSpecById(entryId)
+    return spec != null && (spec.mode == "dynamic" || spec.role in PROTECTED_TOMBSTONE_ROLES)
+}
+
 private suspend fun applyEntryTombstone(
     dao: RocheDao,
     rawKey: String,
     deletedAt: String,
     tombHlc: String,
 ) {
-    if (rawKey in PROTECTED_SYSTEM_COLLECTION_IDS) return
+    if (isProtectedTombstoneTarget(dao, rawKey)) return
     val existing = dao.getEntryById(rawKey)
-    if (existing != null) {
-        if (compareHlc(existing.hlc, tombHlc) > 0) return
-        if (dao.entryHasCatalogHistory(rawKey)) {
+    val shouldRecordTombstone =
+        if (existing == null) {
+            true
+        } else if (compareHlc(existing.hlc, tombHlc) > 0) {
+            false
+        } else if (dao.entryHasCatalogHistory(rawKey)) {
             dao.getEntryStateById(rawKey)?.let { st ->
                 dao.upsertEntryState(
                     st.copy(inboxState = "none", readAt = null, hlc = tombHlc, isLocalDirty = false)
                 )
             }
             dao.deleteEntryContentById(rawKey)
+            false
         } else {
             dao.deleteEntryCascade(rawKey)
+            true
         }
+    if (shouldRecordTombstone) {
+        upsertCleanTombstone(dao, TOMBSTONE_ENTITY_ENTRY, rawKey, deletedAt, tombHlc)
     }
-    upsertCleanTombstone(dao, TOMBSTONE_ENTITY_ENTRY, rawKey, deletedAt, tombHlc)
 }
+
+private val PROTECTED_TOMBSTONE_ROLES = setOf("system", "feed", "tag")
 
 internal suspend fun upsertCleanTombstone(
     dao: RocheDao,

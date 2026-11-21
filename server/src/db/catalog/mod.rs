@@ -30,7 +30,7 @@ pub use models::{
     CollectionGeneratorState, CollectionRankingInputs, CollectionSummary, ComparisonRecord,
     ConsumptionLogRow, ConsumptionLogView, DynamicCollectionRule, EntryDetailView, EntryIdentifier,
     ExportCatalogEntry, ExportCollectionEntry, ExportCollectionGenerator, ExportComparison,
-    ExportConsumptionLog, RankedCollectionView, RankedEntryRow, UpsertEntryInput,
+    ExportConsumptionLog, RankedCollectionView, RankedEntryRow, UpsertEntryInput, WantSearchMatch,
 };
 
 #[derive(Clone, Copy)]

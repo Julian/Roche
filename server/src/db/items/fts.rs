@@ -2,7 +2,8 @@ use sqlx::{QueryBuilder, Sqlite};
 
 use super::{ItemFilter, ItemRepo};
 
-const MAX_SEARCH_TERMS: usize = 16;
+const MAX_SEARCH_TERMS: usize = 8;
+const MAX_SEARCH_QUERY_CHARS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchTerm {
@@ -13,8 +14,9 @@ pub struct SearchTerm {
 impl ItemFilter {
     #[must_use]
     pub fn tokenize_search_terms(input: &str) -> Vec<SearchTerm> {
+        let bounded: String = input.trim().chars().take(MAX_SEARCH_QUERY_CHARS).collect();
         let mut terms = Vec::new();
-        let mut chars = input.chars().peekable();
+        let mut chars = bounded.chars().peekable();
 
         while let Some(&ch) = chars.peek() {
             if ch == '"' {
@@ -87,24 +89,13 @@ impl ItemFilter {
 impl ItemRepo<'_> {
     pub(super) fn append_search_where_clause(
         qb: &mut QueryBuilder<Sqlite>,
-        raw_search: &str,
+        _raw_search: &str,
         search_terms: &[SearchTerm],
     ) {
         if search_terms.is_empty() {
-            let pattern = format!("%{}%", crate::db::escape_like_literal(raw_search));
-            qb.push(" AND (i.title LIKE ")
-                .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR COALESCE(i.summary, '') LIKE ")
-                .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR COALESCE(i.creators_json, '') LIKE ")
-                .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR COALESCE(ec.content_html, '') LIKE ")
-                .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM collection_entries ce_fs JOIN feed_sources fs_s ON fs_s.collection_id = ce_fs.collection_id WHERE ce_fs.entry_id = i.id AND COALESCE(fs_s.feed_title, '') LIKE ")
-                .push_bind(pattern.clone())
-                .push(" ESCAPE '\\') OR EXISTS (SELECT 1 FROM collection_entries ce_ts JOIN collection_specs cs_ts ON cs_ts.collection_id = ce_ts.collection_id JOIN entries e_ts ON e_ts.id = ce_ts.collection_id WHERE ce_ts.entry_id = i.id AND cs_ts.collection_role = 'tag' AND e_ts.title LIKE ")
-                .push_bind(pattern)
-                .push(" ESCAPE '\\'))");
+            // Punctuation-only queries cannot match FTS5 word tokens; fail closed without
+            // triggering an unindexed full-body `content_html LIKE` table scan.
+            qb.push(" AND 1 = 0");
         } else if let [term] = search_terms {
             qb.push(" AND (fts.fts_rowid IS NOT NULL OR EXISTS (SELECT 1 FROM collection_entries ce_fs JOIN feed_sources fs_s ON fs_s.collection_id = ce_fs.collection_id WHERE ce_fs.entry_id = i.id AND COALESCE(fs_s.feed_title, '') LIKE ")
                 .push_bind(term.like_pattern.clone())

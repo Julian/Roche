@@ -550,6 +550,147 @@ impl ItemRepo<'_> {
         Ok(Some((has_feed, logged)))
     }
 
+    /// Atomically undoes reader completion in a single SQLite write transaction:
+    /// deletes `consumed` diary logs (recording sync tombstones), resets the item to
+    /// `Unread` / `progress = 0.0` / `read_at = NULL`, and re-attaches saved non-feed items
+    /// to `Want to Read`.
+    pub async fn unfinish_reader_item(&self, id: &str) -> CatalogResult<bool> {
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+
+        let has_feed = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM collection_entries ce
+             JOIN feed_sources fs ON fs.collection_id = ce.collection_id
+             WHERE ce.entry_id = ? LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+
+        let found = Self::update_in_tx(
+            &mut tx,
+            id,
+            Some(ItemStatus::Unread),
+            None,
+            Some(0.0),
+            ReadAtPatch::MarkUnread,
+            now,
+            false,
+        )
+        .await?;
+        if !found {
+            return Ok(false);
+        }
+
+        let _ = CatalogRepo::delete_consumed_logs_for_entry_in_tx(&mut tx, id, now).await?;
+        if !has_feed {
+            set_collection_flag_membership_in_tx(
+                &mut tx,
+                WANT_TO_READ_COLLECTION_ID,
+                id,
+                true,
+                now,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Atomically toggles `is_favorite` (Starred membership) for a live item in one transaction,
+    /// returning `Ok(Some(new_is_favorite))` or `Ok(None)` if not found.
+    pub async fn toggle_star(&self, id: &str) -> Result<Option<bool>> {
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT EXISTS (
+                 SELECT 1 FROM collection_entries ce_fav
+                 WHERE ce_fav.collection_id = ",
+        );
+        qb.push_bind(STARRED_COLLECTION_ID)
+            .push(
+                " AND ce_fav.entry_id = i.id
+             )
+             FROM entries i
+             LEFT JOIN entry_state es ON es.entry_id = i.id
+             LEFT JOIN entry_content ec ON ec.entry_id = i.id
+             WHERE i.id = ",
+            )
+            .push_bind(id)
+            .push(" AND i.merged_into_id IS NULL AND ")
+            .push(IS_LIVE_ITEM_SQL);
+        let current_fav: Option<bool> = qb.build_query_scalar().fetch_optional(&mut *tx).await?;
+        let Some(cur) = current_fav else {
+            return Ok(None);
+        };
+        let next = !cur;
+        let found = Self::update_in_tx(
+            &mut tx,
+            id,
+            None,
+            Some(next),
+            None,
+            ReadAtPatch::Unchanged,
+            now,
+            true,
+        )
+        .await?;
+        if !found {
+            return Ok(None);
+        }
+        tx.commit().await?;
+        Ok(Some(next))
+    }
+
+    /// Atomically archives a live item while retaining `max(existing_progress, submitted_progress)`
+    /// inside one write transaction so concurrent progress updates are never regressed.
+    pub async fn archive_with_min_progress(
+        &self,
+        id: &str,
+        submitted_progress: Option<f64>,
+    ) -> Result<bool> {
+        let now = now_utc();
+        let clean_sub = submitted_progress.filter(|p| p.is_finite()).map(|p| p.clamp(0.0, 1.0));
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        let merged_prog = if let Some(sub) = clean_sub {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT COALESCE(es.progress, 0.0)
+                 FROM entries i
+                 LEFT JOIN entry_state es ON es.entry_id = i.id
+                 LEFT JOIN entry_content ec ON ec.entry_id = i.id
+                 WHERE i.id = ",
+            );
+            qb.push_bind(id).push(" AND i.merged_into_id IS NULL AND ").push(IS_LIVE_ITEM_SQL);
+            let Some(existing_prog): Option<f64> =
+                qb.build_query_scalar().fetch_optional(&mut *tx).await?
+            else {
+                return Ok(false);
+            };
+            let safe_existing =
+                if existing_prog.is_finite() { existing_prog.clamp(0.0, 1.0) } else { 0.0 };
+            Some(safe_existing.max(sub))
+        } else {
+            None
+        };
+        let found = Self::update_in_tx(
+            &mut tx,
+            id,
+            Some(ItemStatus::Archived),
+            None,
+            merged_prog,
+            ReadAtPatch::Unchanged,
+            now,
+            true,
+        )
+        .await?;
+        if !found {
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn update_in_tx(
         tx: &mut SqliteConnection,
