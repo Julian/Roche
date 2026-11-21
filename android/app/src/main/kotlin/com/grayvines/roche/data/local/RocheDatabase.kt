@@ -29,11 +29,14 @@ import androidx.sqlite.execSQL
             ComparisonEntity::class,
             TombstoneEntity::class,
             LocalSyncFlagEntity::class,
+            TableRevisionEntity::class,
         ],
-    version = 11,
+    version = 12,
     exportSchema = true,
 )
 abstract class RocheDatabase : RoomDatabase() {
+    internal val writeLock: DbWriteLock = DbWriteLock()
+
     abstract fun dao(): RocheDao
 
     companion object {
@@ -187,6 +190,47 @@ abstract class RocheDatabase : RoomDatabase() {
                 }
             }
 
+        internal val MIGRATION_11_12 =
+            object : Migration(11, 12) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    migrateSchemaV11ToV12(connection)
+                }
+            }
+
+        internal fun schemaCallback(): Callback =
+            object : Callback() {
+                override suspend fun onCreate(connection: SQLiteConnection) {
+                    connection.execSQL("PRAGMA recursive_triggers = ON")
+                    installTableRevisionTriggers(connection)
+                }
+
+                override suspend fun onOpen(connection: SQLiteConnection) {
+                    connection.execSQL("PRAGMA recursive_triggers = ON")
+                    installTableRevisionTriggers(connection)
+                }
+            }
+
+        internal fun allMigrations(): Array<Migration> =
+            arrayOf(
+                MIGRATION_1_2,
+                MIGRATION_2_3,
+                MIGRATION_3_4,
+                MIGRATION_4_5,
+                MIGRATION_5_6,
+                MIGRATION_6_7,
+                MIGRATION_7_8,
+                MIGRATION_8_9,
+                MIGRATION_9_10,
+                MIGRATION_10_11,
+                MIGRATION_11_12,
+            )
+
+        internal fun createInMemory(): RocheDatabase =
+            Room.inMemoryDatabaseBuilder<RocheDatabase>()
+                .setDriver(BundledSQLiteDriver())
+                .addCallback(schemaCallback())
+                .build()
+
         fun create(context: Context): RocheDatabase {
             val appContext = context.applicationContext
             val isDebuggable =
@@ -194,25 +238,8 @@ abstract class RocheDatabase : RoomDatabase() {
             val builder =
                 Room.databaseBuilder<RocheDatabase>(appContext, DATABASE_NAME)
                     .setDriver(BundledSQLiteDriver())
-                    .addCallback(
-                        object : Callback() {
-                            override suspend fun onOpen(connection: SQLiteConnection) {
-                                connection.execSQL("PRAGMA recursive_triggers = ON")
-                            }
-                        }
-                    )
-                    .addMigrations(
-                        MIGRATION_1_2,
-                        MIGRATION_2_3,
-                        MIGRATION_3_4,
-                        MIGRATION_4_5,
-                        MIGRATION_5_6,
-                        MIGRATION_6_7,
-                        MIGRATION_7_8,
-                        MIGRATION_8_9,
-                        MIGRATION_9_10,
-                        MIGRATION_10_11,
-                    )
+                    .addCallback(schemaCallback())
+                    .addMigrations(*allMigrations())
             if (isDebuggable) {
                 builder.fallbackToDestructiveMigration(dropAllTables = true)
             }

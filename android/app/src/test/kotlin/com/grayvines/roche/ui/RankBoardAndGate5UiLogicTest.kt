@@ -5,17 +5,18 @@ import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.TestRocheEnv
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
-import com.grayvines.roche.data.catalog.RankClusterCandidate
 import com.grayvines.roche.data.collectInBackground
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDatabase
+import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.local.upsertFeeds
 import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.local.upsertItems
+import com.grayvines.roche.data.mockRepository
 import com.grayvines.roche.data.remote.HttpResponse
-import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.tailnetServerApi
 import com.grayvines.roche.media.BitmapLoader
 import com.grayvines.roche.media.ImageDecoders
 import com.grayvines.roche.media.THUMBNAILS_SUBDIR
@@ -27,6 +28,7 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.ranking.RankBoardState
+import com.grayvines.roche.ranking.RankClusterCandidate
 import com.grayvines.roche.reader.ArticleBlock
 import com.grayvines.roche.reader.extractPlainTextHeadings
 import java.io.File
@@ -151,7 +153,7 @@ class RankBoardAndGate5UiLogicTest {
             val barrier = CountDownLatch(ThumbnailLoader.MAX_CONCURRENT_LOADS)
             val releaseGate = CountDownLatch(1)
 
-            val streamingClient = RocheApiClient { _ ->
+            val streamingClient = tailnetServerApi { _ ->
                 val current = activeStreams.incrementAndGet()
                 peakStreams.accumulateAndGet(current, ::maxOf)
                 barrier.countDown()
@@ -170,7 +172,7 @@ class RankBoardAndGate5UiLogicTest {
             val cacheRoot = File(tempDir, "thumb_cache").apply { mkdirs() }
             val loader =
                 BitmapLoader(
-                    apiClient = streamingClient,
+                    serverApi = streamingClient,
                     settings = settings,
                     decoders = ImageDecoders(decodeBytes = { FakeImage() }, sizeOfKiB = { 16 }),
                     diskCache = ThumbnailDiskCache(cacheRoot),
@@ -197,6 +199,17 @@ class RankBoardAndGate5UiLogicTest {
     @Test
     fun `ArchiveVisibleEntries with active searchQuery archives only filtered entries and SelectTab clears search`() =
         runTest {
+            database
+                .dao()
+                .upsertFeed(
+                    FeedRow(
+                        id = "f-1",
+                        title = "Feed",
+                        url = "https://example.com/rss.xml",
+                        siteUrl = null,
+                        feedType = "rss",
+                    )
+                )
             database
                 .dao()
                 .upsertItems(
@@ -616,10 +629,10 @@ class RankBoardAndGate5UiLogicTest {
         savedJson: String
     ) {
         val coldRepo =
-            RocheRepository(
+            mockRepository(
                 database = database,
-                apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
                 settings = settings,
+                transport = { HttpResponse(statusCode = 200, body = "{}") },
             )
         val restoredHandle =
             androidx.lifecycle.SavedStateHandle(
@@ -674,10 +687,10 @@ class RankBoardAndGate5UiLogicTest {
                 ),
             )
         val coldRepo =
-            RocheRepository(
+            mockRepository(
                 database = database,
-                apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
                 settings = settings,
+                transport = { HttpResponse(statusCode = 200, body = "{}") },
             )
         val staleVm =
             MainViewModel(

@@ -19,6 +19,7 @@ import com.grayvines.roche.core.WANT_TO_READ_SLUG
 import com.grayvines.roche.core.WANT_TO_READ_TITLE
 import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.collectionEntryNaturalKey
+import com.grayvines.roche.core.deterministicTagId
 import com.grayvines.roche.core.encodeCreatorsJson
 import com.grayvines.roche.core.extractArxivIdentifier
 import com.grayvines.roche.core.extractYearPrefix
@@ -167,6 +168,7 @@ internal fun buildSqlContainsPattern(rawQuery: String): String {
 internal suspend fun RocheDao.executeMultiTokenSearch(
     tokenQueries: List<String>,
     likePattern: String,
+    limit: Int = 150,
 ): List<InboxItemRow> {
     val orderedTokens = tokenQueries.distinct().sortedByDescending { it.length }
     val matchedIds = matchItemIdsForFtsToken(orderedTokens.first()).toMutableSet()
@@ -178,11 +180,12 @@ internal suspend fun RocheDao.executeMultiTokenSearch(
     if (matchedIds.isEmpty()) return emptyList()
     val chunks = matchedIds.chunked(SQLITE_DELETE_CHUNK_SIZE)
     return if (chunks.size == 1) {
-        getSearchItemsByIdsChunk(chunks.single())
+        getSearchItemsByIdsChunk(chunks.single(), limit)
     } else {
         chunks
-            .flatMap { chunk -> getSearchItemsByIdsChunk(chunk) }
+            .flatMap { chunk -> getSearchItemsByIdsChunk(chunk, limit) }
             .sortedByDescending { it.publishedAt ?: it.createdAt }
+            .take(limit)
     }
 }
 
@@ -539,7 +542,11 @@ private suspend fun RocheDao.syncInboxItemLinksInTx(
         insertEntryIdentifierIgnore(EntryIdentifierEntity("arxiv", arxiv, bounded.id))
     }
     val feedId = bounded.feedId?.trim()?.takeIf { it.isNotEmpty() }
-    if (feedId != null && hasCollectionMembership(feedId, bounded.id) == 0) {
+    if (
+        feedId != null &&
+            getEntryById(feedId) != null &&
+            hasCollectionMembership(feedId, bounded.id) == 0
+    ) {
         upsertCollectionEntry(
             CollectionEntryEntity(
                 collectionId = feedId,
@@ -1063,7 +1070,7 @@ internal suspend fun RocheDao.updateFeedActiveGraph(
 }
 
 internal suspend fun RocheDao.entryHasCatalogHistory(entryId: String): Boolean =
-    hasCatalogHistoryRaw(entryId, "%\"$entryId\"%") != 0
+    hasCatalogHistoryRaw(entryId, buildSqlContainsPattern("\"$entryId\"")) != 0
 
 @Suppress("FunctionNameMaxLength")
 internal suspend fun RocheDao.deleteCollectionGeneratorWithTombstone(
@@ -1102,25 +1109,28 @@ internal suspend fun RocheDao.deleteEntryCascade(entryId: String) {
     deleteRawEntryById(entryId)
 }
 
+@Suppress("LongParameterList")
 internal suspend fun RocheDao.deleteItemPreservingHistory(
     itemId: String,
     recordTombstones: Boolean = true,
     detachWantQueues: Boolean = true,
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
     hlcOverride: String? = null,
+    preloadedSpecsById: Map<String, CollectionSpecEntity>? = null,
 ): Boolean {
     val entry = getEntryById(itemId) ?: return false
     val isSyncable = !isLocalPdfUrl(entry.url)
     val emitTombstones = recordTombstones && isSyncable
     val nowIso = nowUtcIso()
     val hlc = hlcOverride ?: nextLocalHlc(this, nodeId)
+    val specsById = preloadedSpecsById ?: getAllCollectionSpecs().associateBy { it.collectionId }
     if (detachWantQueues) {
-        detachWantMembershipsForItem(itemId, nowIso, hlc, emitTombstones)
+        detachWantMembershipsForItem(itemId, nowIso, hlc, emitTombstones, specsById)
     }
     if (entryHasCatalogHistory(itemId)) {
         upsertEntry(entry.copy(updatedAt = nowIso, hlc = hlc, isLocalDirty = emitTombstones))
         val prevState = getEntryStateById(itemId)
-        val keepReadable = hasReadableListMembership(itemId)
+        val keepReadable = hasReadableListMembership(itemId, specsById)
         upsertEntryState(
             EntryStateEntity(
                 entryId = itemId,
@@ -1138,21 +1148,36 @@ internal suspend fun RocheDao.deleteItemPreservingHistory(
         if (!keepReadable) {
             deleteEntryContentById(itemId)
         }
-        detachInboxOnlyMemberships(itemId, nowIso, hlc, emitTombstones, detachTags = !keepReadable)
+        detachInboxOnlyMemberships(
+            itemId = itemId,
+            nowIso = nowIso,
+            hlc = hlc,
+            recordTombstones = emitTombstones,
+            detachTags = !keepReadable,
+            specsById = specsById,
+        )
     } else {
-        detachInboxOnlyMemberships(itemId, nowIso, hlc, emitTombstones, detachTags = true)
+        detachInboxOnlyMemberships(
+            itemId = itemId,
+            nowIso = nowIso,
+            hlc = hlc,
+            recordTombstones = emitTombstones,
+            detachTags = true,
+            specsById = specsById,
+        )
         deleteEntryCascade(itemId)
     }
     return true
 }
 
+@Suppress("LongParameterList")
 private suspend fun RocheDao.detachWantMembershipsForItem(
     itemId: String,
     nowIso: String,
     hlc: String,
     recordTombstones: Boolean,
+    specsById: Map<String, CollectionSpecEntity>,
 ) {
-    val specsById = getAllCollectionSpecs().associateBy { it.collectionId }
     for (mem in getCollectionEntriesForEntry(itemId)) {
         val shouldDetach =
             mem.collectionId == STARRED_COLLECTION_ID || specsById[mem.collectionId]?.role == "want"
@@ -1173,22 +1198,24 @@ private suspend fun RocheDao.detachWantMembershipsForItem(
     }
 }
 
-private suspend fun RocheDao.hasReadableListMembership(itemId: String): Boolean {
-    val specsById = getAllCollectionSpecs().associateBy { it.collectionId }
-    return getCollectionEntriesForEntry(itemId).any { mem ->
+private suspend fun RocheDao.hasReadableListMembership(
+    itemId: String,
+    specsById: Map<String, CollectionSpecEntity>,
+): Boolean =
+    getCollectionEntriesForEntry(itemId).any { mem ->
         val role = specsById[mem.collectionId]?.role
         role == "list" || role == "want"
     }
-}
 
+@Suppress("LongParameterList")
 private suspend fun RocheDao.detachInboxOnlyMemberships(
     itemId: String,
     nowIso: String,
     hlc: String,
     recordTombstones: Boolean,
     detachTags: Boolean,
+    specsById: Map<String, CollectionSpecEntity>,
 ) {
-    val specsById = getAllCollectionSpecs().associateBy { it.collectionId }
     for (mem in getCollectionEntriesForEntry(itemId)) {
         val role = specsById[mem.collectionId]?.role
         val isInboxScoped = mem.collectionId == UP_NEXT_COLLECTION_ID || detachTags && role == "tag"
@@ -1217,6 +1244,7 @@ internal suspend fun RocheDao.deleteFeedPreservingHistory(
 ): List<String> {
     val evictedItemIds = ArrayList<String>()
     val allSources = getAllFeedSources().map { it.collectionId }.toHashSet()
+    val specsById = getAllCollectionSpecs().associateBy { it.collectionId }
     val feedMembers = getCollectionMemberships(feedId).map { it.entryId }
     for (entryId in feedMembers) {
         val otherMemberships = getCollectionEntriesForEntry(entryId)
@@ -1232,6 +1260,7 @@ internal suspend fun RocheDao.deleteFeedPreservingHistory(
                 detachWantQueues = false,
                 nodeId = nodeId,
                 hlcOverride = hlcOverride,
+                preloadedSpecsById = specsById,
             )
         }
     }
@@ -1251,3 +1280,27 @@ internal suspend fun RocheDao.deleteFeedPreservingHistory(
 }
 
 private const val MODE_MANUAL = "manual"
+
+internal suspend fun attachTagsLocally(
+    dao: RocheDao,
+    itemId: String,
+    tagNames: List<String>,
+    markDirty: Boolean = false,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+) {
+    for (tagName in tagNames) {
+        val normalized = normalizeTagName(tagName)
+        if (normalized.isNotBlank()) {
+            val tag =
+                dao.getTagByName(normalized)
+                    ?: TagRow(id = deterministicTagId(normalized), name = normalized).also {
+                        dao.upsertTag(it, markDirty = markDirty, nodeId = nodeId)
+                    }
+            dao.insertItemTag(
+                ItemTagRow(itemId = itemId, tagId = tag.id),
+                markDirty = markDirty,
+                nodeId = nodeId,
+            )
+        }
+    }
+}

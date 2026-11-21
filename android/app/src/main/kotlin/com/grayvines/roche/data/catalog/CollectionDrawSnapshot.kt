@@ -7,7 +7,9 @@ import com.grayvines.roche.core.SCHEME_QOBUZ
 import com.grayvines.roche.core.SCHEME_SPOTIFY
 import com.grayvines.roche.core.SCHEME_TIDAL
 import com.grayvines.roche.core.SCHEME_YOUTUBE_MUSIC
-import com.grayvines.roche.core.YT_MUSIC_BROWSE_PREFIX
+import com.grayvines.roche.core.TIDAL_BROWSE_ALBUM_PREFIX
+import com.grayvines.roche.core.TIDAL_LISTEN_ALBUM_PREFIX
+import com.grayvines.roche.core.YT_MUSIC_BROWSE_URL_PREFIX
 import com.grayvines.roche.core.YT_MUSIC_ORIGIN
 import com.grayvines.roche.core.encodeQueryValue
 import com.grayvines.roche.core.externalIdentifierUrl
@@ -69,8 +71,7 @@ data class CollectionDrawSnapshot(
 
 internal val CollectionDrawSnapshot.hasYoutubeAlbumBrowseId: Boolean
     get() =
-        !youtubeMusicId.isNullOrBlank() &&
-            youtubeMusicUrl.startsWith("$YT_MUSIC_ORIGIN/browse/$YT_MUSIC_BROWSE_PREFIX")
+        !youtubeMusicId.isNullOrBlank() && youtubeMusicUrl.startsWith(YT_MUSIC_BROWSE_URL_PREFIX)
 
 internal fun CollectionDrawSnapshot.candidateStreamingUrls(): List<String> = buildList {
     val entryKind = kind.wireValue
@@ -95,10 +96,10 @@ private fun MutableList<String>.addTidalCandidateUrls(rawTidal: String?) {
         val tail = http.substringAfter("/album/", missingDelimiterValue = "").substringBefore('?')
         if (tail.isNotEmpty()) {
             val encoded = encodeQueryValue(tail)
-            add("https://tidal.com/browse/album/$encoded")
-            add("https://listen.tidal.com/album/$encoded")
+            add("$TIDAL_BROWSE_ALBUM_PREFIX$encoded")
+            add("$TIDAL_LISTEN_ALBUM_PREFIX$encoded")
         }
     } else {
-        add("https://listen.tidal.com/album/${encodeQueryValue(raw)}")
+        add("$TIDAL_LISTEN_ALBUM_PREFIX${encodeQueryValue(raw)}")
     }
 }

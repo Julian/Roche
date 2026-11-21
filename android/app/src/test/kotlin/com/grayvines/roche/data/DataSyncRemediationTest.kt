@@ -1,7 +1,5 @@
 package com.grayvines.roche.data
 
-import androidx.room3.Room
-import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.core.FLAG_LOCAL_HLC
 import com.grayvines.roche.core.HlcClock
 import com.grayvines.roche.core.HlcTimestamp
@@ -32,18 +30,18 @@ import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.nextLocalHlc
 import com.grayvines.roche.data.remote.HttpResponse
+import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.RocheServerApi
+import com.grayvines.roche.data.remote.SyncTombstoneDto
 import com.grayvines.roche.data.remote.isCleartextAllowed
 import com.grayvines.roche.data.remote.rocheJson
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.isPermanentKeyInvalidation
-import com.grayvines.roche.data.sync.NetworkTier
 import com.grayvines.roche.data.sync.PeerSyncCoordinator
 import com.grayvines.roche.data.sync.PeerSyncJobTracker
 import com.grayvines.roche.data.sync.PeerSyncRequestConfig
 import com.grayvines.roche.data.sync.PeerSyncScheduler
-import com.grayvines.roche.data.sync.SyncTombstoneDto
 import com.grayvines.roche.data.sync.buildPeerSyncRequest
 import com.grayvines.roche.data.sync.reconcilePeerSyncResponse
 import com.grayvines.roche.isAllowedSharedContentUri
@@ -80,8 +78,7 @@ class DataSyncRemediationTest {
     @BeforeEach
     fun setUp() {
         tempDir = Files.createTempDirectory("roche-remediation-test").toFile()
-        database =
-            Room.inMemoryDatabaseBuilder<RocheDatabase>().setDriver(BundledSQLiteDriver()).build()
+        database = RocheDatabase.createInMemory()
     }
 
     @AfterEach
@@ -188,7 +185,7 @@ class DataSyncRemediationTest {
             val coordinator =
                 PeerSyncCoordinator(
                     dao = dao,
-                    apiClient = apiClient,
+                    serverApi = apiClient,
                     networkTier = NetworkTier.WIFI,
                     catalogStore = catalog,
                 )
@@ -746,9 +743,9 @@ private fun buildHalving413ApiClient(
     nowIso: String,
     receivedRequests: CopyOnWriteArrayList<JsonObject>,
     uploadedEntryIds: LinkedHashSet<String>,
-): RocheApiClient {
+): RocheServerApi {
     var seq = 10L
-    return RocheApiClient { req ->
+    return tailnetServerApi { req ->
         val parsed = rocheJson.parseToJsonElement(req.body.orEmpty()).jsonObject
         receivedRequests.add(parsed)
         val entriesArr = parsed["entries"]?.jsonArray.orEmpty()

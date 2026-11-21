@@ -1,19 +1,55 @@
 package com.grayvines.roche.data.remote
 
-import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.data.catalog.SyncCollectionEntryDto
 import com.grayvines.roche.data.catalog.SyncCollectionGeneratorDto
 import com.grayvines.roche.data.catalog.SyncComparisonDto
 import com.grayvines.roche.data.catalog.SyncConsumptionLogDto
 import com.grayvines.roche.data.catalog.SyncEntryRecordDto
-import com.grayvines.roche.data.sync.NetworkTier
-import com.grayvines.roche.data.sync.PeerNodeDto
-import com.grayvines.roche.data.sync.SyncTombstoneDto
 import java.io.IOException
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+
+private const val DEFAULT_ONLINE_TIER_WEIGHT = 1.0
+private const val OFFLINE_TIER_WEIGHT = 0.0
+
+enum class NetworkTier(val wireValue: String, val defaultWeight: Double, val displayLabel: String) {
+    WIRED("wired", DEFAULT_ONLINE_TIER_WEIGHT, "Wired"),
+    WIFI("wifi", DEFAULT_ONLINE_TIER_WEIGHT, "Wi-Fi"),
+    CELLULAR("cellular", DEFAULT_ONLINE_TIER_WEIGHT, "Cellular"),
+    OFFLINE("offline", OFFLINE_TIER_WEIGHT, "Offline");
+
+    companion object {
+        fun fromWireValue(raw: String?): NetworkTier =
+            entries.firstOrNull { it.wireValue.equals(raw?.trim(), ignoreCase = true) } ?: WIFI
+    }
+}
+
+@Serializable
+data class PeerNodeDto(
+    @SerialName("peer_id") val peerId: String = "",
+    @SerialName("device_name") val deviceName: String = "",
+    @SerialName("network_tier") val networkTier: String = NetworkTier.WIFI.wireValue,
+    val weight: Double = NetworkTier.WIFI.defaultWeight,
+    @SerialName("last_seen_at") val lastSeenAt: String = "",
+)
+
+internal fun PeerNodeDto.normalized(): PeerNodeDto =
+    copy(
+        peerId = peerId.takeIf { it.isNotBlank() }.orEmpty(),
+        deviceName = deviceName.takeIf { it.isNotBlank() }.orEmpty(),
+        networkTier = networkTier.takeIf { it.isNotBlank() } ?: NetworkTier.WIFI.wireValue,
+        lastSeenAt = lastSeenAt.takeIf { it.isNotBlank() }.orEmpty(),
+    )
+
+@Serializable
+data class SyncTombstoneDto(
+    @SerialName("entity_type") val entityType: String = "",
+    @SerialName("natural_key") val naturalKey: String = "",
+    @SerialName("deleted_at") val deletedAt: String = "",
+    val hlc: String = "",
+)
 
 object RocheProblemTypes {
     const val BLANK = "about:blank"
@@ -62,44 +98,6 @@ fun formatProblemDetailsMessage(error: ProblemDetailsException): String =
             error.detail.ifBlank { error.message ?: "URL blocked by server security policy" }
         else -> error.detail.ifBlank { error.message ?: "${error.title} (${error.statusCode})" }
     }
-
-@Serializable
-@Suppress("LongParameterList")
-data class RemoteFeedDto(
-    val id: String = "",
-    val title: String = "",
-    val url: String = "",
-    @SerialName("site_url") val siteUrl: String? = null,
-    @SerialName("feed_type") val feedType: String = DEFAULT_FEED_TYPE,
-    @SerialName("unread_count") val unreadCount: Int = 0,
-    val description: String? = null,
-    val language: String? = null,
-    @SerialName("poll_interval") val pollInterval: Int = DEFAULT_POLL_INTERVAL,
-    @SerialName("last_polled") val lastPolled: String? = null,
-    @SerialName("last_polled_by") val lastPolledBy: String? = null,
-    @SerialName("last_error") val lastError: String? = null,
-    @SerialName("last_error_by") val lastErrorBy: String? = null,
-    @SerialName("consecutive_failures") val consecutiveFailures: Int = 0,
-    @SerialName("is_active") val isActive: Boolean = true,
-)
-
-internal fun RemoteFeedDto.normalized(): RemoteFeedDto {
-    val cleanLastError = lastError.nullIfBlank()
-    return copy(
-        id = id.nullIfBlank().orEmpty(),
-        title = title.nullIfBlank().orEmpty(),
-        url = url.nullIfBlank().orEmpty(),
-        siteUrl = siteUrl.nullIfBlank(),
-        feedType = feedType.nullIfBlank() ?: DEFAULT_FEED_TYPE,
-        description = description.nullIfBlank(),
-        language = language.nullIfBlank(),
-        lastPolled = lastPolled.nullIfBlank(),
-        lastPolledBy = lastPolledBy.nullIfBlank(),
-        lastError = cleanLastError,
-        lastErrorBy = cleanLastError?.let { lastErrorBy.nullIfBlank() },
-        consecutiveFailures = normalizeConsecutiveFailures(cleanLastError, consecutiveFailures),
-    )
-}
 
 @Suppress("LongParameterList")
 data class RemoteItemDto(

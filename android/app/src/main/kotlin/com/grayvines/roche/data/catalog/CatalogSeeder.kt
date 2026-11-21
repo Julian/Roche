@@ -17,6 +17,7 @@ import com.grayvines.roche.core.nowUtcIso
 import com.grayvines.roche.core.systemCollectionUuid
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
+import com.grayvines.roche.data.local.DbWriteLock
 import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.local.LocalSyncFlagEntity
@@ -26,19 +27,17 @@ import com.grayvines.roche.data.local.buildStarredCollectionSpec
 import com.grayvines.roche.data.local.buildWantToReadCollectionSpec
 import com.grayvines.roche.data.local.deleteEntryCascade
 import com.grayvines.roche.data.local.nextLocalHlc
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 
 internal class CatalogSeeder(
     private val dao: RocheDao,
+    private val writeLock: DbWriteLock = DbWriteLock(),
     private val localPeerIdProvider: suspend () -> String = { DEFAULT_LOCAL_HLC_NODE },
 ) {
-    private val seedMutex = Mutex()
     @Volatile private var systemSeeded = false
 
     suspend fun ensureSystemSeeded() {
         if (systemSeeded) return
-        seedMutex.withLock {
+        writeLock.withLock {
             if (!systemSeeded) {
                 seedSystemSpecs()
                 systemSeeded = true
@@ -245,8 +244,9 @@ internal class CatalogSeeder(
                         )
                     )
                 }
+                val freshState = dao.getEntryStateById(state.entryId) ?: state
                 dao.upsertEntryState(
-                    state.copy(
+                    freshState.copy(
                         inboxState = "none",
                         updatedAt = nowIso,
                         hlc = hlc,

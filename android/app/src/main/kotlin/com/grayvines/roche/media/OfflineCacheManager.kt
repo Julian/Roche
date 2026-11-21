@@ -1,20 +1,27 @@
 package com.grayvines.roche.media
 
+import com.grayvines.roche.core.RocheLog
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.collectionEntryNaturalKey
 import com.grayvines.roche.core.deterministicTagId
 import com.grayvines.roche.core.isHttpOrHttpsUrl
+import com.grayvines.roche.core.isLocalPdfUrl
 import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.core.resolveSafeChildFile
 import com.grayvines.roche.core.runSuspendCatching
-import com.grayvines.roche.data.attachTagsLocally
+import com.grayvines.roche.data.local.DbWriteLock
 import com.grayvines.roche.data.local.InboxItemRow
+import com.grayvines.roche.data.local.MAX_SQLITE_HTML_CHARS
+import com.grayvines.roche.data.local.MAX_SQLITE_SUMMARY_CHARS
+import com.grayvines.roche.data.local.MAX_SQLITE_TEXT_CHARS
 import com.grayvines.roche.data.local.RocheDao
+import com.grayvines.roche.data.local.attachTagsLocally
 import com.grayvines.roche.data.local.upsertItem
-import com.grayvines.roche.data.mergeRemoteItemIntoLocal
+import com.grayvines.roche.data.remote.PublicWebFetcher
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RemoteMediaDto
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.RocheServerApi
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.model.extractAllImageUrlsFromHtml
 import com.grayvines.roche.model.extractFirstImageUrlFromHtml
@@ -24,32 +31,51 @@ import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
+@Suppress("LongParameterList", "TooManyFunctions")
 internal class OfflineCacheManager(
     private val dao: RocheDao,
-    private val apiClient: RocheApiClient,
+    private val serverApi: RocheServerApi,
+    private val publicWebFetcher: PublicWebFetcher = PublicWebFetcher(),
     private val settings: SettingsRepository,
     private val cacheDir: File? = null,
     private val thumbnailDiskCache: ThumbnailDiskCache = ThumbnailDiskCache(cacheDir),
+    private val maxOfflineCacheBytes: Long = DEFAULT_MAX_OFFLINE_CACHE_BYTES,
+    private val writeLock: DbWriteLock = DbWriteLock(),
 ) {
     private val activeCacheTokens = ConcurrentHashMap<String, Long>()
     private val tokenSequence = AtomicLong(0L)
+    private val quotaMutex = Mutex()
+    private val _inFlightEntryIds = MutableStateFlow<Set<String>>(emptySet())
+    internal val inFlightEntryIds: StateFlow<Set<String>> = _inFlightEntryIds.asStateFlow()
+
+    private fun publishInFlightIds() {
+        _inFlightEntryIds.value = activeCacheTokens.keys.toSet()
+    }
 
     internal suspend fun setOfflineCacheState(itemId: String, enabled: Boolean): Boolean {
         if (!enabled) {
             activeCacheTokens.remove(itemId)
-            dao.updateItemCachedOffline(itemId, false)
+            publishInFlightIds()
+            writeLock.withLock { dao.updateItemCachedOffline(itemId, false) }
             evictCachedItemFiles(itemId)
             return false
         }
         val attemptToken = tokenSequence.incrementAndGet()
         activeCacheTokens[itemId] = attemptToken
+        publishInFlightIds()
         return try {
             populateOfflineCache(itemId = itemId, attemptToken = attemptToken)
         } finally {
             activeCacheTokens.remove(itemId, attemptToken)
+            publishInFlightIds()
         }
     }
 
@@ -61,10 +87,19 @@ internal class OfflineCacheManager(
         val token = currentSettings.bearerToken
         if (serverUrl.isBlank() || token.isBlank()) return
         runSuspendCatching {
-            val detail = apiClient.fetchItemDetail(serverUrl, token, itemId)
-            val latest = dao.getItemById(itemId) ?: return
-            dao.upsertItem(mergeHydratedItemDetail(latest, detail), markDirty = false)
+            val detail = serverApi.fetchItemDetail(serverUrl, token, itemId)
+            writeLock.withLock {
+                dao.executeInTransaction {
+                    val latest = dao.getItemById(itemId)
+                    if (latest != null) {
+                        dao.upsertItem(mergeHydratedItemDetail(latest, detail), markDirty = false)
+                    }
+                }
+            }
         }
+            .onFailure { err ->
+                RocheLog.warn(LOG_TAG, "Failed to hydrate reader item $itemId", err)
+            }
     }
 
     private fun isCacheAttemptActive(itemId: String, attemptToken: Long): Boolean =
@@ -113,11 +148,23 @@ internal class OfflineCacheManager(
         mediaReady: Boolean,
     ): Boolean {
         val committed =
-            mediaReady &&
-                isCacheAttemptActive(itemId, attemptToken) &&
-                dao.getItemById(itemId) != null
+            if (mediaReady && isCacheAttemptActive(itemId, attemptToken)) {
+                writeLock.withLock {
+                    if (
+                        isCacheAttemptActive(itemId, attemptToken) &&
+                            dao.getItemById(itemId) != null
+                    ) {
+                        dao.updateItemCachedOffline(itemId, true)
+                        true
+                    } else {
+                        false
+                    }
+                }
+            } else {
+                false
+            }
         return if (committed) {
-            dao.updateItemCachedOffline(itemId, true)
+            enforceOfflineDiskQuota(protectedItemId = itemId)
             true
         } else {
             abortOfflineCacheAttempt(itemId)
@@ -125,7 +172,7 @@ internal class OfflineCacheManager(
     }
 
     private suspend fun abortOfflineCacheAttempt(itemId: String): Boolean {
-        dao.updateItemCachedOffline(itemId, false)
+        writeLock.withLock { dao.updateItemCachedOffline(itemId, false) }
         evictCachedItemFiles(itemId)
         return false
     }
@@ -153,7 +200,7 @@ internal class OfflineCacheManager(
                 ?.takeIf { isCacheAttemptActive(itemId, attemptToken) }
                 ?.let { resolveTargetItemMediaFile(it, itemId, AUDIO_ENCLOSURE_FILE_NAME) }
                 ?: return false
-        val streamed = apiClient.streamExternalBinaryToFile(audioUrl, targetFile)
+        val streamed = publicWebFetcher.streamBinaryToFile(audioUrl, targetFile)
         val valid =
             streamed &&
                 isCacheAttemptActive(itemId, attemptToken) &&
@@ -171,7 +218,7 @@ internal class OfflineCacheManager(
         attemptToken: Long,
     ): InboxItemRow? = runSuspendCatching {
         if (!isCacheAttemptActive(itemId, attemptToken)) return null
-        val detail = apiClient.fetchItemDetail(serverUrl, token, itemId)
+        val detail = serverApi.fetchItemDetail(serverUrl, token, itemId)
         if (!isCacheAttemptActive(itemId, attemptToken)) return null
         applyHydratedDetail(itemId, detail)
     }
@@ -180,25 +227,39 @@ internal class OfflineCacheManager(
     private suspend fun applyHydratedDetail(
         itemId: String,
         detail: RemoteItemDto,
-    ): InboxItemRow? {
-        val current = dao.getItemById(itemId) ?: return null
-        val hydrated = mergeHydratedItemDetail(current, detail)
-        dao.upsertItem(hydrated, markDirty = false)
-        val tombstones =
-            dao.getAllTombstones()
-                .filter {
-                    it.entityType.equals(TOMBSTONE_ENTITY_COLLECTION_ENTRY, ignoreCase = true)
+    ): InboxItemRow? = writeLock.withLock {
+        var result: InboxItemRow? = null
+        dao.executeInTransaction {
+            val current = dao.getItemById(itemId)
+            if (current != null) {
+                val hydrated = mergeHydratedItemDetail(current, detail)
+                dao.upsertItem(hydrated, markDirty = false)
+                val tombstones =
+                    dao.getAllTombstones()
+                        .filter {
+                            it.entityType.equals(
+                                TOMBSTONE_ENTITY_COLLECTION_ENTRY,
+                                ignoreCase = true,
+                            )
+                        }
+                        .mapTo(HashSet()) { it.naturalKey }
+                val allowedTags =
+                    detail.tagNames.filter { rawTag ->
+                        val tagId = deterministicTagId(normalizeTagName(rawTag))
+                        collectionEntryNaturalKey(tagId, itemId) !in tombstones
+                    }
+                if (allowedTags.isNotEmpty()) {
+                    attachTagsLocally(
+                        dao = dao,
+                        itemId = itemId,
+                        tagNames = allowedTags,
+                        markDirty = false,
+                    )
                 }
-                .mapTo(HashSet()) { it.naturalKey }
-        val allowedTags =
-            detail.tagNames.filter { rawTag ->
-                val tagId = deterministicTagId(normalizeTagName(rawTag))
-                collectionEntryNaturalKey(tagId, itemId) !in tombstones
+                result = hydrated
             }
-        if (allowedTags.isNotEmpty()) {
-            attachTagsLocally(dao = dao, itemId = itemId, tagNames = allowedTags, markDirty = false)
         }
-        return hydrated
+        result
     }
 
     @Suppress("LongParameterList")
@@ -214,7 +275,7 @@ internal class OfflineCacheManager(
         val hasServerAuth = serverUrl.isNotBlank() && token.isNotBlank()
         val remoteMedia =
             if (hasServerAuth) {
-                runSuspendCatching { apiClient.fetchItemMedia(serverUrl, token, itemId) }
+                runSuspendCatching { serverApi.fetchItemMedia(serverUrl, token, itemId) }
                     .getOrDefault(emptyList())
             } else {
                 emptyList()
@@ -266,10 +327,13 @@ internal class OfflineCacheManager(
         attemptToken: Long,
     ) {
         if (!isCacheAttemptActive(itemId, attemptToken)) return
-        val bytes =
-            apiClient.fetchExternalImageBytes(thumbnailUrl)?.takeIf {
-                it.isNotEmpty() && it.size <= MAX_OFFLINE_THUMBNAIL_BYTES
-            } ?: return
+        val fetched =
+            publicWebFetcher.fetchImageBytes(
+                imageUrl = thumbnailUrl,
+                maxBytes = MAX_OFFLINE_THUMBNAIL_BYTES.toInt(),
+            )
+        val bytes = fetched?.takeIf { it.isNotEmpty() && it.size <= MAX_OFFLINE_THUMBNAIL_BYTES }
+        if (bytes == null) return
         if (isCacheAttemptActive(itemId, attemptToken)) {
             runSuspendCatching { thumbnailDiskCache.writeBytes(thumbnailUrl, bytes) }
         }
@@ -293,7 +357,7 @@ internal class OfflineCacheManager(
                 null
             } ?: return false
         val streamed =
-            apiClient.streamMediaToFile(
+            serverApi.streamMediaToFile(
                 serverUrl = serverUrl,
                 token = token,
                 mediaId = mediaId,
@@ -318,7 +382,134 @@ internal class OfflineCacheManager(
                     resolveSafeChildFile(itemsRoot, itemId).deleteRecursively()
                 }
             }
+                .onFailure { err ->
+                    RocheLog.warn(LOG_TAG, "Failed to evict offline files for $itemId", err)
+                }
         }
+    }
+
+    internal suspend fun cachedBytesByEntryId(): Map<String, Long> {
+        val rootDir = cacheDir ?: return emptyMap()
+        return withContext(Dispatchers.IO) {
+            scanCachedItemDirectories(File(rootDir, ITEMS_SUBDIR)).associate {
+                it.itemId to it.sizeBytes
+            }
+        }
+    }
+
+    internal suspend fun totalOfflineCacheBytes(): Long = cachedBytesByEntryId().values.sum()
+
+    internal suspend fun enforceOfflineDiskQuota(protectedItemId: String? = null) {
+        val rootDir = cacheDir ?: return
+        if (maxOfflineCacheBytes <= 0L) return
+        quotaMutex.withLock {
+            val itemsRoot = File(rootDir, ITEMS_SUBDIR)
+            val entries = withContext(Dispatchers.IO) { scanCachedItemDirectories(itemsRoot) }
+            val totalBytes = entries.sumOf { it.sizeBytes }
+            if (totalBytes > maxOfflineCacheBytes) {
+                val archivedIds = loadArchivedEntryIds()
+                val localPdfIds = loadLocalPdfEntryIds()
+                val protectedIds =
+                    activeCacheTokens.keys + localPdfIds + listOfNotNull(protectedItemId)
+                val candidates = sortQuotaEvictionCandidates(entries, protectedIds, archivedIds)
+                evictCandidatesUntilUnderQuota(candidates, totalBytes)
+            }
+        }
+    }
+
+    private suspend fun loadLocalPdfEntryIds(): Set<String> =
+        dao.getAllEntries().filter { isLocalPdfUrl(it.url) }.mapTo(HashSet()) { it.id }
+
+    private suspend fun loadArchivedEntryIds(): Set<String> {
+        val wantIds =
+            dao.getCollectionMemberships(WANT_TO_READ_COLLECTION_ID).mapTo(HashSet()) { it.entryId }
+        return dao.getAllEntryStates()
+            .filter { state ->
+                state.inboxState.equals("dismissed", ignoreCase = true) ||
+                    state.inboxState.equals("none", ignoreCase = true) &&
+                        !state.readAt.isNullOrBlank() &&
+                        state.entryId !in wantIds
+            }
+            .mapTo(HashSet()) { it.entryId }
+    }
+
+    private suspend fun evictCandidatesUntilUnderQuota(
+        candidates: List<CachedItemDirInfo>,
+        initialBytes: Long,
+    ) {
+        var remainingBytes = initialBytes
+        for (candidate in candidates) {
+            if (remainingBytes <= maxOfflineCacheBytes) break
+            if (
+                !activeCacheTokens.containsKey(candidate.itemId) &&
+                    evictSingleQuotaCandidate(candidate)
+            ) {
+                remainingBytes = (remainingBytes - candidate.sizeBytes).coerceAtLeast(0L)
+            }
+        }
+    }
+
+    private suspend fun evictSingleQuotaCandidate(candidate: CachedItemDirInfo): Boolean =
+        writeLock.withLock {
+            if (activeCacheTokens.containsKey(candidate.itemId)) {
+                false
+            } else {
+                val deleted =
+                    withContext(Dispatchers.IO) {
+                        runCatching { candidate.dir.deleteRecursively() }.getOrDefault(false)
+                    }
+                if (deleted) {
+                    dao.updateItemCachedOffline(candidate.itemId, false)
+                }
+                deleted
+            }
+        }
+}
+
+internal data class CachedItemDirInfo(
+    val itemId: String,
+    val dir: File,
+    val sizeBytes: Long,
+    val lastModifiedMs: Long,
+)
+
+internal fun sortQuotaEvictionCandidates(
+    entries: List<CachedItemDirInfo>,
+    protectedIds: Set<String>,
+    archivedIds: Set<String>,
+): List<CachedItemDirInfo> =
+    entries
+        .filter { it.itemId !in protectedIds }
+        .sortedWith(
+            compareBy<CachedItemDirInfo> { if (it.itemId in archivedIds) 0 else 1 }
+                .thenBy { it.lastModifiedMs }
+                .thenBy { it.itemId }
+        )
+
+internal fun scanCachedItemDirectories(itemsRoot: File): List<CachedItemDirInfo> {
+    if (!itemsRoot.isDirectory) return emptyList()
+    return itemsRoot.listFiles().orEmpty().mapNotNull(::measureCachedItemDirectory)
+}
+
+private fun measureCachedItemDirectory(child: File): CachedItemDirInfo? {
+    if (!child.isDirectory) return null
+    var total = 0L
+    var latestMod = child.lastModified()
+    for (file in child.walkTopDown()) {
+        if (file.isFile) {
+            total += file.length()
+            latestMod = maxOf(latestMod, file.lastModified())
+        }
+    }
+    return if (total > 0L) {
+        CachedItemDirInfo(
+            itemId = child.name,
+            dir = child,
+            sizeBytes = total,
+            lastModifiedMs = latestMod,
+        )
+    } else {
+        null
     }
 }
 
@@ -376,8 +567,24 @@ internal suspend fun resolveTargetItemMediaFile(
             .getOrNull()
     }
 
+private fun String?.nonBlankOr(fallback: String?): String? =
+    this?.takeIf { it.isNotBlank() } ?: fallback
+
 internal fun mergeHydratedItemDetail(local: InboxItemRow, detail: RemoteItemDto): InboxItemRow =
-    mergeRemoteItemIntoLocal(local = local, remote = detail)
+    local.copy(
+        title = detail.title.ifBlank { local.title },
+        author = detail.author.nonBlankOr(local.author),
+        summary = detail.summary.nonBlankOr(local.summary)?.take(MAX_SQLITE_SUMMARY_CHARS),
+        contentText =
+            detail.contentText
+                .nonBlankOr(local.contentText?.takeIf { it.isNotBlank() && it != local.summary })
+                ?.take(MAX_SQLITE_TEXT_CHARS),
+        contentHtml = detail.contentHtml.nonBlankOr(local.contentHtml)?.take(MAX_SQLITE_HTML_CHARS),
+        thumbnailMediaId = detail.thumbnailMediaId.nonBlankOr(local.thumbnailMediaId),
+        duration = detail.duration.nonBlankOr(local.duration),
+        thumbnailUrl = detail.thumbnailUrl.nonBlankOr(local.thumbnailUrl),
+        audioUrl = detail.audioUrl.nonBlankOr(local.audioUrl),
+    )
 
 internal fun collectEligibleMediaIds(
     remoteMedia: List<RemoteMediaDto>,
@@ -422,3 +629,5 @@ private const val AUTO_DOWNLOAD_FEED_CHUNK_SIZE = 500
 private const val MAX_OFFLINE_MEDIA_BYTES = 50L * 1024L * 1024L
 private const val MAX_OFFLINE_THUMBNAIL_BYTES = 10L * 1024L * 1024L
 private const val MAX_OFFLINE_EXTERNAL_IMAGES = 16
+internal const val DEFAULT_MAX_OFFLINE_CACHE_BYTES = 512L * 1024L * 1024L
+private const val LOG_TAG = "OfflineCacheManager"

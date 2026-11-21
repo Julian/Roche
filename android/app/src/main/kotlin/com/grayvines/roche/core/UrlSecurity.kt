@@ -176,11 +176,16 @@ internal fun isTailscaleInetAddress(addr: InetAddress): Boolean {
             bytes[0].toInt() and IPV4_OCTET_MAX == IPV4_CGNAT_100 &&
             bytes[1].toInt() and IPV4_OCTET_MAX in IPV4_CGNAT_MIN..IPV4_CGNAT_MAX
     } else {
-        bytes.size == IPV6_BYTE_COUNT &&
-            TAILSCALE_ULA_PREFIX.indices.all { idx ->
-                bytes[idx].toInt() and IPV4_OCTET_MAX == TAILSCALE_ULA_PREFIX[idx]
-            }
+        isTailscaleUlaAddress(addr)
     }
+}
+
+internal fun isTailscaleUlaAddress(addr: InetAddress): Boolean {
+    val bytes = addr.address
+    return bytes.size == IPV6_BYTE_COUNT &&
+        TAILSCALE_ULA_PREFIX.indices.all { idx ->
+            bytes[idx].toInt() and IPV4_OCTET_MAX == TAILSCALE_ULA_PREFIX[idx]
+        }
 }
 
 private fun parseStrictDecimalOctet(part: String): Int? =

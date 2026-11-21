@@ -13,9 +13,10 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
-import com.grayvines.roche.ui.predictiveBackDrawerGraphics
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import kotlinx.coroutines.CancellationException
 
@@ -93,3 +94,21 @@ internal fun PredictiveBackDrawerContainer(
     if (!visible) return
     content(Modifier.predictiveBackDrawerGraphics(backProgress))
 }
+
+internal fun Modifier.predictiveBackDrawerGraphics(progress: Float): Modifier {
+    val clamped = progress.coerceIn(MIN_PROGRESS, FULL_SCALE)
+    if (clamped <= MIN_PROGRESS) return this
+    return graphicsLayer {
+        val scale = FULL_SCALE - clamped * DRAWER_BACK_MAX_SHRINK
+        scaleX = scale
+        scaleY = scale
+        alpha = FULL_SCALE - clamped * DRAWER_BACK_MAX_FADE
+        transformOrigin = TransformOrigin(DRAWER_ORIGIN_CENTER_X, MIN_PROGRESS)
+    }
+}
+
+private const val MIN_PROGRESS = 0f
+private const val FULL_SCALE = 1f
+private const val DRAWER_ORIGIN_CENTER_X = 0.5f
+private const val DRAWER_BACK_MAX_SHRINK = 0.08f
+private const val DRAWER_BACK_MAX_FADE = 0.35f

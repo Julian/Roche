@@ -167,143 +167,25 @@ private const val INBOX_SELECT_SEARCH_PREFIX =
         "COALESCE(es.inboxState, 'none') AS inboxState " +
         INBOX_FROM_WHERE
 
-private const val ENTRIES_STAMP_SQL =
-    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
-        "COALESCE(MAX(updatedAt), '') || ':' || " +
-        "COALESCE(SUM(CASE WHEN mergedIntoId IS NOT NULL AND mergedIntoId != '' " +
-        "THEN 1 ELSE 0 END), 0) || ':' || " +
-        "COALESCE(SUM(LENGTH(title) * 31 + LENGTH(COALESCE(url, '')) * 7 + " +
-        "LENGTH(COALESCE(summary, '')) * 13 + LENGTH(creatorsJson) * 17 + " +
-        "LENGTH(COALESCE(mergedIntoId, '')) * 23 + LENGTH(COALESCE(thumbnailUrl, '')) * 29 + " +
-        "LENGTH(metadataJson) * 37 + COALESCE(releaseYear, 0) * 41 + " +
-        "LENGTH(COALESCE(publishedAt, '')) * 43 + isLocalDirty * 47 + " +
-        "COALESCE(UNICODE(title), 0) * 3 + " +
-        "COALESCE(UNICODE(SUBSTR(title, -1, 1)), 0) * 5), 0) " +
-        "FROM entries"
-
-private const val IDENTS_STAMP_SQL =
-    "SELECT COUNT(*) || ':' || " +
-        "COALESCE(SUM(LENGTH(entryId) * 31 + LENGTH(scheme) * 7 + LENGTH(value)), 0) || ':' || " +
-        "COALESCE(SUM(COALESCE(UNICODE(entryId), 0) * 17 + " +
-        "COALESCE(UNICODE(SUBSTR(entryId, -1, 1)), 0) * 31 + " +
-        "COALESCE(UNICODE(SUBSTR(entryId, LENGTH(entryId) / 2 + 1, 1)), 0) * 13 + " +
-        "COALESCE(UNICODE(value), 0) * 7 + " +
-        "COALESCE(UNICODE(SUBSTR(value, -1, 1)), 0)), 0) || ':' || " +
-        "COALESCE(MIN(entryId), '') || ':' || COALESCE(MAX(entryId), '') || ':' || " +
-        "COALESCE(MIN(value), '') || ':' || COALESCE(MAX(value), '') " +
-        "FROM entry_identifiers"
-
-private const val SPECS_STAMP_SQL =
-    "SELECT COUNT(*) || ':' || COALESCE(SUM(showInLists), 0) || ':' || " +
-        "COALESCE(SUM(LENGTH(COALESCE(slug, '')) * 31 + LENGTH(role) * 7 + " +
-        "LENGTH(mode) * 13 + LENGTH(COALESCE(ruleJson, '')) * 17 + " +
-        "LENGTH(COALESCE(color, '')) * 23 + " +
-        "COALESCE(UNICODE(COALESCE(slug, '')), 0) * 3 + " +
-        "COALESCE(UNICODE(SUBSTR(COALESCE(slug, ''), -1, 1)), 0) * 5 + " +
-        "COALESCE(UNICODE(role), 0) * 11 + COALESCE(UNICODE(mode), 0) * 19 + " +
-        "COALESCE(UNICODE(COALESCE(ruleJson, '')), 0) * 29 + " +
-        "COALESCE(UNICODE(SUBSTR(COALESCE(ruleJson, ''), -1, 1)), 0) * 37 + " +
-        "COALESCE(UNICODE(COALESCE(color, '')), 0) * 41 + " +
-        "COALESCE(UNICODE(SUBSTR(COALESCE(color, ''), 2, 1)), 0) * 47 + " +
-        "COALESCE(UNICODE(SUBSTR(COALESCE(color, ''), -1, 1)), 0) * 43), 0) || ':' || " +
-        "COALESCE(MIN(COALESCE(slug, '')), '') || ':' || " +
-        "COALESCE(MAX(COALESCE(slug, '')), '') || ':' || " +
-        "COALESCE(MIN(COALESCE(color, '')), '') || ':' || " +
-        "COALESCE(MAX(COALESCE(color, '')), '') " +
-        "FROM collection_specs"
-
-private const val MEMBERS_STAMP_SQL =
-    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
-        "COALESCE(MAX(addedAt), '') || ':' || COALESCE(SUM(COALESCE(position, 0.0)), 0.0) || ':' || " +
-        "COALESCE(SUM(LENGTH(collectionId) * 7 + LENGTH(entryId) * 13 + " +
-        "COALESCE(UNICODE(collectionId), 0) * 3 + COALESCE(UNICODE(entryId), 0) * 5 + " +
-        "COALESCE(UNICODE(SUBSTR(entryId, -1, 1)), 0) * 11), 0) || ':' || " +
-        "COALESCE(MIN(entryId), '') || ':' || COALESCE(MAX(entryId), '') " +
-        "FROM collection_entries"
-
-private const val GENERATORS_STAMP_SQL =
-    "SELECT COUNT(*) || ':' || COALESCE(SUM(enabled), 0) || ':' || " +
-        "COALESCE(MAX(hlc), '') || ':' || COALESCE(MAX(updatedAt), '') || ':' || " +
-        "COALESCE(MIN(COALESCE(currentEntryId, '')), '') || ':' || " +
-        "COALESCE(MAX(COALESCE(currentEntryId, '')), '') || ':' || " +
-        "COALESCE(SUM(LENGTH(COALESCE(currentEntryId, '')) * 7 + " +
-        "COALESCE(UNICODE(COALESCE(currentEntryId, '')), 0) * 13 + " +
-        "COALESCE(UNICODE(SUBSTR(COALESCE(currentEntryId, ''), -1, 1)), 0) * 17), 0) " +
-        "FROM collection_generators"
-
-private const val LOGS_STAMP_SQL =
-    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
-        "COALESCE(MAX(ts), '') || ':' || COALESCE(MIN(entryId), '') || ':' || " +
-        "COALESCE(MAX(entryId), '') || ':' || " +
-        "COALESCE(SUM(LENGTH(status) * 7 + LENGTH(COALESCE(notes, '')) * 13 + " +
-        "COALESCE(UNICODE(status), 0) * 3 + " +
-        "COALESCE(UNICODE(COALESCE(notes, '')), 0) * 5), 0) " +
-        "FROM consumption_log"
-
-private const val COMPARISONS_STAMP_SQL =
-    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
-        "COALESCE(MIN(id), '') || ':' || COALESCE(MAX(id), '') || ':' || " +
-        "COALESCE(SUM(LENGTH(orderingJson) * 7 + " +
-        "LENGTH(COALESCE(scopeCollectionId, '')) * 13 + " +
-        "COALESCE(UNICODE(orderingJson), 0) * 3 + " +
-        "COALESCE(UNICODE(SUBSTR(orderingJson, -2, 1)), 0) * 5), 0) " +
-        "FROM comparisons"
-
-private const val STATES_STAMP_SQL =
-    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
-        "COALESCE(MAX(updatedAt), '') || ':' || " +
-        "COALESCE(MAX(COALESCE(interactionUpdatedAt, '')), '') || ':' || " +
-        "COALESCE(MAX(COALESCE(readAt, '')), '') || ':' || " +
-        "COALESCE(SUM(CASE WHEN readAt IS NOT NULL THEN 1 ELSE 0 END), 0) || ':' || " +
-        "COALESCE(SUM(isCachedOffline), 0) || ':' || " +
-        "COALESCE(SUM(CASE WHEN inboxState = 'unread' THEN 1 " +
-        "WHEN inboxState = 'dismissed' THEN 2 " +
-        "WHEN inboxState = 'deleted' THEN 4 ELSE 0 END), 0) || ':' || " +
-        "COALESCE(SUM(progress), 0.0) " +
-        "FROM entry_state"
-
-private const val CONTENTS_STAMP_SQL =
-    "SELECT COUNT(*) || ':' || " +
-        "COALESCE(SUM(LENGTH(COALESCE(contentHtml, '')) * 31 + " +
-        "LENGTH(COALESCE(contentText, '')) * 17 + " +
-        "LENGTH(COALESCE(audioUrl, '')) * 7 + LENGTH(COALESCE(duration, '')) * 13 + " +
-        "LENGTH(COALESCE(thumbnailMediaId, '')) * 19 + " +
-        "LENGTH(COALESCE(fallbackFeedTitle, '')) * 23 + LENGTH(contentType) * 3 + " +
-        "COALESCE(UNICODE(contentType), 0) * 5 + " +
-        "COALESCE(UNICODE(SUBSTR(COALESCE(contentHtml, ''), 1, 1)), 0) * 11 + " +
-        "COALESCE(UNICODE(SUBSTR(COALESCE(contentText, ''), 1, 1)), 0) * 29), 0) || ':' || " +
-        "COALESCE(MIN(COALESCE(fallbackFeedTitle, '')), '') || ':' || " +
-        "COALESCE(MAX(COALESCE(fallbackFeedTitle, '')), '') || ':' || " +
-        "COALESCE(MIN(COALESCE(duration, '')), '') || ':' || " +
-        "COALESCE(MAX(COALESCE(duration, '')), '') " +
-        "FROM entry_content"
-
-private const val FEEDS_STAMP_SQL =
-    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
-        "COALESCE(SUM(isActive), 0) || ':' || COALESCE(SUM(autoDownloadEpisodes), 0) || ':' || " +
-        "COALESCE(SUM(consecutiveFailures), 0) || ':' || " +
-        "COALESCE(SUM(COALESCE(customPlaybackSpeed, 0.0)), 0.0) || ':' || " +
-        "COALESCE(MAX(COALESCE(lastPolledAt, '')), '') || ':' || " +
-        "COALESCE(MAX(COALESCE(lastError, '')), '') || ':' || " +
-        "COALESCE(SUM(LENGTH(COALESCE(feedTitle, '')) * 7 + LENGTH(sourceType) * 13 + " +
-        "LENGTH(COALESCE(lastError, '')) * 17 + " +
-        "COALESCE(UNICODE(COALESCE(feedTitle, '')), 0) * 3 + isLocalDirty * 19), 0) " +
-        "FROM feed_sources"
-
 private const val CATALOG_STAMP_SELECT =
-    "SELECT ($ENTRIES_STAMP_SQL) AS entriesStamp, " +
-        "($IDENTS_STAMP_SQL) AS identsStamp, " +
-        "($SPECS_STAMP_SQL) AS specsStamp, " +
-        "($MEMBERS_STAMP_SQL) AS membersStamp, " +
-        "($GENERATORS_STAMP_SQL) AS generatorsStamp, " +
-        "($LOGS_STAMP_SQL) AS logsStamp, " +
-        "($COMPARISONS_STAMP_SQL) AS comparisonsStamp"
+    "SELECT " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'entries'), 0) AS entriesStamp, " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'entry_identifiers'), 0) AS identsStamp, " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'collection_specs'), 0) AS specsStamp, " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'collection_entries'), 0) AS membersStamp, " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'collection_generators'), 0) AS generatorsStamp, " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'consumption_log'), 0) AS logsStamp, " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'comparisons'), 0) AS comparisonsStamp"
 
 private const val REPOSITORY_STAMP_SELECT =
     "$CATALOG_STAMP_SELECT, " +
-        "($STATES_STAMP_SQL) AS statesStamp, " +
-        "($CONTENTS_STAMP_SQL) AS contentsStamp, " +
-        "($FEEDS_STAMP_SQL) AS feedsStamp"
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'entry_state'), 0) AS statesStamp, " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'entry_content'), 0) AS contentsStamp, " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'feed_sources'), 0) AS feedsStamp"
+
+private const val DEFAULT_FTS_SEARCH_LIMIT = 150
+private const val DEFAULT_FTS_TOKEN_ID_LIMIT = 600
+private const val DEFAULT_EXTRA_SEARCH_LIMIT = 50
 
 private const val FEED_ROW_SELECT =
     "SELECT fs.collectionId AS id, " +
@@ -328,49 +210,10 @@ private const val FEED_ROW_SELECT =
         "INNER JOIN entries e ON e.id = fs.collectionId " +
         "WHERE e.mergedIntoId IS NULL"
 
+@Suppress("LargeClass")
 @Dao
 interface RocheDao {
-    // --- Reactive UI Observers ---
-
-    @Query("$FEED_ROW_SELECT ORDER BY title COLLATE NOCASE ASC, title ASC")
-    fun observeFeeds(): Flow<List<FeedRow>>
-
-    @Query("$INBOX_SELECT_LIST_PREFIX ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC")
-    fun observeItems(): Flow<List<InboxItemRow>>
-
-    @Query(
-        "SELECT e.id AS id, e.title AS name, cs.color AS color " +
-            "FROM collection_specs cs " +
-            "INNER JOIN entries e ON e.id = cs.collectionId " +
-            "WHERE cs.role = 'tag' AND e.mergedIntoId IS NULL " +
-            "ORDER BY e.title COLLATE NOCASE ASC, e.title ASC"
-    )
-    fun observeTags(): Flow<List<TagRow>>
-
-    @Query(
-        "SELECT ce.entryId AS itemId, ce.collectionId AS tagId " +
-            "FROM collection_entries ce " +
-            "INNER JOIN collection_specs cs ON cs.collectionId = ce.collectionId " +
-            "INNER JOIN entries e ON e.id = cs.collectionId " +
-            "WHERE cs.role = 'tag' AND e.mergedIntoId IS NULL"
-    )
-    fun observeItemTags(): Flow<List<ItemTagRow>>
-
-    @Query(ENTRIES_STAMP_SQL) fun observeEntriesStamp(): Flow<String>
-
-    @Query(IDENTS_STAMP_SQL) fun observeIdentsStamp(): Flow<String>
-
-    @Query(SPECS_STAMP_SQL) fun observeSpecsStamp(): Flow<String>
-
-    @Query(MEMBERS_STAMP_SQL) fun observeMembersStamp(): Flow<String>
-
-    @Query(GENERATORS_STAMP_SQL) fun observeGeneratorsStamp(): Flow<String>
-
-    @Query(LOGS_STAMP_SQL) fun observeLogsStamp(): Flow<String>
-
-    @Query(COMPARISONS_STAMP_SQL) fun observeComparisonsStamp(): Flow<String>
-
-    @Query(CATALOG_STAMP_SELECT) fun observeCatalogStamp(): Flow<CatalogStampRow>
+    // --- Reactive O(1) Table-Revision Observer ---
 
     @Query(CATALOG_STAMP_SELECT) suspend fun getCatalogStamp(): CatalogStampRow
 
@@ -381,6 +224,21 @@ interface RocheDao {
     // --- Core Entries (`entries` + FTS-safe upserts) ---
 
     @Query("SELECT * FROM entries") suspend fun getAllEntries(): List<EntryEntity>
+
+    @Query("SELECT id FROM entries") suspend fun getAllEntryIds(): List<String>
+
+    @Query(
+        "SELECT * FROM entries " +
+            "WHERE kind = 'artist' AND (mergedIntoId IS NULL OR mergedIntoId = '') " +
+            "AND LOWER(title) = LOWER(:title) LIMIT 1"
+    )
+    suspend fun findActiveArtistByTitle(title: String): EntryEntity?
+
+    @Query(
+        "SELECT * FROM entries " +
+            "WHERE kind = :kind AND (mergedIntoId IS NULL OR mergedIntoId = '')"
+    )
+    suspend fun getActiveEntriesByKind(kind: String): List<EntryEntity>
 
     @Query("SELECT * FROM entries WHERE id IN (:ids)")
     suspend fun getEntriesByIds(ids: List<String>): List<EntryEntity>
@@ -533,6 +391,9 @@ interface RocheDao {
 
     @Query(INBOX_SELECT_FULL_PREFIX) suspend fun getAllItems(): List<InboxItemRow>
 
+    @Query("$INBOX_SELECT_LIST_PREFIX ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC")
+    suspend fun getAllPreviewItems(): List<InboxItemRow>
+
     @Query("$INBOX_SELECT_LIST_PREFIX AND e.id IN (:ids)")
     suspend fun getPreviewItemsByIds(ids: List<String>): List<InboxItemRow>
 
@@ -618,11 +479,12 @@ interface RocheDao {
             "INNER JOIN entries te_tg ON te_tg.id = cs_tg.collectionId " +
             "WHERE ce_tg.entryId = e.id AND cs_tg.role = 'tag' AND te_tg.mergedIntoId IS NULL " +
             "AND te_tg.title LIKE :likePattern ESCAPE '\\')" +
-            ") ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC"
+            ") ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC LIMIT :limit"
     )
     suspend fun searchSingleTokenFullItems(
         tokenMatchQuery: String,
         likePattern: String,
+        limit: Int = DEFAULT_FTS_SEARCH_LIMIT,
     ): List<InboxItemRow>
 
     @Query(
@@ -648,9 +510,13 @@ interface RocheDao {
             "INNER JOIN entries fe ON fe.id = fs.collectionId " +
             "INNER JOIN entries_fts ON fe.rowid = entries_fts.rowid " +
             "WHERE e3.mergedIntoId IS NULL AND es3.inboxState IN ('unread', 'dismissed') " +
-            "AND entries_fts MATCH :tokenMatchQuery"
+            "AND entries_fts MATCH :tokenMatchQuery " +
+            "LIMIT :limit"
     )
-    suspend fun matchItemIdsForFtsToken(tokenMatchQuery: String): List<String>
+    suspend fun matchItemIdsForFtsToken(
+        tokenMatchQuery: String,
+        limit: Int = DEFAULT_FTS_TOKEN_ID_LIMIT,
+    ): List<String>
 
     @Query(
         "SELECT DISTINCT ce.entryId FROM collection_entries ce " +
@@ -661,15 +527,22 @@ interface RocheDao {
             "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
             "WHERE cs.role = 'tag' AND te.mergedIntoId IS NULL " +
             "AND $IS_LIVE_ITEM_WHERE " +
-            "AND te.title LIKE :likePattern ESCAPE '\\'"
+            "AND te.title LIKE :likePattern ESCAPE '\\' " +
+            "LIMIT :limit"
     )
-    suspend fun matchItemIdsByTagLike(likePattern: String): List<String>
+    suspend fun matchItemIdsByTagLike(
+        likePattern: String,
+        limit: Int = DEFAULT_FTS_TOKEN_ID_LIMIT,
+    ): List<String>
 
     @Query(
         "$INBOX_SELECT_SEARCH_PREFIX AND e.id IN (:ids) " +
-            "ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC"
+            "ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC LIMIT :limit"
     )
-    suspend fun getSearchItemsByIdsChunk(ids: List<String>): List<InboxItemRow>
+    suspend fun getSearchItemsByIdsChunk(
+        ids: List<String>,
+        limit: Int = DEFAULT_FTS_SEARCH_LIMIT,
+    ): List<InboxItemRow>
 
     @Query(
         "$INBOX_SELECT_SEARCH_PREFIX AND EXISTS (" +
@@ -678,19 +551,75 @@ interface RocheDao {
             "INNER JOIN entries te_tg ON te_tg.id = cs_tg.collectionId " +
             "WHERE ce_tg.entryId = e.id AND cs_tg.role = 'tag' AND te_tg.mergedIntoId IS NULL " +
             "AND te_tg.title LIKE :likePattern ESCAPE '\\'" +
-            ") ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC"
+            ") ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC LIMIT :limit"
     )
-    suspend fun searchItemsByTagOnly(likePattern: String): List<InboxItemRow>
+    suspend fun searchItemsByTagOnly(
+        likePattern: String,
+        limit: Int = DEFAULT_FTS_SEARCH_LIMIT,
+    ): List<InboxItemRow>
+
+    @Query(
+        "SELECT e.id AS entryId, " +
+            "snippet(entries_fts, -1, '', '', '…', 14) AS excerpt " +
+            "FROM entries e " +
+            "INNER JOIN entries_fts ON e.rowid = entries_fts.rowid " +
+            "WHERE e.mergedIntoId IS NULL AND entries_fts MATCH :tokenMatchQuery " +
+            "LIMIT :limit"
+    )
+    suspend fun searchEntryFtsSnippets(
+        tokenMatchQuery: String,
+        limit: Int = DEFAULT_FTS_SEARCH_LIMIT,
+    ): List<SearchSnippetRow>
+
+    @Query(
+        "SELECT ec.entryId AS entryId, " +
+            "snippet(entry_content_fts, -1, '', '', '…', 14) AS excerpt " +
+            "FROM entry_content ec " +
+            "INNER JOIN entries e ON e.id = ec.entryId " +
+            "INNER JOIN entry_content_fts ON ec.rowid = entry_content_fts.rowid " +
+            "WHERE e.mergedIntoId IS NULL AND entry_content_fts MATCH :tokenMatchQuery " +
+            "LIMIT :limit"
+    )
+    suspend fun searchContentFtsSnippets(
+        tokenMatchQuery: String,
+        limit: Int = DEFAULT_FTS_SEARCH_LIMIT,
+    ): List<SearchSnippetRow>
+
+    @Query(
+        "SELECT e.id FROM collection_specs cs " +
+            "INNER JOIN entries e ON e.id = cs.collectionId " +
+            "WHERE e.mergedIntoId IS NULL AND cs.role IN ('list', 'want', 'system') " +
+            "AND (e.title LIKE :likePattern ESCAPE '\\' " +
+            "OR COALESCE(cs.slug, '') LIKE :likePattern ESCAPE '\\') " +
+            "ORDER BY e.title COLLATE NOCASE ASC LIMIT :limit"
+    )
+    suspend fun searchCollectionIdsByTitle(
+        likePattern: String,
+        limit: Int = DEFAULT_EXTRA_SEARCH_LIMIT,
+    ): List<String>
+
+    @Query(
+        "SELECT cl.* FROM consumption_log cl " +
+            "INNER JOIN entries e ON e.id = cl.entryId " +
+            "WHERE e.mergedIntoId IS NULL AND cl.notes IS NOT NULL " +
+            "AND cl.notes LIKE :likePattern ESCAPE '\\' " +
+            "ORDER BY cl.ts DESC LIMIT :limit"
+    )
+    suspend fun searchConsumptionLogsByNotes(
+        likePattern: String,
+        limit: Int = DEFAULT_EXTRA_SEARCH_LIMIT,
+    ): List<ConsumptionLogEntity>
 
     @Transaction
     suspend fun searchFullItemsByTokens(
         tokenQueries: List<String>,
         likePattern: String,
+        limit: Int = DEFAULT_FTS_SEARCH_LIMIT,
     ): List<InboxItemRow> =
         when (tokenQueries.size) {
-            0 -> searchItemsByTagOnly(likePattern)
-            1 -> searchSingleTokenFullItems(tokenQueries.single(), likePattern)
-            else -> executeMultiTokenSearch(tokenQueries, likePattern)
+            0 -> searchItemsByTagOnly(likePattern, limit)
+            1 -> searchSingleTokenFullItems(tokenQueries.single(), likePattern, limit)
+            else -> executeMultiTokenSearch(tokenQueries, likePattern, limit)
         }
 
     // --- Feeds (`feed_sources` + `entries` + `collection_specs`) ---
@@ -819,11 +748,36 @@ interface RocheDao {
     @Query("SELECT * FROM collection_specs WHERE LOWER(slug) = LOWER(:slug) LIMIT 1")
     suspend fun getCollectionSpecBySlug(slug: String): CollectionSpecEntity?
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertCollectionSpec(spec: CollectionSpecEntity)
+    @Query(
+        "SELECT collectionId FROM collection_specs " +
+            "WHERE (slug = :slug OR LOWER(slug) = LOWER(:slug)) " +
+            "AND collectionId != :excludeId LIMIT 1"
+    )
+    suspend fun findOtherCollectionIdBySlug(slug: String, excludeId: String): String?
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertCollectionSpecs(specs: List<CollectionSpecEntity>)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertCollectionSpecIgnore(spec: CollectionSpecEntity): Long
+
+    @Update suspend fun updateCollectionSpec(spec: CollectionSpecEntity)
+
+    @Transaction
+    suspend fun upsertCollectionSpec(spec: CollectionSpecEntity) {
+        val cleanSlug = spec.slug?.trim()?.takeIf { it.isNotEmpty() }
+        val hasConflictingOwner =
+            cleanSlug != null && findOtherCollectionIdBySlug(cleanSlug, spec.collectionId) != null
+        val safeSlug = if (hasConflictingOwner) null else cleanSlug
+        val safeSpec = spec.copy(slug = safeSlug)
+        if (insertCollectionSpecIgnore(safeSpec) == -1L) {
+            updateCollectionSpec(safeSpec)
+        }
+    }
+
+    @Transaction
+    suspend fun upsertCollectionSpecs(specs: List<CollectionSpecEntity>) {
+        for (spec in specs) {
+            upsertCollectionSpec(spec)
+        }
+    }
 
     @Query("DELETE FROM collection_specs WHERE collectionId = :collectionId")
     suspend fun deleteCollectionSpec(collectionId: String)
@@ -886,6 +840,33 @@ interface RocheDao {
         expectedHlc: String,
     )
 
+    @Query(
+        "WITH RECURSIVE descendants(id, depth) AS (" +
+            "SELECT :childId, 0 " +
+            "UNION " +
+            "SELECT ce.entryId, d.depth + 1 " +
+            "FROM collection_entries ce " +
+            "INNER JOIN descendants d ON ce.collectionId = d.id " +
+            "WHERE d.depth < 64" +
+            ") " +
+            "SELECT CASE WHEN EXISTS (" +
+            "SELECT 1 FROM descendants WHERE id = :parentId OR depth >= 64" +
+            ") THEN 1 ELSE 0 END"
+    )
+    suspend fun hasCollectionCycleRaw(parentId: String, childId: String): Int
+
+    @Query(
+        "SELECT DISTINCT ce.entryId FROM collection_entries ce " +
+            "INNER JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND (e.mergedIntoId IS NULL OR e.mergedIntoId = '') " +
+            "AND NOT EXISTS (" +
+            "SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = ce.entryId AND cl.status IN ('consumed', 'abandoned')" +
+            ") ORDER BY ce.entryId ASC"
+    )
+    suspend fun getEligibleDrawEntryIds(collectionId: String): List<String>
+
     @Query("SELECT * FROM collection_generators")
     suspend fun getAllCollectionGenerators(): List<CollectionGeneratorEntity>
 
@@ -936,8 +917,8 @@ interface RocheDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertConsumptionLogsIgnore(logs: List<ConsumptionLogEntity>)
 
-    @Query("UPDATE consumption_log SET isLocalDirty = 0 WHERE id IN (:ids)")
-    suspend fun clearConsumptionLogsDirty(ids: List<String>)
+    @Query("UPDATE consumption_log SET isLocalDirty = 0 WHERE id = :id AND hlc = :expectedHlc")
+    suspend fun clearLogDirtyIfSameHlc(id: String, expectedHlc: String)
 
     @Query("DELETE FROM consumption_log WHERE id = :id")
     suspend fun deleteConsumptionLogById(id: String)
@@ -960,8 +941,8 @@ interface RocheDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertComparisonsIgnore(comparisons: List<ComparisonEntity>)
 
-    @Query("UPDATE comparisons SET isLocalDirty = 0 WHERE id IN (:ids)")
-    suspend fun clearComparisonsDirty(ids: List<String>)
+    @Query("UPDATE comparisons SET isLocalDirty = 0 WHERE id = :id AND hlc = :expectedHlc")
+    suspend fun clearComparisonDirtyIfSameHlc(id: String, expectedHlc: String)
 
     @Query("DELETE FROM comparisons WHERE id = :id") suspend fun deleteComparisonById(id: String)
 
@@ -1005,6 +986,9 @@ interface RocheDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertLocalSyncFlag(flag: LocalSyncFlagEntity)
 
+    @Query("DELETE FROM local_sync_flags WHERE flagKey = :key")
+    suspend fun deleteLocalSyncFlag(key: String)
+
     @Query(
         "INSERT INTO local_sync_flags(flagKey, flagValue) VALUES (:key, :value) " +
             "ON CONFLICT(flagKey) DO UPDATE SET flagValue = " +
@@ -1018,7 +1002,8 @@ interface RocheDao {
     @Query(
         "SELECT CASE WHEN " +
             "EXISTS (SELECT 1 FROM consumption_log WHERE entryId = :entryId) " +
-            "OR EXISTS (SELECT 1 FROM comparisons WHERE orderingJson LIKE :quotedPattern) " +
+            "OR EXISTS (SELECT 1 FROM comparisons " +
+            "WHERE orderingJson LIKE :quotedPattern ESCAPE '\\') " +
             "OR EXISTS (SELECT 1 FROM collection_entries ce " +
             "INNER JOIN collection_specs cs ON cs.collectionId = ce.collectionId " +
             "WHERE ce.entryId = :entryId AND cs.role IN ('list', 'want')) " +

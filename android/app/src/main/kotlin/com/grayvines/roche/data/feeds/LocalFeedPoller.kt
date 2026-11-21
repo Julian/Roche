@@ -25,6 +25,7 @@ import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.core.parseDurationToSecondsLong
 import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.core.runSuspendCatching
+import com.grayvines.roche.data.local.DbWriteLock
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.MAX_SQLITE_HTML_CHARS
@@ -35,7 +36,7 @@ import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.local.upsertItems
 import com.grayvines.roche.data.remote.HttpStatusException
 import com.grayvines.roche.data.remote.ProblemDetailsException
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.PublicWebFetcher
 import com.grayvines.roche.model.ItemStatus
 import java.net.URI
 import java.time.Instant
@@ -82,32 +83,35 @@ internal object LocalFeedPoller {
     @Suppress("LongParameterList")
     suspend fun pollFeed(
         dao: RocheDao,
-        apiClient: RocheApiClient,
+        publicWebFetcher: PublicWebFetcher,
         feed: FeedRow,
         localPeerId: String,
         nowInstant: Instant? = null,
         prefetchedBatch: ParsedFeedBatch? = null,
         clock: () -> Instant = { Instant.now().truncatedTo(ChronoUnit.SECONDS) },
+        writeLock: DbWriteLock = DbWriteLock(),
     ): Result<Int> =
         withContext(Dispatchers.Default) {
             pollFeedInternal(
                 dao = dao,
-                apiClient = apiClient,
+                publicWebFetcher = publicWebFetcher,
                 feed = feed,
                 localPeerId = localPeerId,
                 resolveNow = { nowInstant ?: clock() },
                 prefetchedBatch = prefetchedBatch,
+                writeLock = writeLock,
             )
         }
 
     @Suppress("LongParameterList")
     private suspend fun pollFeedInternal(
         dao: RocheDao,
-        apiClient: RocheApiClient,
+        publicWebFetcher: PublicWebFetcher,
         feed: FeedRow,
         localPeerId: String,
         resolveNow: () -> Instant,
         prefetchedBatch: ParsedFeedBatch?,
+        writeLock: DbWriteLock,
     ): Result<Int> {
         val fetchUrl = canonicalizeFeedUrl(feed.url)
         val syncableFeed = isSyncablePublicUrl(feed.url)
@@ -117,7 +121,7 @@ internal object LocalFeedPoller {
                 prefetchedBatch
             } else {
                 val xml =
-                    apiClient.fetchExternalFeedXml(fetchUrl).getOrElse { error ->
+                    publicWebFetcher.fetchFeedXml(fetchUrl).getOrElse { error ->
                         recordPollFailure(
                             dao = dao,
                             feed = feed,
@@ -126,6 +130,7 @@ internal object LocalFeedPoller {
                             errorMessage = sanitizeFeedFetchError(error),
                             syncableFeed = syncableFeed,
                             nodeId = effectiveNodeId,
+                            writeLock = writeLock,
                         )
                         return Result.failure(error)
                     }
@@ -141,30 +146,64 @@ internal object LocalFeedPoller {
                             errorMessage = "Feed XML parse failed",
                             syncableFeed = syncableFeed,
                             nodeId = effectiveNodeId,
+                            writeLock = writeLock,
                         )
                         return Result.failure(error)
                     }
             }
 
         val nowIso = formatUtcMillisIso(resolveNow())
-        val updatedFeed = buildUpdatedPolledFeed(feed, batch, nowIso, localPeerId, syncableFeed)
-        val configChanged = updatedFeed.title != feed.title || updatedFeed.feedType != feed.feedType
-        dao.upsertFeed(
-            feed = updatedFeed,
-            markDirty = configChanged && syncableFeed,
-            nodeId = effectiveNodeId,
-        )
-
         val insertedOrUpdatedCount =
-            upsertPolledItems(
+            persistPolledBatchLocked(
                 dao = dao,
-                feed = updatedFeed,
-                candidates = batch.items,
+                writeLock = writeLock,
+                feed = feed,
+                batch = batch,
                 nowIso = nowIso,
-                markDirty = syncableFeed,
+                localPeerId = localPeerId,
+                syncableFeed = syncableFeed,
                 nodeId = effectiveNodeId,
             )
         return Result.success(maxOf(insertedOrUpdatedCount, batch.items.size))
+    }
+
+    @Suppress("LongParameterList")
+    private suspend fun persistPolledBatchLocked(
+        dao: RocheDao,
+        writeLock: DbWriteLock,
+        feed: FeedRow,
+        batch: ParsedFeedBatch,
+        nowIso: String,
+        localPeerId: String,
+        syncableFeed: Boolean,
+        nodeId: String,
+    ): Int = writeLock.withLock {
+        var count = 0
+        dao.executeInTransaction {
+            val freshFeed = dao.getFeedById(feed.id)
+            if (freshFeed != null) {
+                val updatedFeed =
+                    buildUpdatedPolledFeed(freshFeed, batch, nowIso, localPeerId, syncableFeed)
+                val configChanged =
+                    updatedFeed.title != freshFeed.title ||
+                        updatedFeed.feedType != freshFeed.feedType
+                dao.upsertFeed(
+                    feed = updatedFeed,
+                    markDirty = configChanged && syncableFeed,
+                    nodeId = nodeId,
+                )
+                count =
+                    upsertPolledItems(
+                        dao = dao,
+                        feed = updatedFeed,
+                        candidates = batch.items,
+                        nowIso = nowIso,
+                        markDirty = syncableFeed,
+                        nodeId = nodeId,
+                    )
+            }
+        }
+        count
     }
 
     @Suppress("LongParameterList")
@@ -176,21 +215,32 @@ internal object LocalFeedPoller {
         errorMessage: String,
         syncableFeed: Boolean,
         nodeId: String,
+        writeLock: DbWriteLock,
     ) {
-        val previousFailures =
-            normalizeConsecutiveFailures(feed.lastError, feed.consecutiveFailures)
-        val nextFailures = (previousFailures + 1).coerceAtMost(MAX_CONSECUTIVE_FAILURES)
-        dao.upsertFeed(
-            feed =
-                feed.copy(
-                    lastPolled = completedIso,
-                    lastError = errorMessage,
-                    lastErrorBy = localPeerId,
-                    consecutiveFailures = nextFailures,
-                    isLocalDirty = syncableFeed || feed.isLocalDirty,
-                ),
-            nodeId = nodeId,
-        )
+        writeLock.withLock {
+            dao.executeInTransaction {
+                val freshFeed = dao.getFeedById(feed.id)
+                if (freshFeed != null) {
+                    val previousFailures =
+                        normalizeConsecutiveFailures(
+                            freshFeed.lastError,
+                            freshFeed.consecutiveFailures,
+                        )
+                    val nextFailures = (previousFailures + 1).coerceAtMost(MAX_CONSECUTIVE_FAILURES)
+                    dao.upsertFeed(
+                        feed =
+                            freshFeed.copy(
+                                lastPolled = completedIso,
+                                lastError = errorMessage,
+                                lastErrorBy = localPeerId,
+                                consecutiveFailures = nextFailures,
+                                isLocalDirty = syncableFeed || freshFeed.isLocalDirty,
+                            ),
+                        nodeId = nodeId,
+                    )
+                }
+            }
+        }
     }
 
     private fun sanitizeFeedFetchError(error: Throwable): String =

@@ -22,9 +22,9 @@ import com.grayvines.roche.data.catalog.matchesDynamicCollectionRule
 import com.grayvines.roche.data.catalog.normalizeIdentifierValue
 import com.grayvines.roche.data.catalog.parseDynamicCollectionRule
 import com.grayvines.roche.data.catalog.rankEntriesByOrderings
+import com.grayvines.roche.data.remote.NetworkTier
+import com.grayvines.roche.data.remote.PeerNodeDto
 import com.grayvines.roche.data.remote.rocheJson
-import com.grayvines.roche.data.sync.NetworkTier
-import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.data.sync.feedPhaseOffsetSecs
 import com.grayvines.roche.data.sync.nextScheduledPollEpochSecs
 import com.grayvines.roche.data.sync.selectFeedPoller

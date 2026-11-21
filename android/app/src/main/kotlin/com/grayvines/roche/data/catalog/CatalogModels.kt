@@ -333,15 +333,6 @@ data class UpsertCatalogEntryInput(
     val identifiers: List<EntryIdentifierDto> = emptyList(),
 )
 
-data class RankClusterCandidate(
-    val entryId: String,
-    val title: String,
-    val subtitle: String,
-    val thumbnailUrl: String?,
-    val mean: Double,
-    val variance: Double,
-)
-
 data class RankSettlementSummary(
     val entryId: String,
     val title: String,

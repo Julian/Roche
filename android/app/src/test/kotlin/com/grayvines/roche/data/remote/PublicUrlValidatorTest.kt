@@ -18,7 +18,7 @@ class PublicUrlValidatorTest {
     @Test
     fun `VPN gate covers https ts_net and scheduler requires VPN for Tailnet hosts`() = runTest {
         val vpnOffClient =
-            RocheApiClient(
+            RocheServerApi(
                 vpnCheck = VpnTransportCheck { false },
                 transport = { HttpResponse(statusCode = 200, body = "<opml/>") },
             )
@@ -34,7 +34,7 @@ class PublicUrlValidatorTest {
         )
 
         val vpnOnClient =
-            RocheApiClient(
+            RocheServerApi(
                 vpnCheck = VpnTransportCheck { true },
                 transport = { HttpResponse(statusCode = 200, body = "<opml/>") },
             )

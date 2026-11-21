@@ -73,6 +73,7 @@ import com.grayvines.roche.data.local.ensureStarredSpecExists
 import com.grayvines.roche.data.local.entryHasCatalogHistory
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
+import com.grayvines.roche.data.remote.SyncTombstoneDto
 import com.grayvines.roche.model.ContentType
 
 internal suspend fun reconcilePeerSyncResponse(
@@ -154,15 +155,11 @@ private suspend fun acknowledgeSentDirtyRows(
     for ((colId, hlc) in sentBatch.sentGeneratorHlcById) {
         dao.clearGeneratorDirtyIfSameHlc(colId, hlc)
     }
-    if (sentBatch.sentLogIds.isNotEmpty()) {
-        sentBatch.sentLogIds.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach {
-            dao.clearConsumptionLogsDirty(it)
-        }
+    for ((id, hlc) in sentBatch.sentLogHlcById) {
+        dao.clearLogDirtyIfSameHlc(id, hlc)
     }
-    if (sentBatch.sentComparisonIds.isNotEmpty()) {
-        sentBatch.sentComparisonIds.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach {
-            dao.clearComparisonsDirty(it)
-        }
+    for ((id, hlc) in sentBatch.sentComparisonHlcById) {
+        dao.clearComparisonDirtyIfSameHlc(id, hlc)
     }
     for ((key, hlc) in sentBatch.sentTombstoneHlcByKey) {
         dao.clearTombstoneDirtyIfSameHlc(key.first, key.second, hlc)
@@ -613,19 +610,76 @@ private suspend fun mergeIncomingEntriesInTx(
     }
     val mergeRedirects = buildMergeRedirectMap(dao.getMergedEntries())
     val combinedRedirects = ctx.idRemap + mergeRedirects
-    if (explicitMerges.isNotEmpty()) {
-        val foldCache = DuplicateFoldBatchCache(dao)
-        for ((dupId, rawCanonId) in explicitMerges) {
-            val canonId = followMergedInMap(rawCanonId, combinedRedirects)
-            if (canonId.isNotEmpty() && canonId != dupId) {
-                foldMergedDuplicateInDao(dao, dupId, canonId, nowIso, foldCache)
-            }
+    val arrivedIds = HashSet<String>(response.entries.size + ctx.idRemap.size)
+    for (rec in response.entries) {
+        val rawId = rec.id.trim()
+        if (rawId.isNotEmpty()) {
+            arrivedIds.add(rawId)
         }
     }
+    arrivedIds.addAll(ctx.idRemap.values)
+    foldIncomingAndDeferredMerges(
+        dao = dao,
+        explicitMerges = explicitMerges,
+        mergeRedirects = mergeRedirects,
+        combinedRedirects = combinedRedirects,
+        arrivedIds = arrivedIds,
+        nowIso = nowIso,
+    )
     return MergedIncomingEntriesResult(
         redirects = combinedRedirects,
         suppressedEntryIds = ctx.suppressedEntryIds,
     )
+}
+
+@Suppress("LongParameterList")
+private suspend fun foldIncomingAndDeferredMerges(
+    dao: RocheDao,
+    explicitMerges: List<Pair<String, String>>,
+    mergeRedirects: Map<String, String>,
+    combinedRedirects: Map<String, String>,
+    arrivedIds: Set<String>,
+    nowIso: String,
+) {
+    val pendingFolds =
+        collectPendingMergeFolds(
+            explicitMerges = explicitMerges,
+            mergeRedirects = mergeRedirects,
+            combinedRedirects = combinedRedirects,
+            arrivedIds = arrivedIds,
+        )
+    if (pendingFolds.isEmpty()) return
+    val foldCache = DuplicateFoldBatchCache(dao)
+    for ((dupId, canonId) in pendingFolds) {
+        if (dao.getEntryById(canonId) != null) {
+            foldMergedDuplicateInDao(dao, dupId, canonId, nowIso, foldCache)
+        }
+    }
+}
+
+private fun collectPendingMergeFolds(
+    explicitMerges: List<Pair<String, String>>,
+    mergeRedirects: Map<String, String>,
+    combinedRedirects: Map<String, String>,
+    arrivedIds: Set<String>,
+): Map<String, String> {
+    val pending = LinkedHashMap<String, String>()
+    for ((dupId, rawCanonId) in explicitMerges) {
+        val canonId = followMergedInMap(rawCanonId, combinedRedirects)
+        if (canonId.isNotEmpty() && canonId != dupId) {
+            pending[dupId] = canonId
+        }
+    }
+    if (arrivedIds.isNotEmpty()) {
+        for ((dupId, rawCanonId) in mergeRedirects) {
+            val canonId = followMergedInMap(rawCanonId, combinedRedirects)
+            val touchesArrived = canonId in arrivedIds || rawCanonId in arrivedIds
+            if (touchesArrived && canonId != dupId && dupId !in pending) {
+                pending[dupId] = canonId
+            }
+        }
+    }
+    return pending
 }
 
 private suspend fun buildIncomingEntriesMergeCtx(
@@ -1239,12 +1293,30 @@ private suspend fun mergeIncomingSpecInDao(
             color = cleanColor,
         )
     )
+    insertIncomingSpecIdentifier(
+        dao = dao,
+        targetId = targetId,
+        role = role,
+        resolvedKind = resolvedKind,
+        cleanSlug = cleanSlug,
+    )
+}
+
+private suspend fun insertIncomingSpecIdentifier(
+    dao: RocheDao,
+    targetId: String,
+    role: CollectionRole,
+    resolvedKind: EntryKind,
+    cleanSlug: String?,
+) {
+    if (cleanSlug.isNullOrEmpty()) return
+    if (dao.getCollectionSpecById(targetId)?.slug != cleanSlug) return
     if (role == CollectionRole.TAG) {
-        val tagVal = cleanSlug?.removePrefix("tag:").orEmpty()
+        val tagVal = cleanSlug.removePrefix("tag:")
         if (tagVal.isNotEmpty()) {
             dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("tag", tagVal, targetId))
         }
-    } else if (!cleanSlug.isNullOrEmpty() && resolvedKind == EntryKind.COLLECTION) {
+    } else if (resolvedKind == EntryKind.COLLECTION) {
         dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", cleanSlug, targetId))
     }
 }
@@ -1713,7 +1785,7 @@ private suspend fun mergeIncomingIdentifiersInDao(
     resolvedKind: EntryKind,
     rec: SyncEntryRecordDto,
 ) {
-    val identOwner = mergedInto ?: targetId
+    val identOwner = mergedInto?.takeIf { dao.getEntryById(it) != null } ?: targetId
     val rows = ArrayList<EntryIdentifierEntity>()
     for (ident in rec.identifiers) {
         val s = normalizeIdentifierScheme(ident.scheme)

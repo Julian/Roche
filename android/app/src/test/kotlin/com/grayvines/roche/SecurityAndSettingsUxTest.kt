@@ -12,6 +12,7 @@ import com.grayvines.roche.core.isValidArxivId
 import com.grayvines.roche.core.normalizeIdentifierValueRaw
 import com.grayvines.roche.data.enrichment.parseOdesliLinksPayload
 import com.grayvines.roche.data.feeds.writeSharedPdfToItemDir
+import com.grayvines.roche.data.remote.PeerNodeDto
 import com.grayvines.roche.data.remote.PublicUrlValidator
 import com.grayvines.roche.data.remote.serverEndpointViolation
 import com.grayvines.roche.data.settings.ENCRYPTED_TOKEN_PREFIX
@@ -19,7 +20,6 @@ import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.settings.TokenCipher
 import com.grayvines.roche.data.settings.redactedForUi
-import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.data.sync.effectivePeerWeight
 import com.grayvines.roche.data.sync.selectFeedPoller
 import com.grayvines.roche.media.ITEMS_SUBDIR

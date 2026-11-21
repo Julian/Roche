@@ -8,17 +8,17 @@ import androidx.media3.session.MediaController
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.google.common.util.concurrent.ListenableFuture
-import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.collectInBackground
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.upsertFeeds
 import com.grayvines.roche.data.local.upsertItems
+import com.grayvines.roche.data.mockRepository
 import com.grayvines.roche.data.remote.HttpRequest
 import com.grayvines.roche.data.remote.HttpResponse
-import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.tailnetNetworkTierProvider
 import com.grayvines.roche.playback.AndroidPodcastMediaSessionBridge
 import com.grayvines.roche.playback.AudioPlayerBackend
 import com.grayvines.roche.playback.ExoPlayerAudioBackend
@@ -82,6 +82,7 @@ class PodcastMedia3PlaybackTest {
         database =
             Room.inMemoryDatabaseBuilder<RocheDatabase>()
                 .setDriver(BundledSQLiteDriver())
+                .addCallback(RocheDatabase.schemaCallback())
                 .allowMainThreadQueries()
                 .build()
         dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -236,15 +237,12 @@ class PodcastMedia3PlaybackTest {
             }
             settings.prewarm()
 
-            val apiClient = RocheApiClient {
-                HttpResponse(statusCode = 200, body = PEER_SYNC_OK_BODY)
-            }
             val backend = InspectableAudioBackend().apply { skipSilenceEnabled = true }
             val repo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = apiClient,
                     settings = settings,
+                    transport = { HttpResponse(statusCode = 200, body = PEER_SYNC_OK_BODY) },
                     cacheDir = File(tempDir, "cache_skip_init"),
                 )
             val playerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -447,19 +445,19 @@ class PodcastMedia3PlaybackTest {
                 suspend () -> Unit,
             ) -> Unit,
     ) {
-        val apiClient = RocheApiClient { request ->
-            if (request.url.endsWith("/api/v1/sync/peer")) syncRequests.add(request)
-            HttpResponse(statusCode = 200, body = PEER_SYNC_OK_BODY)
-        }
         seedPodcastEpisode()
         val backend = InspectableAudioBackend()
         val playerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
         val repo =
-            RocheRepository(
+            mockRepository(
                 database = database,
-                apiClient = apiClient,
                 settings = settings,
+                transport = { request ->
+                    if (request.url.endsWith("/api/v1/sync/peer")) syncRequests.add(request)
+                    HttpResponse(statusCode = 200, body = PEER_SYNC_OK_BODY)
+                },
                 cacheDir = File(tempDir, "cache"),
+                networkTierProvider = tailnetNetworkTierProvider(),
                 backgroundScope = playerScope,
             )
         val controller =

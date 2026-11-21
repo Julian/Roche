@@ -111,6 +111,15 @@ data class EntryContentFtsEntity(
 @Entity(
     tableName = "entry_identifiers",
     primaryKeys = ["scheme", "value"],
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = EntryEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["entryId"],
+                onDelete = ForeignKey.CASCADE,
+            )
+        ],
     indices = [Index(value = ["entryId"])],
 )
 data class EntryIdentifierEntity(
@@ -121,6 +130,15 @@ data class EntryIdentifierEntity(
 
 @Entity(
     tableName = "feed_sources",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = EntryEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["collectionId"],
+                onDelete = ForeignKey.CASCADE,
+            )
+        ],
     indices =
         [
             Index(value = ["feedUrl"], unique = true),
@@ -149,9 +167,18 @@ data class FeedSourceEntity(
 
 @Entity(
     tableName = "collection_specs",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = EntryEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["collectionId"],
+                onDelete = ForeignKey.CASCADE,
+            )
+        ],
     indices =
         [
-            Index(value = ["slug"]),
+            Index(value = ["slug"], unique = true),
             Index(value = ["role"]),
         ],
 )
@@ -168,6 +195,21 @@ data class CollectionSpecEntity(
 @Entity(
     tableName = "collection_entries",
     primaryKeys = ["collectionId", "entryId"],
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = EntryEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["collectionId"],
+                onDelete = ForeignKey.CASCADE,
+            ),
+            ForeignKey(
+                entity = EntryEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["entryId"],
+                onDelete = ForeignKey.CASCADE,
+            ),
+        ],
     indices =
         [
             Index(value = ["entryId"]),
@@ -184,7 +226,18 @@ data class CollectionEntryEntity(
     val isLocalDirty: Boolean = false,
 )
 
-@Entity(tableName = "collection_generators")
+@Entity(
+    tableName = "collection_generators",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = EntryEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["collectionId"],
+                onDelete = ForeignKey.CASCADE,
+            )
+        ],
+)
 data class CollectionGeneratorEntity(
     @PrimaryKey val collectionId: String,
     val enabled: Boolean = false,
@@ -197,6 +250,15 @@ data class CollectionGeneratorEntity(
 
 @Entity(
     tableName = "consumption_log",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = EntryEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["entryId"],
+                onDelete = ForeignKey.CASCADE,
+            )
+        ],
     indices =
         [
             Index(value = ["entryId"]),
@@ -218,6 +280,15 @@ data class ConsumptionLogEntity(
 
 @Entity(
     tableName = "comparisons",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = EntryEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["scopeCollectionId"],
+                onDelete = ForeignKey.CASCADE,
+            )
+        ],
     indices =
         [
             Index(value = ["scopeCollectionId"]),
@@ -252,6 +323,12 @@ data class TombstoneEntity(
 data class LocalSyncFlagEntity(
     @PrimaryKey val flagKey: String,
     val flagValue: String,
+)
+
+@Entity(tableName = "table_revisions")
+data class TableRevisionEntity(
+    @PrimaryKey val tableName: String,
+    val revision: Long = 0L,
 )
 
 @Suppress("LongParameterList")
@@ -328,6 +405,11 @@ data class ItemTagRow(
     val tagId: String,
 )
 
+data class SearchSnippetRow(
+    val entryId: String,
+    val excerpt: String,
+)
+
 @Suppress("LongParameterList")
 data class EntryContentPreviewRow(
     val entryId: String,
@@ -342,27 +424,27 @@ data class EntryContentPreviewRow(
 
 @Suppress("LongParameterList")
 data class CatalogStampRow(
-    val entriesStamp: String,
-    val identsStamp: String,
-    val specsStamp: String,
-    val membersStamp: String,
-    val generatorsStamp: String,
-    val logsStamp: String,
-    val comparisonsStamp: String,
+    val entriesStamp: Long,
+    val identsStamp: Long,
+    val specsStamp: Long,
+    val membersStamp: Long,
+    val generatorsStamp: Long,
+    val logsStamp: Long,
+    val comparisonsStamp: Long,
 )
 
 @Suppress("LongParameterList")
 data class RepositoryStampRow(
-    val entriesStamp: String,
-    val identsStamp: String,
-    val specsStamp: String,
-    val membersStamp: String,
-    val generatorsStamp: String,
-    val logsStamp: String,
-    val comparisonsStamp: String,
-    val statesStamp: String,
-    val contentsStamp: String,
-    val feedsStamp: String,
+    val entriesStamp: Long,
+    val identsStamp: Long,
+    val specsStamp: Long,
+    val membersStamp: Long,
+    val generatorsStamp: Long,
+    val logsStamp: Long,
+    val comparisonsStamp: Long,
+    val statesStamp: Long,
+    val contentsStamp: Long,
+    val feedsStamp: Long,
 )
 
 internal fun RepositoryStampRow.toCatalogStamp(): CatalogStampRow =

@@ -4,9 +4,7 @@ package com.grayvines.roche.data.remote
 
 import com.grayvines.roche.core.coreJson
 import com.grayvines.roche.core.formatDurationSecondsLabel
-import com.grayvines.roche.core.inferFeedTypeWireValue
 import com.grayvines.roche.data.settings.validateCanonicalDiscoveryUrl
-import com.grayvines.roche.data.sync.normalized
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
@@ -34,13 +32,6 @@ internal data class PairDeviceWireRequest(
 )
 
 @Serializable internal data class PairDeviceWireResponse(val token: String? = null)
-
-@Serializable
-internal data class CreateFeedWireRequest(
-    val url: String,
-    @SerialName("feed_type") val feedType: String,
-    val title: String? = null,
-)
 
 @Serializable internal data class ImportOpmlWireRequest(val opml: String)
 
@@ -184,16 +175,6 @@ internal fun extractTokenFromPairResponse(raw: String): String =
         .nullIfBlank()
         .orEmpty()
 
-internal fun buildCreateFeedPayload(url: String, title: String? = null): String =
-    rocheJson.encodeToString(
-        CreateFeedWireRequest.serializer(),
-        CreateFeedWireRequest(
-            url = url,
-            feedType = inferFeedTypeWireValue(url),
-            title = title.nullIfBlank(),
-        ),
-    )
-
 internal fun buildImportOpmlPayload(opmlXml: String): String =
     rocheJson.encodeToString(
         ImportOpmlWireRequest.serializer(),
@@ -204,9 +185,6 @@ internal fun parseImportedCountJson(raw: String): Int {
     val parsed = rocheJson.decodeFromString(ImportOpmlWireResponse.serializer(), raw)
     return parsed.importedCount ?: parsed.imported
 }
-
-internal fun parseFeedJson(raw: String): RemoteFeedDto =
-    rocheJson.decodeFromString(RemoteFeedDto.serializer(), raw).normalized()
 
 internal fun parseItemJson(raw: String): RemoteItemDto =
     rocheJson.decodeFromString(WireItemDto.serializer(), raw).toRemoteItemDto()

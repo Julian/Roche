@@ -3,8 +3,8 @@ package com.grayvines.roche.ui
 import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
-import com.grayvines.roche.data.catalog.RankClusterCandidate
 import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
+import com.grayvines.roche.ranking.RankClusterCandidate
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -316,10 +316,13 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
         val creators = action.creatorsCsv.split(',').map { it.trim() }.filter { it.isNotEmpty() }
         val input =
             UpsertCatalogEntryInput(
+                id = action.existingEntryId?.trim()?.takeIf { it.isNotEmpty() },
                 kind = action.kind,
                 title = cleanTitle,
                 creators = creators,
                 releaseYear = action.releaseYear,
+                thumbnailUrl = action.thumbnailUrl?.trim()?.takeIf { it.isNotEmpty() },
+                identifiers = action.identifiers,
             )
         val savedId =
             when {

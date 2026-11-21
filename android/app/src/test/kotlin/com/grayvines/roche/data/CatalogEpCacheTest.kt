@@ -58,7 +58,7 @@ class CatalogEpCacheTest {
     fun `unrelated catalog writes reuse cached global and local EP scores with zero recomputes`() =
         runTest {
             val fixture = seedEpCacheFixture(catalog)
-            catalog.snapshot.first()
+            catalog.getSnapshot()
             val baseline = catalog.epCacheStats
             assertEquals(1, baseline.globalRecomputes)
             assertEquals(2, baseline.localRecomputes)
@@ -69,14 +69,14 @@ class CatalogEpCacheTest {
                 ConsumptionStatus.CONSUMED,
                 notes = "Finished",
             )
-            catalog.snapshot.first()
+            catalog.getSnapshot()
 
             // 2. Toggle and advance a generator draw
             val initialDraw =
                 catalog.setCollectionGeneratorEnabled(fixture.albumListId, enabled = true)
             assertNotNull(initialDraw)
             catalog.finishActiveDraw(fixture.albumListId, notes = "Great listen")
-            catalog.snapshot.first()
+            catalog.getSnapshot()
 
             // 3. Edit entry metadata
             catalog.upsertEntry(
@@ -87,7 +87,7 @@ class CatalogEpCacheTest {
                     summary = "Updated synopsis",
                 )
             )
-            catalog.snapshot.first()
+            catalog.getSnapshot()
 
             // 4. Add an entry to a list
             val extraAlbum =
@@ -95,7 +95,7 @@ class CatalogEpCacheTest {
                     UpsertCatalogEntryInput(kind = EntryKind.ALBUM, title = "Vespertine")
                 )
             catalog.addCollectionEntry(fixture.albumListId, extraAlbum)
-            catalog.snapshot.first()
+            catalog.getSnapshot()
 
             val after = catalog.epCacheStats
             assertEquals(baseline.globalRecomputes, after.globalRecomputes)
@@ -108,7 +108,7 @@ class CatalogEpCacheTest {
     fun `local want comparison recomputes only that want queue and evicts deleted scopes`() =
         runTest {
             val fixture = seedEpCacheFixture(catalog)
-            catalog.snapshot.first()
+            catalog.getSnapshot()
             val before = catalog.epCacheStats
 
             val book3 =
@@ -119,7 +119,7 @@ class CatalogEpCacheTest {
                 ordering = listOf(listOf(fixture.book2), listOf(book3)),
                 scopeCollectionId = fixture.wantBooksId,
             )
-            val warmSnap = catalog.snapshot.first()
+            val warmSnap = catalog.getSnapshot()
             val after = catalog.epCacheStats
 
             assertEquals(before.globalRecomputes, after.globalRecomputes)
@@ -137,7 +137,7 @@ class CatalogEpCacheTest {
             assertRankedCollectionParity(warmSnap, coldSnap, fixture.wantGamesId)
 
             dao.deleteCollectionSpec(fixture.wantGamesId)
-            catalog.snapshot.first()
+            catalog.getSnapshot()
             assertEquals(after.cachedScopeCount - 1, catalog.epCacheStats.cachedScopeCount)
         }
 
@@ -150,13 +150,13 @@ class CatalogEpCacheTest {
                     UpsertCatalogEntryInput(kind = EntryKind.MOVIE, title = "Mirror"),
                     ConsumptionStatus.CONSUMED,
                 )
-            catalog.snapshot.first()
+            catalog.getSnapshot()
             val before = catalog.epCacheStats
 
             catalog.recordComparison(
                 ordering = listOf(listOf(fixture.movie2), listOf(fixture.movie3, movie4))
             )
-            val warmSnap = catalog.snapshot.first()
+            val warmSnap = catalog.getSnapshot()
             val after = catalog.epCacheStats
             assertEquals(before.globalRecomputes + 1, after.globalRecomputes)
             assertEquals(before.localRecomputes, after.localRecomputes)
@@ -206,13 +206,13 @@ class CatalogEpCacheTest {
                 ConsumptionStatus.CONSUMED,
             )
         catalog.recordComparison(listOf(listOf(dup), listOf(other)))
-        catalog.snapshot.first()
+        catalog.getSnapshot()
         val before = catalog.epCacheStats
 
         val dupEntity = dao.getEntryById(dup)!!
         dao.upsertEntry(dupEntity.copy(mergedIntoId = canon))
 
-        val warmSnap = catalog.snapshot.first()
+        val warmSnap = catalog.getSnapshot()
         val coldSnap = buildCatalogSnapshot(catalog.loadRawCatalogTables(), epScoreCache = null)
         assertTrue(catalog.epCacheStats.globalRecomputes > before.globalRecomputes)
 
@@ -230,7 +230,7 @@ class CatalogEpCacheTest {
         runTest {
             val fixture = seedEpCacheFixture(catalog)
             val draw = catalog.setCollectionGeneratorEnabled(fixture.albumListId, enabled = true)!!
-            catalog.snapshot.first()
+            catalog.getSnapshot()
 
             val buildsBefore = catalog.catalogSnapshotBuilds
             val reloadsBefore = catalog.catalogTableReloads
@@ -280,7 +280,6 @@ class CatalogEpCacheTest {
             setOf(STATELESS_ART_ID, STATELESS_PAPER_ID, STATELESS_VIDEO_ID, STATELESS_POD_ID)
         assertEquals(expectedIds.size, dao.countItems())
         assertEquals(expectedIds, dao.getAllItems().map { it.id }.toSet())
-        assertEquals(expectedIds, dao.observeItems().first().map { it.id }.toSet())
 
         val repoSnap = repository.snapshot.first()
         val entriesById = repoSnap.entries.associateBy { it.id }
@@ -316,10 +315,10 @@ class CatalogEpCacheTest {
 
             val expectedBase =
                 buildSnapshot(
-                    items = dao.observeItems().first(),
-                    feeds = dao.observeFeeds().first(),
-                    tags = dao.observeTags().first(),
-                    itemTags = dao.observeItemTags().first(),
+                    items = dao.getAllPreviewItems(),
+                    feeds = dao.getAllFeeds(),
+                    tags = dao.getAllTags(),
+                    itemTags = dao.getAllItemTags(),
                 )
             assertEquals(expectedBase.entries, snap1.entries)
             assertEquals(expectedBase.feeds, snap1.feeds)

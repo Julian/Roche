@@ -7,7 +7,9 @@ import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.enrichment.AlbumStreamingResolver
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.remote.HttpEngineTransport
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.PinnedPublicHttpTransport
+import com.grayvines.roche.data.remote.PublicWebFetcher
+import com.grayvines.roche.data.remote.RocheServerApi
 import com.grayvines.roche.data.remote.VpnTransportCheck
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.sync.AndroidNetworkTierProvider
@@ -52,11 +54,15 @@ class AppGraph(context: Context) : AutoCloseable {
 
     internal val httpTransport: HttpEngineTransport by httpTransportDelegate
 
-    val apiClient: RocheApiClient by lazy {
-        RocheApiClient(
+    val serverApi: RocheServerApi by lazy {
+        RocheServerApi(
             vpnCheck = vpnCheck,
             transport = httpTransport,
         )
+    }
+
+    val publicWebFetcher: PublicWebFetcher by lazy {
+        PublicWebFetcher(transport = PinnedPublicHttpTransport())
     }
 
     val offlineCacheDir: File by lazy { File(appContext.filesDir, "offline_media") }
@@ -72,16 +78,13 @@ class AppGraph(context: Context) : AutoCloseable {
                 localPeerIdProvider = {
                     settings.settings.first().peerId.ifBlank { DEFAULT_LOCAL_HLC_NODE }
                 },
+                writeLock = database.writeLock,
             )
-        val resolver =
-            AlbumStreamingResolver(
-                transport = httpTransport,
-                backgroundScope = appScope,
-                catalogStore = catalogStore,
-            )
+        val resolver = AlbumStreamingResolver(transport = publicWebFetcher.transport)
         RocheRepository(
             database = database,
-            apiClient = apiClient,
+            serverApi = serverApi,
+            publicWebFetcher = publicWebFetcher,
             settings = settings,
             cacheDir = offlineCacheDir,
             networkTierProvider = networkTierProvider,
@@ -94,7 +97,8 @@ class AppGraph(context: Context) : AutoCloseable {
 
     val thumbnailLoader: ThumbnailLoader by lazy {
         ThumbnailLoader(
-            apiClient = apiClient,
+            serverApi = serverApi,
+            publicWebFetcher = publicWebFetcher,
             settings = settings,
             cacheDir = offlineCacheDir,
             diskCache = thumbnailDiskCache,
@@ -107,7 +111,6 @@ class AppGraph(context: Context) : AutoCloseable {
             allowedLocalDirs =
                 com.grayvines.roche.playback.defaultAllowedLocalAudioDirs(offlineCacheDir),
             parentScope = appScope,
-            httpEngineProvider = { httpTransport.sharedHttpEngine },
         )
     }
 

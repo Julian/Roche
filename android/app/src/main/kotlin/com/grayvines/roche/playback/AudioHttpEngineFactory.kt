@@ -2,7 +2,6 @@ package com.grayvines.roche.playback
 
 import android.content.Context
 import android.net.Uri
-import android.net.http.HttpEngine
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
 import androidx.media3.common.C
@@ -18,8 +17,10 @@ import androidx.media3.datasource.HttpUtil
 import com.grayvines.roche.core.ROCHE_USER_AGENT
 import com.grayvines.roche.data.remote.MAX_REDIRECTS
 import com.grayvines.roche.data.remote.PublicUrlValidator
+import com.grayvines.roche.data.remote.ResolvedPublicTarget
 import com.grayvines.roche.data.remote.filterRedirectHeaders
 import com.grayvines.roche.data.remote.isSameOriginHost
+import com.grayvines.roche.data.remote.openPinnedPublicConnection
 import com.grayvines.roche.data.remote.resolveRedirectUrl
 import com.grayvines.roche.data.remote.shouldRewriteRedirectToGet
 import java.io.EOFException
@@ -27,17 +28,25 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.InetAddress
+import java.net.Proxy
 import java.net.URI
 import java.net.URL
 
 @OptIn(UnstableApi::class)
-internal fun createAudioDataSourceFactory(
-    context: Context,
-    httpEngine: HttpEngine,
-): DataSource.Factory {
+internal fun createAudioDataSourceFactory(context: Context): DataSource.Factory {
     val safeHttpFactory = DataSource.Factory {
         SafeRedirectHttpDataSource(
-            openConnection = { url -> httpEngine.openConnection(url) as HttpURLConnection },
+            resolveTarget = { rawUrl ->
+                PublicUrlValidator.resolvePublicTarget(rawUrl = rawUrl, upgradeCleartext = true)
+            },
+            openPinnedConnection = { target, address ->
+                openPinnedPublicConnection(
+                    target = target,
+                    address = address,
+                    connectTimeoutMs = AUDIO_HTTP_CONNECT_TIMEOUT_MS,
+                    readTimeoutMs = AUDIO_HTTP_READ_TIMEOUT_MS,
+                )
+            },
             userAgent = ROCHE_AUDIO_USER_AGENT,
             connectTimeoutMs = AUDIO_HTTP_CONNECT_TIMEOUT_MS,
             readTimeoutMs = AUDIO_HTTP_READ_TIMEOUT_MS,
@@ -47,11 +56,13 @@ internal fun createAudioDataSourceFactory(
 }
 
 @OptIn(UnstableApi::class)
+@Suppress("LongParameterList")
 internal class SafeRedirectHttpDataSource(
-    private val openConnection: (URL) -> HttpURLConnection = { url ->
-        url.openConnection() as HttpURLConnection
-    },
+    private val openConnection: ((URL) -> HttpURLConnection)? = null,
     private val validateUrl: (String) -> String = { resolveSafeHttpPlaybackUrl(it) },
+    private val resolveTarget: ((String) -> ResolvedPublicTarget)? = null,
+    private val openPinnedConnection: ((ResolvedPublicTarget, InetAddress) -> HttpURLConnection)? =
+        null,
     private val userAgent: String = ROCHE_AUDIO_USER_AGENT,
     private val connectTimeoutMs: Int = AUDIO_HTTP_CONNECT_TIMEOUT_MS,
     private val readTimeoutMs: Int = AUDIO_HTTP_READ_TIMEOUT_MS,
@@ -236,20 +247,34 @@ internal class SafeRedirectHttpDataSource(
         position: Long = 0L,
         length: Long = C.LENGTH_UNSET.toLong(),
     ): Pair<HttpURLConnection, String> {
-        var currentUrl = validateUrl(rawUrl.trim())
-        var method = httpMethod
-        var body = httpBody
-        var currentHeaders = requestHeaders
+        val initialTarget = resolveTarget?.invoke(rawUrl.trim())
+        var state =
+            AudioRedirectHop(
+                target = initialTarget,
+                url = initialTarget?.canonicalUrl ?: validateUrl(rawUrl.trim()),
+                method = httpMethod,
+                body = httpBody,
+                headers = requestHeaders,
+            )
 
         for (hop in 0..maxRedirects) {
             val conn =
-                openSingleConnection(
-                    url = currentUrl,
-                    httpMethod = method,
-                    httpBody = body,
-                    requestHeaders = currentHeaders,
-                    position = position,
-                    length = length,
+                openAudioHopConnection(
+                    target = state.target,
+                    url = state.url,
+                    openPinnedConnection = openPinnedConnection,
+                    openConnection = openConnection,
+                    request =
+                        AudioConnectionRequest(
+                            httpMethod = state.method,
+                            httpBody = state.body,
+                            requestHeaders = state.headers,
+                            position = position,
+                            length = length,
+                            userAgent = userAgent,
+                            connectTimeoutMs = connectTimeoutMs,
+                            readTimeoutMs = readTimeoutMs,
+                        ),
                 )
             var keepConnectionOpen = false
             var disconnected = false
@@ -257,28 +282,20 @@ internal class SafeRedirectHttpDataSource(
                 val responseCode = conn.responseCode
                 if (responseCode !in REDIRECT_STATUS_CODES) {
                     keepConnectionOpen = true
-                    return conn to currentUrl
+                    return conn to state.url
                 }
                 val location = conn.getHeaderField("Location")
                 disconnected = true
                 runCatching { conn.disconnect() }
                 if (hop >= maxRedirects) break
-                val nextRaw =
-                    location?.let { resolveRedirectUrl(currentUrl, it) }
-                        ?: throw IOException("Blocked or invalid audio redirect URL")
-                val nextUrl = validateUrl(nextRaw)
-                val switchToGet = shouldRewriteRedirectToGet(method, responseCode)
-                currentHeaders =
-                    filterRedirectHeaders(
-                        headers = currentHeaders,
-                        sameOrigin = isSameOriginHost(currentUrl, nextUrl),
-                        dropPayloadHeaders = switchToGet,
+                state =
+                    resolveAudioRedirectHop(
+                        current = state,
+                        responseCode = responseCode,
+                        location = location,
+                        resolveTarget = resolveTarget,
+                        validateUrl = validateUrl,
                     )
-                currentUrl = nextUrl
-                if (switchToGet) {
-                    method = "GET"
-                    body = null
-                }
             } finally {
                 if (!keepConnectionOpen && !disconnected) {
                     runCatching { conn.disconnect() }
@@ -286,47 +303,6 @@ internal class SafeRedirectHttpDataSource(
             }
         }
         throw IOException("Too many audio redirects")
-    }
-
-    private fun openSingleConnection(
-        url: String,
-        httpMethod: String,
-        httpBody: ByteArray?,
-        requestHeaders: Map<String, String>,
-        position: Long,
-        length: Long,
-    ): HttpURLConnection {
-        val conn = openConnection(URI.create(url.trim().replace(" ", "%20")).toURL())
-        var handedOff = false
-        try {
-            conn.instanceFollowRedirects = false
-            conn.connectTimeout = connectTimeoutMs
-            conn.readTimeout = readTimeoutMs
-            conn.requestMethod = httpMethod
-            conn.setRequestProperty("User-Agent", userAgent)
-            conn.setRequestProperty("Accept-Encoding", "identity")
-            for ((key, value) in requestHeaders) {
-                conn.setRequestProperty(key, value)
-            }
-            val rangeHeader = HttpUtil.buildRangeRequestHeader(position, length)
-            if (rangeHeader != null) {
-                conn.setRequestProperty("Range", rangeHeader)
-            }
-            if (httpBody != null) {
-                conn.doOutput = true
-                conn.setFixedLengthStreamingMode(httpBody.size)
-                conn.connect()
-                conn.outputStream.use { out -> out.write(httpBody) }
-            } else {
-                conn.connect()
-            }
-            handedOff = true
-            return conn
-        } finally {
-            if (!handedOff) {
-                runCatching { conn.disconnect() }
-            }
-        }
     }
 
     private fun skipFully(stream: InputStream, bytesToSkip: Long) {
@@ -358,6 +334,125 @@ internal class SafeRedirectHttpDataSource(
         val REDIRECT_STATUS_CODES = setOf(300, 301, 302, 303, 307, 308)
     }
 }
+
+internal class AudioRedirectHop(
+    val target: ResolvedPublicTarget?,
+    val url: String,
+    val method: String,
+    val body: ByteArray?,
+    val headers: Map<String, String>,
+)
+
+internal fun resolveAudioRedirectHop(
+    current: AudioRedirectHop,
+    responseCode: Int,
+    location: String?,
+    resolveTarget: ((String) -> ResolvedPublicTarget)?,
+    validateUrl: (String) -> String,
+): AudioRedirectHop {
+    val nextRaw =
+        location?.let { resolveRedirectUrl(current.url, it) }
+            ?: throw IOException("Blocked or invalid audio redirect URL")
+    val nextTarget = resolveTarget?.invoke(nextRaw)
+    val nextUrl = nextTarget?.canonicalUrl ?: validateUrl(nextRaw)
+    val switchToGet = shouldRewriteRedirectToGet(current.method, responseCode)
+    val nextHeaders =
+        filterRedirectHeaders(
+            headers = current.headers,
+            sameOrigin =
+                isSameOriginHost(current.url, nextRaw) && isSameOriginHost(current.url, nextUrl),
+            dropPayloadHeaders = switchToGet,
+        )
+    return AudioRedirectHop(
+        target = nextTarget,
+        url = nextUrl,
+        method = if (switchToGet) "GET" else current.method,
+        body = if (switchToGet) null else current.body,
+        headers = nextHeaders,
+    )
+}
+
+internal class AudioConnectionRequest(
+    val httpMethod: String,
+    val httpBody: ByteArray?,
+    val requestHeaders: Map<String, String>,
+    val position: Long,
+    val length: Long,
+    val userAgent: String,
+    val connectTimeoutMs: Int,
+    val readTimeoutMs: Int,
+)
+
+@OptIn(UnstableApi::class)
+internal fun openAudioHopConnection(
+    target: ResolvedPublicTarget?,
+    url: String,
+    openPinnedConnection: ((ResolvedPublicTarget, InetAddress) -> HttpURLConnection)?,
+    openConnection: ((URL) -> HttpURLConnection)?,
+    request: AudioConnectionRequest,
+): HttpURLConnection {
+    if (target != null && openPinnedConnection != null) {
+        var lastError: IOException? = null
+        for (address in target.addresses.take(MAX_PINNED_AUDIO_ADDRS)) {
+            try {
+                return connectAudioConnection(
+                    conn = openPinnedConnection(target, address),
+                    request = request,
+                )
+            } catch (err: IOException) {
+                lastError = err
+            }
+        }
+        throw lastError ?: IOException("Failed to connect to pinned audio host")
+    }
+    val opener =
+        openConnection ?: { parsed -> parsed.openConnection(Proxy.NO_PROXY) as HttpURLConnection }
+    return connectAudioConnection(
+        conn = opener(URI.create(url.trim().replace(" ", "%20")).toURL()),
+        request = request,
+    )
+}
+
+@OptIn(UnstableApi::class)
+private fun connectAudioConnection(
+    conn: HttpURLConnection,
+    request: AudioConnectionRequest,
+): HttpURLConnection {
+    var handedOff = false
+    try {
+        conn.instanceFollowRedirects = false
+        conn.connectTimeout = request.connectTimeoutMs
+        conn.readTimeout = request.readTimeoutMs
+        conn.requestMethod = request.httpMethod
+        conn.setRequestProperty("User-Agent", request.userAgent)
+        conn.setRequestProperty("Accept-Encoding", "identity")
+        for ((key, value) in request.requestHeaders) {
+            if (!key.equals("Host", ignoreCase = true)) {
+                conn.setRequestProperty(key, value)
+            }
+        }
+        val rangeHeader = HttpUtil.buildRangeRequestHeader(request.position, request.length)
+        if (rangeHeader != null) {
+            conn.setRequestProperty("Range", rangeHeader)
+        }
+        val body = request.httpBody
+        if (body != null) {
+            conn.doOutput = true
+            conn.setFixedLengthStreamingMode(body.size)
+            conn.outputStream.use { out -> out.write(body) }
+        } else {
+            conn.connect()
+        }
+        handedOff = true
+        return conn
+    } finally {
+        if (!handedOff) {
+            runCatching { conn.disconnect() }
+        }
+    }
+}
+
+private const val MAX_PINNED_AUDIO_ADDRS = 4
 
 internal data class ResponseMetadata(
     val responseCode: Int,

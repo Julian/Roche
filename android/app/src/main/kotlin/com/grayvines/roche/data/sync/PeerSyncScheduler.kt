@@ -11,10 +11,10 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.PersistableBundle
-import com.grayvines.roche.RocheApp
 import com.grayvines.roche.core.isLoopbackHost
 import com.grayvines.roche.core.isTailnetOnlyHost
-import com.grayvines.roche.core.isTailscaleInetAddress
+import com.grayvines.roche.core.isTailscaleUlaAddress
+import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.settings.extractTailnetDomains
 import java.net.InetAddress
 import java.net.NetworkInterface
@@ -98,7 +98,7 @@ class AndroidNetworkTierProvider(context: Context) : NetworkTierProvider, AutoCl
     }
 }
 
-private val VPN_TUNNEL_NAME_PREFIXES = listOf("tun", "wg", "tailscale", "utun", "ppp")
+private val VPN_TUNNEL_NAME_PREFIXES = listOf("tun", "wg", "tailscale", "utun", "ppp", "ipsec")
 
 internal fun hasActiveVpnTunnelInterface(): Boolean = runCatching {
     val interfaces = NetworkInterface.getNetworkInterfaces()
@@ -126,8 +126,8 @@ internal fun isActiveVpnTunnelInterface(
     val lowerName = name.trim().lowercase(Locale.ROOT)
     val hasTunnelPrefix = VPN_TUNNEL_NAME_PREFIXES.any { lowerName.startsWith(it) }
     val hasNonLoopbackAddress = addresses.any { !it.isLoopbackAddress }
-    val hasTailscaleAddress = addresses.any(::isTailscaleInetAddress)
-    return hasTunnelPrefix && hasNonLoopbackAddress || hasTailscaleAddress
+    val hasTailscaleUla = addresses.any(::isTailscaleUlaAddress)
+    return hasTunnelPrefix && hasNonLoopbackAddress || hasTailscaleUla
 }
 
 @Suppress("LongParameterList")
@@ -221,6 +221,12 @@ internal class PeerSyncJobTracker<P>(
     }
 }
 
+interface PeerSyncHost {
+    val peerSyncScope: CoroutineScope
+
+    suspend fun runBackgroundPeerSyncAndPoll()
+}
+
 class PeerSyncJobService : JobService() {
     private val tracker =
         PeerSyncJobTracker<JobParameters>(
@@ -230,10 +236,8 @@ class PeerSyncJobService : JobService() {
 
     override fun onStartJob(params: JobParameters?): Boolean {
         val jobParams = params ?: return false
-        val graph = (application as? RocheApp)?.graph ?: return false
-        return tracker.start(graph.appScope, jobParams) {
-            graph.repository.runBackgroundPeerSyncAndPoll()
-        }
+        val host = application as? PeerSyncHost ?: return false
+        return tracker.start(host.peerSyncScope, jobParams) { host.runBackgroundPeerSyncAndPoll() }
     }
 
     override fun onStopJob(params: JobParameters?): Boolean {

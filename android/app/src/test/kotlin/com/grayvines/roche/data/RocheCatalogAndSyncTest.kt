@@ -29,7 +29,6 @@ import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
 import com.grayvines.roche.data.feeds.LocalFeedPoller
 import com.grayvines.roche.data.feeds.decodeHtmlText
 import com.grayvines.roche.data.feeds.resolveRelativeUrl
-import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.LocalSyncFlagEntity
@@ -41,13 +40,13 @@ import com.grayvines.roche.data.local.upsertFeeds
 import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.local.upsertItems
 import com.grayvines.roche.data.remote.HttpResponse
+import com.grayvines.roche.data.remote.PeerNodeDto
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.PublicWebFetcher
 import com.grayvines.roche.data.remote.buildPeerSyncRequestPayload
 import com.grayvines.roche.data.remote.parsePeerSyncResponseJson
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.sync.FLAG_LOCAL_THROUGHPUT_WEIGHT
-import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.data.sync.PeerSyncRequestConfig
 import com.grayvines.roche.data.sync.buildTrackedPeerSyncRequest
 import com.grayvines.roche.data.sync.feedPhaseOffsetSecs
@@ -173,17 +172,8 @@ class RocheCatalogAndSyncTest {
             val migratedDb =
                 Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
                     .setDriver(BundledSQLiteDriver())
-                    .addMigrations(
-                        RocheDatabase.MIGRATION_2_3,
-                        RocheDatabase.MIGRATION_3_4,
-                        RocheDatabase.MIGRATION_4_5,
-                        RocheDatabase.MIGRATION_5_6,
-                        RocheDatabase.MIGRATION_6_7,
-                        RocheDatabase.MIGRATION_7_8,
-                        RocheDatabase.MIGRATION_8_9,
-                        RocheDatabase.MIGRATION_9_10,
-                        RocheDatabase.MIGRATION_10_11,
-                    )
+                    .addCallback(RocheDatabase.schemaCallback())
+                    .addMigrations(*RocheDatabase.allMigrations())
                     .build()
             try {
                 assertEquals(1, migratedDb.dao().getAllFeeds().size)
@@ -505,10 +495,7 @@ class RocheCatalogAndSyncTest {
 
             // Simulate a second fresh peer receiving that catalog state + a server-completed
             // article
-            val peerDb =
-                Room.inMemoryDatabaseBuilder<RocheDatabase>()
-                    .setDriver(BundledSQLiteDriver())
-                    .build()
+            val peerDb = RocheDatabase.createInMemory()
             try {
                 val peerCatalog = CatalogStore(peerDb.dao())
                 val serverHlc = "001780000001000-0000-server-1"
@@ -597,7 +584,7 @@ class RocheCatalogAndSyncTest {
                     catalogStore = peerCatalog,
                 )
 
-                val peerSnap = peerCatalog.snapshot.first()
+                val peerSnap = peerCatalog.getSnapshot()
                 assertTrue(peerSnap.lists.any { it.title == "Sci-Fi Essentials" })
                 val booksSpec = peerSnap.lists.first { it.slug == "books" }
                 assertEquals(
@@ -644,7 +631,7 @@ class RocheCatalogAndSyncTest {
             catalog.addCollectionEntry(listId, albB, position = 2.0)
             catalog.setCollectionGeneratorEnabled(listId, true)
 
-            val initialSnap = catalog.snapshot.first()
+            val initialSnap = catalog.getSnapshot()
             val listBefore = initialSnap.lists.first { it.collectionId == listId }
             assertEquals(0, listBefore.entryCount)
             assertEquals(2, listBefore.poolTotalCount)
@@ -652,7 +639,7 @@ class RocheCatalogAndSyncTest {
             assertTrue(catalog.selectNextRankCluster(listId).isEmpty())
 
             val finished1 = catalog.finishActiveDraw(listId, "First listen")
-            val afterOneSnap = catalog.snapshot.first()
+            val afterOneSnap = catalog.getSnapshot()
             val listAfterOne = afterOneSnap.lists.first { it.collectionId == listId }
             assertEquals(1, listAfterOne.entryCount)
             assertEquals(
@@ -737,7 +724,7 @@ class RocheCatalogAndSyncTest {
                 catalogStore = catalog,
             )
 
-            val snap = catalog.snapshot.first()
+            val snap = catalog.getSnapshot()
             assertTrue(
                 snap.diaryEntries.any { it.entryId == canonId && it.notes == "Noir atmosphere" }
             )
@@ -834,12 +821,8 @@ class RocheCatalogAndSyncTest {
             val migratedDb =
                 Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
                     .setDriver(BundledSQLiteDriver())
-                    .addMigrations(
-                        RocheDatabase.MIGRATION_7_8,
-                        RocheDatabase.MIGRATION_8_9,
-                        RocheDatabase.MIGRATION_9_10,
-                        RocheDatabase.MIGRATION_10_11,
-                    )
+                    .addCallback(RocheDatabase.schemaCallback())
+                    .addMigrations(*RocheDatabase.allMigrations())
                     .build()
             try {
                 val dao = migratedDb.dao()
@@ -865,23 +848,25 @@ class RocheCatalogAndSyncTest {
                     )
                 }
                 val syncBodies = mutableListOf<String>()
-                val upgradeClient = RocheApiClient { request ->
-                    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
-                        syncBodies.add(request.body.orEmpty())
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"server_peer_id":"server","sync_seq":7,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-06-02T00:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
-                        )
-                    } else {
-                        HttpResponse(statusCode = 404, body = "{}")
-                    }
-                }
                 val upgradedRepo =
-                    RocheRepository(
+                    mockRepository(
                         database = migratedDb,
-                        apiClient = upgradeClient,
                         settings = settings,
+                        transport = { request ->
+                            if (
+                                request.method == "POST" &&
+                                    request.url.endsWith("/api/v1/sync/peer")
+                            ) {
+                                syncBodies.add(request.body.orEmpty())
+                                HttpResponse(
+                                    statusCode = 200,
+                                    body =
+                                        """{"server_peer_id":"server","sync_seq":7,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-06-02T00:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+                                )
+                            } else {
+                                HttpResponse(statusCode = 404, body = "{}")
+                            }
+                        },
                     )
                 upgradedRepo.syncWithServer().getOrThrow()
                 assertFalse(syncBodies.single().contains("since_seq"))
@@ -1073,13 +1058,13 @@ class RocheCatalogAndSyncTest {
                     feedType = "podcast",
                 )
             dao.upsertFeed(errFeed)
-            val failingClient = RocheApiClient {
+            val failingFetcher = PublicWebFetcher {
                 HttpResponse(
                     statusCode = 502,
                     body = """{"title":"Bad Gateway","detail":"INTERNAL_SECRET_TOKEN_LEAK"}""",
                 )
             }
-            LocalFeedPoller.pollFeed(dao, failingClient, errFeed, "peer-1")
+            LocalFeedPoller.pollFeed(dao, failingFetcher, errFeed, "peer-1")
             assertEquals("HTTP 502", dao.getFeedById("f-err")?.lastError)
 
             val schemeXml =
@@ -1089,8 +1074,10 @@ class RocheCatalogAndSyncTest {
                     """<item><title>ValidLinkBadAudio</title><link>https://feeds.example.com/ep1</link>""" +
                     """<enclosure url="file:///data/data/com.grayvines.roche/secret" type="audio/mpeg"/></item>""" +
                     """</channel></rss>"""
-            val schemeClient = RocheApiClient { HttpResponse(statusCode = 200, body = schemeXml) }
-            LocalFeedPoller.pollFeed(dao, schemeClient, errFeed, "peer-1")
+            val schemeFetcher = PublicWebFetcher {
+                HttpResponse(statusCode = 200, body = schemeXml)
+            }
+            LocalFeedPoller.pollFeed(dao, schemeFetcher, errFeed, "peer-1")
             val parsedItem = dao.getAllItems().single { it.feedId == "f-err" }
             assertEquals("ValidLinkBadAudio", parsedItem.title)
             assertEquals(null, parsedItem.audioUrl)
@@ -1138,18 +1125,15 @@ class RocheCatalogAndSyncTest {
             val migratedDb =
                 Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
                     .setDriver(BundledSQLiteDriver())
-                    .addMigrations(
-                        RocheDatabase.MIGRATION_8_9,
-                        RocheDatabase.MIGRATION_9_10,
-                        RocheDatabase.MIGRATION_10_11,
-                    )
+                    .addCallback(RocheDatabase.schemaCallback())
+                    .addMigrations(*RocheDatabase.allMigrations())
                     .build()
             try {
                 val upgradedRepo =
-                    RocheRepository(
+                    mockRepository(
                         database = migratedDb,
-                        apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
                         settings = settings,
+                        transport = { HttpResponse(statusCode = 200, body = "{}") },
                     )
                 val inlineHits = upgradedRepo.searchDeepEntries("AlphaInlineToken88")
                 assertEquals(listOf("v8-inline"), inlineHits.map { it.id })
@@ -1253,10 +1237,8 @@ class RocheCatalogAndSyncTest {
             val migratedDb =
                 Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
                     .setDriver(BundledSQLiteDriver())
-                    .addMigrations(
-                        RocheDatabase.MIGRATION_9_10,
-                        RocheDatabase.MIGRATION_10_11,
-                    )
+                    .addCallback(RocheDatabase.schemaCallback())
+                    .addMigrations(*RocheDatabase.allMigrations())
                     .build()
             try {
                 val dao = migratedDb.dao()
@@ -1280,10 +1262,10 @@ class RocheCatalogAndSyncTest {
                 assertEquals("Stalker", dao.getEntryById("mov-v9")?.title)
 
                 val upgradedRepo =
-                    RocheRepository(
+                    mockRepository(
                         database = migratedDb,
-                        apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
                         settings = settings,
+                        transport = { HttpResponse(statusCode = 200, body = "{}") },
                     )
                 assertEquals(
                     listOf("ep-v9"),
@@ -1609,7 +1591,7 @@ class RocheCatalogAndSyncTest {
                         """</channel></rss>""",
                     )
                     .joinToString("\n")
-            val pollClient = RocheApiClient { HttpResponse(statusCode = 200, body = rssXml) }
+            val pollClient = PublicWebFetcher { HttpResponse(statusCode = 200, body = rssXml) }
             val feed = dao.getFeedById("feed-placeholder")!!
             LocalFeedPoller.pollFeed(dao, pollClient, feed, "peer-local").getOrThrow()
 
@@ -1652,7 +1634,8 @@ class RocheCatalogAndSyncTest {
             val migratedDb =
                 Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
                     .setDriver(BundledSQLiteDriver())
-                    .addMigrations(RocheDatabase.MIGRATION_10_11)
+                    .addCallback(RocheDatabase.schemaCallback())
+                    .addMigrations(*RocheDatabase.allMigrations())
                     .build()
             try {
                 val dao = migratedDb.dao()
@@ -1817,9 +1800,9 @@ class RocheCatalogAndSyncTest {
                 )
             dao.upsertFeed(feed)
 
-            val httpFailClient = RocheApiClient { HttpResponse(statusCode = 503, body = "err") }
-            val badXmlClient = RocheApiClient { HttpResponse(statusCode = 200, body = "not xml") }
-            val okClient = RocheApiClient {
+            val httpFailClient = PublicWebFetcher { HttpResponse(statusCode = 503, body = "err") }
+            val badXmlClient = PublicWebFetcher { HttpResponse(statusCode = 200, body = "not xml") }
+            val okClient = PublicWebFetcher {
                 HttpResponse(
                     statusCode = 200,
                     body =
@@ -1911,7 +1894,7 @@ class RocheCatalogAndSyncTest {
             val advancingClock: () -> Instant = {
                 Instant.ofEpochSecond(baseEpoch + tickCounter.getAndIncrement() * 5L)
             }
-            val mixedClient = RocheApiClient { req ->
+            val mixedFetcher = PublicWebFetcher { req ->
                 if (req.url.contains("broken.example.com")) {
                     HttpResponse(statusCode = 500, body = "fail")
                 } else {
@@ -1923,7 +1906,7 @@ class RocheCatalogAndSyncTest {
             val outcome1 =
                 pollCooperativeFeedsOnDevice(
                     dao = dao,
-                    apiClient = mixedClient,
+                    publicWebFetcher = mixedFetcher,
                     localPeerId = "android-1",
                     activePeers = listOf(PeerNodeDto("android-1", "Pixel", "wifi", 0.8)),
                     clock = advancingClock,
@@ -1944,11 +1927,11 @@ class RocheCatalogAndSyncTest {
 
             // Failed-only poll preserves EWMA flag and returns null measuredWeight
             dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_LOCAL_THROUGHPUT_WEIGHT, "2.5"))
-            val failOnlyClient = RocheApiClient { HttpResponse(statusCode = 503, body = "down") }
+            val failOnlyFetcher = PublicWebFetcher { HttpResponse(statusCode = 503, body = "down") }
             val outcomeFail =
                 pollCooperativeFeedsOnDevice(
                     dao = dao,
-                    apiClient = failOnlyClient,
+                    publicWebFetcher = failOnlyFetcher,
                     localPeerId = "android-1",
                     activePeers = listOf(PeerNodeDto("android-1", "Pixel", "wifi", 0.5)),
                     nowInstant = Instant.parse("2026-06-02T12:00:00Z"),
@@ -1962,7 +1945,8 @@ class RocheCatalogAndSyncTest {
             val outcome2 =
                 pollCooperativeFeedsOnDevice(
                     dao = dao,
-                    apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = rssBody) },
+                    publicWebFetcher =
+                        PublicWebFetcher { HttpResponse(statusCode = 200, body = rssBody) },
                     localPeerId = "android-1",
                     activePeers = listOf(PeerNodeDto("android-1", "Pixel", "wifi", 0.5)),
                     nowInstant = Instant.parse("2026-06-04T12:00:00Z"),
@@ -2236,13 +2220,11 @@ class RocheCatalogAndSyncTest {
             catalog.addCollectionEntry(listId, entryB)
             val initialSpec = dao.getCollectionSpecById(listId)!!
             dao.upsertCollectionSpec(initialSpec.copy(color = "#112233"))
-            dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("custom", "keep-min", "00000000"))
-            dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("custom", "keep-max", "zzzzzzzz"))
 
             val emissions = Channel<CatalogSnapshot>(Channel.UNLIMITED)
             val collectJob =
                 launch(Dispatchers.Default) {
-                    catalog.snapshot.collect { emissions.send(it) }
+                    repository.snapshot.collect { emissions.send(it.catalog) }
                 }
             try {
                 awaitCatalogSnapshot(emissions) { snap ->
@@ -2251,10 +2233,10 @@ class RocheCatalogAndSyncTest {
                     }
                 }
 
-                // 1. Repoint identifier in-place (same row count, same min/max entryId!)
-                val identsBefore = dao.observeIdentsStamp().first()
+                // 1. Repoint identifier in-place bumps entry_identifiers revision trigger
+                val identsBefore = dao.getRepositoryStamp().identsStamp
                 dao.repointIdentifiersToEntry(entryA, entryB)
-                assertNotEquals(identsBefore, dao.observeIdentsStamp().first())
+                assertNotEquals(identsBefore, dao.getRepositoryStamp().identsStamp)
                 awaitCatalogSnapshot(emissions) { snap ->
                     snap.entriesByCollectionId[listId]
                         .orEmpty()
@@ -2264,19 +2246,19 @@ class RocheCatalogAndSyncTest {
                         ?.any { it.value == "tt0069293" } == true
                 }
 
-                // 2. Update collection_specs.color (same row count, same length!)
-                val specsBeforeColor = dao.observeSpecsStamp().first()
+                // 2. Update collection_specs.color bumps collection_specs revision trigger
+                val specsBeforeColor = dao.getRepositoryStamp().specsStamp
                 val updatedColorSpec = dao.getCollectionSpecById(listId)!!.copy(color = "#112234")
                 dao.upsertCollectionSpec(updatedColorSpec)
-                assertNotEquals(specsBeforeColor, dao.observeSpecsStamp().first())
+                assertNotEquals(specsBeforeColor, dao.getRepositoryStamp().specsStamp)
                 val afterColorSnap =
                     withContext(Dispatchers.Default) { withTimeout(5_000L) { emissions.receive() } }
                 assertTrue(afterColorSnap.lists.any { it.collectionId == listId })
 
-                // 3. Update collection_specs.slug
-                val specsBeforeSlug = dao.observeSpecsStamp().first()
+                // 3. Update collection_specs.slug bumps collection_specs revision trigger
+                val specsBeforeSlug = dao.getRepositoryStamp().specsStamp
                 dao.upsertCollectionSpec(updatedColorSpec.copy(slug = "stamp_watch_v2"))
-                assertNotEquals(specsBeforeSlug, dao.observeSpecsStamp().first())
+                assertNotEquals(specsBeforeSlug, dao.getRepositoryStamp().specsStamp)
                 awaitCatalogSnapshot(emissions) { snap ->
                     snap.lists.any { it.collectionId == listId && it.slug == "stamp_watch_v2" }
                 }

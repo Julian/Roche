@@ -12,10 +12,11 @@ import com.grayvines.roche.core.isLocalPdfUrl
 import com.grayvines.roche.core.isValidArxivId
 import com.grayvines.roche.core.isYoutubeChannelId
 import com.grayvines.roche.core.runSuspendCatching
+import com.grayvines.roche.data.local.DbWriteLock
 import com.grayvines.roche.data.local.MAX_SQLITE_HTML_CHARS
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.enrichEntryMetadataIfPresent
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.PublicWebFetcher
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.inferContentType
 import java.net.URI
@@ -50,23 +51,23 @@ internal fun normalizeUserSubmittedUrl(rawInput: String): String {
 }
 
 internal suspend fun discoverFeedFromUrl(
-    apiClient: RocheApiClient,
+    publicWebFetcher: PublicWebFetcher,
     rawInputUrl: String,
 ): Result<DiscoveredFeedResult> =
     withContext(Dispatchers.Default) {
         runSuspendCatching {
             val normalizedUrl = canonicalizeFeedUrl(normalizeUserSubmittedUrl(rawInputUrl))
             check(normalizedUrl.isNotBlank()) { "Enter a valid site or feed URL" }
-            probeSiteForRssFeed(apiClient, normalizedUrl)
+            probeSiteForRssFeed(publicWebFetcher, normalizedUrl)
         }
     }
 
 private suspend fun probeSiteForRssFeed(
-    apiClient: RocheApiClient,
+    publicWebFetcher: PublicWebFetcher,
     siteUrl: String,
 ): DiscoveredFeedResult {
     val pageBody =
-        apiClient.fetchExternalFeedXml(siteUrl).getOrElse { error ->
+        publicWebFetcher.fetchFeedXml(siteUrl).getOrElse { error ->
             if (isLikelyFeedUrl(siteUrl)) {
                 return DiscoveredFeedResult(feedUrl = siteUrl, siteTitle = null)
             }
@@ -92,7 +93,7 @@ private suspend fun probeSiteForRssFeed(
     val candidates = extractDocFeedCandidates(doc, siteUrl)
     for (candidateUrl in candidates.take(MAX_DISCOVERY_PROBES)) {
         val probed =
-            apiClient.fetchExternalFeedXml(candidateUrl).getOrNull()?.let { xml ->
+            publicWebFetcher.fetchFeedXml(candidateUrl).getOrNull()?.let { xml ->
                 runCatching { LocalFeedPoller.parseFeedXml(xml = xml, feedUrl = candidateUrl) }
                     .getOrNull()
             }
@@ -181,36 +182,48 @@ private fun buildOriginFallbackFeedUrls(baseUrl: String): List<String> {
 @Suppress("LongParameterList")
 internal suspend fun enrichWantToReadItemOnDevice(
     dao: RocheDao,
-    apiClient: RocheApiClient,
+    publicWebFetcher: PublicWebFetcher,
     itemId: String,
     url: String,
     hasUserTitleOverride: Boolean,
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+    writeLock: DbWriteLock = DbWriteLock(),
 ) {
     if (!isHttpOrHttpsUrl(url)) return
     val arxivId = extractArxivIdentifier(url)
     if (arxivId != null) {
-        enrichArxivItemOnDevice(dao, apiClient, itemId, arxivId, hasUserTitleOverride, nodeId)
+        enrichArxivItemOnDevice(
+            dao,
+            publicWebFetcher,
+            itemId,
+            arxivId,
+            hasUserTitleOverride,
+            nodeId,
+            writeLock,
+        )
         return
     }
     if (inferContentType(url) != ContentType.ARTICLE) return
-    val html = apiClient.fetchExternalFeedXml(url).getOrNull() ?: return
+    val html = publicWebFetcher.fetchHtml(url).getOrNull() ?: return
     val snapshot = withContext(Dispatchers.Default) { extractWebPageSnapshot(html, url) }
-    applyWebPageSnapshotToItem(dao, itemId, snapshot, hasUserTitleOverride, nodeId)
+    writeLock.withLock {
+        applyWebPageSnapshotToItem(dao, itemId, snapshot, hasUserTitleOverride, nodeId)
+    }
 }
 
 @Suppress("LongParameterList")
 private suspend fun enrichArxivItemOnDevice(
     dao: RocheDao,
-    apiClient: RocheApiClient,
+    publicWebFetcher: PublicWebFetcher,
     itemId: String,
     arxivId: String,
     hasUserTitleOverride: Boolean,
     nodeId: String,
+    writeLock: DbWriteLock,
 ) {
     if (!isValidArxivId(arxivId)) return
     val queryUrl = "https://export.arxiv.org/api/query?id_list=${encodeQueryValue(arxivId)}"
-    val xml = apiClient.fetchExternalFeedXml(queryUrl).getOrNull() ?: return
+    val xml = publicWebFetcher.fetchFeedXml(queryUrl).getOrNull() ?: return
     val candidate =
         withContext(Dispatchers.Default) {
             runCatching { LocalFeedPoller.parseFeedXml(xml, queryUrl, "arxiv") }
@@ -222,15 +235,17 @@ private suspend fun enrichArxivItemOnDevice(
         candidate.title.replace(WHITESPACE_SPLIT_REGEX, " ").trim().takeIf {
             it.isNotEmpty()
         }
-    dao.enrichEntryMetadataIfPresent(
-        itemId = itemId,
-        title = cleanTitle,
-        hasUserTitleOverride = hasUserTitleOverride,
-        author = candidate.author,
-        summary = candidate.summary,
-        publishedAt = candidate.publishedAt,
-        nodeId = nodeId,
-    )
+    writeLock.withLock {
+        dao.enrichEntryMetadataIfPresent(
+            itemId = itemId,
+            title = cleanTitle,
+            hasUserTitleOverride = hasUserTitleOverride,
+            author = candidate.author,
+            summary = candidate.summary,
+            publishedAt = candidate.publishedAt,
+            nodeId = nodeId,
+        )
+    }
 }
 
 internal fun extractWebPageSnapshot(rawHtml: String, pageUrl: String): ExtractedWebPageSnapshot {

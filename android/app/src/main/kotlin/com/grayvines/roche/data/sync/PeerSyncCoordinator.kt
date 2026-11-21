@@ -4,15 +4,19 @@ import com.grayvines.roche.core.FLAG_LOCAL_HLC
 import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.feeds.LocalFeedPoller
+import com.grayvines.roche.data.local.DbWriteLock
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.LocalSyncFlagEntity
 import com.grayvines.roche.data.local.RocheDao
+import com.grayvines.roche.data.remote.NetworkTier
+import com.grayvines.roche.data.remote.PeerNodeDto
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.data.remote.ProblemDetailsException
+import com.grayvines.roche.data.remote.PublicWebFetcher
 import com.grayvines.roche.data.remote.ResponseTooLargeException
-import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.remote.RocheProblemTypes
+import com.grayvines.roche.data.remote.RocheServerApi
 import com.grayvines.roche.data.settings.Settings
 import java.time.Instant
 import java.time.temporal.ChronoUnit
@@ -61,11 +65,14 @@ internal fun shouldAdvanceSyncSeq(previousCursor: String?, candidateSeq: Long): 
     return prevParsed == null || candidateSeq >= prevParsed
 }
 
+@Suppress("LongParameterList")
 internal class PeerSyncCoordinator(
     private val dao: RocheDao,
-    private val apiClient: RocheApiClient,
+    private val serverApi: RocheServerApi,
+    private val publicWebFetcher: PublicWebFetcher = PublicWebFetcher(),
     private val networkTier: NetworkTier = NetworkTier.WIFI,
     private val catalogStore: CatalogStore? = null,
+    private val writeLock: DbWriteLock = catalogStore?.writeLock ?: DbWriteLock(),
     private val onPeersUpdated: (List<PeerNodeDto>) -> Unit = {},
     private val onSyncCursorUpdated: suspend (String) -> Unit = {},
 ) {
@@ -105,9 +112,10 @@ internal class PeerSyncCoordinator(
             if (networkTier != NetworkTier.OFFLINE) {
                 pollCooperativeFeedsOnDevice(
                     dao = dao,
-                    apiClient = apiClient,
+                    publicWebFetcher = publicWebFetcher,
                     localPeerId = initialCycle.settings.peerId,
                     activePeers = initialCycle.latestPeers,
+                    writeLock = writeLock,
                 )
             } else {
                 null
@@ -240,7 +248,7 @@ internal class PeerSyncCoordinator(
                 clientHlc = clientHlc,
             )
         val response =
-            apiClient.syncPeer(
+            serverApi.syncPeer(
                 serverUrl = currentSettings.serverUrl,
                 token = currentSettings.bearerToken,
                 request = request,
@@ -472,8 +480,8 @@ internal class PeerSyncCoordinator(
                     colId !in droppedEntryIds && entryId !in droppedEntryIds
                 },
             sentGeneratorHlcById = tracked.sentGeneratorHlcById.filterKeys { it in keptGenIds },
-            sentLogIds = tracked.sentLogIds.filterTo(HashSet()) { it in keptLogIds },
-            sentComparisonIds = tracked.sentComparisonIds.filterTo(HashSet()) { it in keptCompIds },
+            sentLogHlcById = tracked.sentLogHlcById.filterKeys { it in keptLogIds },
+            sentComparisonHlcById = tracked.sentComparisonHlcById.filterKeys { it in keptCompIds },
             byteOverflowEntryIds = droppedEntryIds + tracked.byteOverflowEntryIds,
         )
     }
@@ -483,7 +491,7 @@ internal class PeerSyncCoordinator(
         request: PeerSyncRequestDto,
     ): SyncRoundCallResult? {
         val primary = runSuspendCatching {
-            apiClient.syncPeer(
+            serverApi.syncPeer(
                 serverUrl = currentSettings.serverUrl,
                 token = currentSettings.bearerToken,
                 request = request,
@@ -497,7 +505,7 @@ internal class PeerSyncCoordinator(
             }
             payloadProblem != null && request.entries.isNotEmpty() -> {
                 val strippedRequest = stripEntriesFor413Retry(request)
-                apiClient
+                serverApi
                     .syncPeer(
                         serverUrl = currentSettings.serverUrl,
                         token = currentSettings.bearerToken,
@@ -580,11 +588,12 @@ internal fun foldThroughputSamplesIntoEwma(
 @Suppress("LongParameterList")
 internal suspend fun pollCooperativeFeedsOnDevice(
     dao: RocheDao,
-    apiClient: RocheApiClient,
+    publicWebFetcher: PublicWebFetcher,
     localPeerId: String,
     activePeers: List<PeerNodeDto>,
     nowInstant: Instant? = null,
     clock: () -> Instant = { Instant.now().truncatedTo(ChronoUnit.SECONDS) },
+    writeLock: DbWriteLock = DbWriteLock(),
 ): CooperativePollOutcome {
     val effectiveClock: () -> Instant = nowInstant?.let { fixed -> { fixed } } ?: clock
     val attemptedIds = mutableSetOf<String>()
@@ -608,7 +617,14 @@ internal suspend fun pollCooperativeFeedsOnDevice(
         } else {
             slice.forEach { attemptedIds.add(it.id) }
             val succeededSamples =
-                pollCooperativeSlice(dao, apiClient, slice, localPeerId, effectiveClock)
+                pollCooperativeSlice(
+                    dao = dao,
+                    publicWebFetcher = publicWebFetcher,
+                    slice = slice,
+                    localPeerId = localPeerId,
+                    clock = effectiveClock,
+                    writeLock = writeLock,
+                )
             if (succeededSamples.isNotEmpty()) {
                 polledFeedsCount += succeededSamples.size
                 ewmaWeight = foldThroughputSamplesIntoEwma(ewmaWeight, succeededSamples)
@@ -620,12 +636,14 @@ internal suspend fun pollCooperativeFeedsOnDevice(
         }
     }
     if (measuredWeight != null) {
-        dao.upsertLocalSyncFlag(
-            LocalSyncFlagEntity(
-                flagKey = FLAG_LOCAL_THROUGHPUT_WEIGHT,
-                flagValue = measuredWeight.toString(),
+        writeLock.withLock {
+            dao.upsertLocalSyncFlag(
+                LocalSyncFlagEntity(
+                    flagKey = FLAG_LOCAL_THROUGHPUT_WEIGHT,
+                    flagValue = measuredWeight.toString(),
+                )
             )
-        )
+        }
     }
     return CooperativePollOutcome(
         polledFeedsCount = polledFeedsCount,
@@ -634,12 +652,14 @@ internal suspend fun pollCooperativeFeedsOnDevice(
     )
 }
 
+@Suppress("LongParameterList")
 internal suspend fun pollCooperativeSlice(
     dao: RocheDao,
-    apiClient: RocheApiClient,
+    publicWebFetcher: PublicWebFetcher,
     slice: List<FeedRow>,
     localPeerId: String,
     clock: () -> Instant = { Instant.now().truncatedTo(ChronoUnit.SECONDS) },
+    writeLock: DbWriteLock = DbWriteLock(),
 ): List<FeedPollSample> = coroutineScope {
     slice
         .map { feed ->
@@ -648,10 +668,11 @@ internal suspend fun pollCooperativeSlice(
                 val outcome =
                     LocalFeedPoller.pollFeed(
                         dao = dao,
-                        apiClient = apiClient,
+                        publicWebFetcher = publicWebFetcher,
                         feed = feed,
                         localPeerId = localPeerId,
                         clock = clock,
+                        writeLock = writeLock,
                     )
                 val elapsedSeconds =
                     (System.nanoTime() - startedNanos).toDouble() / NANOS_PER_SECOND

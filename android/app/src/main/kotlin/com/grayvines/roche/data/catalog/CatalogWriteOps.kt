@@ -58,6 +58,20 @@ internal suspend fun attachIdentifiersInDao(
     nowIso: String = nowUtcIso(),
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ): Boolean {
+    var attached = false
+    dao.executeInTransaction {
+        attached = attachIdentifiersInTx(dao, entryId, identifiers, nowIso, nodeId)
+    }
+    return attached
+}
+
+private suspend fun attachIdentifiersInTx(
+    dao: RocheDao,
+    entryId: String,
+    identifiers: Map<String, String>,
+    nowIso: String,
+    nodeId: String,
+): Boolean {
     val resolvedId = followMergedIdInDao(dao, entryId) ?: return false
     val entry = dao.getEntryById(resolvedId) ?: return false
     val kind = EntryKind.fromWireValue(entry.kind)
@@ -251,14 +265,10 @@ private suspend fun synthesizeArtistsInDao(
     markDirty: Boolean,
     nodeId: String,
 ) {
-    val allArtists =
-        dao.getAllEntries().filter {
-            it.mergedIntoId.isNullOrBlank() && EntryKind.fromWireValue(it.kind) == EntryKind.ARTIST
-        }
     for (rawArtist in creators) {
         val clean = rawArtist.trim()
         if (clean.isEmpty()) continue
-        val existing = allArtists.firstOrNull { it.title.equals(clean, ignoreCase = true) }
+        val existing = dao.findActiveArtistByTitle(clean)
         val artistId =
             existing?.id ?: ensureSynthesizedArtist(dao, clean, nowIso, markDirty, nodeId)
         val hlc =
@@ -318,11 +328,9 @@ private suspend fun findAlbumByTitleArtist(
     creators: List<String>,
 ): String? {
     val primaryCreator = creators.map { it.trim() }.firstOrNull { it.isNotEmpty() } ?: return null
-    return dao.getAllEntries()
+    return dao.getActiveEntriesByKind(EntryKind.ALBUM.wireValue)
         .firstOrNull { cand ->
-            cand.mergedIntoId.isNullOrBlank() &&
-                EntryKind.fromWireValue(cand.kind) == EntryKind.ALBUM &&
-                stripAlbumEditionSuffix(cand.title).equals(normalizedTitle, ignoreCase = true) &&
+            stripAlbumEditionSuffix(cand.title).equals(normalizedTitle, ignoreCase = true) &&
                 decodeCreatorsJson(cand.creatorsJson).any {
                     it.equals(primaryCreator, ignoreCase = true)
                 }
@@ -386,7 +394,7 @@ internal suspend fun appendConsumptionInDao(
 }
 
 @Suppress("LongParameterList")
-private suspend fun engageParentArtistsInDao(
+internal suspend fun engageParentArtistsInDao(
     dao: RocheDao,
     entryId: String,
     tsIso: String,
@@ -449,7 +457,7 @@ private suspend fun engageSingleArtistInDao(
     )
 }
 
-private suspend fun removeFromWantQueuesInDao(
+internal suspend fun removeFromWantQueuesInDao(
     dao: RocheDao,
     entryId: String,
     nowIso: String,
@@ -586,9 +594,7 @@ internal suspend fun addCollectionMemberInDao(
         "Cannot manually modify entries of ${mode.wireValue} collection '$specTitle'"
     }
     require(spec.collectionId != entryId) { "A collection cannot contain itself" }
-    val childrenByParent =
-        dao.getAllCollectionEntries().groupBy({ it.collectionId }, { it.entryId })
-    require(!wouldIntroduceCycleInGraph(childrenByParent, spec.collectionId, entryId)) {
+    require(dao.hasCollectionCycleRaw(spec.collectionId, entryId) == 0) {
         "Adding '$entryId' to '$specTitle' would create a collection cycle"
     }
     dao.deleteTombstone(

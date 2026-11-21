@@ -7,7 +7,9 @@ import androidx.media3.datasource.DataSourceException
 import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.TestRocheEnv
 import com.grayvines.roche.data.remote.HttpResponse
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.HttpTransport
+import com.grayvines.roche.data.remote.PublicWebFetcher
+import com.grayvines.roche.data.tailnetServerApi
 import com.grayvines.roche.media.BitmapLoader
 import com.grayvines.roche.media.ImageDecoders
 import com.grayvines.roche.media.THUMBNAILS_SUBDIR
@@ -412,7 +414,7 @@ class UiReviewFixesTest {
             val env = TestRocheEnv(tempDir, "thumb_https_test.preferences_pb")
             try {
                 val requestedUrls = mutableListOf<String>()
-                val apiClient = RocheApiClient { req ->
+                val transport = HttpTransport { req ->
                     requestedUrls += req.url
                     HttpResponse(statusCode = 200, body = "img", bodyBytes = byteArrayOf(1, 2, 3))
                 }
@@ -424,7 +426,8 @@ class UiReviewFixesTest {
                 }
                 val loader =
                     ThumbnailLoader(
-                        apiClient = apiClient,
+                        serverApi = tailnetServerApi(transport),
+                        publicWebFetcher = PublicWebFetcher(transport),
                         settings = env.settings,
                         decoder = { null },
                     )
@@ -452,7 +455,7 @@ class UiReviewFixesTest {
                 var decodeCalls = 0
                 var serveValid = false
 
-                val apiClient = RocheApiClient {
+                val transport = HttpTransport {
                     networkCalls++
                     val payload =
                         if (serveValid) {
@@ -464,7 +467,8 @@ class UiReviewFixesTest {
                 }
                 val loader =
                     BitmapLoader(
-                        apiClient = apiClient,
+                        serverApi = tailnetServerApi(transport),
+                        publicWebFetcher = PublicWebFetcher(transport),
                         settings = env.settings,
                         decoders =
                             ImageDecoders(
@@ -515,9 +519,11 @@ class UiReviewFixesTest {
                         writeBytes("CORRUPT".encodeToByteArray())
                     }
                 var decodeCalls = 0
+                val failTransport = HttpTransport { HttpResponse(statusCode = 500, body = "") }
                 val loader =
                     ThumbnailLoader(
-                        apiClient = RocheApiClient { HttpResponse(statusCode = 500, body = "") },
+                        serverApi = tailnetServerApi(failTransport),
+                        publicWebFetcher = PublicWebFetcher(failTransport),
                         settings = env.settings,
                         cacheDir = cacheRoot,
                         decoder = {

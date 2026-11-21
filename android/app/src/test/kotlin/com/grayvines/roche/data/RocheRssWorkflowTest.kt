@@ -22,12 +22,11 @@ import com.grayvines.roche.data.local.SeedData
 import com.grayvines.roche.data.local.updateFeedActiveGraph
 import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.remote.HttpResponse
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.HttpTransport
+import com.grayvines.roche.data.remote.NetworkTier
+import com.grayvines.roche.data.remote.PeerNodeDto
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.sync.FLAG_LOCAL_THROUGHPUT_WEIGHT
-import com.grayvines.roche.data.sync.NetworkTier
-import com.grayvines.roche.data.sync.NetworkTierProvider
-import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.data.sync.PeerSyncRequestConfig
 import com.grayvines.roche.data.sync.buildTrackedPeerSyncRequest
 import com.grayvines.roche.data.sync.computeThroughputWeight
@@ -94,10 +93,10 @@ class RocheRssWorkflowTest {
             }
             val requests = mutableListOf<String>()
             val batchRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = buildBatchAndOpmlMockClient(requests),
                     settings = settings,
+                    transport = buildBatchAndOpmlMockTransport(requests),
                 )
 
             // 1. Lazy reader hydration for item whose contentHtml was omitted on list
@@ -307,10 +306,10 @@ class RocheRssWorkflowTest {
         }
         val requests = mutableListOf<String>()
         val batchRepo =
-            RocheRepository(
+            mockRepository(
                 database = database,
-                apiClient = buildBatchAndOpmlMockClient(requests),
                 settings = settings,
+                transport = buildBatchAndOpmlMockTransport(requests),
             )
         val vm = MainViewModel(repository = batchRepo, settingsRepository = settings)
 
@@ -419,10 +418,10 @@ class RocheRssWorkflowTest {
             }
             val peerSyncBodies = mutableListOf<String>()
             val peerRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = buildPeerSyncAndExternalFeedMockClient(peerSyncBodies),
                     settings = settings,
+                    transport = buildPeerSyncAndExternalFeedMockTransport(peerSyncBodies),
                 )
 
             // 1. Offline from server: subscribe to an RSS feed on Android -> Android polls XML
@@ -493,11 +492,11 @@ class RocheRssWorkflowTest {
                 )
             }
             val peerRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = buildPeerSyncAndExternalFeedMockClient(peerSyncBodies),
                     settings = settings,
-                    networkTierProvider = NetworkTierProvider { currentTier },
+                    transport = buildPeerSyncAndExternalFeedMockTransport(peerSyncBodies),
+                    networkTierProvider = tailnetNetworkTierProvider { currentTier },
                 )
 
             // 1. Pre-poll sync omits weight so previously measured throughput is preserved,
@@ -560,7 +559,7 @@ class RocheRssWorkflowTest {
         runTest {
             verifyRoomMigrationsPreserveData(tempDir)
             val peerSyncBodies = mutableListOf<String>()
-            val pagedClient = buildPaginatedAndResetPeerSyncClient(peerSyncBodies)
+            val pagedTransport = buildPaginatedAndResetPeerSyncTransport(peerSyncBodies)
             settings.update {
                 it.copy(
                     serverUrl = "https://100.64.0.12:8080",
@@ -570,10 +569,10 @@ class RocheRssWorkflowTest {
                 )
             }
             val repo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = pagedClient,
                     settings = settings,
+                    transport = pagedTransport,
                     networkTierProvider = { NetworkTier.OFFLINE },
                 )
             val count = repo.syncWithServer().getOrThrow()
@@ -591,15 +590,15 @@ class RocheRssWorkflowTest {
             seedDatabase()
             val peerSyncBodies = mutableListOf<String>()
             var failSync = true
-            val client = buildOfflineFeedArchiveMockClient(peerSyncBodies) { failSync }
+            val transport = buildOfflineFeedArchiveMockTransport(peerSyncBodies) { failSync }
             settings.update {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val repo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = client,
                     settings = settings,
+                    transport = transport,
                     networkTierProvider = { NetworkTier.OFFLINE },
                 )
 
@@ -704,15 +703,18 @@ class RocheRssWorkflowTest {
                     """<description>Short teaser excerpt only.</description>""" +
                     """<content:encoded><![CDATA[$longHtmlBody]]></content:encoded></item>""" +
                     """</channel></rss>"""
-            val pollClient = RocheApiClient { request ->
-                if (request.url == "https://essays.example.com/rss.xml") {
-                    HttpResponse(statusCode = 200, body = rssXml)
-                } else {
-                    HttpResponse(statusCode = 404, body = "{}")
-                }
-            }
             val pollRepo =
-                RocheRepository(database = database, apiClient = pollClient, settings = settings)
+                mockRepository(
+                    database = database,
+                    settings = settings,
+                    transport = { request ->
+                        if (request.url == "https://essays.example.com/rss.xml") {
+                            HttpResponse(statusCode = 200, body = rssXml)
+                        } else {
+                            HttpResponse(statusCode = 404, body = "{}")
+                        }
+                    },
+                )
             pollRepo.saveUrlOrFeed(
                 inputUrl = "https://essays.example.com/rss.xml",
                 titleOverride = null,
@@ -759,13 +761,13 @@ class RocheRssWorkflowTest {
             }
 
             val receivedBodies = mutableListOf<String>()
-            val strictLimitClient = buildStrictLimitChunkingClient(receivedBodies)
+            val strictLimitTransport = buildStrictLimitChunkingTransport(receivedBodies)
 
             val chunkRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = strictLimitClient,
                     settings = settings,
+                    transport = strictLimitTransport,
                     networkTierProvider = { NetworkTier.OFFLINE },
                 )
 
@@ -783,26 +785,25 @@ class RocheRssWorkflowTest {
     @Test
     fun `addUrlToWantToRead enriches metadata caches shared PDF stream and keeps Inbox feed-only`() =
         runTest {
-            val enrichClient = RocheApiClient { request ->
-                if (request.url == "https://essays.example.com/storage") {
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """<html><head><title>Log-Structured Merge Trees</title>""" +
-                                """<meta name="author" content="Pat O'Neil">""" +
-                                """<meta name="description" content="Write amplification and compaction.">""" +
-                                """</head><body><article><p>Full article body text.</p></article></body></html>""",
-                    )
-                } else {
-                    HttpResponse(statusCode = 404, body = "")
-                }
-            }
             val bgScope = kotlinx.coroutines.CoroutineScope(UnconfinedTestDispatcher(testScheduler))
             val wantRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = enrichClient,
                     settings = settings,
+                    transport = { request ->
+                        if (request.url == "https://essays.example.com/storage") {
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """<html><head><title>Log-Structured Merge Trees</title>""" +
+                                        """<meta name="author" content="Pat O'Neil">""" +
+                                        """<meta name="description" content="Write amplification and compaction.">""" +
+                                        """</head><body><article><p>Full article body text.</p></article></body></html>""",
+                            )
+                        } else {
+                            HttpResponse(statusCode = 404, body = "")
+                        }
+                    },
                     cacheDir = File(tempDir, "pdf_cache"),
                     backgroundScope = bgScope,
                 )
@@ -962,42 +963,41 @@ class RocheRssWorkflowTest {
             var rssFetches = 0
             val sawSyncActiveDuringFetch = java.util.concurrent.atomic.AtomicBoolean(false)
             lateinit var discRepo: RocheRepository
-            val discoveryClient = RocheApiClient { request ->
-                sawSyncActiveDuringFetch.compareAndSet(false, discRepo.isSyncActive.value)
-                when (request.url) {
-                    "https://systems.example.com" -> {
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """<html><head><title>Systems Notes</title>""" +
-                                    """<link rel="alternate" type="application/rss+xml" href="/index.xml">""" +
-                                    """</head><body><p>Blog home</p></body></html>""",
-                        )
-                    }
-                    "https://systems.example.com/index.xml" -> {
-                        rssFetches += 1
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """<?xml version="1.0" encoding="UTF-8"?>""" +
-                                    """<rss version="2.0"><channel><title>Systems Notes</title>""" +
-                                    """<link>https://systems.example.com</link>""" +
-                                    """<item><title>Kernel Bypass</title>""" +
-                                    """<link>https://systems.example.com/kernel-bypass</link>""" +
-                                    """<description>&lt;p&gt;Zero-copy rings&lt;/p&gt;</description></item>""" +
-                                    """</channel></rss>""",
-                        )
-                    }
-                    else -> {
-                        HttpResponse(statusCode = 404, body = "")
-                    }
-                }
-            }
             discRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = discoveryClient,
                     settings = settings,
+                    transport = { request ->
+                        sawSyncActiveDuringFetch.compareAndSet(false, discRepo.isSyncActive.value)
+                        when (request.url) {
+                            "https://systems.example.com" -> {
+                                HttpResponse(
+                                    statusCode = 200,
+                                    body =
+                                        """<html><head><title>Systems Notes</title>""" +
+                                            """<link rel="alternate" type="application/rss+xml" href="/index.xml">""" +
+                                            """</head><body><p>Blog home</p></body></html>""",
+                                )
+                            }
+                            "https://systems.example.com/index.xml" -> {
+                                rssFetches += 1
+                                HttpResponse(
+                                    statusCode = 200,
+                                    body =
+                                        """<?xml version="1.0" encoding="UTF-8"?>""" +
+                                            """<rss version="2.0"><channel><title>Systems Notes</title>""" +
+                                            """<link>https://systems.example.com</link>""" +
+                                            """<item><title>Kernel Bypass</title>""" +
+                                            """<link>https://systems.example.com/kernel-bypass</link>""" +
+                                            """<description>&lt;p&gt;Zero-copy rings&lt;/p&gt;</description></item>""" +
+                                            """</channel></rss>""",
+                                )
+                            }
+                            else -> {
+                                HttpResponse(statusCode = 404, body = "")
+                            }
+                        }
+                    },
                 )
             val result = discRepo.discoverAndSubscribeFeed("systems.example.com").getOrThrow()
             assertTrue(sawSyncActiveDuringFetch.get())
@@ -1049,10 +1049,10 @@ class RocheRssWorkflowTest {
         }
 }
 
-private fun buildStrictLimitChunkingClient(receivedBodies: MutableList<String>): RocheApiClient {
+private fun buildStrictLimitChunkingTransport(receivedBodies: MutableList<String>): HttpTransport {
     val storedEntryJsons = mutableListOf<String>()
     var nextSeq = 0L
-    return RocheApiClient { request ->
+    return HttpTransport { request ->
         if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
             val body = request.body.orEmpty()
             if (body.toByteArray().size > 6 * 1024 * 1024) {
@@ -1079,10 +1079,10 @@ private fun buildStrictLimitChunkingClient(receivedBodies: MutableList<String>):
     }
 }
 
-private fun buildOfflineFeedArchiveMockClient(
+private fun buildOfflineFeedArchiveMockTransport(
     peerSyncBodies: MutableList<String>,
     shouldFailSync: () -> Boolean,
-): RocheApiClient = RocheApiClient { request ->
+): HttpTransport = HttpTransport { request ->
     if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
         if (shouldFailSync()) {
             throw java.io.IOException("Offline")
@@ -1147,6 +1147,7 @@ private suspend fun verifyRoomMigrationsPreserveData(tempDir: File) {
         RocheDatabase.MIGRATION_8_9.migrate(conn)
         RocheDatabase.MIGRATION_9_10.migrate(conn)
         RocheDatabase.MIGRATION_10_11.migrate(conn)
+        RocheDatabase.MIGRATION_11_12.migrate(conn)
         conn.prepare("SELECT COUNT(*) FROM entries WHERE id = 'i-1'").use { stmt ->
             assertTrue(stmt.step())
             assertEquals(1L, stmt.getLong(0))
@@ -1169,9 +1170,9 @@ private suspend fun verifyRoomMigrationsPreserveData(tempDir: File) {
     }
 }
 
-private fun buildPaginatedAndResetPeerSyncClient(
+private fun buildPaginatedAndResetPeerSyncTransport(
     peerSyncBodies: MutableList<String>
-): RocheApiClient = RocheApiClient { request ->
+): HttpTransport = HttpTransport { request ->
     if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
         val body = request.body.orEmpty()
         peerSyncBodies.add(body)
@@ -1206,8 +1207,8 @@ private fun buildPaginatedAndResetPeerSyncClient(
     }
 }
 
-internal fun buildBatchAndOpmlMockClient(requests: MutableList<String>): RocheApiClient =
-    RocheApiClient { request ->
+internal fun buildBatchAndOpmlMockTransport(requests: MutableList<String>): HttpTransport =
+    HttpTransport { request ->
         requests.add("${request.method} ${request.url}")
         when {
             request.method == "GET" && request.url.endsWith("/api/v1/items/item-5") ->
@@ -1228,9 +1229,9 @@ internal fun buildBatchAndOpmlMockClient(requests: MutableList<String>): RocheAp
         }
     }
 
-internal fun buildPeerSyncAndExternalFeedMockClient(
+internal fun buildPeerSyncAndExternalFeedMockTransport(
     peerSyncBodies: MutableList<String>
-): RocheApiClient = RocheApiClient { request ->
+): HttpTransport = HttpTransport { request ->
     when {
         request.method == "GET" && request.url == "https://blog.example.com/rss.xml" ->
             mockBlogRssResponse()

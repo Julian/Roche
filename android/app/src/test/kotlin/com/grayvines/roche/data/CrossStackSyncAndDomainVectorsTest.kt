@@ -1,7 +1,5 @@
 package com.grayvines.roche.data
 
-import androidx.room3.Room
-import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.core.canonicalOrderingJson
 import com.grayvines.roche.core.deriveCollectionIdentity
 import com.grayvines.roche.core.encodeCreatorsJson
@@ -14,17 +12,12 @@ import com.grayvines.roche.core.isPublicIpAddress
 import com.grayvines.roche.core.isSyncablePublicUrl
 import com.grayvines.roche.core.isYoutubeFeedUrl
 import com.grayvines.roche.data.catalog.CatalogStore
-import com.grayvines.roche.data.catalog.RankClusterCandidate
 import com.grayvines.roche.data.catalog.SyncCollectionEntryDto
 import com.grayvines.roche.data.catalog.SyncCollectionGeneratorDto
 import com.grayvines.roche.data.catalog.SyncComparisonDto
 import com.grayvines.roche.data.catalog.SyncConsumptionLogDto
 import com.grayvines.roche.data.catalog.SyncEntryRecordDto
 import com.grayvines.roche.data.catalog.decodeComparisonOrdering
-import com.grayvines.roche.data.enrichment.WikipediaSearchHit
-import com.grayvines.roche.data.enrichment.extractSpotifyArtistUri
-import com.grayvines.roche.data.enrichment.scoreArtistWikiCandidate
-import com.grayvines.roche.data.enrichment.selectBestArtistWikiSlug
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
@@ -36,11 +29,12 @@ import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
+import com.grayvines.roche.data.remote.SyncTombstoneDto
 import com.grayvines.roche.data.remote.rocheJson
-import com.grayvines.roche.data.sync.SyncTombstoneDto
 import com.grayvines.roche.data.sync.reconcilePeerSyncResponse
 import com.grayvines.roche.model.inferContentType
 import com.grayvines.roche.ranking.RankBoardState
+import com.grayvines.roche.ranking.RankClusterCandidate
 import java.io.File
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.SerialName
@@ -381,44 +375,11 @@ class CrossStackSyncAndDomainVectorsTest {
     }
 
     @Test
-    fun `artist Wikipedia scoring and Spotify HTML extraction match Rust golden vectors`() {
-        val suite = loadExpandedGoldenVectors().artistWikipediaScoring
-        assertTrue(suite.wikipediaScoring.size >= MIN_WIKI_SCORING_SCENARIOS)
-        assertTrue(suite.spotifyHtmlExtraction.size >= MIN_SPOTIFY_HTML_VECTORS)
-        suite.wikipediaScoring.forEach { scenario ->
-            val hits = scenario.hits.map { WikipediaSearchHit(it.title, it.snippet) }
-            val actualScores = hits.map { hit ->
-                scoreArtistWikiCandidate(hit, scenario.artistName, scenario.childTitles)
-            }
-            assertEquals(
-                scenario.expectedScores,
-                actualScores,
-                "scores mismatch for ${scenario.name}",
-            )
-            assertEquals(
-                scenario.expectedWinner,
-                selectBestArtistWikiSlug(hits, scenario.artistName, scenario.childTitles),
-                "winner mismatch for ${scenario.name}",
-            )
-        }
-        suite.spotifyHtmlExtraction.forEach { vector ->
-            assertEquals(
-                vector.expectedUri,
-                extractSpotifyArtistUri(vector.html, vector.artistName, vector.allowSingleFallback),
-                "spotify html mismatch for ${vector.name}",
-            )
-        }
-    }
-
-    @Test
     fun `peer sync merge conflict scenarios converge identically to Rust`() = runTest {
         val scenarios = loadExpandedGoldenVectors().peerSyncMergeScenarios
         assertTrue(scenarios.size >= MIN_PEER_SYNC_SCENARIOS)
         for (scenario in scenarios) {
-            val db =
-                Room.inMemoryDatabaseBuilder<RocheDatabase>()
-                    .setDriver(BundledSQLiteDriver())
-                    .build()
+            val db = RocheDatabase.createInMemory()
             try {
                 runPeerSyncScenario(db.dao(), scenario)
             } finally {
@@ -434,8 +395,6 @@ internal const val MIN_SSRF_IP_VECTORS = 25
 internal const val MIN_SSRF_URL_VECTORS = 20
 internal const val MIN_EXTERNAL_ID_URL_VECTORS = 30
 internal const val MIN_RANK_BOARD_SCENARIOS = 4
-internal const val MIN_WIKI_SCORING_SCENARIOS = 5
-internal const val MIN_SPOTIFY_HTML_VECTORS = 6
 internal const val MIN_PEER_SYNC_SCENARIOS = 4
 internal const val SYNC_PROGRESS_EPSILON = 1e-9
 

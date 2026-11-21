@@ -2,10 +2,20 @@
 
 package com.grayvines.roche.data.enrichment
 
+import com.grayvines.roche.core.SCHEME_AMAZON_MUSIC
+import com.grayvines.roche.core.SCHEME_APPLE_MUSIC
+import com.grayvines.roche.core.SCHEME_DEEZER
+import com.grayvines.roche.core.SCHEME_QOBUZ
+import com.grayvines.roche.core.SCHEME_TIDAL
+import com.grayvines.roche.core.SCHEME_WIKIPEDIA
 import com.grayvines.roche.core.SCHEME_YOUTUBE
+import com.grayvines.roche.core.SCHEME_YOUTUBE_MUSIC
+import com.grayvines.roche.core.YT_MUSIC_BROWSE_PREFIX
+import com.grayvines.roche.core.YT_MUSIC_BROWSE_URL_PREFIX
+import com.grayvines.roche.core.YT_MUSIC_OLAK_PREFIX
+import com.grayvines.roche.core.YT_MUSIC_ORIGIN
 import com.grayvines.roche.core.buildYoutubeMusicAlbumUrl
 import com.grayvines.roche.core.coreJson
-import com.grayvines.roche.core.deterministicTitleEntryId
 import com.grayvines.roche.core.encodeQueryValue
 import com.grayvines.roche.core.externalIdentifierUrl
 import com.grayvines.roche.core.extractQueryParam
@@ -16,19 +26,15 @@ import com.grayvines.roche.core.sanitizeYoutubeMusicToken
 import com.grayvines.roche.core.stripAlbumEditionSuffix
 import com.grayvines.roche.core.stripYoutubePlaylistPrefix
 import com.grayvines.roche.core.validatedBrandedHttpsUrl
-import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
-import com.grayvines.roche.data.catalog.attachEntryIdentifiers
 import com.grayvines.roche.data.catalog.candidateStreamingUrls
 import com.grayvines.roche.data.catalog.hasYoutubeAlbumBrowseId
 import com.grayvines.roche.data.remote.HttpRequest
 import com.grayvines.roche.data.remote.HttpTransport
 import java.net.URI
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -42,15 +48,9 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 
-class AlbumStreamingResolver(
-    private val transport: HttpTransport,
-    private val backgroundScope: CoroutineScope? = null,
-    private val catalogStore: CatalogStore? = null,
-    private val onArtistIdsResolved: (suspend (String, Map<String, String>) -> Unit)? = null,
-) {
+class AlbumStreamingResolver(private val transport: HttpTransport) {
     private val inFlightMutex = Mutex()
     private val inFlightByKey = HashMap<String, Deferred<Map<String, String>>>()
-    private val completedArtistSchemes = HashSet<Pair<String, String>>()
 
     suspend fun resolveStreamingIds(
         album: CollectionDrawSnapshot,
@@ -77,134 +77,7 @@ class AlbumStreamingResolver(
                 deferred.complete(emptyMap())
             }
         }
-        scheduleArtistEnrichment(album)
         return result
-    }
-
-    private suspend fun scheduleArtistEnrichment(album: CollectionDrawSnapshot) {
-        if (catalogStore == null && onArtistIdsResolved == null) return
-        if (backgroundScope != null) {
-            backgroundScope.launch { enrichAlbumArtistBestEffort(album) }
-        } else {
-            enrichAlbumArtistBestEffort(album)
-        }
-    }
-
-    private suspend fun enrichAlbumArtistBestEffort(album: CollectionDrawSnapshot) {
-        val cleanArtist = album.creator.trim()
-        if (cleanArtist.isEmpty() || cleanArtist.equals(VARIOUS_ARTISTS_NAME, ignoreCase = true)) {
-            return
-        }
-        val plan = buildArtistEnrichmentPlan(cleanArtist, album.spotifyId) ?: return
-        val artistIds =
-            resolveArtistStreamingIds(
-                artistName = cleanArtist,
-                albumTitle = album.title,
-                albumSpotifyId = album.spotifyId,
-                needWikipedia = plan.needWikipedia,
-                needSpotify = plan.needSpotify,
-            )
-        inFlightMutex.withLock {
-            if (plan.needWikipedia) {
-                completedArtistSchemes.add(plan.lowerArtist to SCHEME_WIKIPEDIA)
-            }
-            if (plan.needSpotify) {
-                completedArtistSchemes.add(plan.lowerArtist to SCHEME_SPOTIFY)
-            }
-        }
-        if (artistIds.isNotEmpty()) {
-            runSuspendCatching {
-                catalogStore?.attachEntryIdentifiers(plan.artistId, artistIds)
-                onArtistIdsResolved?.invoke(plan.artistId, artistIds)
-            }
-        }
-    }
-
-    private suspend fun buildArtistEnrichmentPlan(
-        cleanArtist: String,
-        albumSpotifyId: String?,
-    ): ArtistEnrichmentPlan? {
-        val lowerArtist = cleanArtist.lowercase()
-        val detId = deterministicTitleEntryId("artist", lowerArtist)
-        val store = catalogStore
-        val resolvedId = if (store != null) store.followMergedId(detId) ?: return null else detId
-        val existingSchemes = store?.getEntryIdentifierSchemes(resolvedId).orEmpty()
-        val (doneWiki, doneSpotify) =
-            inFlightMutex.withLock {
-                val wikiDone = lowerArtist to SCHEME_WIKIPEDIA in completedArtistSchemes
-                val spDone = lowerArtist to SCHEME_SPOTIFY in completedArtistSchemes
-                wikiDone to spDone
-            }
-        val needWiki = SCHEME_WIKIPEDIA !in existingSchemes && !doneWiki
-        val needSpotify =
-            SCHEME_SPOTIFY !in existingSchemes && !albumSpotifyId.isNullOrBlank() && !doneSpotify
-        return if (needWiki || needSpotify) {
-            ArtistEnrichmentPlan(resolvedId, lowerArtist, needWiki, needSpotify)
-        } else {
-            null
-        }
-    }
-
-    @Suppress("LongParameterList")
-    suspend fun resolveArtistStreamingIds(
-        artistName: String,
-        albumTitle: String = "",
-        albumSpotifyId: String? = null,
-        needWikipedia: Boolean = true,
-        needSpotify: Boolean = true,
-    ): Map<String, String> {
-        val cleanArtist = artistName.trim()
-        if (cleanArtist.isEmpty() || !needWikipedia && !needSpotify) {
-            return emptyMap()
-        }
-        val key = "artist|${cleanArtist.lowercase()}|wiki=$needWikipedia|sp=$needSpotify"
-        val (deferred, isOwner) = acquireInFlight(key)
-        if (!isOwner) {
-            return deferred.await()
-        }
-        return try {
-            val result = runSuspendCatching {
-                performArtistResolution(
-                    artistName = cleanArtist,
-                    albumTitle = albumTitle,
-                    albumSpotifyId = albumSpotifyId,
-                    needWikipedia = needWikipedia,
-                    needSpotify = needSpotify,
-                )
-            }
-                .getOrDefault(emptyMap())
-            deferred.complete(result)
-            result
-        } finally {
-            try {
-                withContext(NonCancellable) {
-                    inFlightMutex.withLock { inFlightByKey.remove(key) }
-                }
-            } finally {
-                deferred.complete(emptyMap())
-            }
-        }
-    }
-
-    private suspend fun performArtistResolution(
-        artistName: String,
-        albumTitle: String,
-        albumSpotifyId: String?,
-        needWikipedia: Boolean,
-        needSpotify: Boolean,
-    ): Map<String, String> {
-        val resolved = LinkedHashMap<String, String>()
-        if (needWikipedia) {
-            resolveArtistWikiSlug(transport, artistName, albumTitle)?.let {
-                resolved[SCHEME_WIKIPEDIA] = it
-            }
-        }
-        if (needSpotify && !albumSpotifyId.isNullOrBlank()) {
-            resolveSpotifyArtistUri(transport, albumSpotifyId, artistName)?.let {
-                resolved[SCHEME_SPOTIFY] = it
-            }
-        }
-        return resolved
     }
 
     private suspend fun acquireInFlight(
@@ -242,11 +115,11 @@ class AlbumStreamingResolver(
         if (seedUrl != null && shouldQueryOdesli(album)) {
             resolved.putAll(fetchOdesliPlatformIds(seedUrl))
         }
-        val currentYt = resolved[SCHEME_YT_MUSIC] ?: album.youtubeMusicId
+        val currentYt = resolved[SCHEME_YOUTUBE_MUSIC] ?: album.youtubeMusicId
         if (!isAlbumBrowseYoutubeId(currentYt)) {
             val resolvedBrowse = searchInnertubeAlbumId(album)
             if (!resolvedBrowse.isNullOrBlank()) {
-                resolved[SCHEME_YT_MUSIC] = resolvedBrowse
+                resolved[SCHEME_YOUTUBE_MUSIC] = resolvedBrowse
             }
         }
     }
@@ -310,7 +183,7 @@ internal fun CollectionDrawSnapshot.withResolvedStreamingIds(
 ): CollectionDrawSnapshot {
     if (resolved.isEmpty()) return this
     return copy(
-        youtubeMusicId = resolved[SCHEME_YT_MUSIC] ?: youtubeMusicId,
+        youtubeMusicId = resolved[SCHEME_YOUTUBE_MUSIC] ?: youtubeMusicId,
         appleMusicId = appleMusicId ?: resolved[SCHEME_APPLE_MUSIC],
         tidalId = tidalId ?: resolved[SCHEME_TIDAL],
         qobuzId = qobuzId ?: resolved[SCHEME_QOBUZ],
@@ -332,7 +205,7 @@ internal fun parseOdesliLinksPayload(rawJson: String): Map<String, String> {
     val entities = root["entitiesByUniqueId"] as? JsonObject
     val out = LinkedHashMap<String, String>()
 
-    extractOdesliYoutubeId(links, entities)?.let { out[SCHEME_YT_MUSIC] = it }
+    extractOdesliYoutubeId(links, entities)?.let { out[SCHEME_YOUTUBE_MUSIC] = it }
     extractPlatformUrl(links, "appleMusic", SCHEME_APPLE_MUSIC)?.let {
         out[SCHEME_APPLE_MUSIC] = it
     }
@@ -362,7 +235,7 @@ private fun extractOdesliYoutubeId(
     links: JsonObject,
     entities: JsonObject?,
 ): String? {
-    val ytMusicUrl = extractPlatformUrl(links, "youtubeMusic", SCHEME_YT_MUSIC)
+    val ytMusicUrl = extractPlatformUrl(links, "youtubeMusic", SCHEME_YOUTUBE_MUSIC)
     val ytUrl = extractPlatformUrl(links, "youtube", SCHEME_YOUTUBE)
     val directBrowse =
         extractYoutubeBrowseIdFromUrl(ytMusicUrl) ?: extractBrowseIdFromEntities(entities)
@@ -376,7 +249,7 @@ private fun extractBrowseIdFromEntities(entities: JsonObject?): String? {
     if (entities == null) return null
     return entities.values.firstNotNullOfOrNull { value ->
         val rawId = ((value as? JsonObject)?.get("id") as? JsonPrimitive)?.contentOrNull?.trim()
-        rawId?.let(::sanitizeYoutubeMusicToken)?.takeIf { it.startsWith(YT_BROWSE_PREFIX) }
+        rawId?.let(::sanitizeYoutubeMusicToken)?.takeIf { it.startsWith(YT_MUSIC_BROWSE_PREFIX) }
     }
 }
 
@@ -396,7 +269,7 @@ private fun extractYoutubeBrowseIdFromUrl(rawUrl: String?): String? {
             ?.trim('/')
             ?.let(::sanitizeYoutubeMusicToken)
             .orEmpty()
-    return browseId.takeIf { it.startsWith(YT_BROWSE_PREFIX) }
+    return browseId.takeIf { it.startsWith(YT_MUSIC_BROWSE_PREFIX) }
 }
 
 private fun extractYoutubeIdFromUrl(rawUrl: String?): String? {
@@ -407,7 +280,7 @@ private fun extractYoutubeIdFromUrl(rawUrl: String?): String? {
             ?.trim('/')
             ?.let(::sanitizeYoutubeMusicToken)
             .orEmpty()
-    if (browseId.startsWith(YT_BROWSE_PREFIX) || isYoutubePlaylistToken(browseId)) {
+    if (browseId.startsWith(YT_MUSIC_BROWSE_PREFIX) || isYoutubePlaylistToken(browseId)) {
         return browseId
     }
     val listParam = extractQueryParam(uri.rawQuery, "list")?.let(::sanitizeYoutubeMusicToken)
@@ -520,7 +393,7 @@ internal fun findFirstPlaylistId(element: JsonElement): String? =
     findFirstJsonToken(element, "playlistId", ::isYoutubePlaylistToken)
 
 private fun findFirstAlbumBrowseId(element: JsonElement): String? =
-    findFirstJsonToken(element, "browseId") { token -> token.startsWith(YT_BROWSE_PREFIX) }
+    findFirstJsonToken(element, "browseId") { token -> token.startsWith(YT_MUSIC_BROWSE_PREFIX) }
 
 private fun containsPageType(element: JsonElement, targetPageType: String): Boolean =
     findFirstJsonToken(element, "pageType") { it == targetPageType } != null
@@ -594,12 +467,11 @@ private fun collectRunsText(element: JsonElement, out: StringBuilder) {
 }
 
 private fun isYoutubePlaylistToken(token: String): Boolean =
-    token.startsWith(YT_OLAK_PREFIX) || token.startsWith("PL")
+    token.startsWith(YT_MUSIC_OLAK_PREFIX) || token.startsWith("PL")
 
 internal fun isAlbumBrowseYoutubeId(rawId: String?): Boolean {
     val clean = rawId?.trim()?.takeIf(String::isNotEmpty) ?: return false
-    return buildYoutubeMusicAlbumUrl(clean)
-        .startsWith("$YT_MUSIC_ORIGIN_URL/browse/$YT_BROWSE_PREFIX")
+    return buildYoutubeMusicAlbumUrl(clean).startsWith(YT_MUSIC_BROWSE_URL_PREFIX)
 }
 
 internal fun buildInnertubeSearchBody(query: String): String = buildJsonObject {
@@ -620,26 +492,8 @@ private fun JsonObjectBuilder.putInnertubeContext() {
     }
 }
 
-private data class ArtistEnrichmentPlan(
-    val artistId: String,
-    val lowerArtist: String,
-    val needWikipedia: Boolean,
-    val needSpotify: Boolean,
-)
-
-private const val SCHEME_YT_MUSIC = "youtube_music"
-private const val SCHEME_APPLE_MUSIC = "apple_music"
-private const val SCHEME_TIDAL = "tidal"
-private const val SCHEME_QOBUZ = "qobuz"
-private const val SCHEME_DEEZER = "deezer"
-private const val SCHEME_AMAZON_MUSIC = "amazon_music"
-private const val SCHEME_WIKIPEDIA = "wikipedia"
-private const val SCHEME_SPOTIFY = "spotify"
-private const val YT_BROWSE_PREFIX = "MPREb"
-private const val YT_OLAK_PREFIX = "OLAK5uy_"
-private const val YT_MUSIC_ORIGIN_URL = "https://music.youtube.com"
 private const val ODESLI_ENDPOINT = "https://api.song.link/v1-alpha.1/links"
-private const val INNERTUBE_SEARCH_URL = "$YT_MUSIC_ORIGIN_URL/youtubei/v1/search?prettyPrint=false"
+private const val INNERTUBE_SEARCH_URL = "$YT_MUSIC_ORIGIN/youtubei/v1/search?prettyPrint=false"
 private const val INNERTUBE_ALBUMS_FILTER_PARAMS = "EgWKAQIYAWoKEAkQChAFEAMQBA=="
 private const val INNERTUBE_WEB_REMIX_VERSION = "1.20260707.12.00"
 private const val AUDIOBOOK_PAGE_TYPE = "MUSIC_PAGE_TYPE_AUDIOBOOK"
@@ -660,5 +514,5 @@ internal val INNERTUBE_POST_HEADERS =
     mapOf(
         "Content-Type" to MIME_APPLICATION_JSON,
         "Accept" to MIME_APPLICATION_JSON,
-        "Origin" to YT_MUSIC_ORIGIN_URL,
+        "Origin" to YT_MUSIC_ORIGIN,
     )

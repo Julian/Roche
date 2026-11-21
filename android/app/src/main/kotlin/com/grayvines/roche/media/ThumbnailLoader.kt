@@ -6,7 +6,8 @@ import androidx.collection.LruCache
 import com.grayvines.roche.core.isHttpOrHttpsUrl
 import com.grayvines.roche.core.isHttpsUrl
 import com.grayvines.roche.core.runSuspendCatching
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.PublicWebFetcher
+import com.grayvines.roche.data.remote.RocheServerApi
 import com.grayvines.roche.data.settings.SettingsRepository
 import java.io.File
 import java.nio.ByteBuffer
@@ -19,16 +20,19 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
+@Suppress("LongParameterList")
 class ThumbnailLoader(
-    apiClient: RocheApiClient,
+    serverApi: RocheServerApi,
     settings: SettingsRepository,
     cacheDir: File? = null,
     decoder: (ByteArray) -> Bitmap? = ::decodeBitmapBytes,
     clockMs: () -> Long = System::currentTimeMillis,
     diskCache: ThumbnailDiskCache = ThumbnailDiskCache(cacheDir, clockMs = clockMs),
+    publicWebFetcher: PublicWebFetcher = PublicWebFetcher(),
 ) :
     BitmapLoader<Bitmap>(
-        apiClient = apiClient,
+        serverApi = serverApi,
+        publicWebFetcher = publicWebFetcher,
         settings = settings,
         decoders = createBitmapDecoders(decoder),
         clockMs = clockMs,
@@ -64,13 +68,15 @@ internal data class ImageDecoders<T : Any>(
     val sizeOfKiB: (T) -> Int,
 )
 
+@Suppress("LongParameterList")
 open class BitmapLoader<T : Any>
 internal constructor(
-    private val apiClient: RocheApiClient,
+    private val serverApi: RocheServerApi,
     private val settings: SettingsRepository,
     private val decoders: ImageDecoders<T>,
     private val clockMs: () -> Long = System::currentTimeMillis,
     private val diskCache: ThumbnailDiskCache = ThumbnailDiskCache(null, clockMs = clockMs),
+    private val publicWebFetcher: PublicWebFetcher = PublicWebFetcher(),
 ) {
     private val imageCache: LruCache<String, T> =
         createImageLruCache(MAX_IMAGE_CACHE_KIB, decoders.sizeOfKiB)
@@ -285,7 +291,10 @@ internal constructor(
                 when {
                     isHttpsUrl(mediaId) -> {
                         attempted = true
-                        apiClient.fetchExternalImageBytes(mediaId)
+                        publicWebFetcher.fetchImageBytes(
+                            imageUrl = mediaId,
+                            maxBytes = ThumbnailLoader.MAX_THUMBNAIL_BYTES.toInt(),
+                        )
                     }
                     policy == ImageSourcePolicy.EXTERNAL_HTTPS_ONLY ||
                         isHttpOrHttpsUrl(mediaId) -> {
@@ -297,7 +306,7 @@ internal constructor(
                         val token = currentSettings.bearerToken
                         if (serverUrl.isNotBlank() && token.isNotBlank()) {
                             attempted = true
-                            apiClient.fetchMediaBytes(serverUrl, token, mediaId)
+                            serverApi.fetchMediaBytes(serverUrl, token, mediaId)
                         } else {
                             null
                         }
@@ -324,11 +333,12 @@ internal constructor(
                     val (streamed, didAttempt) =
                         if (stagingFile != null) {
                             streamRemoteSourceToFile(
-                                apiClient,
-                                settings,
-                                mediaId,
-                                policy,
-                                stagingFile,
+                                serverApi = serverApi,
+                                publicWebFetcher = publicWebFetcher,
+                                settings = settings,
+                                mediaId = mediaId,
+                                policy = policy,
+                                stagingFile = stagingFile,
                             )
                         } else {
                             false to false
@@ -382,8 +392,10 @@ internal fun bitmapSizeKiB(bitmap: Bitmap): Int =
         .toInt()
         .coerceAtLeast(1)
 
+@Suppress("LongParameterList")
 internal suspend fun streamRemoteSourceToFile(
-    apiClient: RocheApiClient,
+    serverApi: RocheServerApi,
+    publicWebFetcher: PublicWebFetcher,
     settings: SettingsRepository,
     mediaId: String,
     policy: ImageSourcePolicy,
@@ -391,10 +403,10 @@ internal suspend fun streamRemoteSourceToFile(
 ): Pair<Boolean, Boolean> =
     when {
         isHttpsUrl(mediaId) -> {
-            apiClient.streamExternalBinaryToFile(
-                mediaId,
-                stagingFile,
-                ThumbnailLoader.MAX_THUMBNAIL_BYTES,
+            publicWebFetcher.streamBinaryToFile(
+                fileUrl = mediaId,
+                targetFile = stagingFile,
+                maxBytes = ThumbnailLoader.MAX_THUMBNAIL_BYTES,
             ) to true
         }
         policy == ImageSourcePolicy.EXTERNAL_HTTPS_ONLY || isHttpOrHttpsUrl(mediaId) -> {
@@ -405,7 +417,7 @@ internal suspend fun streamRemoteSourceToFile(
             val serverUrl = currentSettings.serverUrl
             val token = currentSettings.bearerToken
             if (serverUrl.isNotBlank() && token.isNotBlank()) {
-                apiClient.streamMediaToFile(
+                serverApi.streamMediaToFile(
                     serverUrl = serverUrl,
                     token = token,
                     mediaId = mediaId,

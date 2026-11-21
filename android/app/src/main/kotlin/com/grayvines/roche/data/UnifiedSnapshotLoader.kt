@@ -20,7 +20,7 @@ import com.grayvines.roche.data.local.RepositoryStampRow
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TagRow
 import com.grayvines.roche.data.local.toCatalogStamp
-import com.grayvines.roche.data.sync.PeerNodeDto
+import com.grayvines.roche.data.remote.PeerNodeDto
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -49,20 +49,27 @@ internal class UnifiedSnapshotLoader(
     internal var inboxProjectionRebuilds: Int = 0
         private set
 
-    suspend fun loadSnapshot(activePeers: List<PeerNodeDto>): RepositorySnapshot =
-        loadMutex.withLock {
-            val tablesState = refreshUnifiedTables()
-            val catalogSnap =
-                catalog.resolveFromPreloadedTables(
-                    stamp = tablesState.stamp.toCatalogStamp(),
-                    tables = tablesState.catalogTables,
-                )
-            val inboxBase = resolveInboxBase(tablesState, activePeers)
-            inboxBase.copy(activePeers = activePeers, catalog = catalogSnap)
-        }
+    suspend fun loadSnapshot(
+        activePeers: List<PeerNodeDto>,
+        observedStamp: RepositoryStampRow? = null,
+    ): RepositorySnapshot = loadMutex.withLock {
+        val tablesState = refreshUnifiedTables(observedStamp)
+        val catalogSnap =
+            catalog.resolveFromPreloadedTables(
+                stamp = tablesState.stamp.toCatalogStamp(),
+                tables = tablesState.catalogTables,
+            )
+        val inboxBase = resolveInboxBase(tablesState, activePeers)
+        inboxBase.copy(activePeers = activePeers, catalog = catalogSnap)
+    }
 
-    private suspend fun refreshUnifiedTables(): CachedUnifiedTables {
+    private suspend fun refreshUnifiedTables(
+        observedStamp: RepositoryStampRow?
+    ): CachedUnifiedTables {
         val existing = cachedTablesState
+        if (observedStamp != null && existing != null && existing.stamp == observedStamp) {
+            return existing
+        }
         var loaded: CachedUnifiedTables? = null
         dao.executeInTransaction {
             val currentStamp = dao.getRepositoryStamp()
@@ -198,12 +205,12 @@ internal class UnifiedSnapshotLoader(
 }
 
 internal data class InboxInputStamp(
-    val entriesStamp: String,
-    val specsStamp: String,
-    val membersStamp: String,
-    val statesStamp: String,
-    val contentsStamp: String,
-    val feedsStamp: String,
+    val entriesStamp: Long,
+    val specsStamp: Long,
+    val membersStamp: Long,
+    val statesStamp: Long,
+    val contentsStamp: Long,
+    val feedsStamp: Long,
 )
 
 internal data class InboxSatelliteTables(

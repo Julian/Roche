@@ -56,6 +56,10 @@ private class GraphEdgesBatchCache(private val dao: RocheDao) {
     private var specsByIdCache: Map<String, CollectionSpecEntity>? = null
     private var membershipsByKeyCache: MutableMap<Pair<String, String>, CollectionEntryEntity>? =
         null
+    private var knownEntryIdsCache: Set<String>? = null
+
+    suspend fun knownEntryIds(): Set<String> =
+        knownEntryIdsCache ?: dao.getAllEntryIds().toHashSet().also { knownEntryIdsCache = it }
 
     suspend fun tombstonesFor(entityType: String): MutableMap<String, TombstoneEntity> {
         val grouped =
@@ -103,6 +107,7 @@ private class GraphEdgesBatchCache(private val dao: RocheDao) {
     }
 
     suspend fun refreshMembershipsForEntry(entryId: String) {
+        knownEntryIdsCache = null
         val map = membershipsByKeyCache ?: return
         val iter = map.entries.iterator()
         while (iter.hasNext()) {
@@ -281,10 +286,12 @@ private suspend fun mergeCollectionEntriesInDao(
         childrenByParent.getOrPut(colId) { HashSet() }.add(entryId)
     }
     val tombstones = cache.tombstonesFor(TOMBSTONE_ENTITY_COLLECTION_ENTRY)
+    val knownEntryIds = cache.knownEntryIds()
     val ctx =
         IncomingMembershipCtx(
             redirects = redirects,
             suppressedEntryIds = suppressedEntryIds,
+            knownEntryIds = knownEntryIds,
             existingMemberships = existingMemberships,
             tombstones = tombstones,
             childrenByParent = childrenByParent,
@@ -319,11 +326,27 @@ private suspend fun mergeCollectionEntriesInDao(
 private data class IncomingMembershipCtx(
     val redirects: Map<String, String>,
     val suppressedEntryIds: Set<String>,
+    val knownEntryIds: Set<String>,
     val existingMemberships: Map<Pair<String, String>, CollectionEntryEntity>,
     val tombstones: Map<String, TombstoneEntity>,
     val childrenByParent: Map<String, Set<String>>,
     val nowMs: Long,
 )
+
+private fun resolveKnownEntryId(
+    rawId: String,
+    redirects: Map<String, String>,
+    knownEntryIds: Set<String>,
+): String? {
+    val clean = rawId.trim()
+    if (clean.isEmpty()) return null
+    val resolved = followMergedInMap(clean, redirects)
+    return when {
+        resolved.isNotEmpty() && resolved in knownEntryIds -> resolved
+        clean in knownEntryIds -> clean
+        else -> null
+    }
+}
 
 private fun resolveIncomingMembershipDto(
     ce: SyncCollectionEntryDto,
@@ -333,8 +356,8 @@ private fun resolveIncomingMembershipDto(
 ): Pair<CollectionEntryEntity, String?>? {
     val rawColId = ce.collectionId.trim()
     val rawEntryId = ce.entryId.trim()
-    val colId = followMergedInMap(rawColId, ctx.redirects)
-    val entryId = followMergedInMap(rawEntryId, ctx.redirects)
+    val colId = resolveKnownEntryId(rawColId, ctx.redirects, ctx.knownEntryIds) ?: return null
+    val entryId = resolveKnownEntryId(rawEntryId, ctx.redirects, ctx.knownEntryIds) ?: return null
     if (isInvalidOrSuppressedEdge(rawColId, rawEntryId, colId, entryId, ctx.suppressedEntryIds)) {
         return null
     }
@@ -390,14 +413,25 @@ private suspend fun mergeConsumptionLogsInDao(
 ) {
     if (incoming.isEmpty()) return
     val tombstonesById = cache.tombstonesFor(TOMBSTONE_ENTITY_CONSUMPTION_LOG)
+    val allExistingLogs = dao.getAllConsumptionLogs()
+    val existingById = allExistingLogs.associateBy { it.id }
     val existingConsumedByEntry =
-        dao.getAllConsumptionLogs()
+        allExistingLogs
             .filter { ConsumptionStatus.fromWireValue(it.status) == ConsumptionStatus.CONSUMED }
             .groupBy { it.entryId }
-    val acc = IncomingLogsAcc(existingConsumedByEntry, tombstonesById, serverNode, nowIso, nowMs)
+    val knownEntryIds = cache.knownEntryIds()
+    val acc =
+        IncomingLogsAcc(
+            existingById = existingById,
+            existingConsumedByEntry = existingConsumedByEntry,
+            tombstonesById = tombstonesById,
+            serverNode = serverNode,
+            nowIso = nowIso,
+            nowMs = nowMs,
+        )
     for (log in incoming) {
-        val entryId = followMergedInMap(log.entryId, redirects)
-        if (entryId.isNotEmpty()) {
+        val entryId = resolveKnownEntryId(log.entryId, redirects, knownEntryIds)
+        if (entryId != null) {
             acc.accept(log, entryId)
         }
     }
@@ -407,15 +441,21 @@ private suspend fun mergeConsumptionLogsInDao(
         cache.removeTombstone(TOMBSTONE_ENTITY_CONSUMPTION_LOG, it)
     }
     plan.replacedAutoLogIds.forEach { dao.deleteConsumptionLogById(it) }
-    if (plan.toInsert.isNotEmpty()) {
-        dao.insertConsumptionLogsIgnore(plan.toInsert)
+    for (row in plan.toInsert) {
+        if (row.id in existingById) {
+            dao.upsertConsumptionLog(row)
+        } else {
+            dao.insertConsumptionLogIgnore(row)
+        }
     }
     if (plan.maxConsumedHlcByEntry.isNotEmpty()) {
         prunePromotedWantMemberships(dao, cache, plan.maxConsumedHlcByEntry)
     }
 }
 
+@Suppress("LongParameterList")
 private class IncomingLogsAcc(
+    private val existingById: Map<String, ConsumptionLogEntity>,
     private val existingConsumedByEntry: Map<String, List<ConsumptionLogEntity>>,
     private val tombstonesById: Map<String, TombstoneEntity>,
     private val serverNode: String,
@@ -436,7 +476,12 @@ private class IncomingLogsAcc(
         val logHlc = resolveOrSynthesizeHlc(log.hlc, log.ts, nowIso, serverNode, nowMs)
         if (!checkAndClearLogTombstone(id, logHlc)) return
 
-        if (isConsumed && id == autoLogId && entryId in consumedInBatch) {
+        val existing = existingById[id]
+        if (existing != null) {
+            if (!shouldIncomingWinHlc(logHlc, existing.hlc, existing.isLocalDirty)) {
+                return
+            }
+        } else if (isConsumed && id == autoLogId && entryId in consumedInBatch) {
             recordConsumedHlc(entryId, logHlc)
             return
         }
@@ -447,11 +492,11 @@ private class IncomingLogsAcc(
             ConsumptionLogEntity(
                 id = id,
                 entryId = entryId,
-                ts = log.ts.ifBlank { nowIso },
+                ts = log.ts.ifBlank { existing?.ts ?: nowIso },
                 status = status.wireValue,
                 notes = log.notes?.trim()?.takeIf { it.isNotEmpty() },
-                createdAt = log.createdAt ?: nowIso,
-                hlc = logHlc,
+                createdAt = log.createdAt ?: existing?.createdAt ?: nowIso,
+                hlc = maxHlc(logHlc, existing?.hlc),
                 isLocalDirty = false,
             )
         )
@@ -574,7 +619,10 @@ private suspend fun resolveIncomingComparisonDto(
     val canonicalOrdering = canonicalizeIncomingOrdering(comp.ordering, redirects)
     if (EpRankingEngine.validateOrdering(canonicalOrdering).isFailure) return null
     val rawScope = comp.scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }
-    val scope = rawScope?.let { followMergedInMap(it, redirects) }?.takeIf { it.isNotEmpty() }
+    val knownIds = cache.knownEntryIds()
+    val scope = rawScope?.let { raw ->
+        resolveKnownEntryId(raw, redirects, knownIds) ?: return null
+    }
     val tsMillis = parseIsoInstant(comp.ts)?.toEpochMilli() ?: 0L
     val wasRewritten = canonicalOrdering != comp.ordering || scope != rawScope
     val rawId = comp.id.trim()
@@ -908,6 +956,7 @@ internal suspend fun foldMergedDuplicateInDao(
     nowIso: String,
     cache: DuplicateFoldBatchCache? = null,
 ) {
+    if (dupId == canonId || dao.getEntryById(canonId) == null) return
     val batch = cache ?: DuplicateFoldBatchCache(dao)
     dao.repointMergedIntoEntries(dupId = dupId, canonId = canonId, updatedAt = nowIso)
     backfillCanonicalEntryOnFold(dao = dao, dupId = dupId, canonId = canonId, nowIso = nowIso)

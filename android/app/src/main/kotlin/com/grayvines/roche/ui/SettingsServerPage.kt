@@ -61,9 +61,9 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.grayvines.roche.BuildConfig
 import com.grayvines.roche.core.isLoopbackHost
+import com.grayvines.roche.data.remote.NetworkTier
+import com.grayvines.roche.data.remote.PeerNodeDto
 import com.grayvines.roche.data.settings.normalizeServerUrl
-import com.grayvines.roche.data.sync.NetworkTier
-import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.model.isCrossPeerRescueError
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle

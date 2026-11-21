@@ -7,62 +7,25 @@ import com.grayvines.roche.core.isSyncablePublicUrl
 import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.core.parseIsoEpochSecs
 import com.grayvines.roche.data.local.FeedRow
+import com.grayvines.roche.data.remote.NetworkTier
+import com.grayvines.roche.data.remote.PeerNodeDto
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Instant
 import kotlin.math.abs
 import kotlin.math.ln
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
 
 internal const val SERVER_PEER_ID = "server"
 internal const val DEFAULT_POLL_INTERVAL_MINUTES = 30
 
-enum class NetworkTier(val wireValue: String, val defaultWeight: Double, val displayLabel: String) {
-    WIRED("wired", WIRED_DEFAULT_WEIGHT, "Wired"),
-    WIFI("wifi", WIFI_DEFAULT_WEIGHT, "Wi-Fi"),
-    CELLULAR("cellular", CELLULAR_DEFAULT_WEIGHT, "Cellular"),
-    OFFLINE("offline", OFFLINE_DEFAULT_WEIGHT, "Offline");
-
-    companion object {
-        fun fromWireValue(raw: String?): NetworkTier =
-            entries.firstOrNull { it.wireValue.equals(raw?.trim(), ignoreCase = true) } ?: WIFI
-    }
-}
-
 fun interface NetworkTierProvider {
     fun currentNetworkTier(): NetworkTier
 
-    fun isVpnTransportActive(): Boolean = true
+    fun isVpnTransportActive(): Boolean = false
 
     fun activeTailnetDomains(): List<String> = emptyList()
 }
-
-@Serializable
-data class PeerNodeDto(
-    @SerialName("peer_id") val peerId: String = "",
-    @SerialName("device_name") val deviceName: String = "",
-    @SerialName("network_tier") val networkTier: String = NetworkTier.WIFI.wireValue,
-    val weight: Double = NetworkTier.WIFI.defaultWeight,
-    @SerialName("last_seen_at") val lastSeenAt: String = "",
-)
-
-internal fun PeerNodeDto.normalized(): PeerNodeDto =
-    copy(
-        peerId = peerId.takeIf { it.isNotBlank() }.orEmpty(),
-        deviceName = deviceName.takeIf { it.isNotBlank() }.orEmpty(),
-        networkTier = networkTier.takeIf { it.isNotBlank() } ?: NetworkTier.WIFI.wireValue,
-        lastSeenAt = lastSeenAt.takeIf { it.isNotBlank() }.orEmpty(),
-    )
-
-@Serializable
-data class SyncTombstoneDto(
-    @SerialName("entity_type") val entityType: String = "",
-    @SerialName("natural_key") val naturalKey: String = "",
-    @SerialName("deleted_at") val deletedAt: String = "",
-    val hlc: String = "",
-)
 
 /**
  * Maps `(peerId, feedUrl, epoch)` deterministically to a uniform value in `(0.0, 1.0)` using the
@@ -387,10 +350,6 @@ internal fun shouldPeerPollFeed(
 
 private const val DIGEST_ALGORITHM_SHA256 = "SHA-256"
 internal const val DEFAULT_ONLINE_PEER_WEIGHT = 1.0
-private const val WIRED_DEFAULT_WEIGHT = DEFAULT_ONLINE_PEER_WEIGHT
-private const val WIFI_DEFAULT_WEIGHT = DEFAULT_ONLINE_PEER_WEIGHT
-private const val CELLULAR_DEFAULT_WEIGHT = DEFAULT_ONLINE_PEER_WEIGHT
-private const val OFFLINE_DEFAULT_WEIGHT = 0.0
 private const val HRW_SHIFT_BITS = 11
 private const val HRW_HALF_OFFSET = 0.5
 private const val IEEE754_MANTISSA_BITS = 53

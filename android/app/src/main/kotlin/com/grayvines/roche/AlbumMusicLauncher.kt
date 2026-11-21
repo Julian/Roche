@@ -11,6 +11,11 @@ import android.content.pm.verify.domain.DomainVerificationUserState
 import android.provider.MediaStore
 import androidx.core.net.toUri
 import com.grayvines.roche.core.SCHEME_SPOTIFY
+import com.grayvines.roche.core.TIDAL_BROWSE_ALBUM_PREFIX
+import com.grayvines.roche.core.TIDAL_LISTEN_ALBUM_PREFIX
+import com.grayvines.roche.core.YT_MUSIC_BROWSE_URL_PREFIX
+import com.grayvines.roche.core.YT_MUSIC_OLAK_PLAYLIST_URL_PREFIX
+import com.grayvines.roche.core.YT_MUSIC_PLAYLIST_URL_PREFIX
 import com.grayvines.roche.core.externalIdentifierUrl
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.MusicTrackLaunchRequest
@@ -476,8 +481,7 @@ internal fun buildTrackSearchIntent(
 
 private const val BROWSER_PROBE_URL = "https://example.invalid"
 private const val SHARED_VIDEO_PARENT_DOMAIN = "youtube.com"
-private const val YT_MUSIC_PLAYLIST_URL_PREFIX = "https://music.youtube.com/playlist?list="
-private const val YT_MUSIC_OLAK_PLAYLIST_PREFIX = "https://music.youtube.com/playlist?list=OLAK5uy_"
+private const val YT_MUSIC_OLAK_PLAYLIST_PREFIX = YT_MUSIC_OLAK_PLAYLIST_URL_PREFIX
 private const val METROLIST_PACKAGE = "com.metrolist.music"
 private const val METROLIST_ALT_PACKAGE_PREFIX = "com.metrolist.android"
 
@@ -504,12 +508,12 @@ private val NON_MUSIC_VIDEO_PACKAGE_PREFIXES =
 
 private val PLATFORM_PROBE_URLS =
     listOf(
-        "https://music.youtube.com/playlist?list=OLAK5uy_probe",
-        "https://music.youtube.com/browse/MPREb_probe",
+        "${YT_MUSIC_OLAK_PLAYLIST_URL_PREFIX}probe",
+        "${YT_MUSIC_BROWSE_URL_PREFIX}_probe",
         "https://open.spotify.com/album/0probe",
         "https://music.apple.com/album/1",
-        "https://tidal.com/browse/album/1",
-        "https://listen.tidal.com/album/1",
+        "${TIDAL_BROWSE_ALBUM_PREFIX}1",
+        "${TIDAL_LISTEN_ALBUM_PREFIX}1",
         "https://open.qobuz.com/album/1",
         "https://www.deezer.com/album/1",
         "https://music.amazon.com/albums/B000000000",

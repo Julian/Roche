@@ -77,10 +77,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import com.grayvines.roche.data.catalog.CatalogSnapshot
-import com.grayvines.roche.data.catalog.RankClusterCandidate
 import com.grayvines.roche.data.catalog.RankSettlementSummary
 import com.grayvines.roche.data.catalog.RankedCatalogEntry
 import com.grayvines.roche.ranking.RankBoardState
+import com.grayvines.roche.ranking.RankClusterCandidate
 import com.grayvines.roche.ranking.RankDropTarget
 import com.grayvines.roche.ranking.RankDropZone
 import com.grayvines.roche.ranking.resolveRankDropTarget

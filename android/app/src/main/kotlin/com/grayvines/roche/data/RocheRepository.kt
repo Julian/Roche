@@ -1,12 +1,16 @@
 package com.grayvines.roche.data
 
 import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
+import com.grayvines.roche.core.RocheLog
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.collectionEntryNaturalKey
+import com.grayvines.roche.core.deterministicFeedId
 import com.grayvines.roche.core.deterministicTagId
 import com.grayvines.roche.core.extractHostTitle
+import com.grayvines.roche.core.feedNaturalKey
+import com.grayvines.roche.core.inferFeedTypeWireValue
 import com.grayvines.roche.core.isLikelyFeedUrl
 import com.grayvines.roche.core.isLocalPdfUrl
 import com.grayvines.roche.core.isSyncableItemUrl
@@ -24,18 +28,27 @@ import com.grayvines.roche.data.catalog.attachEntryIdentifiers
 import com.grayvines.roche.data.catalog.hasYoutubeAlbumBrowseId
 import com.grayvines.roche.data.enrichment.AlbumStreamingResolver
 import com.grayvines.roche.data.enrichment.withResolvedStreamingIds
+import com.grayvines.roche.data.feeds.LocalFeedPoller
+import com.grayvines.roche.data.feeds.ParsedFeedBatch
+import com.grayvines.roche.data.feeds.buildLocalOpmlXml
+import com.grayvines.roche.data.feeds.canonicalizeFeedUrl
 import com.grayvines.roche.data.feeds.copySharedPdfStreamToCache
 import com.grayvines.roche.data.feeds.discoverFeedFromUrl
 import com.grayvines.roche.data.feeds.enrichWantToReadItemOnDevice
 import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
 import com.grayvines.roche.data.local.CollectionEntryEntity
+import com.grayvines.roche.data.local.DbWriteLock
+import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.ItemTagRow
+import com.grayvines.roche.data.local.LocalSyncFlagEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.TagRow
 import com.grayvines.roche.data.local.TombstoneEntity
+import com.grayvines.roche.data.local.attachTagsLocally
 import com.grayvines.roche.data.local.buildSqlContainsPattern
+import com.grayvines.roche.data.local.deleteFeedPreservingHistory
 import com.grayvines.roche.data.local.deleteItemPreservingHistory
 import com.grayvines.roche.data.local.ensureWantToReadSpecExists
 import com.grayvines.roche.data.local.extractFtsTokenQueries
@@ -48,25 +61,26 @@ import com.grayvines.roche.data.local.setItemReadProgress
 import com.grayvines.roche.data.local.setItemStatusAndReadAt
 import com.grayvines.roche.data.local.updateFeedActiveGraph
 import com.grayvines.roche.data.local.updateFeedTitleGraph
+import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.local.upsertTag
+import com.grayvines.roche.data.remote.HttpStatusException
+import com.grayvines.roche.data.remote.NetworkTier
+import com.grayvines.roche.data.remote.PeerNodeDto
+import com.grayvines.roche.data.remote.ProblemDetailsException
 import com.grayvines.roche.data.remote.PublicUrlValidator
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.PublicWebFetcher
+import com.grayvines.roche.data.remote.RocheServerApi
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
 import com.grayvines.roche.data.settings.keepTokenOnDiscovery
 import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.data.settings.parsePairingInput
 import com.grayvines.roche.data.settings.tailscaleHttpsUpgrades
-import com.grayvines.roche.data.sync.NetworkTier
 import com.grayvines.roche.data.sync.NetworkTierProvider
-import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.data.sync.PeerSyncCoordinator
-import com.grayvines.roche.data.sync.buildLocalOpmlXml
-import com.grayvines.roche.data.sync.deleteFeedFromServerOrLocal
 import com.grayvines.roche.data.sync.pollCooperativeFeedsOnDevice
-import com.grayvines.roche.data.sync.refreshFeedOnlineOrOnDevice
-import com.grayvines.roche.data.sync.subscribeFeedBestEffort
+import com.grayvines.roche.media.DEFAULT_MAX_OFFLINE_CACHE_BYTES
 import com.grayvines.roche.media.OfflineCacheManager
 import com.grayvines.roche.media.ThumbnailDiskCache
 import com.grayvines.roche.media.resolveCachedAudioFile
@@ -126,6 +140,19 @@ data class ReaderItemContent(
     val contentText: String?,
 )
 
+data class SyncStatusState(
+    val lastSyncedAtIso: String? = null,
+    val lastError: String? = null,
+    val isAuthError: Boolean = false,
+)
+
+data class WorkspaceSearchResult(
+    val entries: List<InboxEntry> = emptyList(),
+    val snippetsByEntryId: Map<String, String> = emptyMap(),
+    val matchedCollectionIds: List<String> = emptyList(),
+    val matchedDiaryLogs: List<com.grayvines.roche.data.local.ConsumptionLogEntity> = emptyList(),
+)
+
 data class RepositorySnapshot(
     val entries: List<InboxEntry>,
     val feeds: List<FeedItem>,
@@ -137,7 +164,7 @@ data class RepositorySnapshot(
 @Suppress("TooManyFunctions", "LargeClass", "LongParameterList")
 class RocheRepository(
     private val database: RocheDatabase,
-    private val apiClient: RocheApiClient,
+    private val serverApi: RocheServerApi,
     private val settings: SettingsRepository,
     private val cacheDir: File? = null,
     private val networkTierProvider: NetworkTierProvider = NetworkTierProvider { NetworkTier.WIFI },
@@ -145,23 +172,33 @@ class RocheRepository(
     private val albumStreamingResolver: AlbumStreamingResolver? = null,
     private val thumbnailDiskCache: ThumbnailDiskCache = ThumbnailDiskCache(cacheDir),
     catalogStore: CatalogStore? = null,
+    private val publicWebFetcher: PublicWebFetcher = PublicWebFetcher(),
+    maxOfflineCacheBytes: Long = DEFAULT_MAX_OFFLINE_CACHE_BYTES,
 ) {
     private val dao = database.dao()
     private val syncMutex = Mutex()
-    private val itemMutationMutex = Mutex()
     private val backgroundSyncRunning = AtomicBoolean(false)
     private val backgroundSyncPending = AtomicBoolean(false)
     private val activeSyncCount = AtomicInteger(0)
     private val _isSyncActive = MutableStateFlow(false)
     val isSyncActive: StateFlow<Boolean> = _isSyncActive.asStateFlow()
+    private val _syncStatus = MutableStateFlow(SyncStatusState())
+    val syncStatus: StateFlow<SyncStatusState> = _syncStatus.asStateFlow()
     private val entryCache = InboxEntryCache()
     private val activePeersFlow = MutableStateFlow<List<PeerNodeDto>>(emptyList())
     internal val hasBackgroundScope: Boolean
         get() = backgroundScope != null
 
     val catalog: CatalogStore =
-        (catalogStore ?: CatalogStore(dao = dao, localPeerIdProvider = ::currentLocalPeerId))
+        (catalogStore
+                ?: CatalogStore(
+                    dao = dao,
+                    localPeerIdProvider = ::currentLocalPeerId,
+                    writeLock = database.writeLock,
+                ))
             .also { store -> store.setOnLocalMutation(::triggerBackgroundSync) }
+
+    private val itemMutationMutex: DbWriteLock = catalog.writeLock
     @Volatile
     internal var latestSnapshot: RepositorySnapshot? = null
         private set
@@ -169,11 +206,16 @@ class RocheRepository(
     private val offlineCacheManager =
         OfflineCacheManager(
             dao = dao,
-            apiClient = apiClient,
+            serverApi = serverApi,
+            publicWebFetcher = publicWebFetcher,
             settings = settings,
             cacheDir = cacheDir,
             thumbnailDiskCache = thumbnailDiskCache,
+            maxOfflineCacheBytes = maxOfflineCacheBytes,
+            writeLock = database.writeLock,
         )
+
+    val inFlightOfflineEntryIds: StateFlow<Set<String>> = offlineCacheManager.inFlightEntryIds
 
     internal val unifiedSnapshotLoader =
         UnifiedSnapshotLoader(dao = dao, catalog = catalog, entryCache = entryCache)
@@ -189,15 +231,31 @@ class RocheRepository(
                 stamp to activePeers
             }
             .conflate()
-            .mapLatest { (_, activePeers) ->
-                unifiedSnapshotLoader.loadSnapshot(activePeers).also { latestSnapshot = it }
+            .mapLatest { (stamp, activePeers) ->
+                unifiedSnapshotLoader.loadSnapshot(activePeers, observedStamp = stamp).also {
+                    latestSnapshot = it
+                }
             }
             .flowOn(Dispatchers.Default)
 
     private val prewarmedAlbumKeys: MutableSet<String> =
         java.util.Collections.synchronizedSet(HashSet())
 
-    suspend fun prewarm(): RepositorySnapshot = snapshot.first()
+    suspend fun prewarm(): RepositorySnapshot {
+        loadPersistedSyncStatus()
+        return snapshot.first()
+    }
+
+    internal suspend fun loadPersistedSyncStatus(): SyncStatusState {
+        val loaded =
+            SyncStatusState(
+                lastSyncedAtIso = dao.getLocalSyncFlag(FLAG_LAST_SYNCED_AT_ISO),
+                lastError = dao.getLocalSyncFlag(FLAG_LAST_SYNC_ERROR),
+                isAuthError = dao.getLocalSyncFlag(FLAG_LAST_SYNC_AUTH_ERROR) == "1",
+            )
+        _syncStatus.value = loaded
+        return loaded
+    }
 
     suspend fun resolveCollectionDrawStreaming(
         draw: CollectionDrawSnapshot,
@@ -221,10 +279,13 @@ class RocheRepository(
     }
 
     internal suspend fun searchDeepEntries(rawQuery: String): List<InboxEntry> =
+        searchWorkspace(rawQuery).entries
+
+    internal suspend fun searchWorkspace(rawQuery: String): WorkspaceSearchResult =
         withContext(Dispatchers.Default) {
             val cleanQuery = rawQuery.replace("\u0000", "").trim().trimStart('#').trim()
             if (cleanQuery.isBlank()) {
-                emptyList()
+                WorkspaceSearchResult()
             } else {
                 val likePattern = buildSqlContainsPattern(cleanQuery)
                 val tokenQueries = extractFtsTokenQueries(cleanQuery)
@@ -233,17 +294,67 @@ class RocheRepository(
                         tokenQueries = tokenQueries,
                         likePattern = likePattern,
                     )
-                if (matchedItems.isEmpty()) {
-                    emptyList()
-                } else {
-                    val tagNamesByItemId =
-                        groupSortedTagNamesByItemId(dao.getAllTags(), dao.getAllItemTags())
-                    matchedItems.map { entity ->
-                        toInboxEntry(entity, tagNamesByItemId[entity.id].orEmpty())
+                val entries =
+                    if (matchedItems.isEmpty()) {
+                        emptyList()
+                    } else {
+                        val tagNamesByItemId =
+                            groupSortedTagNamesByItemId(dao.getAllTags(), dao.getAllItemTags())
+                        matchedItems.map { entity ->
+                            toInboxEntry(entity, tagNamesByItemId[entity.id].orEmpty())
+                        }
                     }
-                }
+                val snippetsById = buildFtsSnippetsMap(tokenQueries)
+                val matchedCollectionIds = dao.searchCollectionIdsByTitle(likePattern)
+                val matchedDiaryLogs = dao.searchConsumptionLogsByNotes(likePattern)
+                WorkspaceSearchResult(
+                    entries = entries,
+                    snippetsByEntryId = snippetsById,
+                    matchedCollectionIds = matchedCollectionIds,
+                    matchedDiaryLogs = matchedDiaryLogs,
+                )
             }
         }
+
+    private suspend fun buildFtsSnippetsMap(tokenQueries: List<String>): Map<String, String> {
+        val firstToken = tokenQueries.firstOrNull() ?: return emptyMap()
+        val combinedMatch = tokenQueries.joinToString(" ")
+        val snippets = LinkedHashMap<String, String>()
+        querySnippetsWithFallback(combinedMatch, firstToken, tokenQueries.size > 1) { q ->
+                dao.searchContentFtsSnippets(q)
+            }
+            .forEach { row ->
+                val clean = sanitizeSnippetExcerpt(row.excerpt)
+                if (clean.isNotEmpty() && row.entryId !in snippets) {
+                    snippets[row.entryId] = clean
+                }
+            }
+        querySnippetsWithFallback(combinedMatch, firstToken, tokenQueries.size > 1) { q ->
+                dao.searchEntryFtsSnippets(q)
+            }
+            .forEach { row ->
+                val clean = sanitizeSnippetExcerpt(row.excerpt)
+                if (clean.isNotEmpty() && row.entryId !in snippets) {
+                    snippets[row.entryId] = clean
+                }
+            }
+        return snippets
+    }
+
+    private suspend fun querySnippetsWithFallback(
+        combinedMatch: String,
+        firstToken: String,
+        hasMultipleTokens: Boolean,
+        query: suspend (String) -> List<com.grayvines.roche.data.local.SearchSnippetRow>,
+    ): List<com.grayvines.roche.data.local.SearchSnippetRow> {
+        val primary = runSuspendCatching { query(combinedMatch) }.getOrNull()
+        if (!primary.isNullOrEmpty()) return primary
+        return if (primary == null || hasMultipleTokens) {
+            runSuspendCatching { query(firstToken) }.getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
+    }
 
     fun currentNetworkTier(): NetworkTier = networkTierProvider.currentNetworkTier()
 
@@ -272,12 +383,41 @@ class RocheRepository(
         itemId: String,
         archived: Boolean,
     ): Pair<ArchiveStateSnapshot?, Boolean> {
-        val current = dao.getItemStateById(itemId) ?: return null to false
-        val previous = ItemStatus.fromWireValue(current.status)
+        var result: Pair<ArchiveStateSnapshot?, Boolean> = null to false
+        dao.executeInTransaction {
+            val current = dao.getItemStateById(itemId)
+            if (current != null) {
+                val transition = buildArchiveTransition(current, archived)
+                dao.setItemStatusAndReadAt(
+                    itemId,
+                    transition.newStatus.wireValue,
+                    transition.newReadAt,
+                    currentLocalPeerId(),
+                )
+                if (archived) {
+                    maybeAutoLogFeedItemCompletion(itemId)
+                }
+                result = transition.snapshot to transition.shouldEvictAudio
+            }
+        }
+        return result
+    }
+
+    private data class ArchiveTransition(
+        val snapshot: ArchiveStateSnapshot,
+        val newStatus: ItemStatus,
+        val newReadAt: String?,
+        val shouldEvictAudio: Boolean,
+    )
+
+    private fun buildArchiveTransition(
+        current: com.grayvines.roche.data.local.ItemStateRow,
+        archived: Boolean,
+    ): ArchiveTransition {
         val snapshot =
             ArchiveStateSnapshot(
-                itemId = itemId,
-                previousStatus = previous,
+                itemId = current.id,
+                previousStatus = ItemStatus.fromWireValue(current.status),
                 previousReadAt = current.readAt,
             )
         val newStatus = if (archived) ItemStatus.ARCHIVED else ItemStatus.UNREAD
@@ -285,20 +425,19 @@ class RocheRepository(
             current.contentType.equals(AUDIO_CONTENT_TYPE, ignoreCase = true) ||
                 !current.audioUrl.isNullOrBlank()
         val newReadAt =
-            if (archived) {
-                if (isAudioItem) {
-                    nowUtcIso()
-                } else {
-                    current.readAt?.takeIf { it.isNotBlank() } ?: nowUtcIso()
-                }
-            } else {
+            if (!archived) {
                 null
+            } else if (isAudioItem) {
+                nowUtcIso()
+            } else {
+                current.readAt?.takeIf { it.isNotBlank() } ?: nowUtcIso()
             }
-        dao.setItemStatusAndReadAt(itemId, newStatus.wireValue, newReadAt, currentLocalPeerId())
-        if (archived) {
-            maybeAutoLogFeedItemCompletion(itemId)
-        }
-        return snapshot to (archived && current.isCachedOffline && isAudioItem)
+        return ArchiveTransition(
+            snapshot = snapshot,
+            newStatus = newStatus,
+            newReadAt = newReadAt,
+            shouldEvictAudio = archived && current.isCachedOffline && isAudioItem,
+        )
     }
 
     internal suspend fun restoreStatus(
@@ -493,7 +632,9 @@ class RocheRepository(
     }
 
     suspend fun setFeedAutoDownload(feedId: String, enabled: Boolean) {
-        dao.updateFeedAutoDownload(feedId = feedId, enabled = enabled)
+        itemMutationMutex.withLock {
+            dao.updateFeedAutoDownload(feedId = feedId, enabled = enabled)
+        }
         if (enabled) {
             offlineCacheManager.autoDownloadNewEpisodes()
         }
@@ -501,7 +642,7 @@ class RocheRepository(
 
     suspend fun setFeedPlaybackSpeed(feedId: String, speed: Float?) {
         val clamped = speed?.takeIf { it.isFinite() }?.let(::clampPlaybackSpeed)
-        dao.updateFeedPlaybackSpeed(feedId = feedId, speed = clamped)
+        itemMutationMutex.withLock { dao.updateFeedPlaybackSpeed(feedId = feedId, speed = clamped) }
     }
 
     fun resolveAudioPlaybackSource(entry: InboxEntry): String =
@@ -522,7 +663,7 @@ class RocheRepository(
                     "Configure Server URL in Settings before importing OPML"
                 }
                 val imported =
-                    apiClient.importOpml(
+                    serverApi.importOpml(
                         serverUrl = currentSettings.serverUrl,
                         token = currentSettings.bearerToken,
                         opmlXml = trimmed,
@@ -541,11 +682,18 @@ class RocheRepository(
                         currentSettings.bearerToken.isNotBlank()
                 ) {
                     runSuspendCatching {
-                        apiClient.exportOpml(
+                        serverApi.exportOpml(
                             serverUrl = currentSettings.serverUrl,
                             token = currentSettings.bearerToken,
                         )
                     }
+                        .onFailure { err ->
+                            RocheLog.warn(
+                                LOG_TAG,
+                                "Server OPML export failed; falling back to local",
+                                err,
+                            )
+                        }
                         .getOrElse { buildLocalOpmlXml(dao.getAllFeeds()) }
                 } else {
                     buildLocalOpmlXml(dao.getAllFeeds())
@@ -629,15 +777,24 @@ class RocheRepository(
 
     internal suspend fun renameFeed(feedId: String, newTitle: String): String? {
         val cleanTitle = newTitle.trim()
-        val existing = if (cleanTitle.isNotBlank()) dao.getFeedById(feedId) else null
-        if (existing == null) return null
-        if (existing.title != cleanTitle) {
-            dao.updateFeedTitleGraph(
-                feedId = feedId,
-                cleanTitle = cleanTitle,
-                markDirty = isSyncablePublicUrl(existing.url),
-                nodeId = currentLocalPeerId(),
-            )
+        if (cleanTitle.isBlank()) return null
+        val changed =
+            itemMutationMutex.withLock {
+                dao.getFeedById(feedId)?.let { existing ->
+                    if (existing.title != cleanTitle) {
+                        dao.updateFeedTitleGraph(
+                            feedId = feedId,
+                            cleanTitle = cleanTitle,
+                            markDirty = isSyncablePublicUrl(existing.url),
+                            nodeId = currentLocalPeerId(),
+                        )
+                        true
+                    } else {
+                        false
+                    }
+                }
+            } ?: return null
+        if (changed) {
             triggerBackgroundSync()
         }
         return cleanTitle
@@ -645,16 +802,19 @@ class RocheRepository(
 
     suspend fun toggleFeedArchive(feedId: String): Result<Pair<String, Boolean>> =
         runSuspendCatching {
-            val existing = dao.getFeedById(feedId) ?: error("Feed not found: $feedId")
-            val nextIsActive = !existing.isActive
-            dao.updateFeedActiveGraph(
-                feedId = feedId,
-                isActive = nextIsActive,
-                markDirty = isSyncablePublicUrl(existing.url),
-                nodeId = currentLocalPeerId(),
-            )
+            val outcome = itemMutationMutex.withLock {
+                val existing = dao.getFeedById(feedId) ?: error("Feed not found: $feedId")
+                val nextIsActive = !existing.isActive
+                dao.updateFeedActiveGraph(
+                    feedId = feedId,
+                    isActive = nextIsActive,
+                    markDirty = isSyncablePublicUrl(existing.url),
+                    nodeId = currentLocalPeerId(),
+                )
+                existing.title.ifBlank { feedId } to !nextIsActive
+            }
             triggerBackgroundSync()
-            existing.title.ifBlank { feedId } to !nextIsActive
+            outcome
         }
 
     internal suspend fun applyTagToFeedItems(feedId: String, tagName: String): Int {
@@ -696,16 +856,32 @@ class RocheRepository(
     suspend fun refreshFeed(feedId: String): Result<String> = withSyncIndicator {
         withContext(Dispatchers.Default) {
             runSuspendCatching {
-                val title =
-                    refreshFeedOnlineOrOnDevice(
+                val currentSettings = settings.settings.first()
+                val localFeed = dao.getFeedById(feedId) ?: error("Feed not found: $feedId")
+                val existingTitle = localFeed.title
+                val localPoll =
+                    LocalFeedPoller.pollFeed(
                         dao = dao,
-                        apiClient = apiClient,
-                        settings = settings,
-                        feedId = feedId,
-                        onSyncWithServer = { syncWithServer() },
+                        publicWebFetcher = publicWebFetcher,
+                        feed = localFeed,
+                        localPeerId = currentSettings.peerId,
+                        writeLock = database.writeLock,
                     )
+                val hasServer =
+                    currentSettings.serverUrl.isNotBlank() &&
+                        currentSettings.bearerToken.isNotBlank() &&
+                        isServerSyncAllowedByTransport(currentSettings.serverUrl)
+                if (hasServer) {
+                    val syncOutcome = syncWithServer()
+                    if (localPoll.isFailure && syncOutcome.isFailure) {
+                        localPoll.getOrThrow()
+                    }
+                } else {
+                    localPoll.getOrThrow()
+                }
                 offlineCacheManager.autoDownloadNewEpisodes()
-                title
+                dao.getFeedById(localFeed.id)?.title?.ifBlank { existingTitle.ifBlank { feedId } }
+                    ?: existingTitle.ifBlank { feedId }
             }
         }
     }
@@ -713,16 +889,73 @@ class RocheRepository(
     suspend fun deleteFeed(feedId: String): Result<String> =
         withContext(Dispatchers.Default) {
             runSuspendCatching {
-                val deletedTitle =
-                    deleteFeedFromServerOrLocal(
-                        dao = dao,
-                        apiClient = apiClient,
-                        settings = settings,
-                        offlineCacheManager = offlineCacheManager,
-                        feedId = feedId,
-                    )
+                val (deletedTitle, evictedIds) =
+                    itemMutationMutex.withLock {
+                        val existing = dao.getFeedById(feedId)
+                        val isLocalOnly = existing != null && !isSyncablePublicUrl(existing.url)
+                        val nodeId = currentLocalPeerId()
+                        val ids = ArrayList<String>()
+                        dao.executeInTransaction {
+                            val hlc = nextLocalHlc(dao, nodeId)
+                            if (existing != null) {
+                                dao.upsertTombstone(
+                                    TombstoneEntity(
+                                        entityType = "feed",
+                                        naturalKey = feedNaturalKey(existing.url),
+                                        deletedAt = nowUtcIso(),
+                                        hlc = hlc,
+                                        isLocalDirty = !isLocalOnly,
+                                    )
+                                )
+                            }
+                            ids.addAll(
+                                dao.deleteFeedPreservingHistory(
+                                    feedId = feedId,
+                                    recordTombstones = !isLocalOnly,
+                                    nodeId = nodeId,
+                                    hlcOverride = hlc,
+                                )
+                            )
+                        }
+                        (existing?.title ?: feedId) to ids
+                    }
+                for (itemId in evictedIds) {
+                    if (dao.getEntryContentById(itemId) == null) {
+                        offlineCacheManager.evictCachedItemFiles(itemId)
+                    }
+                }
                 triggerBackgroundSync()
                 deletedTitle
+            }
+        }
+
+    internal suspend fun cachedItemBytesByEntryId(): Map<String, Long> =
+        offlineCacheManager.cachedBytesByEntryId()
+
+    internal suspend fun totalOfflineCacheBytes(): Long =
+        offlineCacheManager.totalOfflineCacheBytes()
+
+    internal suspend fun enrichCatalogEntryOnline(entryId: String): Result<Boolean> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val cleanId = entryId.trim()
+                val currentSettings = settings.settings.first()
+                val canEnrich =
+                    cleanId.isNotEmpty() &&
+                        currentSettings.serverUrl.isNotBlank() &&
+                        currentSettings.bearerToken.isNotBlank() &&
+                        isServerSyncAllowedByTransport(currentSettings.serverUrl)
+                if (canEnrich) {
+                    serverApi.enrichCatalogEntry(
+                        serverUrl = currentSettings.serverUrl,
+                        token = currentSettings.bearerToken,
+                        entryId = cleanId,
+                    )
+                    syncWithServer().getOrThrow()
+                    true
+                } else {
+                    false
+                }
             }
         }
 
@@ -772,10 +1005,7 @@ class RocheRepository(
             val trimmedUrl = normalizeUserSubmittedUrl(inputUrl)
             if (isLikelyFeedUrl(trimmedUrl)) {
                 val feedTitle =
-                    subscribeFeedBestEffort(
-                        dao = dao,
-                        apiClient = apiClient,
-                        settings = settings,
+                    subscribeFeedLocal(
                         url = trimmedUrl,
                         titleOverride = titleOverride,
                     )
@@ -1022,13 +1252,17 @@ class RocheRepository(
                 runSuspendCatching {
                     enrichWantToReadItemOnDevice(
                         dao = dao,
-                        apiClient = apiClient,
+                        publicWebFetcher = publicWebFetcher,
                         itemId = itemId,
                         url = url,
                         hasUserTitleOverride = hasUserTitleOverride,
                         nodeId = currentLocalPeerId(),
+                        writeLock = database.writeLock,
                     )
                 }
+                    .onFailure { err ->
+                        RocheLog.warn(LOG_TAG, "Background Want to Read enrichment failed", err)
+                    }
                 triggerBackgroundSync()
             }
         } else {
@@ -1045,12 +1279,9 @@ class RocheRepository(
     ): Result<SaveUrlResult> = withSyncIndicator {
         withContext(Dispatchers.Default) {
             runSuspendCatching {
-                val discovered = discoverFeedFromUrl(apiClient, inputUrl).getOrThrow()
+                val discovered = discoverFeedFromUrl(publicWebFetcher, inputUrl).getOrThrow()
                 val subscribedTitle =
-                    subscribeFeedBestEffort(
-                        dao = dao,
-                        apiClient = apiClient,
-                        settings = settings,
+                    subscribeFeedLocal(
                         url = discovered.feedUrl,
                         titleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() },
                         prefetchedBatch = discovered.prefetchedBatch,
@@ -1059,6 +1290,107 @@ class RocheRepository(
                 triggerBackgroundSync()
                 SaveUrlResult(title = subscribedTitle, kind = SavedResourceKind.FEED)
             }
+        }
+    }
+
+    private suspend fun subscribeFeedLocal(
+        url: String,
+        titleOverride: String?,
+        prefetchedBatch: ParsedFeedBatch? = null,
+        discoveredSiteTitle: String? = null,
+    ): String {
+        val cleanTitleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() }
+        val canonicalUrl = canonicalizeFeedUrl(url)
+        val fallbackTitle =
+            cleanTitleOverride
+                ?: prefetchedBatch?.title?.trim()?.takeIf { it.isNotEmpty() }
+                ?: discoveredSiteTitle?.trim()?.takeIf { it.isNotEmpty() }
+                ?: extractHostTitle(url)
+        val currentSettings = settings.settings.first()
+        val nodeId = currentSettings.peerId.ifBlank { DEFAULT_LOCAL_HLC_NODE }
+        val prepared =
+            upsertOrUnarchiveFeedLocked(
+                rawUrl = url,
+                canonicalUrl = canonicalUrl,
+                cleanTitleOverride = cleanTitleOverride,
+                fallbackTitle = fallbackTitle,
+                nodeId = nodeId,
+                hasPrefetchedBatch = prefetchedBatch != null,
+            )
+        val subscribedEntity = prepared.first ?: return prepared.second
+        LocalFeedPoller.pollFeed(
+                dao = dao,
+                publicWebFetcher = publicWebFetcher,
+                feed = subscribedEntity,
+                localPeerId = currentSettings.peerId,
+                prefetchedBatch = prefetchedBatch,
+                writeLock = database.writeLock,
+            )
+            .onFailure { err ->
+                RocheLog.warn(LOG_TAG, "Initial poll failed for subscribed feed $canonicalUrl", err)
+            }
+        return dao.getFeedById(subscribedEntity.id)?.title ?: subscribedEntity.title
+    }
+
+    @Suppress("LongParameterList")
+    private suspend fun upsertOrUnarchiveFeedLocked(
+        rawUrl: String,
+        canonicalUrl: String,
+        cleanTitleOverride: String?,
+        fallbackTitle: String,
+        nodeId: String,
+        hasPrefetchedBatch: Boolean,
+    ): Pair<FeedRow?, String> = itemMutationMutex.withLock {
+        val isPublic = isSyncablePublicUrl(canonicalUrl)
+        dao.deleteTombstone("feed", feedNaturalKey(canonicalUrl))
+        val existingLocal =
+            dao.getFeedByUrl(canonicalUrl) ?: dao.getFeedById(deterministicFeedId(canonicalUrl))
+        if (existingLocal != null && !existingLocal.isActive) {
+            val syncable = isSyncablePublicUrl(existingLocal.url)
+            dao.updateFeedActiveGraph(
+                feedId = existingLocal.id,
+                isActive = true,
+                markDirty = syncable,
+                nodeId = nodeId,
+            )
+            if (cleanTitleOverride != null && cleanTitleOverride != existingLocal.title) {
+                dao.updateFeedTitleGraph(
+                    feedId = existingLocal.id,
+                    cleanTitle = cleanTitleOverride,
+                    markDirty = syncable,
+                    nodeId = nodeId,
+                )
+            }
+            val nextTitle = cleanTitleOverride ?: existingLocal.title
+            val entityToPoll =
+                if (hasPrefetchedBatch) {
+                    existingLocal.copy(title = nextTitle, isActive = true)
+                } else {
+                    null
+                }
+            entityToPoll to nextTitle
+        } else {
+            val entity =
+                existingLocal?.copy(
+                    title = cleanTitleOverride ?: existingLocal.title,
+                    isActive = true,
+                )
+                    ?: FeedRow(
+                        id = deterministicFeedId(canonicalUrl),
+                        title = fallbackTitle,
+                        url = canonicalUrl,
+                        siteUrl = null,
+                        feedType = inferFeedTypeWireValue(rawUrl),
+                        lastPolled = null,
+                    )
+            val hlc = nextLocalHlc(dao, nodeId)
+            dao.upsertFeed(
+                feed = entity,
+                markDirty = isPublic,
+                hlcOverride = hlc,
+                nodeId = nodeId,
+            )
+            entity to entity.title
         }
     }
 
@@ -1081,7 +1413,7 @@ class RocheRepository(
         val savedUrl = settings.settings.first().serverUrl
         val domains = tailnetDomains.ifEmpty { networkTierProvider.activeTailnetDomains() }
         val discovered =
-            apiClient.discoverServer(
+            serverApi.discoverServer(
                 tailnetDomains = domains,
                 extraCandidates = tailscaleHttpsUpgrades(savedUrl),
             )
@@ -1121,7 +1453,7 @@ class RocheRepository(
                 ) {
                     savedUrl
                 } else {
-                    apiClient
+                    serverApi
                         .discoverServer(
                             tailnetDomains = networkTierProvider.activeTailnetDomains(),
                             extraCandidates = tailscaleHttpsUpgrades(savedUrl),
@@ -1134,12 +1466,17 @@ class RocheRepository(
             "Could not auto-discover Roche server on Tailnet; paste the full https://...#code bundle"
         }
         val token =
-            apiClient.pairDevice(
+            serverApi.pairDevice(
                 serverUrl = resolvedUrl,
                 code = cleanCode,
                 deviceName = deviceName.trim().ifBlank { "Roche Android" },
             )
         settings.update { it.copy(serverUrl = resolvedUrl, bearerToken = token) }
+        recordSyncStatus(
+            lastSyncedAtIso = _syncStatus.value.lastSyncedAtIso,
+            lastError = null,
+            isAuthError = false,
+        )
         token
     }
 
@@ -1160,7 +1497,7 @@ class RocheRepository(
     suspend fun syncWithServer(): Result<Int> = withSyncIndicator {
         withContext(Dispatchers.Default) {
             syncMutex.withLock {
-                runSuspendCatching {
+                val result = runSuspendCatching {
                     val currentSettings = settings.settings.first()
                     val currentTier = networkTierProvider.currentNetworkTier()
                     if (currentSettings.serverUrl.isBlank()) {
@@ -1168,9 +1505,10 @@ class RocheRepository(
                         val pollOutcome =
                             pollCooperativeFeedsOnDevice(
                                 dao = dao,
-                                apiClient = apiClient,
+                                publicWebFetcher = publicWebFetcher,
                                 localPeerId = currentSettings.peerId,
                                 activePeers = emptyList(),
+                                writeLock = database.writeLock,
                             )
                         offlineCacheManager.autoDownloadNewEpisodes()
                         pollOutcome.polledFeedsCount
@@ -1185,8 +1523,57 @@ class RocheRepository(
                         syncedCount
                     }
                 }
+                result
+                    .onSuccess {
+                        recordSyncStatus(
+                            lastSyncedAtIso = nowUtcIso(),
+                            lastError = null,
+                            isAuthError = false,
+                        )
+                    }
+                    .onFailure { err ->
+                        RocheLog.warn(LOG_TAG, "Sync failed", err)
+                        recordSyncStatus(
+                            lastSyncedAtIso = _syncStatus.value.lastSyncedAtIso,
+                            lastError = err.message ?: "Sync failed",
+                            isAuthError = isAuthFailure(err),
+                        )
+                    }
+                result
             }
         }
+    }
+
+    private suspend fun recordSyncStatus(
+        lastSyncedAtIso: String?,
+        lastError: String?,
+        isAuthError: Boolean,
+    ) {
+        val next =
+            SyncStatusState(
+                lastSyncedAtIso = lastSyncedAtIso,
+                lastError = lastError,
+                isAuthError = isAuthError,
+            )
+        _syncStatus.value = next
+        runSuspendCatching {
+            if (lastSyncedAtIso != null) {
+                dao.upsertLocalSyncFlag(
+                    LocalSyncFlagEntity(FLAG_LAST_SYNCED_AT_ISO, lastSyncedAtIso)
+                )
+            }
+            if (lastError != null) {
+                dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_LAST_SYNC_ERROR, lastError))
+            } else {
+                dao.deleteLocalSyncFlag(FLAG_LAST_SYNC_ERROR)
+            }
+            if (isAuthError) {
+                dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_LAST_SYNC_AUTH_ERROR, "1"))
+            } else {
+                dao.deleteLocalSyncFlag(FLAG_LAST_SYNC_AUTH_ERROR)
+            }
+        }
+            .onFailure { err -> RocheLog.warn(LOG_TAG, "Failed persisting sync status", err) }
     }
 
     suspend fun pollDueFeedsOnDeviceNow(): Result<Int> = withSyncIndicator {
@@ -1199,9 +1586,10 @@ class RocheRepository(
                     val pollOutcome =
                         pollCooperativeFeedsOnDevice(
                             dao = dao,
-                            apiClient = apiClient,
+                            publicWebFetcher = publicWebFetcher,
                             localPeerId = currentSettings.peerId,
                             activePeers = activePeersFlow.value,
+                            writeLock = database.writeLock,
                         )
                     if (
                         pollOutcome.polledFeedsCount > 0 &&
@@ -1215,6 +1603,9 @@ class RocheRepository(
                                     initialWeightOverride = pollOutcome.measuredWeight,
                                 )
                         }
+                            .onFailure { err ->
+                                RocheLog.warn(LOG_TAG, "Post-poll sync failed", err)
+                            }
                     }
                     offlineCacheManager.autoDownloadNewEpisodes()
                     pollOutcome.polledFeedsCount
@@ -1240,9 +1631,10 @@ class RocheRepository(
                 runSuspendCatching {
                     pollCooperativeFeedsOnDevice(
                             dao = dao,
-                            apiClient = apiClient,
+                            publicWebFetcher = publicWebFetcher,
                             localPeerId = currentSettings.peerId,
                             activePeers = activePeersFlow.value,
+                            writeLock = database.writeLock,
                         )
                         .polledFeedsCount
                 }
@@ -1292,9 +1684,11 @@ class RocheRepository(
     private fun peerSyncCoordinator(networkTier: NetworkTier): PeerSyncCoordinator =
         PeerSyncCoordinator(
             dao = dao,
-            apiClient = apiClient,
+            serverApi = serverApi,
+            publicWebFetcher = publicWebFetcher,
             networkTier = networkTier,
             catalogStore = catalog,
+            writeLock = database.writeLock,
             onPeersUpdated = { activePeersFlow.value = it },
             onSyncCursorUpdated = { cursor ->
                 settings.update { it.copy(lastPeerSyncCursor = cursor) }
@@ -1371,11 +1765,32 @@ class RocheRepository(
     }
 }
 
+private const val LOG_TAG = "RocheRepository"
+private const val FLAG_LAST_SYNCED_AT_ISO = "last_synced_at_iso"
+private const val FLAG_LAST_SYNC_ERROR = "last_sync_error"
+private const val FLAG_LAST_SYNC_AUTH_ERROR = "last_sync_auth_error"
+private const val HTTP_UNAUTHORIZED = 401
+private const val HTTP_FORBIDDEN = 403
 private const val AUDIO_CONTENT_TYPE = "audio"
 private const val MIN_READ_PROGRESS = 0.0
 private const val MAX_READ_PROGRESS = 1.0
 private const val ARCHIVE_COMPLETE_PROGRESS_THRESHOLD = 0.9
 private const val AUDIO_COMPLETE_PROGRESS_THRESHOLD = 0.98
+
+internal fun isAuthFailure(error: Throwable): Boolean =
+    when (error) {
+        is ProblemDetailsException ->
+            error.statusCode == HTTP_UNAUTHORIZED || error.statusCode == HTTP_FORBIDDEN
+        is HttpStatusException ->
+            error.statusCode == HTTP_UNAUTHORIZED || error.statusCode == HTTP_FORBIDDEN
+        else -> false
+    }
+
+internal fun sanitizeSnippetExcerpt(raw: String): String =
+    raw.replace(SNIPPET_HTML_TAG_REGEX, " ").replace(SNIPPET_WHITESPACE_REGEX, " ").trim()
+
+private val SNIPPET_HTML_TAG_REGEX = Regex("""<[^>]*>""")
+private val SNIPPET_WHITESPACE_REGEX = Regex("""\s+""")
 
 internal suspend fun resolveArchiveBatchTargetIds(
     dao: RocheDao,

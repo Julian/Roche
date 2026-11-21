@@ -45,8 +45,8 @@ import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.settings.Settings
-import com.grayvines.roche.data.sync.NetworkTier
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode

@@ -27,6 +27,7 @@ import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
 import com.grayvines.roche.data.local.TagRow
+import com.grayvines.roche.data.local.attachTagsLocally
 import com.grayvines.roche.data.local.buildSqlContainsPattern
 import com.grayvines.roche.data.local.extractFtsTokenQueries
 import com.grayvines.roche.data.local.insertItemTag
@@ -36,9 +37,11 @@ import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.local.upsertItems
 import com.grayvines.roche.data.local.upsertTag
 import com.grayvines.roche.data.remote.HttpResponse
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.HttpTransport
+import com.grayvines.roche.data.remote.NetworkTier
+import com.grayvines.roche.data.remote.PublicWebFetcher
+import com.grayvines.roche.data.remote.RocheServerApi
 import com.grayvines.roche.data.settings.SettingsRepository
-import com.grayvines.roche.data.sync.NetworkTier
 import com.grayvines.roche.data.sync.PeerSyncScheduler
 import com.grayvines.roche.data.sync.isActiveVpnTunnelInterface
 import com.grayvines.roche.data.sync.resolveActiveNetworkTier
@@ -211,12 +214,15 @@ class RocheRepositoryTest {
 
     @Test
     fun `pairWithCode exchanges 6 digit code and persists serverUrl and bearerToken`() = runTest {
-        val pairingClient = RocheApiClient { request ->
-            assertEquals("https://100.64.0.12:8080/auth/pair", request.url)
-            HttpResponse(statusCode = 200, body = """{"token":"paired-bearer-999"}""")
-        }
         val pairingRepo =
-            RocheRepository(database = database, apiClient = pairingClient, settings = settings)
+            mockRepository(
+                database = database,
+                settings = settings,
+                transport = { request ->
+                    assertEquals("https://100.64.0.12:8080/auth/pair", request.url)
+                    HttpResponse(statusCode = 200, body = """{"token":"paired-bearer-999"}""")
+                },
+            )
 
         val result =
             pairingRepo.pairWithCode(
@@ -234,24 +240,23 @@ class RocheRepositoryTest {
 
     @Test
     fun `pairWithCode auto-discovers Roche server on Tailnet when serverUrl is blank`() = runTest {
-        val autoDiscoverClient = RocheApiClient { request ->
-            when (request.url) {
-                "https://roche/health" ->
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """{"status":"ok","service":"roche","canonical_url":"https://roche.tail9876.ts.net"}""",
-                    )
-                "https://roche.tail9876.ts.net/auth/pair" ->
-                    HttpResponse(statusCode = 200, body = """{"token":"auto-paired-tok"}""")
-                else -> HttpResponse(statusCode = 404, body = "{}")
-            }
-        }
         val autoRepo =
-            RocheRepository(
+            mockRepository(
                 database = database,
-                apiClient = autoDiscoverClient,
                 settings = settings,
+                transport = { request ->
+                    when (request.url) {
+                        "https://roche/health" ->
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """{"status":"ok","service":"roche","canonical_url":"https://roche.tail9876.ts.net"}""",
+                            )
+                        "https://roche.tail9876.ts.net/auth/pair" ->
+                            HttpResponse(statusCode = 200, body = """{"token":"auto-paired-tok"}""")
+                        else -> HttpResponse(statusCode = 404, body = "{}")
+                    }
+                },
             )
 
         val result =
@@ -277,22 +282,21 @@ class RocheRepositoryTest {
                     bearerToken = "secret-existing-token",
                 )
             }
-            val discoverClient = RocheApiClient { request ->
-                if (request.url == "https://roche/health") {
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """{"status":"ok","service":"roche","canonical_url":"https://roche.tail9876.ts.net"}""",
-                    )
-                } else {
-                    HttpResponse(statusCode = 404, body = "{}")
-                }
-            }
             val repo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = discoverClient,
                     settings = settings,
+                    transport = { request ->
+                        if (request.url == "https://roche/health") {
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """{"status":"ok","service":"roche","canonical_url":"https://roche.tail9876.ts.net"}""",
+                            )
+                        } else {
+                            HttpResponse(statusCode = 404, body = "{}")
+                        }
+                    },
                 )
 
             val discoveredUrl = repo.discoverServer().getOrThrow()
@@ -312,22 +316,21 @@ class RocheRepositoryTest {
                     bearerToken = "keep-my-paired-token",
                 )
             }
-            val discoverClient = RocheApiClient { request ->
-                if (request.url == "https://mac-mini.tail9876.ts.net/health") {
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """{"status":"ok","service":"roche","canonical_url":"https://mac-mini.tail9876.ts.net"}""",
-                    )
-                } else {
-                    HttpResponse(statusCode = 404, body = "{}")
-                }
-            }
             val repo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = discoverClient,
                     settings = settings,
+                    transport = { request ->
+                        if (request.url == "https://mac-mini.tail9876.ts.net/health") {
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """{"status":"ok","service":"roche","canonical_url":"https://mac-mini.tail9876.ts.net"}""",
+                            )
+                        } else {
+                            HttpResponse(statusCode = 404, body = "{}")
+                        }
+                    },
                 )
 
             val discoveredUrl = repo.discoverServer().getOrThrow()
@@ -345,24 +348,27 @@ class RocheRepositoryTest {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val hlc = "001780000001000-0000-server"
-            val syncClient = RocheApiClient { request ->
-                if (request.url == "https://100.64.0.12:8080/api/v1/sync/peer") {
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """{"server_peer_id":"server","sync_seq":1,"server_hlc":"$hlc","sync_timestamp":"2026-04-01T10:00:00Z","active_peers":[],""" +
-                                """"entries":[{"id":"f-live","kind":"feed","title":"Live RSS","url":"https://example.com","hlc":"$hlc","feed_source":{"feed_url":"https://example.com/rss","source_type":"rss","feed_title":"Live RSS","last_polled_at":"2099-01-01T00:00:00Z","hlc":"$hlc"}},""" +
-                                """{"id":"t-live","kind":"collection","title":"rust","hlc":"$hlc","collection_spec":{"mode":"manual","role":"tag","show_in_lists":false}},""" +
-                                """{"id":"i-live-1","kind":"article","title":"Synced Post","url":"https://example.com/1","summary":"<p>Summary &amp; intro</p>","created_at":"2026-04-01T10:00:00Z","hlc":"$hlc","content":{"content_type":"article","content_html":"<p>First para &lt;b&gt; &amp; details.</p><p>Second <em>italic</em> para with &amp;lt;tag&amp;gt;.</p>"},"state":{"inbox_state":"unread","hlc":"$hlc"}}],""" +
-                                """"collection_entries":[{"collection_id":"f-live","entry_id":"i-live-1","added_at":"2026-04-01T10:00:00Z","hlc":"$hlc"},{"collection_id":"t-live","entry_id":"i-live-1","added_at":"2026-04-01T10:00:00Z","hlc":"$hlc"}],""" +
-                                """"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
-                    )
-                } else {
-                    HttpResponse(statusCode = 404, body = "{}")
-                }
-            }
             val syncedRepo =
-                RocheRepository(database = database, apiClient = syncClient, settings = settings)
+                mockRepository(
+                    database = database,
+                    settings = settings,
+                    transport = { request ->
+                        if (request.url == "https://100.64.0.12:8080/api/v1/sync/peer") {
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """{"server_peer_id":"server","sync_seq":1,"server_hlc":"$hlc","sync_timestamp":"2026-04-01T10:00:00Z","active_peers":[],""" +
+                                        """"entries":[{"id":"f-live","kind":"feed","title":"Live RSS","url":"https://example.com","hlc":"$hlc","feed_source":{"feed_url":"https://example.com/rss","source_type":"rss","feed_title":"Live RSS","last_polled_at":"2099-01-01T00:00:00Z","hlc":"$hlc"}},""" +
+                                        """{"id":"t-live","kind":"collection","title":"rust","hlc":"$hlc","collection_spec":{"mode":"manual","role":"tag","show_in_lists":false}},""" +
+                                        """{"id":"i-live-1","kind":"article","title":"Synced Post","url":"https://example.com/1","summary":"<p>Summary &amp; intro</p>","created_at":"2026-04-01T10:00:00Z","hlc":"$hlc","content":{"content_type":"article","content_html":"<p>First para &lt;b&gt; &amp; details.</p><p>Second <em>italic</em> para with &amp;lt;tag&amp;gt;.</p>"},"state":{"inbox_state":"unread","hlc":"$hlc"}}],""" +
+                                        """"collection_entries":[{"collection_id":"f-live","entry_id":"i-live-1","added_at":"2026-04-01T10:00:00Z","hlc":"$hlc"},{"collection_id":"t-live","entry_id":"i-live-1","added_at":"2026-04-01T10:00:00Z","hlc":"$hlc"}],""" +
+                                        """"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+                            )
+                        } else {
+                            HttpResponse(statusCode = 404, body = "{}")
+                        }
+                    },
+                )
 
             val count = syncedRepo.syncWithServer().getOrThrow()
             assertEquals(1, count)
@@ -386,20 +392,23 @@ class RocheRepositoryTest {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val requests = mutableListOf<String>()
-            val liveClient = RocheApiClient { request ->
-                requests.add("${request.method} ${request.url}")
-                if (request.method == "POST" && request.url.endsWith("/api/v1/feeds")) {
-                    HttpResponse(
-                        statusCode = 201,
-                        body =
-                            """{"id":"feed-srv-1","title":"Rust Blog","url":"https://blog.rust-lang.org/feed.xml","feed_type":"rss","unread_count":0}""",
-                    )
-                } else {
-                    HttpResponse(statusCode = 404, body = "{}")
-                }
-            }
             val liveRepo =
-                RocheRepository(database = database, apiClient = liveClient, settings = settings)
+                mockRepository(
+                    database = database,
+                    settings = settings,
+                    transport = { request ->
+                        requests.add("${request.method} ${request.url}")
+                        if (request.url == "https://blog.rust-lang.org/feed.xml") {
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Rust Blog</title><link>https://blog.rust-lang.org</link></channel></rss>""",
+                            )
+                        } else {
+                            HttpResponse(statusCode = 404, body = "{}")
+                        }
+                    },
+                )
 
             val savedFeed =
                 liveRepo.saveUrlOrFeed(
@@ -410,6 +419,9 @@ class RocheRepositoryTest {
             assertTrue(savedFeed.isFeed)
             assertEquals("Rust Blog", savedFeed.title)
             assertFalse(requests.any { it.endsWith("/api/v1/items/save") })
+            assertFalse(requests.any { it.endsWith("/api/v1/feeds") })
+            val rustFeedId = deterministicFeedId("https://blog.rust-lang.org/feed.xml")
+            assertEquals(true, database.dao().getFeedSourceById(rustFeedId)?.isLocalDirty)
 
             liveRepo.toggleTagOnItem(itemId = "item-2", tagName = "ebpf")
             assertTrue(database.dao().getTagNamesForItem("item-2").contains("ebpf"))
@@ -433,24 +445,23 @@ class RocheRepositoryTest {
         }
         val syncBodies = mutableListOf<String>()
         var seq = 0L
-        val liveClient = RocheApiClient { request ->
-            if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
-                syncBodies.add(request.body.orEmpty())
-                seq += 1L
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"server_peer_id":"server","sync_seq":$seq,"server_hlc":"00178000000${seq}000-0000-server","sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
-                )
-            } else {
-                HttpResponse(statusCode = 404, body = "{}")
-            }
-        }
         val liveRepo =
-            RocheRepository(
+            mockRepository(
                 database = database,
-                apiClient = liveClient,
                 settings = settings,
+                transport = { request ->
+                    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+                        syncBodies.add(request.body.orEmpty())
+                        seq += 1L
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"server_peer_id":"server","sync_seq":$seq,"server_hlc":"00178000000${seq}000-0000-server","sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+                        )
+                    } else {
+                        HttpResponse(statusCode = 404, body = "{}")
+                    }
+                },
                 networkTierProvider = { NetworkTier.OFFLINE },
             )
 
@@ -490,12 +501,12 @@ class RocheRepositoryTest {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val pushedBodies = mutableListOf<String>()
-            val syncClient = buildTwoWaySyncMockClient(pushedBodies)
+            val syncTransport = buildTwoWaySyncMockTransport(pushedBodies)
             val syncedRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = syncClient,
                     settings = settings,
+                    transport = syncTransport,
                     networkTierProvider = { NetworkTier.OFFLINE },
                 )
 
@@ -553,12 +564,12 @@ class RocheRepositoryTest {
             val cacheDir = File(tempDir, "offline_media")
             val pdfBytes = "%PDF-1.7-test".toByteArray(Charsets.UTF_8)
             val thumbBytes = byteArrayOf(1, 2, 3, 4)
-            val offlineClient = buildOfflineCacheMockClient(pdfBytes, thumbBytes)
+            val offlineTransport = buildOfflineCacheMockTransport(pdfBytes, thumbBytes)
             val cachedRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = offlineClient,
                     settings = settings,
+                    transport = offlineTransport,
                     cacheDir = cacheDir,
                 )
 
@@ -617,12 +628,12 @@ class RocheRepositoryTest {
             val requests = mutableListOf<String>()
             val syncBodies = mutableListOf<String>()
             val managedRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = buildFeedAndItemManagementMockClient(requests, syncBodies),
                     settings = settings,
+                    transport = buildFeedAndItemManagementMockTransport(requests, syncBodies),
                     cacheDir = cacheDir,
-                    networkTierProvider = { NetworkTier.OFFLINE },
+                    networkTierProvider = tailnetNetworkTierProvider { NetworkTier.OFFLINE },
                 )
 
             val refreshedTitle = managedRepo.refreshFeed("feed-arxiv-cs-lg").getOrThrow()
@@ -653,10 +664,22 @@ class RocheRepositoryTest {
             assertFalse(managedRepo.snapshot.first().entries.any { it.id == "item-1" })
             assertEquals(false, database.dao().getTombstone("item", item1NatKey)?.isLocalDirty)
 
-            // Delete remote feed purges feed AND its remaining local items (item-fresh)
+            // Delete feed locally records a feed tombstone and purges its remaining unreferenced
+            // items
             assertEquals("arXiv cs.LG", managedRepo.deleteFeed("feed-arxiv-cs-lg").getOrThrow())
             assertFalse(managedRepo.snapshot.first().feeds.any { it.id == "feed-arxiv-cs-lg" })
             assertFalse(managedRepo.snapshot.first().entries.any { it.id == "item-fresh" })
+            assertEquals(
+                true,
+                database
+                    .dao()
+                    .getTombstone(
+                        "feed",
+                        "https://export.arxiv.org/api/query?search_query=cat:cs.LG",
+                    )
+                    ?.isLocalDirty,
+            )
+            assertFalse(requests.any { it.startsWith("DELETE ") })
         }
 
     @Test
@@ -668,10 +691,10 @@ class RocheRepositoryTest {
             val longHtml =
                 "<article><p>" + List(2_200) { "essayword$it" }.joinToString(" ") + "</p></article>"
             val syncedRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = buildLongHtmlSyncMockClient(longHtml),
                     settings = settings,
+                    transport = buildLongHtmlSyncMockTransport(longHtml),
                 )
             syncedRepo.syncWithServer().getOrThrow()
 
@@ -690,10 +713,10 @@ class RocheRepositoryTest {
             seedLanFeedAndOverflowDataset(database)
             val peerSyncBodies = mutableListOf<String>()
             val syncedRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = buildLanAndOverflowPeerSyncMockClient(peerSyncBodies),
                     settings = settings,
+                    transport = buildLanAndOverflowPeerSyncMockTransport(peerSyncBodies),
                 )
 
             syncedRepo.syncWithServer().getOrThrow()
@@ -730,14 +753,14 @@ class RocheRepositoryTest {
             var syncAvailable = false
             val syncBodies = mutableListOf<String>()
             val renameRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient =
-                        buildRenameFeedSyncMockClient(
+                    settings = settings,
+                    transport =
+                        buildRenameFeedSyncMockTransport(
                             isSyncAvailable = { syncAvailable },
                             syncBodies = syncBodies,
                         ),
-                    settings = settings,
                     networkTierProvider = { NetworkTier.OFFLINE },
                 )
 
@@ -816,10 +839,10 @@ class RocheRepositoryTest {
                 )
             val cacheDir = File(tempDir, "broken_audio_cache")
             val brokenRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = buildFailingAudioCacheMockClient(),
                     settings = settings,
+                    transport = buildFailingAudioCacheMockTransport(),
                     cacheDir = cacheDir,
                 )
 
@@ -837,10 +860,10 @@ class RocheRepositoryTest {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val cancellingRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = RocheApiClient { throw CancellationException("cancelled") },
                     settings = settings,
+                    transport = { throw CancellationException("cancelled") },
                     cacheDir = File(tempDir, "cancel_cache"),
                 )
 
@@ -864,10 +887,10 @@ class RocheRepositoryTest {
             }
             var syncRound = 1
             val diffRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = buildTargetedDiffSyncMockClient { syncRound },
                     settings = settings,
+                    transport = buildTargetedDiffSyncMockTransport { syncRound },
                     networkTierProvider = { NetworkTier.OFFLINE },
                 )
 
@@ -913,10 +936,10 @@ class RocheRepositoryTest {
             }
             val peerSyncBodies = mutableListOf<String>()
             val paginatedRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = buildPaginatedDeltaSyncMockClient(feedId, peerSyncBodies),
                     settings = settings,
+                    transport = buildPaginatedDeltaSyncMockTransport(feedId, peerSyncBodies),
                 )
 
             val totalSynced = paginatedRepo.syncWithServer().getOrThrow()
@@ -949,25 +972,27 @@ class RocheRepositoryTest {
             val allowSyncFinish = CountDownLatch(1)
             val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
             try {
-                val slowApiClient = RocheApiClient { request ->
-                    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
-                        syncStarted.countDown()
-                        allowSyncFinish.await(5, TimeUnit.SECONDS)
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-04-01T10:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
-                        )
-                    } else {
-                        HttpResponse(statusCode = 200, body = "{}")
-                    }
-                }
                 val asyncRepo =
-                    RocheRepository(
+                    mockRepository(
                         database = database,
-                        apiClient = slowApiClient,
                         settings = settings,
-                        networkTierProvider = { NetworkTier.WIFI },
+                        transport = { request ->
+                            if (
+                                request.method == "POST" &&
+                                    request.url.endsWith("/api/v1/sync/peer")
+                            ) {
+                                syncStarted.countDown()
+                                allowSyncFinish.await(5, TimeUnit.SECONDS)
+                                HttpResponse(
+                                    statusCode = 200,
+                                    body =
+                                        """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-04-01T10:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+                                )
+                            } else {
+                                HttpResponse(statusCode = 200, body = "{}")
+                            }
+                        },
+                        networkTierProvider = tailnetNetworkTierProvider(),
                         backgroundScope = bgScope,
                     )
 
@@ -994,6 +1019,7 @@ class RocheRepositoryTest {
                     "x".repeat(12_000) +
                     " NeedleInHaystackToken99 appears deep in the article body."
             val deepHtml = "<p>$deepBody</p>"
+            database.dao().upsertFeeds(SeedData.feeds)
             database
                 .dao()
                 .upsertItem(
@@ -1030,7 +1056,6 @@ class RocheRepositoryTest {
             assertTrue(extractFtsTokenQueries("--- () *** \"\"").isEmpty())
             assertTrue(repository.searchDeepEntries("--- () ***").isEmpty())
 
-            database.dao().upsertFeeds(SeedData.feeds)
             repository.renameFeed("feed-arxiv-cs-lg", "RenamedCustomFeed77")
             assertEquals(
                 listOf("item-deep"),
@@ -1091,19 +1116,22 @@ class RocheRepositoryTest {
                 lastPeerSyncCursor = "50",
             )
         }
-        val skewedClient = RocheApiClient { request ->
-            if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"server_peer_id":"server","sync_seq":40,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-06-09T00:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
-                )
-            } else {
-                HttpResponse(statusCode = 404, body = "{}")
-            }
-        }
         val skewedRepo =
-            RocheRepository(database = database, apiClient = skewedClient, settings = settings)
+            mockRepository(
+                database = database,
+                settings = settings,
+                transport = { request ->
+                    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"server_peer_id":"server","sync_seq":40,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-06-09T00:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+                        )
+                    } else {
+                        HttpResponse(statusCode = 404, body = "{}")
+                    }
+                },
+            )
         skewedRepo.syncWithServer().getOrThrow()
 
         assertEquals("50", settings.settings.first().lastPeerSyncCursor)
@@ -1118,25 +1146,28 @@ class RocheRepositoryTest {
             val syncedLatch = CountDownLatch(1)
             val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
             try {
-                val catSyncClient = RocheApiClient { request ->
-                    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
-                        if (request.body.orEmpty().contains("Neuromancer")) {
-                            syncedLatch.countDown()
-                        }
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-07-01T00:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
-                        )
-                    } else {
-                        HttpResponse(statusCode = 404, body = "{}")
-                    }
-                }
                 val bgRepo =
-                    RocheRepository(
+                    mockRepository(
                         database = database,
-                        apiClient = catSyncClient,
                         settings = settings,
+                        transport = { request ->
+                            if (
+                                request.method == "POST" &&
+                                    request.url.endsWith("/api/v1/sync/peer")
+                            ) {
+                                if (request.body.orEmpty().contains("Neuromancer")) {
+                                    syncedLatch.countDown()
+                                }
+                                HttpResponse(
+                                    statusCode = 200,
+                                    body =
+                                        """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-07-01T00:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+                                )
+                            } else {
+                                HttpResponse(statusCode = 404, body = "{}")
+                            }
+                        },
+                        networkTierProvider = tailnetNetworkTierProvider(),
                         backgroundScope = bgScope,
                     )
                 bgRepo.catalog.logEntry(
@@ -1247,9 +1278,11 @@ class RocheRepositoryTest {
         val loopback = InetAddress.getByName("127.0.0.1")
 
         assertTrue(isActiveVpnTunnelInterface("tun0", true, false, listOf(lanIp)))
+        assertTrue(isActiveVpnTunnelInterface("tun0", true, false, listOf(cgnat)))
         assertTrue(isActiveVpnTunnelInterface("wg0", true, false, listOf(lanIp)))
         assertTrue(isActiveVpnTunnelInterface("utun3", true, false, listOf(lanIp)))
-        assertTrue(isActiveVpnTunnelInterface("wlan0", true, false, listOf(cgnat)))
+        assertFalse(isActiveVpnTunnelInterface("wlan0", true, false, listOf(cgnat)))
+        assertFalse(isActiveVpnTunnelInterface("rmnet0", true, false, listOf(cgnat)))
         assertTrue(isActiveVpnTunnelInterface("eth0", true, false, listOf(tsUla)))
         assertFalse(isActiveVpnTunnelInterface("wlan0", true, false, listOf(lanIp)))
         assertFalse(isActiveVpnTunnelInterface("tun0", false, false, listOf(cgnat)))
@@ -1355,9 +1388,11 @@ class RocheRepositoryTest {
                     maxFiles = 4,
                     maxBytes = 1024L * 1024L,
                 )
-            val apiClient = RocheApiClient {
+            val payloadTransport = HttpTransport {
                 HttpResponse(statusCode = 200, body = "", bodyBytes = payload)
             }
+            val serverApi = tailnetServerApi(payloadTransport)
+            val publicWebFetcher = PublicWebFetcher(payloadTransport)
             val dao = database.dao()
             for (idx in 1..4) {
                 dao.upsertItem(
@@ -1387,7 +1422,8 @@ class RocheRepositoryTest {
             val cacheManager =
                 OfflineCacheManager(
                     dao = dao,
-                    apiClient = apiClient,
+                    serverApi = serverApi,
+                    publicWebFetcher = publicWebFetcher,
                     settings = settings,
                     cacheDir = sharedCacheDir,
                     thumbnailDiskCache = sharedDiskCache,
@@ -1402,7 +1438,8 @@ class RocheRepositoryTest {
                 )
             val loader =
                 BitmapLoader(
-                    apiClient = apiClient,
+                    serverApi = serverApi,
+                    publicWebFetcher = publicWebFetcher,
                     settings = settings,
                     decoders = decoders,
                     clockMs = { nowMs },
@@ -1411,7 +1448,8 @@ class RocheRepositoryTest {
 
             runConcurrentSharedThumbWrites(
                 cacheManager = cacheManager,
-                apiClient = apiClient,
+                serverApi = serverApi,
+                publicWebFetcher = publicWebFetcher,
                 sharedDiskCache = sharedDiskCache,
                 decoders = decoders,
                 clockMs = { nowMs },
@@ -1444,7 +1482,8 @@ class RocheRepositoryTest {
 
     private suspend fun runConcurrentSharedThumbWrites(
         cacheManager: OfflineCacheManager,
-        apiClient: RocheApiClient,
+        serverApi: RocheServerApi,
+        publicWebFetcher: PublicWebFetcher,
         sharedDiskCache: ThumbnailDiskCache,
         decoders: ImageDecoders<TestImage>,
         clockMs: () -> Long,
@@ -1460,7 +1499,8 @@ class RocheRepositoryTest {
             (1..4).map {
                 async(Dispatchers.IO) {
                     BitmapLoader(
-                            apiClient = apiClient,
+                            serverApi = serverApi,
+                            publicWebFetcher = publicWebFetcher,
                             settings = settings,
                             decoders = decoders,
                             clockMs = clockMs,
@@ -1568,10 +1608,10 @@ private data class DeltaPageFixture(
     val syncTs: String,
 )
 
-private fun buildPaginatedDeltaSyncMockClient(
+private fun buildPaginatedDeltaSyncMockTransport(
     feedId: String,
     peerSyncBodies: MutableList<String>,
-): RocheApiClient = RocheApiClient { request ->
+): HttpTransport = HttpTransport { request ->
     if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
         val body = request.body.orEmpty()
         peerSyncBodies.add(body)
@@ -1599,20 +1639,12 @@ private fun buildPaginatedDeltaSyncMockClient(
     }
 }
 
-internal fun buildFeedAndItemManagementMockClient(
+internal fun buildFeedAndItemManagementMockTransport(
     requests: MutableList<String>,
     syncBodies: MutableList<String>,
-): RocheApiClient = RocheApiClient { request ->
+): HttpTransport = HttpTransport { request ->
     requests.add("${request.method} ${request.url}")
     when {
-        request.method == "POST" &&
-            request.url.endsWith("/api/v1/feeds/feed-arxiv-cs-lg/refresh") -> {
-            HttpResponse(
-                statusCode = 200,
-                body =
-                    """{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":2}""",
-            )
-        }
         request.method == "POST" && request.url.endsWith("/api/v1/sync/peer") -> {
             val body = request.body.orEmpty()
             syncBodies.add(body)
@@ -1650,10 +1682,10 @@ internal fun buildFeedAndItemManagementMockClient(
     }
 }
 
-internal fun buildOfflineCacheMockClient(
+internal fun buildOfflineCacheMockTransport(
     pdfBytes: ByteArray,
     thumbBytes: ByteArray,
-): RocheApiClient = RocheApiClient { request ->
+): HttpTransport = HttpTransport { request ->
     when (request.url) {
         "https://100.64.0.12:8080/api/v1/items/item-5" ->
             HttpResponse(
@@ -1695,8 +1727,8 @@ internal fun assertTwoWaySyncPushedRequests(pushedBodies: List<String>) {
     assertTrue(body.contains(""""natural_key":"tag-systems\u0000item-1""""))
 }
 
-internal fun buildTwoWaySyncMockClient(pushedBodies: MutableList<String>): RocheApiClient =
-    RocheApiClient { request ->
+internal fun buildTwoWaySyncMockTransport(pushedBodies: MutableList<String>): HttpTransport =
+    HttpTransport { request ->
         if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
             pushedBodies.add(request.body.orEmpty())
             val staleHlc = "000000000001000-0000-server"
@@ -1732,8 +1764,8 @@ internal suspend fun assertReadTimestampSync(
     assertFalse(syncBodies.last().contains(""""read_at":"${readItem.readAt}""""))
 }
 
-private fun buildLongHtmlSyncMockClient(longHtml: String): RocheApiClient =
-    RocheApiClient { request ->
+private fun buildLongHtmlSyncMockTransport(longHtml: String): HttpTransport =
+    HttpTransport { request ->
         if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
             val hlc = "001780000001000-0000-server"
             HttpResponse(
@@ -1832,9 +1864,9 @@ private suspend fun seedOverflowPublicItems(
     dao.upsertItems(bulkItems)
 }
 
-private fun buildLanAndOverflowPeerSyncMockClient(
+private fun buildLanAndOverflowPeerSyncMockTransport(
     peerSyncBodies: MutableList<String>
-): RocheApiClient = RocheApiClient { request ->
+): HttpTransport = HttpTransport { request ->
     if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
         val body = request.body.orEmpty()
         peerSyncBodies.add(body)
@@ -1860,10 +1892,10 @@ private fun buildLanAndOverflowPeerSyncMockClient(
     }
 }
 
-private fun buildRenameFeedSyncMockClient(
+private fun buildRenameFeedSyncMockTransport(
     isSyncAvailable: () -> Boolean,
     syncBodies: MutableList<String>,
-): RocheApiClient = RocheApiClient { request ->
+): HttpTransport = HttpTransport { request ->
     if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
         if (isSyncAvailable()) {
             val body = request.body.orEmpty()
@@ -1885,7 +1917,7 @@ private fun buildRenameFeedSyncMockClient(
     }
 }
 
-private fun buildFailingAudioCacheMockClient(): RocheApiClient = RocheApiClient { request ->
+private fun buildFailingAudioCacheMockTransport(): HttpTransport = HttpTransport { request ->
     when (request.url) {
         "https://100.64.0.12:8080/api/v1/items/item-audio-broken" ->
             HttpResponse(
@@ -1903,9 +1935,9 @@ private fun buildFailingAudioCacheMockClient(): RocheApiClient = RocheApiClient 
     }
 }
 
-internal fun buildTargetedDiffSyncMockClient(roundProvider: () -> Int): RocheApiClient {
+internal fun buildTargetedDiffSyncMockTransport(roundProvider: () -> Int): HttpTransport {
     val oversizedSummary = "s".repeat(17_000)
-    return RocheApiClient { request ->
+    return HttpTransport { request ->
         if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
             val round = roundProvider()
             HttpResponse(

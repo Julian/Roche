@@ -2,7 +2,6 @@ package com.grayvines.roche.playback
 
 import android.content.Context
 import android.net.Uri
-import android.net.http.HttpEngine
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
@@ -17,7 +16,6 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import com.grayvines.roche.core.isCanonicalFileWithinDirs
 import com.grayvines.roche.core.isHttpOrHttpsUrl
-import com.grayvines.roche.data.remote.HttpEngineTransport
 import com.grayvines.roche.data.remote.PublicUrlValidator
 import java.io.File
 import java.net.URI
@@ -129,7 +127,6 @@ internal constructor(
     parentScope: CoroutineScope? = null,
     private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
     private val uriResolver: (String) -> Uri? = ::defaultPlaybackUri,
-    private val httpEngineProvider: (() -> HttpEngine)? = null,
 ) : AudioPlayerBackend {
     private val parentJob: Job? = parentScope?.coroutineContext?.get(Job)
     private val scopeLock = Any()
@@ -139,7 +136,6 @@ internal constructor(
         private set
 
     internal var exoPlayer: ExoPlayer? = null
-    internal var ownedFallbackTransport: HttpEngineTransport? = null
     internal var activeLoadId: Long = 0L
     internal var notifiedReadyLoadId: Long = -1L
     internal var lastNotifiedExternalPlaying: Boolean? = null
@@ -196,14 +192,12 @@ internal constructor(
                 File(context.applicationContext.filesDir, "offline_media")
             ),
         parentScope: CoroutineScope? = null,
-        httpEngineProvider: (() -> HttpEngine)? = null,
     ) : this(
         appContext = context.applicationContext,
         allowedLocalDirs = allowedLocalDirs,
         parentScope = parentScope,
         mainDispatcher = Dispatchers.Main.immediate,
         uriResolver = ::defaultPlaybackUri,
-        httpEngineProvider = httpEngineProvider,
     )
 
     private fun createBackendScope(): CoroutineScope =
@@ -245,12 +239,7 @@ internal constructor(
             return it
         }
         val context = checkNotNull(appContext) { "Context required to build ExoPlayer" }
-        val httpEngine = resolveHttpEngine(context)
-        val audioDataSourceFactory =
-            createAudioDataSourceFactory(
-                context = context,
-                httpEngine = httpEngine,
-            )
+        val audioDataSourceFactory = createAudioDataSourceFactory(context = context)
         return ExoPlayer.Builder(context)
             .setMediaSourceFactory(
                 DefaultMediaSourceFactory(context).setDataSourceFactory(audioDataSourceFactory)
@@ -271,16 +260,6 @@ internal constructor(
                 created.addListener(playerListener)
                 exoPlayer = created
             }
-    }
-
-    private fun resolveHttpEngine(context: Context): HttpEngine {
-        httpEngineProvider?.invoke()?.let {
-            return it
-        }
-        val fallback =
-            ownedFallbackTransport
-                ?: HttpEngineTransport(context).also { ownedFallbackTransport = it }
-        return fallback.sharedHttpEngine
     }
 
     override fun loadAndPlay(
@@ -485,8 +464,6 @@ internal constructor(
                 player.release()
             }
             exoPlayer = null
-            ownedFallbackTransport?.let { transport -> runCatching { transport.close() } }
-            ownedFallbackTransport = null
             scopeToCancel.coroutineContext[Job]?.cancel()
             dispatchScope.coroutineContext[Job]?.cancel()
         }

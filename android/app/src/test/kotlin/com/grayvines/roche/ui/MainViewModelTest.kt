@@ -13,15 +13,19 @@ import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
 import com.grayvines.roche.data.local.TagRow
+import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.local.upsertFeeds
 import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.local.upsertItems
 import com.grayvines.roche.data.local.upsertTags
+import com.grayvines.roche.data.mockRepository
 import com.grayvines.roche.data.remote.HttpResponse
-import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.HttpTransport
+import com.grayvines.roche.data.remote.NetworkTier
+import com.grayvines.roche.data.remote.PublicWebFetcher
 import com.grayvines.roche.data.settings.SettingsRepository
-import com.grayvines.roche.data.sync.NetworkTier
 import com.grayvines.roche.data.sync.NetworkTierProvider
+import com.grayvines.roche.data.tailnetServerApi
 import com.grayvines.roche.media.BitmapLoader
 import com.grayvines.roche.media.ImageDecoders
 import com.grayvines.roche.media.MAX_BITMAP_DIMENSION_PX
@@ -644,6 +648,17 @@ class MainViewModelTest {
             val oversizedHtml = "<p>" + "A".repeat(100_000) + "</p><p>Tail Marker</p>"
             database
                 .dao()
+                .upsertFeed(
+                    FeedRow(
+                        id = "f-1",
+                        title = "Test Feed",
+                        url = "https://example.com/feed.xml",
+                        siteUrl = null,
+                        feedType = "rss",
+                    )
+                )
+            database
+                .dao()
                 .upsertItem(
                     testItem(id = "item-large", title = "Persisted Oversized Entry")
                         .copy(contentHtml = oversizedHtml, contentText = "B".repeat(90_000))
@@ -652,10 +667,10 @@ class MainViewModelTest {
             // Construct a cold repository + ViewModel against the already-persisted Room DB so the
             // first snapshot load observes the persisted row instead of an empty @BeforeEach DB.
             val coldRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
                     settings = settings,
+                    transport = { HttpResponse(statusCode = 200, body = "{}") },
                 )
             val coldViewModel =
                 MainViewModel(
@@ -1015,7 +1030,7 @@ class MainViewModelTest {
             var nowMs = 1_000L
             var networkSucceeds = false
             var fetchCalls = 0
-            val flakyClient = RocheApiClient {
+            val flakyTransport = HttpTransport {
                 fetchCalls++
                 if (networkSucceeds) {
                     HttpResponse(statusCode = 200, body = "img", bodyBytes = byteArrayOf(1, 2, 3))
@@ -1025,7 +1040,8 @@ class MainViewModelTest {
             }
             val loader =
                 BitmapLoader(
-                    apiClient = flakyClient,
+                    serverApi = tailnetServerApi(flakyTransport),
+                    publicWebFetcher = PublicWebFetcher(flakyTransport),
                     settings = settings,
                     decoders =
                         ImageDecoders(
@@ -1056,10 +1072,10 @@ class MainViewModelTest {
             var currentTier = NetworkTier.CELLULAR
             var tierQueryCount = 0
             val countingRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
                     settings = settings,
+                    transport = { HttpResponse(statusCode = 200, body = "{}") },
                     networkTierProvider =
                         NetworkTierProvider {
                             tierQueryCount++
@@ -1494,7 +1510,7 @@ class MainViewModelTest {
             val allCallersReady = CompletableDeferred<Unit>()
             val coalescingCacheDir = File(tempDir, "coalesce_cache")
 
-            val coalescingClient = RocheApiClient { request ->
+            val coalescingTransport = HttpTransport { request ->
                 if (request.url == "https://cdn.example.com/shared-cover.png") {
                     fetchCount.incrementAndGet()
                     enteredTransport.complete(Unit)
@@ -1509,7 +1525,8 @@ class MainViewModelTest {
             var nowMs = 1_000_000L
             val loader =
                 BitmapLoader(
-                    apiClient = coalescingClient,
+                    serverApi = tailnetServerApi(coalescingTransport),
+                    publicWebFetcher = PublicWebFetcher(coalescingTransport),
                     settings = settings,
                     decoders =
                         ImageDecoders(
@@ -1552,16 +1569,17 @@ class MainViewModelTest {
                     bearerToken = "tok-thumbs",
                 )
             }
+            val pruneTransport = HttpTransport {
+                HttpResponse(
+                    statusCode = 200,
+                    body = "img",
+                    bodyBytes = byteArrayOf(1, 2, 3, 4),
+                )
+            }
             val pruneLoader =
                 BitmapLoader(
-                    apiClient =
-                        RocheApiClient {
-                            HttpResponse(
-                                statusCode = 200,
-                                body = "img",
-                                bodyBytes = byteArrayOf(1, 2, 3, 4),
-                            )
-                        },
+                    serverApi = tailnetServerApi(pruneTransport),
+                    publicWebFetcher = PublicWebFetcher(pruneTransport),
                     settings = settings,
                     decoders =
                         ImageDecoders(
@@ -1630,6 +1648,17 @@ class MainViewModelTest {
         runTest {
             val deepText =
                 "Lead text. " + "z".repeat(8_000) + " DeepOverlayKeyword42 inside full text."
+            database
+                .dao()
+                .upsertFeed(
+                    FeedRow(
+                        id = "f-1",
+                        title = "Test Feed",
+                        url = "https://example.com/feed.xml",
+                        siteUrl = null,
+                        feedType = "rss",
+                    )
+                )
             database
                 .dao()
                 .upsertItem(
@@ -1938,7 +1967,7 @@ class MainViewModelTest {
             val slowStarted = CompletableDeferred<Unit>()
             val slowGate = CompletableDeferred<Unit>()
             val slowCancelled = CompletableDeferred<Boolean>()
-            val apiClient = RocheApiClient { req ->
+            val transport = HttpTransport { req ->
                 when {
                     req.url.endsWith("/items/ep-slow") -> {
                         slowStarted.complete(Unit)
@@ -1967,10 +1996,10 @@ class MainViewModelTest {
                 }
             }
             val localRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = apiClient,
                     settings = settings,
+                    transport = transport,
                     cacheDir = File(tempDir, "notes_collect_latest_cache"),
                     backgroundScope = backgroundScope,
                 )
@@ -2119,7 +2148,7 @@ class MainViewModelTest {
     fun `SaveUrlOrFeed closes add sheet immediately while slow network runs and separates Want to Read from Feed Inbox`() =
         runTest {
             val networkGate = CompletableDeferred<Unit>()
-            val slowClient = RocheApiClient { request ->
+            val slowTransport = HttpTransport { request ->
                 networkGate.await()
                 when (request.url) {
                     "https://blog.example.com" ->
@@ -2144,10 +2173,10 @@ class MainViewModelTest {
                 }
             }
             val slowRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = slowClient,
                     settings = settings,
+                    transport = slowTransport,
                 )
             val slowVm =
                 MainViewModel(
@@ -2235,7 +2264,7 @@ class MainViewModelTest {
     fun `PairWithServer and SyncNow surface RFC 9457 rate-limit invalid-code and token-invalid banners`() =
         runTest {
             var pairAttempt = 0
-            val problemClient = RocheApiClient { request ->
+            val problemTransport = HttpTransport { request ->
                 when (request.url) {
                     "https://100.64.0.12:8080/auth/pair" -> {
                         pairAttempt++
@@ -2267,10 +2296,10 @@ class MainViewModelTest {
                 }
             }
             val problemRepo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = problemClient,
                     settings = settings,
+                    transport = problemTransport,
                 )
             val problemVm =
                 MainViewModel(

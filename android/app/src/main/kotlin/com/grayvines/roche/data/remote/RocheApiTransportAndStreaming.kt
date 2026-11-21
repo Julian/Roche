@@ -46,6 +46,7 @@ data class HttpRequest(
     val body: String? = null,
     val expectBinary: Boolean = false,
     val requirePublicIp: Boolean = false,
+    val maxResponseBytes: Int? = null,
 )
 
 @Suppress("ArrayInDataClass")
@@ -80,7 +81,7 @@ fun interface VpnTransportCheck {
 
 class HttpEngineTransport(
     context: Context,
-    private val vpnCheck: VpnTransportCheck = VpnTransportCheck { true },
+    private val vpnCheck: VpnTransportCheck = VpnTransportCheck { false },
 ) : HttpTransport, AutoCloseable {
     private val appContext: Context = context.applicationContext ?: context
     private var lockedStoragePath: String? = null
@@ -160,6 +161,12 @@ class HttpEngineTransport(
             val sanitizedUrl = validateAndSanitizeRequestUrl(currentRequest, vpnCheck)
             val effectiveRequest = currentRequest.copy(url = sanitizedUrl)
             val outcome = executeSingleBufferedHop(sanitizedUrl, effectiveRequest)
+            val isRedirect =
+                outcome.redirectLocation != null &&
+                    outcome.response.statusCode in REDIRECT_STATUS_CODES
+            if (isRedirect && hop >= MAX_REDIRECTS) {
+                throw IOException("Too many redirects")
+            }
             val nextRequest =
                 resolveNextRedirectHop(
                     effectiveRequest = effectiveRequest,
@@ -498,8 +505,9 @@ internal class BufferedUrlRequestCallback(
     override fun onResponseStarted(request: UrlRequest, info: UrlResponseInfo) {
         val status = info.httpStatusCode
         val isSuccess = status in HTTP_OK_START..HTTP_OK_END
-        val bound =
+        val defaultBound =
             if (httpRequest.expectBinary && isSuccess) MAX_MEDIA_BYTES else MAX_RESPONSE_CHARS
+        val bound = httpRequest.maxResponseBytes?.coerceIn(1, defaultBound) ?: defaultBound
         maxAllowedBytes = bound
         val declaredLength = parseResponseContentLength(info)
         if (declaredLength != null && declaredLength > bound.toLong()) {
@@ -837,6 +845,7 @@ internal fun parseResponseContentLength(info: UrlResponseInfo): Long? =
 private const val HTTP_MOVED_PERMANENTLY = 301
 private const val HTTP_FOUND = 302
 private const val HTTP_SEE_OTHER = 303
+internal val REDIRECT_STATUS_CODES = setOf(301, 302, 303, 307, 308)
 internal const val REDIRECT_MISSING_LOCATION_MESSAGE = "Redirect missing Location header"
 internal const val HTTP_SCHEME_HTTPS = "https://"
 internal const val HTTP_SCHEME_HTTP = "http://"

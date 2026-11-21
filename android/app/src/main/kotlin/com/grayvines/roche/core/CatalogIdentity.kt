@@ -37,6 +37,13 @@ internal const val SCHEME_YOUTUBE = "youtube"
 
 internal const val YT_MUSIC_ORIGIN = "https://music.youtube.com"
 internal const val YT_MUSIC_BROWSE_PREFIX = "MPREb"
+internal const val YT_MUSIC_OLAK_PREFIX = "OLAK5uy_"
+internal const val YT_MUSIC_BROWSE_URL_PREFIX = "$YT_MUSIC_ORIGIN/browse/$YT_MUSIC_BROWSE_PREFIX"
+internal const val YT_MUSIC_PLAYLIST_URL_PREFIX = "$YT_MUSIC_ORIGIN/playlist?list="
+internal const val YT_MUSIC_OLAK_PLAYLIST_URL_PREFIX =
+    "$YT_MUSIC_PLAYLIST_URL_PREFIX$YT_MUSIC_OLAK_PREFIX"
+internal const val TIDAL_BROWSE_ALBUM_PREFIX = "https://tidal.com/browse/album/"
+internal const val TIDAL_LISTEN_ALBUM_PREFIX = "https://listen.tidal.com/album/"
 
 internal val WANT_TO_READ_BASE_SLUGS: Set<String> =
     setOf("read", "article", "articles", "paper", "papers")

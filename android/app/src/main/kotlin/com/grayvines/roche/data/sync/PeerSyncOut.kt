@@ -39,7 +39,9 @@ import com.grayvines.roche.data.local.FeedSourceEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.entryHasCatalogHistory
+import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
+import com.grayvines.roche.data.remote.SyncTombstoneDto
 import kotlinx.serialization.json.JsonObject
 
 internal const val MAX_PEER_SYNC_PAYLOAD_BYTES = 4 * 1024 * 1024
@@ -72,8 +74,8 @@ internal data class TrackedOutgoingSyncBatch(
     val sentFeedSourceHlcById: Map<String, String> = emptyMap(),
     val sentMembershipHlcByKey: Map<Pair<String, String>, String> = emptyMap(),
     val sentGeneratorHlcById: Map<String, String> = emptyMap(),
-    val sentLogIds: Set<String> = emptySet(),
-    val sentComparisonIds: Set<String> = emptySet(),
+    val sentLogHlcById: Map<String, String> = emptyMap(),
+    val sentComparisonHlcById: Map<String, String> = emptyMap(),
     val sentTombstoneHlcByKey: Map<Pair<String, String>, String> = emptyMap(),
     val byteOverflowEntryIds: Set<String> = emptySet(),
     val countOverflowEntryIds: Set<String> = emptySet(),
@@ -109,32 +111,41 @@ internal suspend fun buildTrackedPeerSyncRequest(
     dao: RocheDao,
     config: PeerSyncRequestConfig,
 ): TrackedOutgoingSyncBatch {
-    val snap = loadOutgoingGraphSnapshot(dao, config)
-    val slices = prepareOutgoingSlices(snap, config)
-    val cappedIds = slices.eligibleEntries.take(MAX_PEER_SYNC_ENTRIES).map { it.id }
-    val contentsById = loadEntryContentsByIds(dao, cappedIds, slices.unsyncedFeedIds)
+    var snap: OutgoingGraphSnapshot? = null
+    var slices: PreparedOutgoingSlices? = null
+    var contentsById: Map<String, EntryContentEntity> = emptyMap()
+    dao.executeInTransaction {
+        val loadedSnap = loadOutgoingGraphSnapshot(dao, config)
+        val loadedSlices = prepareOutgoingSlices(loadedSnap, config)
+        val cappedIds = loadedSlices.eligibleEntries.take(MAX_PEER_SYNC_ENTRIES).map { it.id }
+        contentsById = loadEntryContentsByIds(dao, cappedIds, loadedSlices.unsyncedFeedIds)
+        snap = loadedSnap
+        slices = loadedSlices
+    }
+    val resolvedSnap = checkNotNull(snap)
+    val resolvedSlices = checkNotNull(slices)
     val part =
         partitionOutgoingEntries(
-            slices.eligibleEntries,
-            snap,
+            resolvedSlices.eligibleEntries,
+            resolvedSnap,
             contentsById,
-            slices.unsyncedFeedIds,
+            resolvedSlices.unsyncedFeedIds,
             config.maxPayloadBytes,
             config.maxEntries,
         )
     val allOverflowIds = part.countOverflowIds + part.byteOverflowIds + config.quarantinedEntryIds
-    val filtered = filterNonOverflowSlices(slices, allOverflowIds)
+    val filtered = filterNonOverflowSlices(resolvedSlices, allOverflowIds)
     return assembleTrackedBatch(
         config,
-        snap,
+        resolvedSnap,
         part.wireEntries,
         part.budgetEntries,
-        slices.unsyncedFeedIds,
+        resolvedSlices.unsyncedFeedIds,
         filtered.memberships,
         filtered.generators,
         filtered.logs,
         filtered.comparisons,
-        slices.sentTombstones,
+        resolvedSlices.sentTombstones,
         part.byteOverflowIds,
         part.countOverflowIds,
     )
@@ -936,8 +947,8 @@ private fun assembleTrackedBatch(
         sentMembershipHlcByKey =
             sentMemberships.associate { Pair(it.collectionId, it.entryId) to it.hlc },
         sentGeneratorHlcById = sentGenerators.associate { it.collectionId to it.hlc },
-        sentLogIds = sentLogs.mapTo(HashSet()) { it.id },
-        sentComparisonIds = sentComparisons.mapTo(HashSet()) { it.id },
+        sentLogHlcById = sentLogs.associate { it.id to it.hlc },
+        sentComparisonHlcById = sentComparisons.associate { it.id to it.hlc },
         sentTombstoneHlcByKey =
             sentTombstones.associate { Pair(it.entityType, it.naturalKey) to it.hlc },
         byteOverflowEntryIds = byteOverflowIds,

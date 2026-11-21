@@ -8,13 +8,12 @@ import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
-import com.grayvines.roche.data.catalog.RankClusterCandidate
 import com.grayvines.roche.data.catalog.RankSettlementSummary
 import com.grayvines.roche.data.matchesSearchQuery
+import com.grayvines.roche.data.remote.NetworkTier
+import com.grayvines.roche.data.remote.PeerNodeDto
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.redactedForUi
-import com.grayvines.roche.data.sync.NetworkTier
-import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
@@ -26,6 +25,7 @@ import com.grayvines.roche.model.TagItem
 import com.grayvines.roche.model.ThemeMode
 import com.grayvines.roche.playback.PlayerDrawerTab
 import com.grayvines.roche.playback.findNextQueuedAudioEntry
+import com.grayvines.roche.ranking.RankClusterCandidate
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -478,6 +478,9 @@ sealed interface MainAction {
         val rankAfterLog: Boolean,
         val targetCollectionId: String? = null,
         val addToListOnly: Boolean = false,
+        val existingEntryId: String? = null,
+        val thumbnailUrl: String? = null,
+        val identifiers: List<com.grayvines.roche.data.catalog.EntryIdentifierDto> = emptyList(),
     ) : CatalogMutation
 
     data class CreateCustomCatalogList(val title: String) : CatalogMutation

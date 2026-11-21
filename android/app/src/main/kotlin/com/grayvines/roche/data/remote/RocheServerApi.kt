@@ -1,21 +1,20 @@
 package com.grayvines.roche.data.remote
 
-import com.grayvines.roche.core.EXTERNAL_BROWSER_USER_AGENT
 import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.settings.tailscaleDiscoveryUrls
 import java.io.File
 
-class RocheApiClient(
-    private val vpnCheck: VpnTransportCheck,
+/**
+ * Authenticated RPC client for the user's self-hosted Roche server over Tailnet/loopback.
+ *
+ * Strictly fail-closed: [vpnCheck] defaults to inactive so callers must explicitly wire live VPN
+ * state before Tailnet CGNAT / MagicDNS endpoints are permitted. Public-internet traffic never
+ * passes through this client; use [PublicWebFetcher] instead.
+ */
+class RocheServerApi(
+    private val vpnCheck: VpnTransportCheck = VpnTransportCheck { false },
     private val transport: HttpTransport,
 ) {
-    constructor(
-        transport: HttpTransport
-    ) : this(
-        vpnCheck = VpnTransportCheck { true },
-        transport = transport,
-    )
-
     private suspend fun executeServerRequest(
         serverUrl: String,
         request: HttpRequest,
@@ -87,45 +86,6 @@ class RocheApiClient(
                 body = buildPairDevicePayload(code = code, deviceName = deviceName),
             )
         return extractTokenFromPairResponse(body)
-    }
-
-    internal suspend fun createFeed(
-        serverUrl: String,
-        token: String,
-        url: String,
-        title: String? = null,
-    ): RemoteFeedDto =
-        parseFeedJson(
-            serverJson(
-                serverUrl = serverUrl,
-                method = METHOD_POST,
-                path = FEEDS_PATH,
-                token = token,
-                body = buildCreateFeedPayload(url = url, title = title),
-            )
-        )
-
-    suspend fun refreshFeed(
-        serverUrl: String,
-        token: String,
-        feedId: String,
-    ): RemoteFeedDto =
-        parseFeedJson(
-            serverJson(
-                serverUrl = serverUrl,
-                method = METHOD_POST,
-                path = "${feedPath(feedId)}/refresh",
-                token = token,
-            )
-        )
-
-    suspend fun deleteFeed(serverUrl: String, token: String, feedId: String) {
-        serverJson(
-            serverUrl = serverUrl,
-            method = METHOD_DELETE,
-            path = feedPath(feedId),
-            token = token,
-        )
     }
 
     internal suspend fun fetchItemDetail(
@@ -202,73 +162,6 @@ class RocheApiClient(
     }
         .getOrDefault(false)
 
-    internal suspend fun fetchExternalImageBytes(imageUrl: String): ByteArray? =
-        runSuspendCatching {
-            val trimmed = imageUrl.trim()
-            PublicUrlValidator.ensurePublicUrlSyntax(trimmed)
-            val response =
-                transport.execute(
-                    HttpRequest(
-                        method = METHOD_GET,
-                        url = trimmed,
-                        headers =
-                            mapOf(
-                                HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT,
-                                HEADER_ACCEPT to EXTERNAL_IMAGE_ACCEPT,
-                            ),
-                        expectBinary = true,
-                        requirePublicIp = true,
-                    )
-                )
-            if (response.statusCode !in HTTP_OK_START..HTTP_OK_END) return null
-            val bytes = response.bodyBytes ?: response.body.toByteArray(Charsets.UTF_8)
-            bytes.takeIf { it.size in 1..MAX_MEDIA_BYTES }
-        }
-        .getOrNull()
-
-    internal suspend fun streamExternalBinaryToFile(
-        fileUrl: String,
-        targetFile: File,
-        maxBytes: Long = MAX_AUDIO_ENCLOSURE_BYTES,
-    ): Boolean = runSuspendCatching {
-        val trimmed = fileUrl.trim()
-        PublicUrlValidator.ensurePublicUrlSyntax(trimmed)
-        transport.streamToFile(
-            request =
-                HttpRequest(
-                    method = METHOD_GET,
-                    url = trimmed,
-                    headers = mapOf(HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT),
-                    expectBinary = true,
-                    requirePublicIp = true,
-                ),
-            targetFile = targetFile,
-            maxBytes = maxBytes,
-        )
-    }
-        .getOrDefault(false)
-
-    internal suspend fun fetchExternalFeedXml(feedUrl: String): Result<String> =
-        runSuspendCatching {
-            val trimmed = feedUrl.trim()
-            PublicUrlValidator.ensurePublicUrlSyntax(trimmed)
-            val response =
-                transport.execute(
-                    HttpRequest(
-                        method = METHOD_GET,
-                        url = trimmed,
-                        headers =
-                            mapOf(
-                                HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT,
-                                HEADER_ACCEPT to EXTERNAL_FEED_ACCEPT,
-                            ),
-                        requirePublicIp = true,
-                    )
-                )
-            ensureExternalSuccess(response)
-            response.body
-        }
-
     internal suspend fun syncPeer(
         serverUrl: String,
         token: String,
@@ -295,6 +188,19 @@ class RocheApiClient(
         return parsePeerSyncResponseJson(response.body)
     }
 
+    internal suspend fun enrichCatalogEntry(
+        serverUrl: String,
+        token: String,
+        entryId: String,
+    ) {
+        serverJson(
+            serverUrl = serverUrl,
+            method = METHOD_POST,
+            path = "/api/v1/catalog/entries/${encodePathSegment(entryId)}/enrich",
+            token = token,
+        )
+    }
+
     internal suspend fun importOpml(
         serverUrl: String,
         token: String,
@@ -313,21 +219,12 @@ class RocheApiClient(
     internal suspend fun exportOpml(serverUrl: String, token: String): String =
         serverJson(serverUrl, METHOD_GET, "/api/v1/export/feeds", token)
 
-    private fun feedPath(feedId: String): String = "$FEEDS_PATH/${encodePathSegment(feedId)}"
-
     private fun itemPath(itemId: String): String = "$ITEMS_PATH/${encodePathSegment(itemId)}"
 
     private companion object {
-        private const val FEEDS_PATH = "/api/v1/feeds"
         private const val ITEMS_PATH = "/api/v1/items"
         private const val METHOD_GET = "GET"
         private const val METHOD_POST = "POST"
-        private const val METHOD_DELETE = "DELETE"
-        private const val EXTERNAL_IMAGE_USER_AGENT = EXTERNAL_BROWSER_USER_AGENT
-        private const val EXTERNAL_IMAGE_ACCEPT =
-            "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
-        private const val EXTERNAL_FEED_ACCEPT =
-            "application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8"
         private const val HTTP_NOT_FOUND_CODE = 404
         private const val HTTP_METHOD_NOT_ALLOWED_CODE = 405
     }

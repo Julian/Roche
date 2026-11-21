@@ -1,8 +1,6 @@
 package com.grayvines.roche.data
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
-import androidx.room3.Room
-import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.core.externalIdentifierUrl
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.EntryIdentifierDto
@@ -18,7 +16,6 @@ import com.grayvines.roche.data.enrichment.withResolvedStreamingIds
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.HttpTransport
-import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.sync.PeerSyncRequestConfig
 import com.grayvines.roche.data.sync.buildPeerSyncRequest
@@ -162,10 +159,7 @@ class AlbumStreamingResolverTest {
     @Test
     fun `prewarmCollectionDraw persists YouTube Music and Wikipedia IDs and marks entry dirty for sync`() =
         runTest {
-            val db =
-                Room.inMemoryDatabaseBuilder<RocheDatabase>()
-                    .setDriver(BundledSQLiteDriver())
-                    .build()
+            val db = RocheDatabase.createInMemory()
             val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
             try {
                 val settingsStore =
@@ -175,10 +169,10 @@ class AlbumStreamingResolverTest {
                     )
                 val transport = prewarmMockTransport()
                 val repo =
-                    RocheRepository(
+                    mockRepository(
                         database = db,
-                        apiClient = RocheApiClient(transport = transport),
                         settings = SettingsRepository(settingsStore),
+                        transport = transport,
                         albumStreamingResolver = AlbumStreamingResolver(transport),
                     )
                 val listId = repo.catalog.createCustomList("Jazz Canon")

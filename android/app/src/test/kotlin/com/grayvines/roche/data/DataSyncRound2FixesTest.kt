@@ -9,8 +9,6 @@
 package com.grayvines.roche.data
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
-import androidx.room3.Room
-import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.core.HlcTimestamp
 import com.grayvines.roche.core.MAX_CLOCK_DRIFT_MS
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_CONSUMPTION_LOG
@@ -48,21 +46,22 @@ import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.nextLocalHlc
 import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.remote.HttpResponse
+import com.grayvines.roche.data.remote.HttpTransport
+import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.data.remote.ProblemDetailsException
+import com.grayvines.roche.data.remote.PublicWebFetcher
 import com.grayvines.roche.data.remote.ResponseTooLargeException
-import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.remote.RocheProblemTypes
+import com.grayvines.roche.data.remote.SyncTombstoneDto
 import com.grayvines.roche.data.remote.rocheJson
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.sync.MAX_PEER_SYNC_PAYLOAD_BYTES
 import com.grayvines.roche.data.sync.MIN_SERVER_PAYLOAD_BYTES
-import com.grayvines.roche.data.sync.NetworkTier
 import com.grayvines.roche.data.sync.PeerSyncCoordinator
 import com.grayvines.roche.data.sync.PeerSyncJobTracker
 import com.grayvines.roche.data.sync.PeerSyncScheduler
-import com.grayvines.roche.data.sync.SyncTombstoneDto
 import com.grayvines.roche.data.sync.compute413RetryPayloadBudget
 import com.grayvines.roche.data.sync.isOversizedResponseError
 import com.grayvines.roche.data.sync.isPayloadTooLargeProblem
@@ -105,8 +104,7 @@ class DataSyncRound2FixesTest {
     @BeforeEach
     fun setUp() {
         tempDir = Files.createTempDirectory("roche-r2-test").toFile()
-        database =
-            Room.inMemoryDatabaseBuilder<RocheDatabase>().setDriver(BundledSQLiteDriver()).build()
+        database = RocheDatabase.createInMemory()
     }
 
     @AfterEach
@@ -558,7 +556,7 @@ class DataSyncRound2FixesTest {
             val receivedRequests = CopyOnWriteArrayList<JsonObject>()
             val uploadedIds = LinkedHashSet<String>()
             var seq = 20L
-            val apiClient = RocheApiClient { req ->
+            val apiClient = tailnetServerApi { req ->
                 val parsed = rocheJson.parseToJsonElement(req.body.orEmpty()).jsonObject
                 receivedRequests.add(parsed)
                 val entriesArr = parsed["entries"]?.jsonArray.orEmpty()
@@ -586,7 +584,7 @@ class DataSyncRound2FixesTest {
             val coordinator =
                 PeerSyncCoordinator(
                     dao = dao,
-                    apiClient = apiClient,
+                    serverApi = apiClient,
                     networkTier = NetworkTier.WIFI,
                     catalogStore = catalog,
                 )
@@ -644,8 +642,8 @@ class DataSyncRound2FixesTest {
         val cursorUpdates = CopyOnWriteArrayList<String>()
         val postPollSyncBodies = CopyOnWriteArrayList<JsonObject>()
         val uploadedPostUrls = LinkedHashSet<String>()
-        val apiClient =
-            buildPostPollResetTestClient(
+        val transport =
+            buildPostPollResetTestTransport(
                 feedUrl = feedUrl,
                 rssXml = rssXml,
                 nowIso = nowIso,
@@ -656,7 +654,8 @@ class DataSyncRound2FixesTest {
         val coordinator =
             PeerSyncCoordinator(
                 dao = dao,
-                apiClient = apiClient,
+                serverApi = tailnetServerApi(transport),
+                publicWebFetcher = PublicWebFetcher(transport),
                 networkTier = NetworkTier.WIFI,
                 onSyncCursorUpdated = { cursorUpdates.add(it) },
             )
@@ -681,17 +680,17 @@ class DataSyncRound2FixesTest {
         assertTrue("https://blog.example.com/2" in uploadedPostUrls)
     }
 
-    private fun buildPostPollResetTestClient(
+    private fun buildPostPollResetTestTransport(
         feedUrl: String,
         rssXml: String,
         nowIso: String,
         postPollSyncBodies: CopyOnWriteArrayList<JsonObject>,
         uploadedPostUrls: MutableSet<String>,
-    ): RocheApiClient {
+    ): HttpTransport {
         var syncCallCount = 0
         var seq = 10L
         var postPollResetSent = false
-        return RocheApiClient { req ->
+        return HttpTransport { req ->
             if (req.url == feedUrl) {
                 HttpResponse(statusCode = 200, body = rssXml)
             } else {
@@ -796,10 +795,10 @@ class DataSyncRound2FixesTest {
                     )
                 settings.update { it.copy(peerId = "android-peer-pdf") }
                 val repo =
-                    RocheRepository(
+                    mockRepository(
                         database = database,
-                        apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
                         settings = settings,
+                        transport = { HttpResponse(statusCode = 200, body = "{}") },
                         cacheDir = tempDir,
                     )
                 val badUrl = "localpdf://broken-doc-123"
@@ -839,10 +838,10 @@ class DataSyncRound2FixesTest {
                 )
             settings.update { it.copy(peerId = "android-peer-pdf-reshare") }
             val repo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
                     settings = settings,
+                    transport = { HttpResponse(statusCode = 200, body = "{}") },
                     cacheDir = tempDir,
                 )
             val localUrl = "localpdf://existing-doc-456"
@@ -898,7 +897,7 @@ class DataSyncRound2FixesTest {
 
         LocalFeedPoller.pollFeed(
                 dao = dao,
-                apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "") },
+                publicWebFetcher = PublicWebFetcher { HttpResponse(statusCode = 200, body = "") },
                 feed = storedBefore,
                 localPeerId = "android-peer-88",
                 prefetchedBatch =
@@ -975,18 +974,19 @@ class DataSyncRound2FixesTest {
                     )
                 )
             settings.update { it.copy(peerId = "android-peer-42") }
-            val htmlClient = RocheApiClient {
+            val htmlTransport = HttpTransport {
                 HttpResponse(
                     statusCode = 200,
                     body =
                         "<html><head><title>Enriched Title</title></head><body><article><p>Body text</p></article></body></html>",
                 )
             }
+            val htmlFetcher = PublicWebFetcher(htmlTransport)
             val repo =
-                RocheRepository(
+                mockRepository(
                     database = database,
-                    apiClient = htmlClient,
                     settings = settings,
+                    transport = htmlTransport,
                     cacheDir = tempDir,
                 )
             val dao = database.dao()
@@ -1015,7 +1015,7 @@ class DataSyncRound2FixesTest {
             )
             LocalFeedPoller.pollFeed(
                     dao = dao,
-                    apiClient = htmlClient,
+                    publicWebFetcher = htmlFetcher,
                     feed = dao.getFeedById(feedId)!!,
                     localPeerId = "android-peer-42",
                     prefetchedBatch =
@@ -1050,7 +1050,7 @@ class DataSyncRound2FixesTest {
 
             enrichWantToReadItemOnDevice(
                 dao = dao,
-                apiClient = htmlClient,
+                publicWebFetcher = htmlFetcher,
                 itemId = itemId,
                 url = "https://example.com/tagged-article",
                 hasUserTitleOverride = false,
@@ -1121,7 +1121,7 @@ class DataSyncRound2FixesTest {
             var seq = 30L
             val uploadedIds = LinkedHashSet<String>()
             val serverLimitBytes = 60_000L
-            val cappedClient = RocheApiClient { req ->
+            val cappedClient = tailnetServerApi { req ->
                 val rawBody = req.body.orEmpty()
                 if (rawBody.toByteArray().size > serverLimitBytes) {
                     server413Count++
@@ -1147,7 +1147,7 @@ class DataSyncRound2FixesTest {
             val coordinator =
                 PeerSyncCoordinator(
                     dao = dao,
-                    apiClient = cappedClient,
+                    serverApi = cappedClient,
                     networkTier = NetworkTier.WIFI,
                 )
             val baseSettings =
@@ -1168,8 +1168,8 @@ class DataSyncRound2FixesTest {
             val oversizedCoordinator =
                 PeerSyncCoordinator(
                     dao = dao,
-                    apiClient =
-                        RocheApiClient { throw ResponseTooLargeException(maxBytes = 1024L) },
+                    serverApi =
+                        tailnetServerApi { throw ResponseTooLargeException(maxBytes = 1024L) },
                     networkTier = NetworkTier.WIFI,
                 )
             assertNull(
@@ -1181,8 +1181,8 @@ class DataSyncRound2FixesTest {
             val genericIoCoordinator =
                 PeerSyncCoordinator(
                     dao = dao,
-                    apiClient =
-                        RocheApiClient {
+                    serverApi =
+                        tailnetServerApi {
                             throw IOException("Response exceeds maximum allowed size")
                         },
                     networkTier = NetworkTier.WIFI,

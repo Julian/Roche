@@ -6,6 +6,7 @@ import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
 import com.grayvines.roche.core.HlcTimestamp
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_GENERATOR
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_CONSUMPTION_LOG
 import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
 import com.grayvines.roche.core.canonicalOrderingJson
 import com.grayvines.roche.core.collectionEntryNaturalKey
@@ -17,6 +18,8 @@ import com.grayvines.roche.data.local.CatalogStampRow
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.ComparisonEntity
+import com.grayvines.roche.data.local.ConsumptionLogEntity
+import com.grayvines.roche.data.local.DbWriteLock
 import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.local.RocheDao
@@ -24,16 +27,10 @@ import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.deleteCollectionGeneratorWithTombstone
 import com.grayvines.roche.data.local.nextLocalHlc
 import com.grayvines.roche.ranking.EpRankingEngine
+import com.grayvines.roche.ranking.RankClusterCandidate
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.random.Random
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.conflate
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.flowOn
-import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -42,10 +39,16 @@ class CatalogStore(
     private val random: Random = Random.Default,
     onLocalMutation: () -> Unit = {},
     private val localPeerIdProvider: suspend () -> String = { DEFAULT_LOCAL_HLC_NODE },
+    internal val writeLock: DbWriteLock = DbWriteLock(),
 ) {
     private val localMutationCallback = AtomicReference(onLocalMutation)
-    private val seeder = CatalogSeeder(dao = dao, localPeerIdProvider = ::resolveLocalPeerId)
-    private val mutationMutex = Mutex()
+    private val seeder =
+        CatalogSeeder(
+            dao = dao,
+            writeLock = writeLock,
+            localPeerIdProvider = ::resolveLocalPeerId,
+        )
+    private val mutationMutex: DbWriteLock = writeLock
     private val snapshotCacheMutex = Mutex()
     internal val epScoreCache = EpScoreCache()
     private var cachedState: CachedCatalogState? = null
@@ -65,13 +68,7 @@ class CatalogStore(
     internal var catalogSnapshotCacheHits: Int = 0
         private set
 
-    @OptIn(ExperimentalCoroutinesApi::class)
-    val snapshot: Flow<CatalogSnapshot> =
-        dao.observeCatalogStamp()
-            .conflate()
-            .distinctUntilChanged()
-            .mapLatest { getOrBuildCatalogSnapshot() }
-            .flowOn(Dispatchers.Default)
+    suspend fun getSnapshot(): CatalogSnapshot = getOrBuildCatalogSnapshot()
 
     internal suspend fun resolveLocalPeerId(): String =
         localPeerIdProvider().ifBlank { DEFAULT_LOCAL_HLC_NODE }
@@ -300,6 +297,129 @@ class CatalogStore(
             notifyLocalMutation()
         }
         return loggedId
+    }
+
+    suspend fun updateConsumptionLog(
+        logId: String,
+        status: ConsumptionStatus? = null,
+        notes: String? = null,
+        clearNotes: Boolean = false,
+        tsIso: String? = null,
+    ): Boolean {
+        val cleanId = logId.trim()
+        if (cleanId.isEmpty()) return false
+        val updated = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val existing = dao.getConsumptionLogById(cleanId)
+            if (existing == null) {
+                false
+            } else {
+                val nextStatus = status ?: ConsumptionStatus.fromWireValue(existing.status)
+                val nextNotes =
+                    when {
+                        clearNotes -> null
+                        notes != null -> notes.trim().takeIf { it.isNotEmpty() }
+                        else -> existing.notes
+                    }
+                val nextTs = tsIso?.trim()?.takeIf { it.isNotEmpty() } ?: existing.ts
+                applyConsumptionLogUpdateInTx(
+                    existing = existing,
+                    nextStatus = nextStatus,
+                    nextNotes = nextNotes,
+                    nextTs = nextTs,
+                )
+                true
+            }
+        }
+        if (updated) {
+            notifyLocalMutation()
+        }
+        return updated
+    }
+
+    private suspend fun applyConsumptionLogUpdateInTx(
+        existing: ConsumptionLogEntity,
+        nextStatus: ConsumptionStatus,
+        nextNotes: String?,
+        nextTs: String,
+    ) {
+        val nowIso = nowUtcIso()
+        val nodeId = resolveLocalPeerId()
+        dao.executeInTransaction {
+            val hlc = nextLocalHlc(dao, nodeId)
+            dao.deleteTombstone(TOMBSTONE_ENTITY_CONSUMPTION_LOG, existing.id)
+            dao.upsertConsumptionLog(
+                existing.copy(
+                    ts = nextTs,
+                    status = nextStatus.wireValue,
+                    notes = nextNotes,
+                    hlc = hlc,
+                    isLocalDirty = true,
+                )
+            )
+            if (nextStatus == ConsumptionStatus.CONSUMED) {
+                removeFromWantQueuesInDao(dao, existing.entryId, nowIso, nodeId)
+                dao.getEntryStateById(existing.entryId)?.let { st ->
+                    if (st.readAt == null) {
+                        dao.upsertEntryState(
+                            st.copy(
+                                readAt = nextTs,
+                                interactionUpdatedAt = nowIso,
+                                updatedAt = nowIso,
+                                hlc = hlc,
+                                isLocalDirty = true,
+                            )
+                        )
+                    }
+                }
+                engageParentArtistsInDao(
+                    dao = dao,
+                    entryId = existing.entryId,
+                    tsIso = nextTs,
+                    nowIso = nowIso,
+                    markDirty = true,
+                    nodeId = nodeId,
+                )
+            }
+            if (
+                nextStatus == ConsumptionStatus.CONSUMED ||
+                    nextStatus == ConsumptionStatus.ABANDONED
+            ) {
+                advanceActiveDrawsLocked(existing.entryId, nextStatus, nowIso, nodeId)
+            }
+        }
+    }
+
+    suspend fun deleteConsumptionLog(logId: String): Boolean {
+        val cleanId = logId.trim()
+        if (cleanId.isEmpty()) return false
+        val deleted = mutationMutex.withLock {
+            ensureSystemSeeded()
+            if (dao.getConsumptionLogById(cleanId) == null) {
+                false
+            } else {
+                val nowIso = nowUtcIso()
+                val nodeId = resolveLocalPeerId()
+                dao.executeInTransaction {
+                    val hlc = nextLocalHlc(dao, nodeId)
+                    dao.deleteConsumptionLogById(cleanId)
+                    dao.upsertTombstone(
+                        TombstoneEntity(
+                            entityType = TOMBSTONE_ENTITY_CONSUMPTION_LOG,
+                            naturalKey = cleanId,
+                            deletedAt = nowIso,
+                            hlc = hlc,
+                            isLocalDirty = true,
+                        )
+                    )
+                }
+                true
+            }
+        }
+        if (deleted) {
+            notifyLocalMutation()
+        }
+        return deleted
     }
 
     suspend fun wantEntry(
@@ -766,19 +886,7 @@ class CatalogStore(
     }
 
     internal suspend fun drawRandomRemainingId(collectionId: String): String? {
-        val poolMembers = dao.getCollectionMemberships(collectionId).map { it.entryId }
-        if (poolMembers.isEmpty()) return null
-        val activeIds =
-            dao.getAllEntries().filter { it.mergedIntoId.isNullOrBlank() }.map { it.id }.toHashSet()
-        val finishedIds =
-            dao.getAllConsumptionLogs()
-                .filter {
-                    val s = ConsumptionStatus.fromWireValue(it.status)
-                    s == ConsumptionStatus.CONSUMED || s == ConsumptionStatus.ABANDONED
-                }
-                .map { it.entryId }
-                .toHashSet()
-        val remaining = poolMembers.filter { it in activeIds && it !in finishedIds }.distinct()
+        val remaining = dao.getEligibleDrawEntryIds(collectionId)
         return if (remaining.isEmpty()) null else remaining[random.nextInt(remaining.size)]
     }
 

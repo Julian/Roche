@@ -18,14 +18,30 @@ import java.util.Locale
 private const val SCHEME_HTTP = "http"
 private const val SCHEME_HTTPS = "https"
 
+internal data class ResolvedPublicTarget(
+    val canonicalUrl: String,
+    val scheme: String,
+    val asciiHost: String,
+    val port: Int,
+    val addresses: List<InetAddress>,
+)
+
 internal object PublicUrlValidator {
     fun ensurePublicUrlSyntax(rawUrl: String): String = validatePublicHttpTarget(rawUrl).asciiHost
 
-    fun ensurePublicTarget(
+    fun resolvePublicTarget(
         rawUrl: String,
         resolveAddresses: (String) -> Array<InetAddress> = InetAddress::getAllByName,
-    ): String {
-        val validated = validatePublicHttpTarget(rawUrl)
+        isCleartextPermitted: (String) -> Boolean = ::isCleartextAllowed,
+        upgradeCleartext: Boolean = false,
+    ): ResolvedPublicTarget {
+        val candidateUrl =
+            if (upgradeCleartext) {
+                upgradePublicHttp(rawUrl, isCleartextPermitted)
+            } else {
+                rawUrl
+            }
+        val validated = validatePublicHttpTarget(candidateUrl)
         val lookupHost = validated.asciiHost.trim('[', ']')
         val resolved = runCatching {
             resolveAddresses(lookupHost)
@@ -38,8 +54,33 @@ internal object PublicUrlValidator {
                 "Blocked private or local IP for upstream host: ${validated.asciiHost}"
             )
         }
-        return validated.canonicalUrl
+        val effectivePort =
+            if (validated.port > 0) {
+                validated.port
+            } else if (validated.scheme == SCHEME_HTTPS) {
+                DEFAULT_HTTPS_PORT
+            } else {
+                DEFAULT_HTTP_PORT
+            }
+        return ResolvedPublicTarget(
+            canonicalUrl = validated.canonicalUrl,
+            scheme = validated.scheme,
+            asciiHost = validated.asciiHost,
+            port = effectivePort,
+            addresses = resolved.toList(),
+        )
     }
+
+    fun ensurePublicTarget(
+        rawUrl: String,
+        resolveAddresses: (String) -> Array<InetAddress> = InetAddress::getAllByName,
+    ): String =
+        resolvePublicTarget(
+                rawUrl = rawUrl,
+                resolveAddresses = resolveAddresses,
+                upgradeCleartext = false,
+            )
+            .canonicalUrl
 
     fun isServerEndpointAllowed(
         rawServerUrl: String,
@@ -115,7 +156,9 @@ internal object PublicUrlValidator {
 }
 
 internal data class ValidatedHttpTarget(
+    val scheme: String,
     val asciiHost: String,
+    val port: Int,
     val canonicalUrl: String,
 )
 
@@ -134,7 +177,12 @@ internal fun validatePublicHttpTarget(rawUrl: String): ValidatedHttpTarget {
         throw IOException(violation)
     }
     val canonicalUrl = reconstructCanonicalHttpUrl(uri, scheme, asciiHost, port)
-    return ValidatedHttpTarget(asciiHost = asciiHost, canonicalUrl = canonicalUrl)
+    return ValidatedHttpTarget(
+        scheme = scheme,
+        asciiHost = asciiHost,
+        port = port,
+        canonicalUrl = canonicalUrl,
+    )
 }
 
 internal fun reconstructCanonicalHttpUrl(
@@ -267,3 +315,5 @@ internal fun extractPortOrThrow(uri: URI): Int {
 }
 
 private const val MAX_VALID_TCP_PORT = 65_535
+private const val DEFAULT_HTTP_PORT = 80
+private const val DEFAULT_HTTPS_PORT = 443

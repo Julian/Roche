@@ -6,7 +6,6 @@ import com.grayvines.roche.data.catalog.SyncEntryContentDto
 import com.grayvines.roche.data.catalog.SyncEntryRecordDto
 import com.grayvines.roche.data.catalog.SyncEntryStateDto
 import com.grayvines.roche.data.catalog.SyncFeedSourceDto
-import com.grayvines.roche.data.sync.SyncTombstoneDto
 import com.grayvines.roche.model.ContentType
 import java.io.File
 import java.io.IOException
@@ -61,11 +60,12 @@ class RocheApiClientTest {
         }
             .toString()
 
-        val client = RocheApiClient { request ->
-            assertEquals("http://localhost:8080/api/v1/items/item-42", request.url)
-            assertEquals("Bearer token-123", request.headers["Authorization"])
-            HttpResponse(statusCode = 200, body = body)
-        }
+        val client =
+            RocheServerApi(vpnCheck = VpnTransportCheck { true }) { request ->
+                assertEquals("http://localhost:8080/api/v1/items/item-42", request.url)
+                assertEquals("Bearer token-123", request.headers["Authorization"])
+                HttpResponse(statusCode = 200, body = body)
+            }
 
         val item =
             client.fetchItemDetail(
@@ -82,41 +82,35 @@ class RocheApiClientTest {
     }
 
     @Test
-    fun `pairDevice and createFeed match server wire envelopes`() = runTest {
-        val client = RocheApiClient { request ->
-            when (request.url) {
-                "http://localhost:8080/auth/pair" -> {
-                    assertEquals(
-                        true,
-                        request.body?.contains(""""pairing_code":"123456"""") == true,
-                    )
-                    HttpResponse(statusCode = 200, body = """{"token":"tok-abc"}""")
-                }
-                "http://localhost:8080/api/v1/feeds" -> {
-                    assertEquals("POST", request.method)
-                    assertEquals(
-                        true,
-                        request.body?.contains(""""url":"https://lwn.net/rss"""") == true,
-                    )
-                    HttpResponse(
-                        statusCode = 201,
-                        body =
-                            """{"id":"f-1","title":"LWN","url":"https://lwn.net/rss","feed_type":"rss","unread_count":3}""",
-                    )
-                }
-                else -> {
-                    HttpResponse(statusCode = 404, body = "{}")
+    fun `pairDevice and enrichCatalogEntry match server wire envelopes`() = runTest {
+        var enrichedCount = 0
+        val client =
+            RocheServerApi(vpnCheck = VpnTransportCheck { true }) { request ->
+                when (request.url) {
+                    "http://localhost:8080/auth/pair" -> {
+                        assertEquals(
+                            true,
+                            request.body?.contains(""""pairing_code":"123456"""") == true,
+                        )
+                        HttpResponse(statusCode = 200, body = """{"token":"tok-abc"}""")
+                    }
+                    "http://localhost:8080/api/v1/catalog/entries/entry-42/enrich" -> {
+                        assertEquals("POST", request.method)
+                        assertEquals("Bearer tok", request.headers["Authorization"])
+                        enrichedCount += 1
+                        HttpResponse(statusCode = 200, body = """{"enriched":true}""")
+                    }
+                    else -> {
+                        HttpResponse(statusCode = 404, body = "{}")
+                    }
                 }
             }
-        }
 
         val token = client.pairDevice("http://localhost:8080", "123456", "Pixel")
         assertEquals("tok-abc", token)
 
-        val feed = client.createFeed("http://localhost:8080", "tok", "https://lwn.net/rss", "LWN")
-        assertEquals("f-1", feed.id)
-        assertEquals("LWN", feed.title)
-        assertEquals("rss", feed.feedType)
+        client.enrichCatalogEntry("http://localhost:8080", "tok", "entry-42")
+        assertEquals(1, enrichedCount)
     }
 
     @Test
@@ -129,7 +123,10 @@ class RocheApiClientTest {
         }
             .toString()
 
-        val client = RocheApiClient { HttpResponse(statusCode = 401, body = problemBody) }
+        val client =
+            RocheServerApi(vpnCheck = VpnTransportCheck { true }) {
+                HttpResponse(statusCode = 401, body = problemBody)
+            }
 
         val error =
             assertThrows(ProblemDetailsException::class.java) {
@@ -143,17 +140,18 @@ class RocheApiClientTest {
     @Test
     fun `discoverServer probes Tailscale candidates and adopts canonical_url from health endpoint`() =
         runTest {
-            val client = RocheApiClient { request ->
-                if (request.url == "https://roche/health") {
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """{"status":"ok","service":"roche","version":"0.1.0","canonical_url":"https://mac-mini.tail9876.ts.net"}""",
-                    )
-                } else {
-                    HttpResponse(statusCode = 404, body = "{}")
+            val client =
+                RocheServerApi(vpnCheck = VpnTransportCheck { true }) { request ->
+                    if (request.url == "https://roche/health") {
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"status":"ok","service":"roche","version":"0.1.0","canonical_url":"https://mac-mini.tail9876.ts.net"}""",
+                        )
+                    } else {
+                        HttpResponse(statusCode = 404, body = "{}")
+                    }
                 }
-            }
 
             val discovered = client.discoverServer()
             assertEquals("https://roche", discovered?.probedUrl)
@@ -164,22 +162,24 @@ class RocheApiClientTest {
     @Test
     fun `discoverServer ignores non-roche services and rejects untrusted or cleartext canonical_url redirects`() =
         runTest {
-            val client = RocheApiClient { request ->
-                when (request.url) {
-                    "https://roche.tail9876.ts.net/health" ->
-                        // Non-Roche service returning generic {"status":"ok"} without
-                        // "service":"roche"
-                        HttpResponse(statusCode = 200, body = """{"status":"ok"}""")
-                    "https://roche/health" ->
-                        // Compromised/misconfigured response trying to downgrade to cleartext http
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"status":"ok","service":"roche","canonical_url":"http://roche.tail9876.ts.net:8080"}""",
-                        )
-                    else -> HttpResponse(statusCode = 404, body = "{}")
+            val client =
+                RocheServerApi(vpnCheck = VpnTransportCheck { true }) { request ->
+                    when (request.url) {
+                        "https://roche.tail9876.ts.net/health" ->
+                            // Non-Roche service returning generic {"status":"ok"} without
+                            // "service":"roche"
+                            HttpResponse(statusCode = 200, body = """{"status":"ok"}""")
+                        "https://roche/health" ->
+                            // Compromised/misconfigured response trying to downgrade to cleartext
+                            // http
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """{"status":"ok","service":"roche","canonical_url":"http://roche.tail9876.ts.net:8080"}""",
+                            )
+                        else -> HttpResponse(statusCode = 404, body = "{}")
+                    }
                 }
-            }
 
             val discovered = client.discoverServer(tailnetDomains = listOf("tail9876.ts.net"))
             assertEquals("https://roche", discovered?.probedUrl)
@@ -188,15 +188,12 @@ class RocheApiClientTest {
         }
 
     @Test
-    fun `RocheApiClient rejects cleartext non-Tailscale server URLs VPN-off cleartext and SSRF targets`() =
+    fun `RocheServerApi fails closed on VPN-off cleartext and PublicWebFetcher rejects SSRF targets`() =
         runTest {
-            val vpnOffClient =
-                RocheApiClient(
-                    vpnCheck = VpnTransportCheck { false },
-                    transport = { HttpResponse(statusCode = 200, body = "<opml/>") },
-                )
+            val defaultFailClosedClient =
+                RocheServerApi(transport = { HttpResponse(statusCode = 200, body = "<opml/>") })
             val tailscaleVpnOffErr = runCatching {
-                vpnOffClient.exportOpml(
+                defaultFailClosedClient.exportOpml(
                     serverUrl = "http://100.64.0.9:8080",
                     token = "secret",
                 )
@@ -205,7 +202,7 @@ class RocheApiClientTest {
             assertEquals(true, tailscaleVpnOffErr is java.io.IOException)
 
             val lanCleartextErr = runCatching {
-                vpnOffClient.exportOpml(
+                defaultFailClosedClient.exportOpml(
                     serverUrl = "http://192.168.1.50:8080",
                     token = "secret",
                 )
@@ -213,15 +210,18 @@ class RocheApiClientTest {
                 .exceptionOrNull()
             assertEquals(true, lanCleartextErr is java.io.IOException)
 
+            val publicWebFetcher = PublicWebFetcher {
+                HttpResponse(statusCode = 200, body = "<rss/>")
+            }
             val loopbackFeedErr = runCatching {
-                vpnOffClient.fetchExternalFeedXml("http://127.0.0.1:8080/feed.xml").getOrThrow()
+                publicWebFetcher.fetchFeedXml("http://127.0.0.1:8080/feed.xml").getOrThrow()
             }
                 .exceptionOrNull()
             assertEquals(true, loopbackFeedErr is java.io.IOException)
 
             assertEquals(
                 null,
-                vpnOffClient.fetchExternalImageBytes("http://100.64.0.9:8080/private.png"),
+                publicWebFetcher.fetchImageBytes("http://100.64.0.9:8080/private.png"),
             )
         }
 
@@ -229,29 +229,30 @@ class RocheApiClientTest {
     internal fun `fetchItemDetail fetchItemMedia and fetchMediaBytes parse item details and binary media`() =
         runTest {
             val expectedBytes = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
-            val client = RocheApiClient { request ->
-                when (request.url) {
-                    "http://localhost:8080/api/v1/items/item-42" ->
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"id":"item-42","title":"Full Paper","url":"https://arxiv.org/abs/2603.00001","content_html":"<p>Hydrated article body</p>","content_type":"paper","status":"unread","is_favorite":false,"created_at":"2026-03-29T10:00:00Z","thumbnail_media_id":"thumb-42"}""",
-                        )
-                    "http://localhost:8080/api/v1/items/item-42/media" ->
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"media":[{"id":"thumb-42","item_id":"item-42","media_type":"thumbnail","file_size":8},{"id":"pdf-42","item_id":"item-42","media_type":"pdf","file_size":4096}]}""",
-                        )
-                    "http://localhost:8080/api/v1/media/thumb-42" ->
-                        HttpResponse(
-                            statusCode = 200,
-                            body = "",
-                            bodyBytes = expectedBytes,
-                        )
-                    else -> HttpResponse(statusCode = 404, body = "{}")
+            val client =
+                RocheServerApi(vpnCheck = VpnTransportCheck { true }) { request ->
+                    when (request.url) {
+                        "http://localhost:8080/api/v1/items/item-42" ->
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """{"id":"item-42","title":"Full Paper","url":"https://arxiv.org/abs/2603.00001","content_html":"<p>Hydrated article body</p>","content_type":"paper","status":"unread","is_favorite":false,"created_at":"2026-03-29T10:00:00Z","thumbnail_media_id":"thumb-42"}""",
+                            )
+                        "http://localhost:8080/api/v1/items/item-42/media" ->
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """{"media":[{"id":"thumb-42","item_id":"item-42","media_type":"thumbnail","file_size":8},{"id":"pdf-42","item_id":"item-42","media_type":"pdf","file_size":4096}]}""",
+                            )
+                        "http://localhost:8080/api/v1/media/thumb-42" ->
+                            HttpResponse(
+                                statusCode = 200,
+                                body = "",
+                                bodyBytes = expectedBytes,
+                            )
+                        else -> HttpResponse(statusCode = 404, body = "{}")
+                    }
                 }
-            }
 
             val detail = client.fetchItemDetail("http://localhost:8080", "tok-123", "item-42")
             assertEquals("item-42", detail.id)
@@ -282,63 +283,52 @@ class RocheApiClientTest {
         }
 
     @Test
-    internal fun `refreshFeed and deleteFeed send expected endpoints and methods`() = runTest {
-        val recorded = mutableListOf<String>()
-        val client = RocheApiClient { request ->
-            recorded.add("${request.method} ${request.url}")
-            when {
-                request.method == "POST" &&
-                    request.url == "http://localhost:8080/api/v1/feeds/feed-1/refresh" ->
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """{"id":"feed-1","title":"Refreshed Feed","url":"https://example.com/rss","feed_type":"rss","unread_count":4}""",
-                    )
-                request.method == "DELETE" &&
-                    request.url == "http://localhost:8080/api/v1/feeds/feed-1" ->
-                    HttpResponse(statusCode = 204, body = "")
-                else -> HttpResponse(statusCode = 404, body = "{}")
+    internal fun `PublicWebFetcher sends specialized Accept headers and per-request byte budgets`() =
+        runTest {
+            val captured = mutableListOf<HttpRequest>()
+            val fetcher = PublicWebFetcher { request ->
+                captured.add(request)
+                HttpResponse(statusCode = 200, body = """{"ok":true}""")
             }
+
+            fetcher.fetchFeedXml("https://example.com/feed.xml").getOrThrow()
+            fetcher.fetchHtml("https://example.com/post").getOrThrow()
+            fetcher.fetchJson("https://example.com/api.json").getOrThrow()
+
+            assertEquals(3, captured.size)
+            assertTrue(captured[0].headers["Accept"].orEmpty().contains("application/rss+xml"))
+            assertEquals(MAX_PUBLIC_FEED_BYTES, captured[0].maxResponseBytes)
+            assertTrue(captured[1].headers["Accept"].orEmpty().contains("text/html"))
+            assertEquals(MAX_PUBLIC_HTML_BYTES, captured[1].maxResponseBytes)
+            assertTrue(captured[2].headers["Accept"].orEmpty().contains("application/json"))
+            assertEquals(MAX_PUBLIC_JSON_BYTES, captured[2].maxResponseBytes)
+            assertTrue(captured.all { it.requirePublicIp })
         }
-
-        val refreshed = client.refreshFeed("http://localhost:8080", "tok-123", "feed-1")
-        assertEquals("feed-1", refreshed.id)
-        assertEquals("Refreshed Feed", refreshed.title)
-        assertEquals(4, refreshed.unreadCount)
-
-        client.deleteFeed("http://localhost:8080", "tok-123", "feed-1")
-
-        assertEquals(
-            listOf(
-                "POST http://localhost:8080/api/v1/feeds/feed-1/refresh",
-                "DELETE http://localhost:8080/api/v1/feeds/feed-1",
-            ),
-            recorded,
-        )
-    }
 
     @Test
     internal fun `importOpml and exportOpml send expected requests and parse responses`() =
         runTest {
             val recorded = mutableListOf<Pair<String, String?>>()
-            val client = RocheApiClient { request ->
-                recorded.add("${request.method} ${request.url}" to request.body)
-                when {
-                    request.method == "POST" &&
-                        request.url == "http://localhost:8080/api/v1/import/opml" ->
-                        HttpResponse(
-                            statusCode = 200,
-                            body = """{"imported_count":70,"feeds":[]}""",
-                        )
-                    request.method == "GET" &&
-                        request.url == "http://localhost:8080/api/v1/export/feeds" ->
-                        HttpResponse(
-                            statusCode = 200,
-                            body = """<?xml version="1.0"?><opml version="2.0"><body/></opml>""",
-                        )
-                    else -> HttpResponse(statusCode = 404, body = "{}")
+            val client =
+                RocheServerApi(vpnCheck = VpnTransportCheck { true }) { request ->
+                    recorded.add("${request.method} ${request.url}" to request.body)
+                    when {
+                        request.method == "POST" &&
+                            request.url == "http://localhost:8080/api/v1/import/opml" ->
+                            HttpResponse(
+                                statusCode = 200,
+                                body = """{"imported_count":70,"feeds":[]}""",
+                            )
+                        request.method == "GET" &&
+                            request.url == "http://localhost:8080/api/v1/export/feeds" ->
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """<?xml version="1.0"?><opml version="2.0"><body/></opml>""",
+                            )
+                        else -> HttpResponse(statusCode = 404, body = "{}")
+                    }
                 }
-            }
 
             val imported =
                 client.importOpml(
@@ -402,14 +392,15 @@ class RocheApiClientTest {
         runTest {
             val mediaPayload = byteArrayOf(0x49, 0x44, 0x33, 0x04, 0x00, 0x01, 0x02)
             var capturedMediaAuth: String? = null
-            val client = RocheApiClient { request ->
-                if (request.url == "http://localhost:8080/api/v1/media/audio-7") {
-                    capturedMediaAuth = request.headers["Authorization"]
-                    HttpResponse(statusCode = 200, body = "", bodyBytes = mediaPayload)
-                } else {
-                    HttpResponse(statusCode = 503, body = "{}")
+            val client =
+                RocheServerApi(vpnCheck = VpnTransportCheck { true }) { request ->
+                    if (request.url == "http://localhost:8080/api/v1/media/audio-7") {
+                        capturedMediaAuth = request.headers["Authorization"]
+                        HttpResponse(statusCode = 200, body = "", bodyBytes = mediaPayload)
+                    } else {
+                        HttpResponse(statusCode = 503, body = "{}")
+                    }
                 }
-            }
 
             val targetFile = File(tempDir, "streamed_audio.mp3")
             assertTrue(
@@ -450,18 +441,7 @@ class RocheApiClientTest {
         }
 
     @Test
-    internal fun `RocheJsonCodec handles feed normalization media filtering polymorphic item tags and peer sync`() {
-        val normalizedFeed =
-            parseFeedJson(
-                """{"id":"f-ok","title":"Keep","url":"https://a.com/rss",""" +
-                    """"feed_type":" ","last_error":" ","last_error_by":"p1","consecutive_failures":3}"""
-            )
-        assertEquals("f-ok", normalizedFeed.id)
-        assertEquals("rss", normalizedFeed.feedType)
-        assertNull(normalizedFeed.lastError)
-        assertNull(normalizedFeed.lastErrorBy)
-        assertEquals(0, normalizedFeed.consecutiveFailures)
-
+    internal fun `RocheJsonCodec handles media filtering polymorphic item tags and peer sync`() {
         val media =
             parseMediaJsonArray(
                 """[{"id":"","item_id":"i-1"},{"id":"m-1","item_id":"i-1","media_type":" "}]"""
@@ -643,14 +623,15 @@ class RocheApiClientTest {
     @Test
     internal fun `RFC 9457 ProblemDetails parses type retry_after_seconds Retry-After header max_bytes and candidates`() =
         runTest {
-            val rateLimitedClient = RocheApiClient {
-                HttpResponse(
-                    statusCode = TEST_HTTP_429,
-                    body =
-                        """{"type":"urn:roche:problem:pairing-rate-limited","title":"Too Many Requests","status":429,"detail":"Slow down","retry_after_seconds":42}""",
-                    headers = mapOf("Retry-After" to "99"),
-                )
-            }
+            val rateLimitedClient =
+                RocheServerApi(vpnCheck = VpnTransportCheck { true }) {
+                    HttpResponse(
+                        statusCode = TEST_HTTP_429,
+                        body =
+                            """{"type":"urn:roche:problem:pairing-rate-limited","title":"Too Many Requests","status":429,"detail":"Slow down","retry_after_seconds":42}""",
+                        headers = mapOf("Retry-After" to "99"),
+                    )
+                }
             val rateErr = runCatching {
                 rateLimitedClient.pairDevice("http://localhost:8080", "123456", "P")
             }
@@ -700,9 +681,10 @@ class RocheApiClientTest {
     @Test
     internal fun `malformed peer sync 200 throws ApiProtocolException and external HTTP 500 throws HttpStatusException`() =
         runTest {
-            val malformedClient = RocheApiClient {
-                HttpResponse(statusCode = TEST_HTTP_200, body = "{not valid json")
-            }
+            val malformedClient =
+                RocheServerApi(vpnCheck = VpnTransportCheck { true }) {
+                    HttpResponse(statusCode = TEST_HTTP_200, body = "{not valid json")
+                }
             val malformedErr = runCatching {
                 malformedClient.syncPeer(
                     serverUrl = "http://localhost:8080",
@@ -721,12 +703,12 @@ class RocheApiClientTest {
             assertTrue(missingPeerIdErr is ApiProtocolException)
             assertFalse(missingPeerIdErr is ProblemDetailsException)
 
-            val external500Client = RocheApiClient {
+            val external500Fetcher = PublicWebFetcher {
                 HttpResponse(statusCode = TEST_HTTP_500, body = "<html>500 Error</html>")
             }
             val feedErr =
-                external500Client
-                    .fetchExternalFeedXml("https://feeds.example.com/rss.xml")
+                external500Fetcher
+                    .fetchFeedXml("https://feeds.example.com/rss.xml")
                     .exceptionOrNull()
             assertTrue(feedErr is HttpStatusException)
             assertFalse(feedErr is ProblemDetailsException)
@@ -1061,10 +1043,12 @@ internal suspend fun verifyCustomStreamToFileOverride(
                 return writeBytesAtomicallyToFile(mediaPayload, targetFile)
             }
         }
-    val directClient = RocheApiClient(directStreamTransport)
+    val directServerApi =
+        RocheServerApi(vpnCheck = VpnTransportCheck { true }, transport = directStreamTransport)
+    val directWebFetcher = PublicWebFetcher(directStreamTransport)
     val directTarget = File(tempDir, "direct_stream.mp3")
     assertTrue(
-        directClient.streamMediaToFile(
+        directServerApi.streamMediaToFile(
             "http://localhost:8080",
             "tok-media",
             "audio-7",
@@ -1072,7 +1056,7 @@ internal suspend fun verifyCustomStreamToFileOverride(
         )
     )
     assertTrue(
-        directClient.streamExternalBinaryToFile(
+        directWebFetcher.streamBinaryToFile(
             "https://cdn.example.com/episode.mp3",
             directTarget,
         )

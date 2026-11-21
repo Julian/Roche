@@ -1,6 +1,13 @@
 package com.grayvines.roche.ranking
 
-import com.grayvines.roche.data.catalog.RankClusterCandidate
+data class RankClusterCandidate(
+    val entryId: String,
+    val title: String,
+    val subtitle: String,
+    val thumbnailUrl: String?,
+    val mean: Double,
+    val variance: Double,
+)
 
 @Suppress("DataClassContainsFunctions")
 internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>) {
