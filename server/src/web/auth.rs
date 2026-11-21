@@ -3,7 +3,10 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{
     Form,
     body::{Body, to_bytes},
-    extract::{ConnectInfo, Extension, Request, State, rejection::ExtensionRejection},
+    extract::{
+        ConnectInfo, Extension, Query, Request, State,
+        rejection::{ExtensionRejection, QueryRejection},
+    },
     http::{HeaderMap, HeaderValue, Method, StatusCode, header, uri::Authority},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -12,12 +15,16 @@ use serde::Deserialize;
 
 use super::{
     MAX_WEB_FORM_BODY_BYTES, MAX_WEB_OPML_BODY_BYTES, OPML_UPLOAD_PATH,
-    html::{redirect_see_other, render_error_page, render_login_page},
+    html::{
+        LoginPageArgs, redirect_see_other, render_error_page, render_login_page,
+        safe_local_redirect, urlencode,
+    },
 };
 use crate::service::{AppError, RocheService};
 
 pub(super) const SESSION_COOKIE_NAME: &str = "roche_session";
 pub(super) const LOGGED_OUT_COOKIE_NAME: &str = "roche_logged_out";
+pub(super) const THEME_COOKIE_NAME: &str = "roche_theme";
 pub(super) const CSRF_HEADER_NAME: &str = "x-roche-csrf";
 const TAILSCALE_LOGIN_HEADER: &str = "tailscale-user-login";
 const SESSION_MAX_AGE_SECS: u64 = 365 * 24 * 60 * 60;
@@ -26,6 +33,13 @@ const SESSION_MAX_AGE_SECS: u64 = 365 * 24 * 60 * 60;
 pub(super) struct WebSession {
     pub raw_token: String,
     pub csrf_token: String,
+    pub theme: Option<&'static str>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct LoginQuery {
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +47,14 @@ pub(super) struct LoginForm {
     pub pairing_code: String,
     #[serde(default)]
     pub device_name: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct TailscaleLoginForm {
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[must_use]
@@ -63,6 +85,29 @@ pub(super) fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
 #[must_use]
 pub(super) fn has_logged_out_cookie(headers: &HeaderMap) -> bool {
     extract_named_cookie(headers, LOGGED_OUT_COOKIE_NAME).is_some_and(|v| v == "1")
+}
+
+#[must_use]
+pub(super) fn extract_theme_cookie(headers: &HeaderMap) -> Option<&'static str> {
+    match extract_named_cookie(headers, THEME_COOKIE_NAME).as_deref() {
+        Some("dark") => Some("dark"),
+        Some("light") => Some("light"),
+        _ => None,
+    }
+}
+
+#[must_use]
+fn safe_login_return_to(candidate: Option<&str>) -> String {
+    let dest = safe_local_redirect(candidate, "/");
+    let path = dest.split(['?', '#']).next().unwrap_or("/");
+    if matches!(path, "/login" | "/login/tailscale" | "/logout")
+        || path.starts_with("/web/")
+        || path.starts_with("/api/")
+    {
+        "/".to_owned()
+    } else {
+        dest
+    }
 }
 
 /// Trusts `X-Forwarded-Proto: https` ONLY when the immediate TCP peer is loopback
@@ -237,11 +282,15 @@ pub(super) async fn login_get(
     State(service): State<Arc<RocheService>>,
     connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     headers: HeaderMap,
+    query: Result<Query<LoginQuery>, QueryRejection>,
 ) -> Response {
+    let return_to =
+        safe_login_return_to(query.ok().as_ref().and_then(|Query(q)| q.return_to.as_deref()));
+    let theme = extract_theme_cookie(&headers);
     if let Some(token) = extract_session_cookie(&headers)
         && service.auth().authenticate(&token).await.is_ok()
     {
-        return redirect_see_other("/");
+        return redirect_see_other(&return_to);
     }
 
     let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
@@ -252,12 +301,20 @@ pub(super) async fn login_get(
         && let Ok(minted) = service.auth().mint_tailscale_web_session(login).await
     {
         let secure = is_forwarded_https(peer_addr, &headers);
-        let mut resp = redirect_see_other("/");
+        let mut resp = redirect_see_other(&return_to);
         append_set_cookie(&mut resp, &build_session_set_cookie(&minted, secure));
         return resp;
     }
 
-    render_login_page(None, service.config().tailscale.enabled, ts_login.as_deref()).into_response()
+    render_login_page(&LoginPageArgs {
+        error_msg: None,
+        tailscale_enabled: service.config().tailscale.enabled,
+        tailscale_user: ts_login.as_deref(),
+        return_to: &return_to,
+        device_name: None,
+        theme,
+    })
+    .into_response()
 }
 
 pub(super) async fn login_post(
@@ -268,17 +325,21 @@ pub(super) async fn login_post(
 ) -> Response {
     let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
     let secure = is_forwarded_https(peer_addr, &headers);
+    let theme = extract_theme_cookie(&headers);
+    let return_to = safe_login_return_to(form.return_to.as_deref());
     if !is_same_origin_post(&headers, secure) {
         return render_error_page(
             StatusCode::FORBIDDEN,
             "Forbidden",
             "Cross-site sign-in requests are not permitted.",
             None,
+            theme,
         );
     }
     let ts_login = verified_tailscale_login(&service, peer_addr, &headers);
-    let label =
-        form.device_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Roche Web");
+    let submitted_device_name =
+        form.device_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let label = submitted_device_name.unwrap_or("Roche Web");
     let raw_ts_login_hdr = extract_single_tailscale_login(&headers);
     let x_forwarded_for = extract_last_forwarded_for(&headers);
 
@@ -294,7 +355,7 @@ pub(super) async fn login_post(
         .await
     {
         Ok(raw_token) => {
-            let mut resp = redirect_see_other("/");
+            let mut resp = redirect_see_other(&return_to);
             append_set_cookie(&mut resp, &build_session_set_cookie(&raw_token, secure));
             append_set_cookie(&mut resp, &build_clear_logged_out_cookie(secure));
             resp
@@ -316,11 +377,14 @@ pub(super) async fn login_post(
             };
             let mut resp = (
                 status,
-                render_login_page(
-                    Some(msg),
-                    service.config().tailscale.enabled,
-                    ts_login.as_deref(),
-                ),
+                render_login_page(&LoginPageArgs {
+                    error_msg: Some(msg),
+                    tailscale_enabled: service.config().tailscale.enabled,
+                    tailscale_user: ts_login.as_deref(),
+                    return_to: &return_to,
+                    device_name: submitted_device_name,
+                    theme,
+                }),
             )
                 .into_response();
             if let Some(secs) = retry_after
@@ -337,40 +401,53 @@ pub(super) async fn login_tailscale_post(
     State(service): State<Arc<RocheService>>,
     connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     headers: HeaderMap,
+    form: Result<Form<TailscaleLoginForm>, axum::extract::rejection::FormRejection>,
 ) -> Response {
     let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
     let secure = is_forwarded_https(peer_addr, &headers);
+    let theme = extract_theme_cookie(&headers);
+    let return_to =
+        safe_login_return_to(form.ok().as_ref().and_then(|Form(f)| f.return_to.as_deref()));
     if !is_same_origin_post(&headers, secure) {
         return render_error_page(
             StatusCode::FORBIDDEN,
             "Forbidden",
             "Cross-site sign-in requests are not permitted.",
             None,
+            theme,
         );
     }
     let Some(ts_login) = verified_tailscale_login(&service, peer_addr, &headers) else {
         return (
             StatusCode::UNAUTHORIZED,
-            render_login_page(
-                Some("Tailscale automatic sign-in is not available for this connection."),
-                service.config().tailscale.enabled,
-                None,
-            ),
+            render_login_page(&LoginPageArgs {
+                error_msg: Some(
+                    "Tailscale automatic sign-in is not available for this connection.",
+                ),
+                tailscale_enabled: service.config().tailscale.enabled,
+                tailscale_user: None,
+                return_to: &return_to,
+                device_name: None,
+                theme,
+            }),
         )
             .into_response();
     };
     let Ok(minted) = service.auth().mint_tailscale_web_session(&ts_login).await else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            render_login_page(
-                Some("Unable to start Tailscale browser session."),
-                service.config().tailscale.enabled,
-                Some(&ts_login),
-            ),
+            render_login_page(&LoginPageArgs {
+                error_msg: Some("Unable to start Tailscale browser session."),
+                tailscale_enabled: service.config().tailscale.enabled,
+                tailscale_user: Some(&ts_login),
+                return_to: &return_to,
+                device_name: None,
+                theme,
+            }),
         )
             .into_response();
     };
-    let mut resp = redirect_see_other("/");
+    let mut resp = redirect_see_other(&return_to);
     append_set_cookie(&mut resp, &build_session_set_cookie(&minted, secure));
     append_set_cookie(&mut resp, &build_clear_logged_out_cookie(secure));
     resp
@@ -403,6 +480,7 @@ pub(super) async fn require_web_auth_and_csrf(
     let is_safe_method = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     let peer_addr = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0);
     let secure_cookie = is_forwarded_https(peer_addr, req.headers());
+    let theme = extract_theme_cookie(req.headers());
 
     let mut active_token: Option<String> = None;
     let mut newly_minted_cookie: Option<String> = None;
@@ -429,19 +507,29 @@ pub(super) async fn require_web_auth_and_csrf(
 
     let Some(raw_token) = active_token else {
         return if is_safe_method {
-            redirect_see_other("/login")
+            let return_to = safe_login_return_to(
+                req.uri().path_and_query().map(axum::http::uri::PathAndQuery::as_str),
+            );
+            let dest = if return_to == "/" {
+                "/login".to_owned()
+            } else {
+                format!("/login?return_to={}", urlencode(&return_to))
+            };
+            redirect_see_other(&dest)
         } else {
             render_error_page(
                 StatusCode::UNAUTHORIZED,
                 "Session Required",
                 "Please sign in before submitting changes.",
                 None,
+                theme,
             )
         };
     };
 
     let csrf_token = service.auth().csrf_token_for_session(&raw_token);
-    let session = WebSession { raw_token: raw_token.clone(), csrf_token: csrf_token.clone() };
+    let session =
+        WebSession { raw_token: raw_token.clone(), csrf_token: csrf_token.clone(), theme };
 
     let final_req = if is_safe_method {
         let mut req = req;
@@ -486,6 +574,7 @@ async fn verify_and_rebuild_mutating_request(
             "Invalid CSRF Token",
             "Missing or invalid security token on form submission.",
             Some(&session.csrf_token),
+            session.theme,
         )));
     }
 
@@ -501,6 +590,7 @@ async fn verify_and_rebuild_mutating_request(
             "Payload Too Large",
             "Submitted form exceeded the maximum allowed size.",
             Some(&session.csrf_token),
+            session.theme,
         )));
     };
 
@@ -514,6 +604,7 @@ async fn verify_and_rebuild_mutating_request(
             "Invalid CSRF Token",
             "Missing security token on form submission.",
             Some(&session.csrf_token),
+            session.theme,
         )));
     };
 
@@ -523,6 +614,7 @@ async fn verify_and_rebuild_mutating_request(
             "Invalid CSRF Token",
             "Expired or mismatched security token; please reload the page and try again.",
             Some(&session.csrf_token),
+            session.theme,
         )));
     }
 

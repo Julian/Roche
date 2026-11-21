@@ -99,6 +99,7 @@ pub(in crate::web) async fn lists_get(
         csrf_token: &session.csrf_token,
         flash: &flash,
         is_refreshing: service.is_refreshing(),
+        theme: session.theme,
         body_html: &body,
     })
     .into_response())
@@ -301,7 +302,7 @@ fn render_overview_row(out: &mut String, col: &CollectionSummary, data: &ListsOv
             for (item_title, img_url) in safe_thumbs {
                 let _ = write!(
                     out,
-                    "<a href=\"{}\" title=\"{}\"><img class=\"list-preview-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></a>",
+                    "<a href=\"{}\" title=\"{}\" tabindex=\"-1\" aria-hidden=\"true\"><img class=\"list-preview-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></a>",
                     esc(&href),
                     esc(item_title),
                     esc(img_url),
@@ -365,7 +366,7 @@ fn render_overview_draw_popover(
             if let Some(thumb) = entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
                 let _ = write!(
                     out,
-                    "<a href=\"{}\" title=\"Open {}\"><img class=\"draw-popover-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></a>",
+                    "<a href=\"{}\" title=\"Open {}\" tabindex=\"-1\" aria-hidden=\"true\"><img class=\"draw-popover-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></a>",
                     esc(&entry_href),
                     esc(&entry.title),
                     esc(thumb),
@@ -614,6 +615,7 @@ pub(in crate::web) async fn list_detail_get(
         csrf_token: &session.csrf_token,
         flash: &q.flash,
         is_refreshing: service.is_refreshing(),
+        theme: session.theme,
         body_html: &body,
     })
     .into_response())
@@ -843,7 +845,7 @@ fn render_ranked_table_row(
     if let Some(thumb) = row.entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
         let _ = write!(
             out,
-            "<a class=\"ranked-thumb-link\" href=\"{}\"><img class=\"ranked-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></a>",
+            "<a class=\"ranked-thumb-link\" href=\"{}\" tabindex=\"-1\" aria-hidden=\"true\"><img class=\"ranked-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></a>",
             esc(&entry_href),
             esc(thumb),
         );
@@ -919,7 +921,8 @@ fn render_list_detail_rail(
     if let Some(gs) = gen_state
         && gs.enabled
     {
-        render_collection_draw_section(out, gs, artist_links, csrf);
+        let list_return_to = format!("/lists/{}", urlencode(slug));
+        render_collection_draw_section(out, gs, artist_links, csrf, &list_return_to);
     }
 
     if ranked_mode {

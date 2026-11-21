@@ -69,6 +69,7 @@ pub(in crate::web) async fn entry_detail_get(
             WebError::from_app(
                 AppError::not_found(format!("Entry '{id}' not found")),
                 Some(&session.csrf_token),
+                session.theme,
             )
         })?;
     service.enrich().spawn_artist_enrichment_if_needed(&detail);
@@ -134,6 +135,7 @@ pub(in crate::web) async fn entry_detail_get(
         csrf_token: &session.csrf_token,
         flash: &flash,
         is_refreshing: service.is_refreshing(),
+        theme: session.theme,
         body_html: &body,
     })
     .into_response())
@@ -892,6 +894,7 @@ pub(in crate::web) async fn post_artist_add_album(
                 WebError::from_app(
                     AppError::not_found(format!("Entry '{artist_id}' not found")),
                     Some(&session.csrf_token),
+                    session.theme,
                 )
             },
         )?;

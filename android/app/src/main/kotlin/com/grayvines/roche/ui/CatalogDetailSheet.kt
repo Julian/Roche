@@ -683,17 +683,45 @@ private fun QuietWikiButton(onClick: () -> Unit) {
         horizontalArrangement = Arrangement.spacedBy(5.dp),
         verticalAlignment = Alignment.CenterVertically,
         modifier =
-            Modifier.clip(RoundedCornerShape(6.dp))
+            Modifier.minimumInteractiveComponentSize()
+                .clip(RoundedCornerShape(6.dp))
                 .clickable(onClick = onClick)
                 .semantics {
                     role = Role.Button
                     contentDescription = "Open Wikipedia"
                 }
-                .padding(horizontal = 4.dp, vertical = 2.dp)
+                .padding(horizontal = 6.dp, vertical = 4.dp)
                 .testTag("catalog_detail_wiki_btn"),
     ) {
         WikipediaIcon(tint = colors.textSecondary, size = 14.dp)
         Text(text = "Wiki", color = colors.textSecondary, fontSize = 11.5.sp)
+    }
+}
+
+@Composable
+private fun CatalogDiaryAddLogButton(entry: CatalogEntryItem, onAction: (MainAction) -> Unit) {
+    val colors = LocalRocheColors.current
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.minimumInteractiveComponentSize()
+                .clip(RoundedCornerShape(6.dp))
+                .clickable {
+                    onAction(
+                        MainAction.OpenQuickLogSheet(
+                            defaultToWant = false,
+                            prefillKind = entry.kind,
+                            prefillTitle = entry.title,
+                            prefillCreators = entry.creators.joinToString(", "),
+                            prefillReleaseYear = entry.releaseYear,
+                        )
+                    )
+                }
+                .semantics { role = Role.Button }
+                .padding(horizontal = 6.dp, vertical = 4.dp)
+                .testTag("catalog_detail_log_btn"),
+    ) {
+        Text(text = "+ Log", color = colors.accentBlue, fontSize = 12.sp)
     }
 }
 
@@ -718,27 +746,7 @@ private fun CatalogDiarySection(
                 letterSpacing = 0.8.sp,
                 modifier = Modifier.semantics { heading() },
             )
-            Text(
-                text = "+ Log",
-                color = colors.accentBlue,
-                fontSize = 12.sp,
-                modifier =
-                    Modifier.clip(RoundedCornerShape(6.dp))
-                        .clickable {
-                            onAction(
-                                MainAction.OpenQuickLogSheet(
-                                    defaultToWant = false,
-                                    prefillKind = entry.kind,
-                                    prefillTitle = entry.title,
-                                    prefillCreators = entry.creators.joinToString(", "),
-                                    prefillReleaseYear = entry.releaseYear,
-                                )
-                            )
-                        }
-                        .semantics { role = Role.Button }
-                        .padding(horizontal = 4.dp, vertical = 2.dp)
-                        .testTag("catalog_detail_log_btn"),
-            )
+            CatalogDiaryAddLogButton(entry = entry, onAction = onAction)
         }
         RocheSurfaceCard {
             if (logs.isEmpty()) {

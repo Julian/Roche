@@ -251,6 +251,7 @@ private fun QuickLogSheetBody(
             onSelectStatus = { status = it },
         )
         QuickLogMetadataFields(
+            selectedKind = kind,
             title = title,
             creators = creators,
             yearText = yearText,
@@ -339,7 +340,7 @@ private fun QuickLogSelectorsSection(
     onSelectStatus: (ConsumptionStatus) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val loggableKinds = remember { QUICK_LOG_KINDS }
+    val loggableKinds = remember { EntryKind.quickLogKinds }
     val heading =
         when {
             addToListOnly -> formatAddToListLabel(targetCollectionTitle)
@@ -359,7 +360,6 @@ private fun QuickLogSelectorsSection(
         )
         QuickLogModeChipsRow(
             hasTargetList = hasTargetList,
-            targetCollectionTitle = targetCollectionTitle,
             addToListOnly = addToListOnly,
             addToWant = addToWant,
             onSelectMode = onSelectMode,
@@ -393,7 +393,6 @@ private fun QuickLogSelectorsSection(
 @Composable
 private fun QuickLogModeChipsRow(
     hasTargetList: Boolean,
-    targetCollectionTitle: String?,
     addToListOnly: Boolean,
     addToWant: Boolean,
     onSelectMode: (listOnly: Boolean, want: Boolean) -> Unit,
@@ -411,7 +410,7 @@ private fun QuickLogModeChipsRow(
     ) {
         if (hasTargetList) {
             QuickLogModeSegment(
-                label = formatAddToListLabel(targetCollectionTitle),
+                label = "List Only",
                 selected = addToListOnly,
                 onClick = { onSelectMode(true, false) },
                 modifier = Modifier.weight(1f),
@@ -461,12 +460,12 @@ private fun QuickLogModeSegment(
         contentAlignment = Alignment.Center,
         modifier =
             modifier
-                .heightIn(min = 38.dp)
+                .heightIn(min = 48.dp)
                 .clip(shape)
                 .background(bg)
                 .clickable(onClick = onClick)
                 .semantics {
-                    role = Role.Tab
+                    role = Role.RadioButton
                     this.selected = selected
                 }
                 .padding(horizontal = 8.dp, vertical = 8.dp),
@@ -482,9 +481,24 @@ private fun QuickLogModeSegment(
     }
 }
 
+internal fun creatorFieldLabelForKind(kind: EntryKind): String =
+    when (kind) {
+        EntryKind.MOVIE -> "Director"
+        EntryKind.BOOK -> "Author"
+        EntryKind.GAME -> "Developer / Studio"
+        EntryKind.ALBUM,
+        EntryKind.ARTIST,
+        EntryKind.SONG -> "Artist"
+        EntryKind.TV -> "Creator / Showrunner"
+        EntryKind.PODCAST,
+        EntryKind.PODCAST_EPISODE -> "Host / Show"
+        else -> "Creator"
+    }
+
 @Suppress("LongParameterList")
 @Composable
 private fun QuickLogMetadataFields(
+    selectedKind: EntryKind,
     title: String,
     creators: String,
     yearText: String,
@@ -507,7 +521,7 @@ private fun QuickLogMetadataFields(
             OutlinedTextField(
                 value = creators,
                 onValueChange = onCreatorsChange,
-                label = { Text("Creator / Artist") },
+                label = { Text(creatorFieldLabelForKind(selectedKind)) },
                 singleLine = true,
                 modifier = Modifier.weight(CREATOR_FIELD_WEIGHT).testTag("quick_log_creator_input"),
             )
@@ -556,16 +570,3 @@ private fun QuickLogDiaryOptions(
 private const val MAX_YEAR_DIGITS = 4
 private const val CREATOR_FIELD_WEIGHT = 1.4f
 private const val YEAR_FIELD_WEIGHT = 0.6f
-
-private val QUICK_LOG_KINDS =
-    listOf(
-        EntryKind.ALBUM,
-        EntryKind.MOVIE,
-        EntryKind.BOOK,
-        EntryKind.TV,
-        EntryKind.GAME,
-        EntryKind.SONG,
-        EntryKind.ARTICLE,
-        EntryKind.PAPER,
-        EntryKind.VIDEO,
-    )

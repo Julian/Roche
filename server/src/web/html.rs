@@ -77,8 +77,25 @@ pub(super) fn redirect_with_flash(base: &str, param: &str, msg: &str) -> Respons
         Some((before, frag)) => (before, Some(frag)),
         None => (safe_base.as_str(), None),
     };
-    let sep = if path_and_query.contains('?') { '&' } else { '?' };
-    let mut loc = format!("{path_and_query}{sep}{param}={}", urlencode(msg));
+    let (path, cleaned_query) = match path_and_query.split_once('?') {
+        Some((p, q)) => {
+            let kept: Vec<&str> = q
+                .split('&')
+                .filter(|pair| !pair.is_empty())
+                .filter(|pair| {
+                    let key = pair.split_once('=').map_or(*pair, |(k, _)| k);
+                    key != "notice" && key != "err"
+                })
+                .collect();
+            (p, kept.join("&"))
+        }
+        None => (path_and_query, String::new()),
+    };
+    let mut loc = if cleaned_query.is_empty() {
+        format!("{path}?{param}={}", urlencode(msg))
+    } else {
+        format!("{path}?{cleaned_query}&{param}={}", urlencode(msg))
+    };
     if let Some(frag) = fragment {
         loc.push('#');
         loc.push_str(frag);
@@ -424,7 +441,16 @@ pub(super) struct PageShell<'a> {
     pub csrf_token: &'a str,
     pub flash: &'a FlashQuery,
     pub is_refreshing: bool,
+    pub theme: Option<&'static str>,
     pub body_html: &'a str,
+}
+
+fn html_theme_attr(theme: Option<&'static str>) -> &'static str {
+    match theme {
+        Some("dark") => " data-theme=\"dark\"",
+        Some("light") => " data-theme=\"light\"",
+        _ => "",
+    }
 }
 
 const NAV_ITEMS: [(NavSection, &str, &str); 7] = [
@@ -444,11 +470,12 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
     } else {
         format!("{} — Roche", shell.title)
     };
+    let theme_attr = html_theme_attr(shell.theme);
 
     let _ = write!(
         out,
         "<!doctype html>\n\
-         <html lang=\"en\">\n\
+         <html lang=\"en\"{theme_attr}>\n\
          <head>\n\
            <meta charset=\"utf-8\">\n\
            <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -468,6 +495,7 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
         let _ =
             writeln!(out, "<div class=\"notice notice-error\" role=\"alert\">{}</div>", esc(msg));
     } else if let Some(msg) = shell.flash.notice.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && !(shell.is_refreshing && msg.starts_with("Refreshing "))
     {
         let _ = writeln!(out, "<div class=\"notice\" role=\"status\">{}</div>", esc(msg));
     }
@@ -559,15 +587,26 @@ fn render_masthead(out: &mut String, shell: &PageShell<'_>) {
     );
 }
 
-pub(super) fn render_login_page(
-    error_msg: Option<&str>,
-    tailscale_enabled: bool,
-    tailscale_user: Option<&str>,
-) -> Html<String> {
-    let mut out = String::with_capacity(2_560);
-    out.push_str(
+pub(super) struct LoginPageArgs<'a> {
+    pub error_msg: Option<&'a str>,
+    pub tailscale_enabled: bool,
+    pub tailscale_user: Option<&'a str>,
+    pub return_to: &'a str,
+    pub device_name: Option<&'a str>,
+    pub theme: Option<&'static str>,
+}
+
+pub(super) fn render_login_page(args: &LoginPageArgs<'_>) -> Html<String> {
+    let mut out = String::with_capacity(3_072);
+    let theme_attr = html_theme_attr(args.theme);
+    let ts_user = args.tailscale_user.map(str::trim).filter(|s| !s.is_empty());
+    let trimmed_err = args.error_msg.map(str::trim).filter(|s| !s.is_empty());
+    let heading = if ts_user.is_some() { "Sign in" } else { "Pair Browser" };
+
+    let _ = write!(
+        out,
         "<!doctype html>\n\
-         <html lang=\"en\">\n\
+         <html lang=\"en\"{theme_attr}>\n\
          <head>\n\
            <meta charset=\"utf-8\">\n\
            <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -580,11 +619,9 @@ pub(super) fn render_login_page(
          </header>\n\
          <main>\n\
          <div class=\"login-box\">\n\
-           <h2>Pair Browser</h2>\n\
-           <p class=\"lede\">Run <code>roche pair</code> on your server and enter the one-time pairing code below.</p>\n",
+           <h2>{heading}</h2>\n",
     );
 
-    let trimmed_err = error_msg.map(str::trim).filter(|s| !s.is_empty());
     if let Some(err) = trimmed_err {
         let _ = writeln!(
             out,
@@ -593,37 +630,61 @@ pub(super) fn render_login_page(
         );
     }
 
-    if let Some(ts_login) = tailscale_user.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(ts_login) = ts_user {
         let _ = writeln!(
             out,
-            "<form method=\"post\" action=\"/login/tailscale\" class=\"mb-lg\">\n\
-               <button type=\"submit\" class=\"btn btn-primary w-full\">Sign in as {}</button>\n\
-             </form>\n",
-            esc(ts_login)
+            "<p class=\"lede\">Tailscale identity detected for this browser.</p>\n\
+             <form method=\"post\" action=\"/login/tailscale\" class=\"mb-lg\">\n\
+               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
+               <button type=\"submit\" class=\"btn btn-primary w-full\">Sign in as {login}</button>\n\
+             </form>\n\
+             <details class=\"editorial-panel login-manual-details\"{open_attr}>\n\
+               <summary>Pair with a one-time code instead</summary>\n\
+               <p class=\"meta mt-sm\">Run <code>roche pair</code> on your server and enter the code below.</p>\n",
+            ret = esc(args.return_to),
+            login = esc(ts_login),
+            open_attr = if trimmed_err.is_some() { " open" } else { "" },
+        );
+    } else {
+        out.push_str(
+            "<p class=\"lede\">Run <code>roche pair</code> on your server and enter the one-time pairing code below.</p>\n",
         );
     }
 
     let pairing_attrs = if trimmed_err.is_some() {
-        "aria-invalid=\"true\" aria-describedby=\"login-error\""
-    } else {
+        "autofocus aria-invalid=\"true\" aria-describedby=\"login-error\""
+    } else if ts_user.is_none() {
         "autofocus"
+    } else {
+        ""
     };
+    let device_val = args.device_name.map_or("", str::trim);
     let _ = write!(
         out,
         "<form method=\"post\" action=\"/login\">\n\
+           <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
            <div class=\"field mb-md\">\n\
              <label for=\"pairing_code\">Pairing Code</label>\n\
-             <input id=\"pairing_code\" name=\"pairing_code\" type=\"password\" required autocomplete=\"one-time-code\" {pairing_attrs} placeholder=\"e.g. 4f9a-82c1\">\n\
+             <div class=\"password-field-wrap\">\n\
+               <input id=\"pairing_code\" name=\"pairing_code\" type=\"password\" class=\"pairing-code-input\" required autocomplete=\"one-time-code\" spellcheck=\"false\" autocapitalize=\"off\" {pairing_attrs} placeholder=\"e.g. 4f9a-82c1\">\n\
+               <button type=\"button\" class=\"btn btn-small btn-ghost js-toggle-password\" data-target=\"pairing_code\" aria-pressed=\"false\" aria-label=\"Show pairing code\">Show</button>\n\
+             </div>\n\
            </div>\n\
            <div class=\"field mb-lg\">\n\
              <label for=\"device_name\">Browser Label (optional)</label>\n\
-             <input id=\"device_name\" name=\"device_name\" type=\"text\" maxlength=\"80\" placeholder=\"Roche Web\">\n\
+             <input id=\"device_name\" name=\"device_name\" type=\"text\" maxlength=\"80\" value=\"{dev}\" placeholder=\"Roche Web\">\n\
            </div>\n\
            <button type=\"submit\" class=\"btn btn-primary\">Sign in</button>\n\
          </form>\n",
+        ret = esc(args.return_to),
+        dev = esc(device_val),
     );
 
-    if tailscale_enabled {
+    if ts_user.is_some() {
+        out.push_str("</details>\n");
+    }
+
+    if args.tailscale_enabled && ts_user.is_none() {
         out.push_str(
             "<p class=\"meta login-tip\">\
              Tip: when served via local <code>tailscale serve</code>, add your Tailnet login to \
@@ -632,7 +693,9 @@ pub(super) fn render_login_page(
         );
     }
 
-    out.push_str("</div>\n</main>\n</body>\n</html>\n");
+    out.push_str(
+        "</div>\n</main>\n<script src=\"/static/roche.js\" defer></script>\n</body>\n</html>\n",
+    );
     Html(out)
 }
 
@@ -642,25 +705,32 @@ pub(super) fn render_error_page(
     heading: &str,
     detail: &str,
     csrf_token: Option<&str>,
+    theme: Option<&'static str>,
 ) -> Response {
+    let (cta_href, cta_label, cta_cls) = if status == StatusCode::UNAUTHORIZED {
+        ("/login", "Sign in", "btn btn-primary")
+    } else {
+        ("/", "Return Home", "btn")
+    };
     let mut body = String::with_capacity(512);
     let _ = write!(
         body,
-        "<h2>{}</h2>\n<p class=\"lede\">{}</p>\n<p><a class=\"btn\" href=\"/\">Return Home</a></p>",
+        "<h2>{}</h2>\n<p class=\"lede\">{}</p>\n<p><a class=\"{cta_cls}\" href=\"{cta_href}\">{cta_label}</a></p>",
         esc(heading),
         esc(detail)
     );
+    let theme_attr = html_theme_attr(theme);
     let html = csrf_token.map_or_else(
         || {
             let mut unauthed_body = String::with_capacity(512);
             let _ = write!(
                 unauthed_body,
-                "<h1>{}</h1>\n<p class=\"lede\">{}</p>\n<p><a class=\"btn\" href=\"/\">Return Home</a></p>",
+                "<h1>{}</h1>\n<p class=\"lede\">{}</p>\n<p><a class=\"{cta_cls}\" href=\"{cta_href}\">{cta_label}</a></p>",
                 esc(heading),
                 esc(detail)
             );
             Html(format!(
-                "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+                "<!doctype html><html lang=\"en\"{theme_attr}><head><meta charset=\"utf-8\">\
                  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
                  <title>{}</title><link rel=\"stylesheet\" href=\"/static/roche.css\"></head>\
                  <body><main>{}</main></body></html>",
@@ -675,6 +745,7 @@ pub(super) fn render_error_page(
                 csrf_token: csrf,
                 flash: &FlashQuery::default(),
                 is_refreshing: false,
+                theme,
                 body_html: &body,
             })
         },
@@ -688,12 +759,17 @@ pub(super) fn render_error_page(
 pub(super) struct WebError {
     err: AppError,
     csrf_token: Option<String>,
+    theme: Option<&'static str>,
 }
 
 impl WebError {
     #[must_use]
-    pub(super) fn from_app(err: AppError, csrf_token: Option<&str>) -> Self {
-        Self { err, csrf_token: csrf_token.map(ToOwned::to_owned) }
+    pub(super) fn from_app(
+        err: AppError,
+        csrf_token: Option<&str>,
+        theme: Option<&'static str>,
+    ) -> Self {
+        Self { err, csrf_token: csrf_token.map(ToOwned::to_owned), theme }
     }
 }
 
@@ -703,7 +779,7 @@ pub(super) trait WithWebCsrf<T> {
 
 impl<T> WithWebCsrf<T> for Result<T, AppError> {
     fn web_err(self, session: &WebSession) -> Result<T, WebError> {
-        self.map_err(|err| WebError::from_app(err, Some(&session.csrf_token)))
+        self.map_err(|err| WebError::from_app(err, Some(&session.csrf_token), session.theme))
     }
 }
 
@@ -807,7 +883,8 @@ fn classify_web_internal_error(
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
         let (status, heading, detail, retry_after) = classify_web_app_error(&self.err);
-        let mut resp = render_error_page(status, heading, &detail, self.csrf_token.as_deref());
+        let mut resp =
+            render_error_page(status, heading, &detail, self.csrf_token.as_deref(), self.theme);
         if let Some(secs) = retry_after
             && let Ok(val) = HeaderValue::from_str(&secs.to_string())
         {

@@ -214,6 +214,8 @@ private fun InboxEmptyOrLoadingPane(state: MainUiState, onAction: (MainAction) -
     } else {
         InboxEmptyState(
             hasEntriesAtAll = state.allEntries.any { it.inFeedInbox },
+            canResetFilter = state.activeFilter != InboxFilter.ALL,
+            onShowAllClick = { onAction(MainAction.SelectFilter(InboxFilter.ALL)) },
             onManageFeedsClick = { onAction(MainAction.SelectTab(AppTab.FEEDS)) },
             onSyncClick = { onAction(MainAction.SyncNow) },
         )
@@ -443,9 +445,12 @@ private fun ArchiveAllConfirmDialog(
     )
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun InboxEmptyState(
     hasEntriesAtAll: Boolean,
+    canResetFilter: Boolean,
+    onShowAllClick: () -> Unit,
     onManageFeedsClick: () -> Unit,
     onSyncClick: () -> Unit,
 ) {
@@ -469,7 +474,17 @@ private fun InboxEmptyState(
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Normal,
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (canResetFilter) {
+                    HeaderActionButton(
+                        label = "Show All",
+                        onClick = onShowAllClick,
+                        modifier = Modifier.testTag("inbox_show_all_btn"),
+                    )
+                }
                 HeaderActionButton(label = "Manage Feeds", onClick = onManageFeedsClick)
                 HeaderActionButton(label = "Sync", onClick = onSyncClick)
             }
@@ -477,8 +492,27 @@ private fun InboxEmptyState(
     }
 }
 
+internal fun resolveInboxStripFilters(state: MainUiState): List<InboxFilter> {
+    val feedId = state.selectedFeedId ?: return InboxFilter.inboxStripFilters
+    val distinctTypes =
+        state.allEntries
+            .asSequence()
+            .filter { it.feedId == feedId }
+            .map { it.contentType }
+            .distinct()
+            .take(2)
+            .count()
+    if (distinctTypes > 1) return InboxFilter.inboxStripFilters
+    val base = listOf(InboxFilter.ALL, InboxFilter.UNREAD, InboxFilter.ARCHIVED)
+    return if (state.activeFilter in base) base else base + state.activeFilter
+}
+
 @Composable
 private fun InboxFilterStrip(state: MainUiState, onAction: (MainAction) -> Unit) {
+    val stripFilters =
+        remember(state.selectedFeedId, state.activeFilter, state.allEntries) {
+            resolveInboxStripFilters(state)
+        }
     Row(
         modifier =
             Modifier.fillMaxWidth()
@@ -487,17 +521,7 @@ private fun InboxFilterStrip(state: MainUiState, onAction: (MainAction) -> Unit)
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (state.selectedTag != null || state.selectedFeedId != null) {
-            val scopeLabel =
-                state.selectedTag?.let { "#$it ✕" } ?: "${state.selectedFeedTitle ?: "Feed"} ✕"
-            InboxFilterTab(
-                label = scopeLabel,
-                selected = true,
-                role = Role.Button,
-                onClick = { onAction(MainAction.NavigateBackFromScope) },
-            )
-        }
-        InboxFilter.inboxStripFilters.forEach { filter ->
+        stripFilters.forEach { filter ->
             InboxFilterTab(
                 label = filter.label,
                 selected = state.activeFilter == filter,

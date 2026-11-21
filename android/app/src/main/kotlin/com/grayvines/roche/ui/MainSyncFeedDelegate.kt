@@ -51,18 +51,28 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
                 host.settingsRepository.update {
                     it.copy(showCollectionDrawsOnHome = action.enabled)
                 }
-            is MainAction.SetBottomNavSlot ->
-                host.settingsRepository.update { current ->
-                    val updatedTabs =
-                        updateBottomNavSlot(current.bottomNavTabs, action.slotIndex, action.tab)
-                    current.copy(bottomNavTabs = updatedTabs)
-                }
+            is MainAction.SetBottomNavSlot -> performSetBottomNavSlot(action.slotIndex, action.tab)
             MainAction.ResetBottomNavTabs ->
                 host.settingsRepository.update { it.copy(bottomNavTabs = AppTab.defaultSideTabs) }
             is MainAction.UpdateServerConfig -> performUpdateServerConfig(action)
             MainAction.DisconnectServer -> performDisconnectServer()
             is MainAction.PairWithServer -> performPairWithServer(action)
             MainAction.DiscoverServer -> performDiscoverServer()
+        }
+    }
+
+    private suspend fun performSetBottomNavSlot(slotIndex: Int, tab: AppTab) {
+        var blockedForSettingsAccess = false
+        host.settingsRepository.update { current ->
+            val before = AppTab.normalizeBottomTabs(current.bottomNavTabs)
+            val updatedTabs = updateBottomNavSlot(before, slotIndex, tab)
+            val isValidSwap = slotIndex in before.indices && tab in AppTab.bottomTabCandidates
+            blockedForSettingsAccess =
+                isValidSwap && before[slotIndex] != tab && updatedTabs == before
+            current.copy(bottomNavTabs = updatedTabs)
+        }
+        if (blockedForSettingsAccess) {
+            host.showStatusMessage("Keep Home or Settings in the bar to access Settings")
         }
     }
 

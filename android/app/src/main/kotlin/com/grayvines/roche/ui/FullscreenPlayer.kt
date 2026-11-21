@@ -5,8 +5,10 @@ package com.grayvines.roche.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -14,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -28,14 +31,19 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -47,6 +55,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.FeedItem
@@ -66,7 +75,12 @@ import com.grayvines.roche.ui.components.SkipNextIcon
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
+import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlin.math.roundToLong
+
+private val MINI_PLAYER_WIDE_BREAKPOINT = 450.dp
+private val MINI_PLAYER_SWIPE_DISMISS_THRESHOLD = 96.dp
 
 /**
  * Persistent docked mini-player rendered directly above the bottom navigation bar across all tabs
@@ -80,113 +94,171 @@ fun DockedMiniPlayer(
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
-
-    Column(
-        modifier =
-            modifier
-                .fillMaxWidth()
-                .background(colors.surfaceElevated)
-                .clickable { onAction(MainAction.OpenFullscreenPlayer) }
-                .testTag("docked_mini_player")
-    ) {
-        Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(colors.border)) {
-            Box(
-                modifier =
-                    Modifier.fillMaxWidth(playerState.progressFraction.coerceIn(0.02f, 1f))
-                        .height(2.dp)
-                        .background(colors.accentBlue)
-            )
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            PodcastArtworkBox(entry = entry, size = 38.dp, cornerRadius = 7.dp)
-
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = entry.title,
-                    color = colors.textPrimary,
-                    fontFamily = currentHeadlineFontFamily(),
-                    fontSize = 13.5.sp,
-                    fontWeight = FontWeight.Normal,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text =
-                        if (playerState.isBuffering) {
-                            "${entry.feedTitle} · Buffering…"
-                        } else {
-                            "${entry.feedTitle} · ${playerState.formattedMiniRemaining}"
-                        },
-                    color = colors.textMuted,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Normal,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+    val currentOnAction by rememberUpdatedState(onAction)
+    val canDismiss = !playerState.isPlaying && !playerState.isBuffering
+    val dismissThresholdPx =
+        with(LocalDensity.current) { MINI_PLAYER_SWIPE_DISMISS_THRESHOLD.toPx() }
+    var dragOffsetX by remember(entry.id, canDismiss) { mutableFloatStateOf(0f) }
+    val swipeModifier =
+        if (canDismiss) {
+            Modifier.pointerInput(entry.id, dismissThresholdPx) {
+                detectHorizontalDragGestures(
+                    onHorizontalDrag = { change, dragAmount ->
+                        change.consume()
+                        dragOffsetX += dragAmount
+                    },
+                    onDragEnd = {
+                        if (abs(dragOffsetX) >= dismissThresholdPx) {
+                            currentOnAction(MainAction.DismissMiniPlayer)
+                        }
+                        dragOffsetX = 0f
+                    },
+                    onDragCancel = { dragOffsetX = 0f },
                 )
             }
+        } else {
+            Modifier
+        }
 
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                RocheIconActionButton(
-                    contentDescription = "Rewind 15 seconds",
-                    onClick = { onAction(MainAction.SkipPlayerBySeconds(-15)) },
-                    outlined = false,
-                    modifier = Modifier.testTag("mini_player_rewind_btn"),
-                ) {
-                    RewindIcon(tint = colors.textSecondary, size = 16.dp)
-                }
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier =
-                        Modifier.minimumInteractiveComponentSize()
-                            .clip(CircleShape)
-                            .clickable { onAction(MainAction.TogglePlayPause) }
-                            .semantics {
-                                role = Role.Button
-                                contentDescription =
-                                    when {
-                                        playerState.isBuffering -> "Buffering"
-                                        playerState.isPlaying -> "Pause"
-                                        else -> "Play"
-                                    }
+    BoxWithConstraints(modifier = modifier.fillMaxWidth()) {
+        val showRewindControl = maxWidth >= MINI_PLAYER_WIDE_BREAKPOINT
+        Column(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .offset { IntOffset(dragOffsetX.roundToInt(), 0) }
+                    .graphicsLayer {
+                        alpha =
+                            if (canDismiss && dragOffsetX != 0f) {
+                                (1f - abs(dragOffsetX) / (dismissThresholdPx * 1.5f)).coerceIn(
+                                    0.35f,
+                                    1f,
+                                )
+                            } else {
+                                1f
                             }
-                            .testTag("mini_player_play_pause_btn"),
+                    }
+                    .background(colors.surfaceElevated)
+                    .then(swipeModifier)
+                    .clickable { currentOnAction(MainAction.OpenFullscreenPlayer) }
+                    .testTag("docked_mini_player")
+        ) {
+            Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(colors.border)) {
+                Box(
+                    modifier =
+                        Modifier.fillMaxWidth(playerState.progressFraction.coerceIn(0.02f, 1f))
+                            .height(2.dp)
+                            .background(colors.accentBlue)
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                PodcastArtworkBox(entry = entry, size = 38.dp, cornerRadius = 7.dp)
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = entry.title,
+                        color = colors.textPrimary,
+                        fontFamily = currentHeadlineFontFamily(),
+                        fontSize = 13.5.sp,
+                        fontWeight = FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text =
+                            if (playerState.isBuffering) {
+                                "${entry.feedTitle} · Buffering…"
+                            } else {
+                                "${entry.feedTitle} · ${playerState.formattedMiniRemaining}"
+                            },
+                        color = colors.textMuted,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
+                    if (showRewindControl) {
+                        RocheIconActionButton(
+                            contentDescription = "Rewind 15 seconds",
+                            onClick = { onAction(MainAction.SkipPlayerBySeconds(-15)) },
+                            outlined = false,
+                            modifier = Modifier.testTag("mini_player_rewind_btn"),
+                        ) {
+                            RewindIcon(tint = colors.textSecondary, size = 16.dp)
+                        }
+                    }
                     Box(
                         contentAlignment = Alignment.Center,
                         modifier =
-                            Modifier.size(34.dp)
+                            Modifier.minimumInteractiveComponentSize()
                                 .clip(CircleShape)
-                                .background(colors.accentBlueFilled),
+                                .clickable { onAction(MainAction.TogglePlayPause) }
+                                .semantics {
+                                    role = Role.Button
+                                    contentDescription =
+                                        when {
+                                            playerState.isBuffering -> "Buffering"
+                                            playerState.isPlaying -> "Pause"
+                                            else -> "Play"
+                                        }
+                                }
+                                .testTag("mini_player_play_pause_btn"),
                     ) {
-                        if (playerState.isBuffering) {
-                            CircularProgressIndicator(
-                                color = Color.White,
-                                strokeWidth = 2.dp,
-                                modifier = Modifier.size(16.dp),
-                            )
-                        } else {
-                            PlayPauseIcon(
-                                isPlaying = playerState.isPlaying,
-                                tint = Color.White,
-                                size = 15.dp,
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier =
+                                Modifier.size(34.dp)
+                                    .clip(CircleShape)
+                                    .background(colors.accentBlueFilled),
+                        ) {
+                            if (playerState.isBuffering) {
+                                CircularProgressIndicator(
+                                    color = Color.White,
+                                    strokeWidth = 2.dp,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                            } else {
+                                PlayPauseIcon(
+                                    isPlaying = playerState.isPlaying,
+                                    tint = Color.White,
+                                    size = 15.dp,
+                                )
+                            }
+                        }
+                    }
+                    RocheIconActionButton(
+                        contentDescription = "Fast-forward 30 seconds",
+                        onClick = { onAction(MainAction.SkipPlayerBySeconds(30)) },
+                        outlined = false,
+                        modifier = Modifier.testTag("mini_player_ff_btn"),
+                    ) {
+                        FastForwardIcon(tint = colors.textSecondary, size = 16.dp)
+                    }
+                    if (canDismiss) {
+                        RocheIconActionButton(
+                            contentDescription = "Dismiss player",
+                            onClick = { onAction(MainAction.DismissMiniPlayer) },
+                            outlined = false,
+                            modifier = Modifier.testTag("mini_player_dismiss_btn"),
+                        ) {
+                            Text(
+                                text = "✕",
+                                color = colors.textMuted,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 13.sp,
+                                modifier = Modifier.clearAndSetSemantics {},
                             )
                         }
                     }
-                }
-                RocheIconActionButton(
-                    contentDescription = "Fast-forward 30 seconds",
-                    onClick = { onAction(MainAction.SkipPlayerBySeconds(30)) },
-                    outlined = false,
-                    modifier = Modifier.testTag("mini_player_ff_btn"),
-                ) {
-                    FastForwardIcon(tint = colors.textSecondary, size = 16.dp)
                 }
             }
         }
@@ -501,6 +573,14 @@ private fun PlayerOverflowMenuButton(
                     },
                 )
             }
+            DropdownMenuItem(
+                text = { Text("Stop & Dismiss Player") },
+                onClick = {
+                    showOverflowMenu = false
+                    onAction(MainAction.DismissMiniPlayer)
+                },
+                modifier = Modifier.testTag("player_dismiss_btn"),
+            )
             DropdownMenuItem(
                 text = {
                     Text(

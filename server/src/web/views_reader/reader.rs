@@ -12,8 +12,8 @@ use crate::{
     content::HtmlSanitizer,
     db::WANT_TO_READ_COLLECTION_ID,
     domain::{
-        ConsumptionStatus, EntryKind, ItemStatus, MediaType, READER_AUTO_READ_THRESHOLD,
-        ReadAtPatch,
+        ConsumptionStatus, ContentType, EntryKind, ItemStatus, MediaType,
+        READER_AUTO_READ_THRESHOLD, ReadAtPatch,
     },
     service::{AppError, ItemDetail, RocheService},
     util::clock::now_utc,
@@ -83,6 +83,7 @@ pub(in crate::web) async fn reader_get(
         csrf_token: &session.csrf_token,
         flash: &flash,
         is_refreshing: service.is_refreshing(),
+        theme: session.theme,
         body_html: &body,
     })
     .into_response())
@@ -169,8 +170,27 @@ fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail) {
     if let Some(mins) = read_mins {
         let _ = write!(out, "{mins} min read");
     }
-    if let Some(ext_href) = sanitize_non_local_href(item.url.as_str()) {
+    if matches!(item.content_type, ContentType::Article | ContentType::Paper)
+        && item.read_progress >= 0.05
+        && item.read_progress < 0.95
+    {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let pct = (item.read_progress * 100.0).round().clamp(1.0, 99.0) as u32;
         if read_mins.is_some() {
+            out.push_str(" &middot; ");
+        }
+        let _ = write!(
+            out,
+            "<button type=\"button\" class=\"pill js-reader-resume-btn\" data-resume-progress=\"{:.4}\">Resume at {pct}%</button>",
+            item.read_progress.clamp(0.0, 1.0),
+        );
+    }
+    if let Some(ext_href) = sanitize_non_local_href(item.url.as_str()) {
+        if read_mins.is_some()
+            || (matches!(item.content_type, ContentType::Article | ContentType::Paper)
+                && item.read_progress >= 0.05
+                && item.read_progress < 0.95)
+        {
             out.push_str(" &middot; ");
         }
         let _ = write!(
@@ -341,9 +361,14 @@ fn render_reader_end_card(
     let toggle_btn = format!(
         "<button type=\"submit\" class=\"{btn_cls}\" aria-pressed=\"{pressed}\" title=\"{title}\">{label}</button>"
     );
+    let confirm_attr = if is_finished {
+        " data-confirm=\"Mark unfinished and delete any saved Diary log and notes for this item?\""
+    } else {
+        ""
+    };
     let _ = writeln!(
         out,
-        "<form method=\"post\" action=\"{}\" class=\"inline-form js-finish-toggle-form\" data-finish-action=\"{}\" data-unfinish-action=\"{}\">\
+        "<form method=\"post\" action=\"{}\" class=\"inline-form js-finish-toggle-form\" data-finish-action=\"{}\" data-unfinish-action=\"{}\"{confirm_attr}>\
            <input type=\"hidden\" name=\"_csrf\" value=\"{}\">\
            <input type=\"hidden\" name=\"return_to\" value=\"{}\">\
            {toggle_btn}\
@@ -360,7 +385,13 @@ fn render_reader_end_card(
 fn render_reader_tags(out: &mut String, detail: &ItemDetail, id_enc: &str, csrf: &str) {
     out.push_str("<h3>Tags</h3>\n<div class=\"pill-bar\">\n");
     for tag in &detail.tags {
-        let _ = write!(out, "<span class=\"pill\">#{} ", esc(&tag.name));
+        let tag_href = format!("/inbox?status=all&tag={}", urlencode(&tag.id));
+        let _ = write!(
+            out,
+            "<span class=\"pill\"><a class=\"tag-pill-link\" href=\"{}\">#{}</a> ",
+            esc(&tag_href),
+            esc(&tag.name),
+        );
         let remove_btn = format!(
             "<button type=\"submit\" class=\"link-btn ml-xs\" aria-label=\"Remove tag {}\" title=\"Remove tag\"><span aria-hidden=\"true\">&times;</span></button>",
             esc(&tag.name),
@@ -538,6 +569,7 @@ pub(in crate::web) async fn item_audio_get(
     Err(WebError::from_app(
         AppError::not_found("Audio stream not found for this item"),
         Some(&session.csrf_token),
+        session.theme,
     ))
 }
 
@@ -703,12 +735,59 @@ fn has_html_attr(attrs: &str, target: &str) -> bool {
     false
 }
 
+fn parse_heading_level(tag_name: &str) -> Option<u8> {
+    let bytes = tag_name.as_bytes();
+    if bytes.len() == 2 && bytes[0].eq_ignore_ascii_case(&b'h') && (b'1'..=b'6').contains(&bytes[1])
+    {
+        Some(bytes[1] - b'0')
+    } else {
+        None
+    }
+}
+
+const fn heading_tag_for_level(level: u8) -> &'static str {
+    match level {
+        1 => "h1",
+        2 => "h2",
+        3 => "h3",
+        4 => "h4",
+        5 => "h5",
+        _ => "h6",
+    }
+}
+
+fn find_min_heading_level(clean_html: &str) -> Option<u8> {
+    let mut min_lvl: Option<u8> = None;
+    let mut rest = clean_html;
+    while let Some(lt) = rest.find('<') {
+        let after_lt = &rest[lt + 1..];
+        let Some(gt) = find_html_tag_end(after_lt) else {
+            break;
+        };
+        let raw_tag = &after_lt[..gt];
+        rest = &after_lt[gt + 1..];
+        let tag_body = raw_tag.strip_prefix('/').unwrap_or(raw_tag);
+        let name_end =
+            tag_body.find(|c: char| c.is_ascii_whitespace() || c == '/').unwrap_or(tag_body.len());
+        if let Some(lvl) = parse_heading_level(&tag_body[..name_end]) {
+            min_lvl = Some(min_lvl.map_or(lvl, |cur| cur.min(lvl)));
+            if lvl == 1 {
+                break;
+            }
+        }
+    }
+    min_lvl
+}
+
 /// Normalizes already-sanitized article HTML for embedding under the Reader's `<h2>` title:
-/// - Demotes embedded `<h1>`..`<h4>` headings by 2 levels (capped at `<h6>`) so the page retains
-///   a single `<h1>` and a valid heading hierarchy.
+/// - Dynamically demotes headings from the highest heading level present so top article
+///   headings land on `<h3>` (and subheadings on `<h4>`/`<h5>`, capped at `<h6>`), preserving
+///   a single `<h1>` and a clean prose heading hierarchy without skipping levels.
 /// - Ensures `<pre>` blocks carry `tabindex="0"` for keyboard scrolling.
 /// - Ensures `<img>` tags without an `alt` attribute default to `alt=""`.
 fn harden_reader_prose_html(clean_html: &str) -> String {
+    let heading_shift =
+        find_min_heading_level(clean_html).map_or(0, |min_lvl| 3u8.saturating_sub(min_lvl));
     let mut out = String::with_capacity(clean_html.len() + 64);
     let mut rest = clean_html;
     while let Some(lt) = rest.find('<') {
@@ -729,13 +808,8 @@ fn harden_reader_prose_html(clean_html: &str) -> String {
         let tag_name = &tag_body[..name_end];
         let attrs = &tag_body[name_end..];
 
-        let demoted_heading = match tag_name.to_ascii_lowercase().as_str() {
-            "h1" => Some("h3"),
-            "h2" => Some("h4"),
-            "h3" => Some("h5"),
-            "h4" | "h5" | "h6" => Some("h6"),
-            _ => None,
-        };
+        let demoted_heading = parse_heading_level(tag_name)
+            .map(|lvl| heading_tag_for_level((lvl + heading_shift).min(6)));
 
         out.push('<');
         if is_closing {
@@ -801,5 +875,17 @@ mod tests {
 
         let heading_with_gt = r#"<h1 title="a > b">Title</h1>"#;
         assert_eq!(harden_reader_prose_html(heading_with_gt), r#"<h3 title="a > b">Title</h3>"#);
+    }
+
+    #[test]
+    fn test_harden_reader_prose_html_dynamically_demotes_from_highest_heading() {
+        let h2_top = "<h2>Section</h2><h3>Sub</h3><h4>Note</h4>";
+        assert_eq!(harden_reader_prose_html(h2_top), "<h3>Section</h3><h4>Sub</h4><h5>Note</h5>");
+
+        let h1_top = "<h1>Part</h1><h2>Section</h2><h3>Sub</h3>";
+        assert_eq!(harden_reader_prose_html(h1_top), "<h3>Part</h3><h4>Section</h4><h5>Sub</h5>");
+
+        let h3_top = "<h3>Already Three</h3><h4>Four</h4>";
+        assert_eq!(harden_reader_prose_html(h3_top), "<h3>Already Three</h3><h4>Four</h4>");
     }
 }

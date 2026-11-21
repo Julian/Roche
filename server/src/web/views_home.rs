@@ -120,42 +120,18 @@ async fn render_home_inner(
         load_diary_tiers(service, &recent_diary),
     );
 
-    let mut body = String::with_capacity(16_384);
-    body.push_str(
-        "<div class=\"home-grid\">\n<section class=\"home-main\" aria-label=\"Feed Inbox\">\n",
-    );
-    render_in_progress_section(&mut body, &active_readable_page.items);
-    render_unread_summary_section(
-        &mut body,
+    let body = render_home_body(
+        &active_readable_page.items,
         &unread_page.items,
         sync_status.unread_items_count,
-        &session.csrf_token,
-    );
-    body.push_str("</section>\n<div class=\"home-rail\">\n");
-
-    let wtr_total = collections
-        .iter()
-        .find(|c| c.id == WANT_TO_READ_COLLECTION_ID)
-        .map_or(want_to_read_page.items.len(), |c| c.member_count);
-    let other_want_total: usize = collections
-        .iter()
-        .filter(|c| c.role == CollectionRole::Want && c.id != WANT_TO_READ_COLLECTION_ID)
-        .map(|c| c.member_count)
-        .sum();
-    render_want_to_read_section(
-        &mut body,
         &want_to_read_page.items,
-        wtr_total,
-        other_want_total,
+        &collections,
+        &active_generators,
+        &recent_diary,
+        &artist_links,
+        &diary_tiers,
         &session.csrf_token,
     );
-
-    for gen_state in &active_generators {
-        render_collection_draw_section(&mut body, gen_state, &artist_links, &session.csrf_token);
-    }
-
-    render_recent_diary_section(&mut body, &recent_diary, &artist_links, &diary_tiers);
-    body.push_str("</div>\n</div>\n");
 
     Ok(render_page(&PageShell {
         title: "Roche",
@@ -163,9 +139,51 @@ async fn render_home_inner(
         csrf_token: &session.csrf_token,
         flash,
         is_refreshing: sync_status.is_refreshing,
+        theme: session.theme,
         body_html: &body,
     })
     .into_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_home_body(
+    active_readable: &[Item],
+    unread_items: &[Item],
+    unread_total: i64,
+    want_to_read_items: &[Item],
+    collections: &[crate::db::CollectionSummary],
+    active_generators: &[CollectionGeneratorState],
+    recent_diary: &[ConsumptionLogView],
+    artist_links: &HashMap<String, String>,
+    diary_tiers: &HashMap<String, char>,
+    csrf: &str,
+) -> String {
+    let mut body = String::with_capacity(16_384);
+    body.push_str(
+        "<div class=\"home-grid\">\n<section class=\"home-main\" aria-label=\"Feed Inbox\">\n",
+    );
+    render_in_progress_section(&mut body, active_readable);
+    render_unread_summary_section(&mut body, unread_items, unread_total, csrf);
+    body.push_str("</section>\n<div class=\"home-rail\">\n");
+
+    let wtr_total = collections
+        .iter()
+        .find(|c| c.id == WANT_TO_READ_COLLECTION_ID)
+        .map_or(want_to_read_items.len(), |c| c.member_count);
+    let other_want_total: usize = collections
+        .iter()
+        .filter(|c| c.role == CollectionRole::Want && c.id != WANT_TO_READ_COLLECTION_ID)
+        .map(|c| c.member_count)
+        .sum();
+    render_want_to_read_section(&mut body, want_to_read_items, wtr_total, other_want_total, csrf);
+
+    for gen_state in active_generators {
+        render_collection_draw_section(&mut body, gen_state, artist_links, csrf, "/");
+    }
+
+    render_recent_diary_section(&mut body, recent_diary, artist_links, diary_tiers);
+    body.push_str("</div>\n</div>\n");
+    body
 }
 
 pub(in crate::web) fn render_collection_draw_section(
@@ -173,6 +191,7 @@ pub(in crate::web) fn render_collection_draw_section(
     state: &CollectionGeneratorState,
     artist_links: &HashMap<String, String>,
     csrf: &str,
+    return_to: &str,
 ) {
     let list_key = state.collection_slug.as_deref().unwrap_or(&state.collection_id);
     let list_key_enc = urlencode(list_key);
@@ -234,6 +253,7 @@ pub(in crate::web) fn render_collection_draw_section(
            <summary title=\"Skip this work and draw next\">Skip</summary>\n\
            <form class=\"album-inline-form sleeve-skip-form-wrap\" method=\"post\" action=\"/web/lists/{list}/generator/abandon\">\n\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+             <input type=\"hidden\" name=\"return_to\" value=\"{return_to}\">\n\
              <div class=\"field mb-sm\">\n\
                <label for=\"skip-notes-{list}\">Skip note (optional)</label>\n\
                <textarea id=\"skip-notes-{list}\" class=\"textarea-compact\" name=\"notes\" placeholder=\"Optional note…\"></textarea>\n\
@@ -244,6 +264,7 @@ pub(in crate::web) fn render_collection_draw_section(
          </div>\n",
         list = esc(&list_key_enc),
         csrf = esc(csrf),
+        return_to = esc(return_to),
     );
 
     render_creator_year_meta(

@@ -56,6 +56,7 @@ import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.MusicTrackLaunchRequest
 import com.grayvines.roche.data.catalog.generatorFor
 import com.grayvines.roche.model.AppTab
@@ -348,11 +349,19 @@ internal fun MainDestinationScaffold(
         containerColor = colors.background,
         floatingActionButton = {
             if (hasFab && (showSearchFab || showAddFab)) {
+                val addAction = resolveAddFabAction(state)
+                val addLabel =
+                    if (addAction is MainAction.OpenQuickLogSheet) {
+                        "Log or Add Entry"
+                    } else {
+                        SAVE_FAB_DEFAULT_LABEL
+                    }
                 FloatingOverlayButtonStack(
                     showSearchFab = showSearchFab,
                     showAddFab = showAddFab,
+                    addFabContentDescription = addLabel,
                     onOpenSearch = { onAction(MainAction.OpenSearch) },
-                    onOpenAddSheet = { onAction(resolveAddFabAction(state)) },
+                    onOpenAddSheet = { onAction(addAction) },
                 )
             }
         },
@@ -444,6 +453,7 @@ internal fun FloatingOverlayButtonStack(
     onOpenAddSheet: () -> Unit,
     showSearchFab: Boolean = true,
     showAddFab: Boolean = true,
+    addFabContentDescription: String = SAVE_FAB_DEFAULT_LABEL,
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -453,7 +463,10 @@ internal fun FloatingOverlayButtonStack(
             SearchFloatingActionButton(onClick = onOpenSearch)
         }
         if (showAddFab) {
-            SaveFloatingActionButton(onClick = onOpenAddSheet)
+            SaveFloatingActionButton(
+                onClick = onOpenAddSheet,
+                contentDescription = addFabContentDescription,
+            )
         }
     }
 }
@@ -513,7 +526,10 @@ internal fun SearchFloatingActionButton(onClick: () -> Unit) {
 }
 
 @Composable
-internal fun SaveFloatingActionButton(onClick: () -> Unit) {
+internal fun SaveFloatingActionButton(
+    onClick: () -> Unit,
+    contentDescription: String = SAVE_FAB_DEFAULT_LABEL,
+) {
     val colors = LocalRocheColors.current
     FloatingActionButton(
         onClick = onClick,
@@ -522,7 +538,7 @@ internal fun SaveFloatingActionButton(onClick: () -> Unit) {
         contentColor = Color.White,
         modifier =
             Modifier.size(52.dp)
-                .semantics { contentDescription = "Save URL or Feed" }
+                .semantics { this.contentDescription = contentDescription }
                 .testTag("save_fab"),
     ) {
         PlusIcon(tint = Color.White, size = 20.dp)
@@ -959,7 +975,7 @@ internal fun MainTabDestinationContent(
     }
 }
 
-private fun resolveAddFabAction(state: MainUiState): MainAction =
+internal fun resolveAddFabAction(state: MainUiState): MainAction =
     when (state.activeTab) {
         AppTab.LISTS -> resolveListsFabAction(state)
         AppTab.DIARY -> MainAction.OpenQuickLogSheet(defaultToWant = false)
@@ -983,16 +999,24 @@ private fun resolveListsFabAction(state: MainUiState): MainAction {
         defaultToWant = false,
         targetCollectionId = activeList?.collectionId?.takeIf { editable },
         targetCollectionTitle = activeList?.title?.takeIf { editable },
+        prefillKind = EntryKind.inferForCollection(activeList),
     )
 }
 
 private fun resolveQueueFabAction(state: MainUiState): MainAction {
-    val isWantToRead =
-        state.queueSubTab == QueueSubTab.WANT &&
-            (state.selectedWantCollectionId == null ||
-                state.selectedWantCollectionId == WANT_TO_READ_COLLECTION_ID)
-    return if (state.queueSubTab == QueueSubTab.WANT && !isWantToRead) {
-        MainAction.OpenQuickLogSheet(defaultToWant = true)
+    if (state.queueSubTab != QueueSubTab.WANT) {
+        return MainAction.OpenAddSheet()
+    }
+    val activeQueue =
+        resolveActiveWantQueue(
+            queues = state.catalog.wantQueues,
+            selectedId = state.selectedWantCollectionId,
+        )
+    return if (activeQueue != null && activeQueue.collectionId != WANT_TO_READ_COLLECTION_ID) {
+        MainAction.OpenQuickLogSheet(
+            defaultToWant = true,
+            prefillKind = EntryKind.inferForCollection(activeQueue),
+        )
     } else {
         MainAction.OpenAddSheet()
     }
@@ -1133,6 +1157,7 @@ internal class MainScrollStateHolder(
     }
 }
 
+private const val SAVE_FAB_DEFAULT_LABEL = "Save URL or Feed"
 private const val SNACKBAR_AUTO_DISMISS_MS = 4_000L
 private const val MAX_RETAINED_SCOPED_STATES = 8
 internal const val SEARCH_SCROLL_STATE_KEY = "search"

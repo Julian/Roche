@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, sync::Arc};
+use std::{collections::HashMap, fmt::Write as _, sync::Arc};
 
 use axum::{
     Form,
@@ -25,6 +25,17 @@ use crate::{
     },
 };
 
+fn parse_inbox_kind_filter(raw: Option<&str>) -> (Option<ContentType>, Option<&'static str>) {
+    match raw.map(str::trim) {
+        Some("article") => (Some(ContentType::Article), Some("article")),
+        Some("audio") => (Some(ContentType::Audio), Some("audio")),
+        Some("video") => (Some(ContentType::Video), Some("video")),
+        Some("paper") => (Some(ContentType::Paper), Some("paper")),
+        Some("pdf") => (Some(ContentType::Pdf), Some("pdf")),
+        _ => (None, None),
+    }
+}
+
 pub(in crate::web) async fn inbox_get(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
@@ -40,13 +51,7 @@ pub(in crate::web) async fn inbox_get(
         ItemStatusFilter::Archived => "archived",
         ItemStatusFilter::Unread => "unread",
     };
-    let (content_type, clean_kind) = match q.kind.as_deref().map(str::trim) {
-        Some("article") => (Some(ContentType::Article), Some("article")),
-        Some("audio") => (Some(ContentType::Audio), Some("audio")),
-        Some("video") => (Some(ContentType::Video), Some("video")),
-        Some("paper") => (Some(ContentType::Paper), Some("paper")),
-        _ => (None, None),
-    };
+    let (content_type, clean_kind) = parse_inbox_kind_filter(q.kind.as_deref());
     let clean_feed = q.feed.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let clean_tag = q.tag.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let clean_search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -65,11 +70,13 @@ pub(in crate::web) async fn inbox_get(
     };
 
     let sync = service.sync();
-    let (page_res, feeds, sync_res, labels) = tokio::join!(
+    let tags_svc = service.tags();
+    let (page_res, feeds, sync_res, labels, all_tags) = tokio::join!(
         service.items().query().with_filter(filter).list_page(),
         load_sorted_active_feeds(&service),
         sync.status(),
         load_inbox_filter_labels(&service, clean_feed, clean_tag),
+        tags_svc.list(),
     );
     let page = page_res.web_err(&session)?;
     let total_unread = sync_res.map_or_else(
@@ -77,6 +84,13 @@ pub(in crate::web) async fn inbox_get(
         |s| s.unread_items_count,
     );
     let (feed_label, tag_label) = labels;
+    let tag_id_by_lower_name: HashMap<String, String> = all_tags
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| (t.name.to_ascii_lowercase(), t.id))
+        .collect();
+    let selected_feed_unread =
+        clean_feed.and_then(|fid| feeds.iter().find(|f| f.id == fid)).map(|f| f.unread_count);
 
     let nav_ctx = InboxNavParams {
         status: status_slug,
@@ -86,37 +100,18 @@ pub(in crate::web) async fn inbox_get(
         q: clean_search,
         page: page_num,
     };
-    let return_url = build_inbox_href(&nav_ctx);
-
-    let mut body = String::with_capacity(16_384);
-    body.push_str("<div class=\"inbox-layout\">\n");
-    render_inbox_sidebar(&mut body, &nav_ctx, &feeds, total_unread);
-    body.push_str("<section class=\"inbox-stream\" aria-label=\"Feed stream\">\n");
-    render_inbox_mobile_pills(&mut body, &nav_ctx);
-    render_inbox_toolbar(
-        &mut body,
-        &session.csrf_token,
+    let body = render_inbox_body(
         &nav_ctx,
-        feed_label.as_deref(),
+        &feeds,
         total_unread,
+        selected_feed_unread,
         &page.items,
-        &return_url,
+        page.has_more,
+        feed_label.as_deref(),
+        tag_label.as_deref(),
+        &tag_id_by_lower_name,
+        &session.csrf_token,
     );
-    let has_active_filters = nav_ctx.feed.is_some()
-        || nav_ctx.tag.is_some()
-        || nav_ctx.kind.is_some()
-        || nav_ctx.q.is_some();
-    if has_active_filters {
-        render_inbox_active_filters(
-            &mut body,
-            &nav_ctx,
-            feed_label.as_deref(),
-            tag_label.as_deref(),
-        );
-    }
-    render_item_rows(&mut body, &page.items, &session.csrf_token, &return_url);
-    render_inbox_pager(&mut body, &nav_ctx, page_num, page.has_more);
-    body.push_str("</section>\n</div>\n");
 
     Ok(render_page(&PageShell {
         title: feed_label.as_deref().unwrap_or("Inbox"),
@@ -124,9 +119,53 @@ pub(in crate::web) async fn inbox_get(
         csrf_token: &session.csrf_token,
         flash: &q.flash,
         is_refreshing: service.is_refreshing(),
+        theme: session.theme,
         body_html: &body,
     })
     .into_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_inbox_body(
+    nav_ctx: &InboxNavParams<'_>,
+    feeds: &[Feed],
+    total_unread: i64,
+    selected_feed_unread: Option<i64>,
+    items: &[Item],
+    has_more: bool,
+    feed_label: Option<&str>,
+    tag_label: Option<&str>,
+    tag_id_by_lower_name: &HashMap<String, String>,
+    csrf: &str,
+) -> String {
+    let return_url = build_inbox_href(nav_ctx);
+    let mut body = String::with_capacity(16_384);
+    body.push_str("<div class=\"inbox-layout\">\n");
+    render_inbox_sidebar(&mut body, nav_ctx, feeds, total_unread);
+    body.push_str("<section class=\"inbox-stream\" aria-label=\"Feed stream\">\n");
+    render_inbox_mobile_pills(&mut body, nav_ctx);
+    render_inbox_toolbar(
+        &mut body,
+        csrf,
+        nav_ctx,
+        feed_label,
+        total_unread,
+        selected_feed_unread,
+        items,
+        has_more,
+        &return_url,
+    );
+    if nav_ctx.feed.is_some()
+        || nav_ctx.tag.is_some()
+        || nav_ctx.kind.is_some()
+        || nav_ctx.q.is_some()
+    {
+        render_inbox_active_filters(&mut body, nav_ctx, feed_label, tag_label);
+    }
+    render_item_rows(&mut body, items, csrf, &return_url, tag_id_by_lower_name);
+    render_inbox_pager(&mut body, nav_ctx, nav_ctx.page, has_more);
+    body.push_str("</section>\n</div>\n");
+    body
 }
 
 async fn load_sorted_active_feeds(service: &RocheService) -> Vec<Feed> {
@@ -253,9 +292,13 @@ fn render_inbox_sidebar(
            <ul class=\"sidebar-list\">\n",
     );
     // TODO(backend): include per-format unread counts in inbox sidebar
-    for (k_slug, label) in
-        [("article", "Articles"), ("audio", "Podcasts"), ("paper", "Papers"), ("video", "Videos")]
-    {
+    for (k_slug, label) in [
+        ("article", "Articles"),
+        ("audio", "Podcasts"),
+        ("paper", "Papers"),
+        ("pdf", "PDFs"),
+        ("video", "Videos"),
+    ] {
         let is_cur = p.kind == Some(k_slug);
         let attrs = if is_cur { " class=\"is-active\" aria-current=\"true\"" } else { "" };
         let next_kind = if is_cur { None } else { Some(k_slug) };
@@ -280,7 +323,13 @@ fn render_inbox_sidebar(
         let is_cur = p.feed == Some(feed.id.as_str());
         let attrs = if is_cur { " class=\"is-active\" aria-current=\"true\"" } else { "" };
         let next_feed = if is_cur { None } else { Some(feed.id.as_str()) };
-        let next_status = if is_cur { p.status } else { "all" };
+        let next_status = if is_cur {
+            p.status
+        } else if feed.unread_count > 0 {
+            "unread"
+        } else {
+            "all"
+        };
         let href = build_inbox_href(&InboxNavParams {
             status: next_status,
             feed: next_feed,
@@ -315,9 +364,13 @@ fn render_inbox_mobile_pills(out: &mut String, p: &InboxNavParams<'_>) {
         let href = build_inbox_href(&InboxNavParams { status: slug, page: 1, ..*p });
         let _ = writeln!(out, "<a {attrs} href=\"{}\">{label}</a>", esc(&href));
     }
-    for (k_slug, label) in
-        [("article", "Articles"), ("audio", "Audio"), ("video", "Video"), ("paper", "Papers")]
-    {
+    for (k_slug, label) in [
+        ("article", "Articles"),
+        ("audio", "Podcasts"),
+        ("video", "Videos"),
+        ("paper", "Papers"),
+        ("pdf", "PDFs"),
+    ] {
         let is_cur = p.kind == Some(k_slug);
         let attrs = if is_cur {
             "class=\"pill is-active\" aria-current=\"true\""
@@ -331,13 +384,16 @@ fn render_inbox_mobile_pills(out: &mut String, p: &InboxNavParams<'_>) {
     out.push_str("</div>\n");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_inbox_toolbar(
     out: &mut String,
     csrf: &str,
     p: &InboxNavParams<'_>,
     feed_label: Option<&str>,
     total_unread: i64,
+    selected_feed_unread: Option<i64>,
     items: &[Item],
+    has_more: bool,
     return_to: &str,
 ) {
     let heading = feed_label.unwrap_or(match p.status {
@@ -352,8 +408,40 @@ fn render_inbox_toolbar(
              <h2>{}</h2>",
         esc(heading),
     );
-    if feed_label.is_none() && p.status == "unread" && p.kind.is_none() && p.q.is_none() {
-        let _ = write!(out, "<span class=\"inbox-toolbar-count\">{total_unread} items</span>");
+    let count_text = if feed_label.is_none()
+        && p.status == "unread"
+        && p.kind.is_none()
+        && p.tag.is_none()
+        && p.q.is_none()
+    {
+        if total_unread == 1 { "1 item".to_owned() } else { format!("{total_unread} items") }
+    } else if let Some(feed_unread) = selected_feed_unread
+        && p.status == "unread"
+        && p.kind.is_none()
+        && p.tag.is_none()
+        && p.q.is_none()
+    {
+        if feed_unread == 1 { "1 item".to_owned() } else { format!("{feed_unread} items") }
+    } else if has_more {
+        format!("{}+ items", items.len())
+    } else if items.len() == 1 {
+        "1 item".to_owned()
+    } else {
+        format!("{} items", items.len())
+    };
+    let _ = write!(out, "<span class=\"inbox-toolbar-count\">{count_text}</span>");
+    if p.feed.is_some() {
+        out.push_str("<div class=\"inbox-feed-status-toggle pill-bar\" role=\"group\" aria-label=\"Feed status filter\">");
+        for (slug, label) in [("unread", "Unread"), ("all", "All"), ("archived", "Archived")] {
+            let attrs = if p.status == slug {
+                "class=\"pill is-active\" aria-current=\"true\""
+            } else {
+                "class=\"pill\""
+            };
+            let href = build_inbox_href(&InboxNavParams { status: slug, page: 1, ..*p });
+            let _ = write!(out, "<a {attrs} href=\"{}\">{label}</a>", esc(&href));
+        }
+        out.push_str("</div>");
     }
     out.push_str("</div>\n<div class=\"inbox-toolbar-actions\">\n");
     render_inbox_inline_search(out, p);
@@ -544,7 +632,13 @@ fn clean_plain_excerpt(raw: &str) -> String {
     }
 }
 
-pub(super) fn render_item_rows(out: &mut String, items: &[Item], csrf: &str, return_to: &str) {
+pub(super) fn render_item_rows(
+    out: &mut String,
+    items: &[Item],
+    csrf: &str,
+    return_to: &str,
+    tag_id_by_lower_name: &HashMap<String, String>,
+) {
     if items.is_empty() {
         out.push_str("<p class=\"empty\">No matching items.</p>\n");
         return;
@@ -568,14 +662,20 @@ pub(super) fn render_item_rows(out: &mut String, items: &[Item], csrf: &str, ret
             active_day = Some(day_label);
             first_group = false;
         }
-        render_single_inbox_row(out, item, csrf, return_to);
+        render_single_inbox_row(out, item, csrf, return_to, tag_id_by_lower_name);
     }
     if active_day.is_some() {
         out.push_str("</ul>\n");
     }
 }
 
-fn render_single_inbox_row(out: &mut String, item: &Item, csrf: &str, return_to: &str) {
+fn render_single_inbox_row(
+    out: &mut String,
+    item: &Item,
+    csrf: &str,
+    return_to: &str,
+    tag_id_by_lower_name: &HashMap<String, String>,
+) {
     let row_cls =
         if item.status == ItemStatus::Archived { "inbox-row is-archived" } else { "inbox-row" };
     let id_enc = urlencode(&item.id);
@@ -645,7 +745,17 @@ fn render_single_inbox_row(out: &mut String, item: &Item, csrf: &str, return_to:
         let _ = write!(out, "<span class=\"byline-item\">{}</span>", dt.format("%b %d"));
     }
     for tag_name in &item.tag_names.0 {
-        let _ = write!(out, "<span class=\"badge\">#{}</span>", esc(tag_name));
+        if let Some(tag_id) = tag_id_by_lower_name.get(&tag_name.to_ascii_lowercase()) {
+            let tag_href = format!("/inbox?status=all&tag={}", urlencode(tag_id));
+            let _ = write!(
+                out,
+                "<a class=\"badge badge-link\" href=\"{}\">#{}</a>",
+                esc(&tag_href),
+                esc(tag_name),
+            );
+        } else {
+            let _ = write!(out, "<span class=\"badge\">#{}</span>", esc(tag_name));
+        }
     }
     out.push_str("</div>\n");
     if let Some(sum) = item.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -797,10 +907,22 @@ pub(in crate::web) async fn post_item_archive(
     Path(id): Path<String>,
     Form(form): Form<ItemReturnForm>,
 ) -> Result<Response, WebError> {
-    let clamped_prog = form.progress.filter(|p| p.is_finite()).map(|p| p.clamp(0.0, 1.0));
+    let submitted_prog = form.progress.filter(|p| p.is_finite()).map(|p| p.clamp(0.0, 1.0));
+    let merged_prog = if let Some(sub) = submitted_prog {
+        let existing = service
+            .items()
+            .get(&id)
+            .await
+            .ok()
+            .filter(|d| d.item.read_progress.is_finite())
+            .map_or(0.0, |d| d.item.read_progress.clamp(0.0, 1.0));
+        Some(existing.max(sub))
+    } else {
+        None
+    };
     let _ = service
         .items()
-        .update(&id, Some(ItemStatus::Archived), None, clamped_prog, ReadAtPatch::Unchanged)
+        .update(&id, Some(ItemStatus::Archived), None, merged_prog, ReadAtPatch::Unchanged)
         .await
         .web_err(&session)?;
     Ok(redirect_see_other(&safe_local_redirect(form.return_to.as_deref(), "/inbox")))

@@ -130,6 +130,7 @@ pub(in crate::web) async fn diary_get(
         csrf_token: &session.csrf_token,
         flash: &q.flash,
         is_refreshing: service.is_refreshing(),
+        theme: session.theme,
         body_html: &body,
     })
     .into_response())
@@ -253,7 +254,7 @@ fn render_diary_page_row(
     if let Some(thumb) = row.entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
         let _ = write!(
             out,
-            "<a class=\"diary-thumb-link\" href=\"{}\"><img class=\"diary-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></a>",
+            "<a class=\"diary-thumb-link\" href=\"{}\" tabindex=\"-1\" aria-hidden=\"true\"><img class=\"diary-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></a>",
             esc(&entry_href),
             esc(thumb),
         );
@@ -434,7 +435,7 @@ pub(in crate::web) async fn queue_get(
 
     if ranked_queues.is_empty() {
         body.push_str(
-            "<p class=\"empty\">Your queues are empty. Save a URL or add a movie, book, album, paper, or game from the panel on the right.</p>\n",
+            "<p class=\"empty\">Your queues are empty. Save a URL or add a movie, book, album, paper, or game using the Quick Save or Add to Queue panel.</p>\n",
         );
     } else {
         for (_, qview) in ranked_queues {
@@ -457,6 +458,7 @@ pub(in crate::web) async fn queue_get(
         csrf_token: &session.csrf_token,
         flash: &flash,
         is_refreshing: service.is_refreshing(),
+        theme: session.theme,
         body_html: &body,
     })
     .into_response())

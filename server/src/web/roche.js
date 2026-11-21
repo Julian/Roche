@@ -398,11 +398,16 @@
           return;
         }
         if (resp.status === 401) {
+          const curDest = `${window.location.pathname}${window.location.search}`;
+          const loginHref =
+            curDest && curDest !== "/" && !curDest.startsWith("/login")
+              ? `/login?return_to=${encodeURIComponent(curDest)}`
+              : "/login";
           if (!isAudioPlaying()) {
-            window.location.href = "/login";
+            window.location.href = loginHref;
           } else {
             showInlinePjaxError("Your session has expired. Audio playback continues —", {
-              href: "/login",
+              href: loginHref,
               label: "Sign in again",
             });
           }
@@ -635,15 +640,35 @@
 
     window.addEventListener("scroll", onScroll, { passive: true });
 
-    const archiveForm = root.querySelector(".js-reader-archive-form");
-    archiveForm?.addEventListener("submit", () => {
-      const hiddenProg = archiveForm.querySelector("input[name='progress']");
+    const layoutScope = root.closest(".reader-layout") || document;
+    const archiveForms = Array.from(layoutScope.querySelectorAll(".js-reader-archive-form"));
+    const onArchiveSubmit = (ev) => {
+      const formEl = ev.currentTarget;
+      const hiddenProg = formEl?.querySelector("input[name='progress']");
       const live = Math.max(best, measureFraction());
       if (hiddenProg) hiddenProg.value = live.toFixed(4);
-    });
+    };
+    for (const formEl of archiveForms) {
+      formEl.addEventListener("submit", onArchiveSubmit);
+    }
+
+    const resumeBtn = root.querySelector(".js-reader-resume-btn");
+    const onResumeClick = () => {
+      const targetFrac = Number.parseFloat(resumeBtn?.getAttribute("data-resume-progress") || "0");
+      if (!Number.isFinite(targetFrac) || targetFrac <= 0) return;
+      const targetY = Math.round(targetFrac * maxScrollablePixels());
+      const reducedMotion = Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+      window.scrollTo({ top: targetY, behavior: reducedMotion ? "auto" : "smooth" });
+      if (resumeBtn) resumeBtn.hidden = true;
+    };
+    resumeBtn?.addEventListener("click", onResumeClick);
 
     readerCleanup = () => {
       window.removeEventListener("scroll", onScroll);
+      for (const formEl of archiveForms) {
+        formEl.removeEventListener("submit", onArchiveSubmit);
+      }
+      resumeBtn?.removeEventListener("click", onResumeClick);
       if (timer) window.clearTimeout(timer);
     };
   };
@@ -1064,7 +1089,7 @@
     });
 
     const onKeyDown = (ev) => {
-      if (!form.contains(ev.target)) return;
+      if (!document.body.contains(form)) return;
       if (ev.target?.closest?.("input, textarea, select, [contenteditable]")) return;
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
 
@@ -1080,16 +1105,12 @@
         ev.preventDefault();
         selectedCard = cards[Math.min(cards.length - 1, curIdx + 1)];
         syncSelection(`Selected ${cardTitle(selectedCard)}`);
-        if (ev.target.classList?.contains("js-rank-card")) {
-          selectedCard.focus({ preventScroll: true });
-        }
+        selectedCard.focus({ preventScroll: true });
       } else if (ev.key === "k" || (ev.key === "ArrowUp" && !ev.shiftKey)) {
         ev.preventDefault();
         selectedCard = cards[Math.max(0, curIdx - 1)];
         syncSelection(`Selected ${cardTitle(selectedCard)}`);
-        if (ev.target.classList?.contains("js-rank-card")) {
-          selectedCard.focus({ preventScroll: true });
-        }
+        selectedCard.focus({ preventScroll: true });
       } else if (ev.key === "J" || (ev.key === "ArrowDown" && ev.shiftKey)) {
         ev.preventDefault();
         moveDown(selectedCard);
@@ -1108,6 +1129,7 @@
             selectedCard = afterCards[newIdx + 1];
             syncSelection();
           }
+          selectedCard.focus({ preventScroll: true });
         }
       } else if (ev.key === "=") {
         ev.preventDefault();
@@ -1148,6 +1170,13 @@
       document.removeEventListener("keydown", onKeyDown);
     };
     syncBoard();
+    const activeEl = document.activeElement;
+    if (
+      selectedCard &&
+      (!activeEl || activeEl === document.body || activeEl.id === "roche-main")
+    ) {
+      selectedCard.focus({ preventScroll: true });
+    }
   };
 
   /* --- 4. OPML File Picker Helper --- */
@@ -1167,6 +1196,19 @@
     });
   };
 
+  const stripFlashParamsFromUrl = () => {
+    if (!window.location.search || typeof window.history?.replaceState !== "function") return;
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("notice") && !params.has("err")) return;
+    params.delete("notice");
+    params.delete("err");
+    const qs = params.toString();
+    const nextUrl = `${window.location.pathname}${qs ? `?${qs}` : ""}${window.location.hash}`;
+    try {
+      window.history.replaceState(window.history.state, "", nextUrl);
+    } catch {}
+  };
+
   const hasDirtyFormOrOpenDetails = () => {
     const active = document.activeElement;
     if (active?.matches?.("input, textarea, select, [contenteditable]")) {
@@ -1174,9 +1216,6 @@
     }
     const curMain = document.getElementById("roche-main");
     if (!curMain) return false;
-    if (active && active !== curMain && curMain.contains(active)) {
-      return true;
-    }
     if (curMain.querySelector("details[open]:not([data-default-open])")) return true;
     for (const el of curMain.querySelectorAll("input, textarea, select")) {
       if (el.type === "hidden" || el.type === "submit" || el.type === "button") continue;
@@ -1195,11 +1234,54 @@
 
   /* --- 5. Background Refresh Status Indicator --- */
   let refreshPollTimer = null;
+  let refreshHideTimer = null;
 
   const initRefreshBanner = () => {
     const banner = document.getElementById("roche-refresh-banner");
     if (!banner) return;
     const label = banner.querySelector(".js-refresh-label");
+    let baselineUnread = null;
+    let consecutiveErrors = 0;
+    const MAX_POLL_ERRORS = 4;
+
+    const showCompletionCue = (delta, needsManualReload) => {
+      if (refreshHideTimer) clearTimeout(refreshHideTimer);
+      banner.classList.add("is-complete");
+      banner.hidden = false;
+      banner.setAttribute("data-active", "0");
+      if (label) {
+        label.replaceChildren();
+        if (delta > 0) {
+          const itemWord = delta === 1 ? "item" : "items";
+          label.appendChild(document.createTextNode(`+${delta} new ${itemWord}`));
+          if (needsManualReload) {
+            label.appendChild(document.createTextNode(" — "));
+            const reloadLink = document.createElement("a");
+            reloadLink.href = `${window.location.pathname}${window.location.search}`;
+            reloadLink.className = "refresh-reload-link";
+            reloadLink.textContent = "Reload";
+            label.appendChild(reloadLink);
+          }
+        } else {
+          label.textContent = "Up to date";
+        }
+      }
+      if (!needsManualReload || delta === 0) {
+        refreshHideTimer = setTimeout(() => {
+          banner.hidden = true;
+          banner.classList.remove("is-complete");
+          if (label) label.textContent = "Refreshing feeds & metadata in background…";
+        }, 3500);
+      }
+    };
+
+    const cleanCurrentPathSearch = () => {
+      const cleanParams = new URLSearchParams(window.location.search);
+      cleanParams.delete("notice");
+      cleanParams.delete("err");
+      const qs = cleanParams.toString();
+      return `${window.location.pathname}${qs ? `?${qs}` : ""}`;
+    };
 
     const scheduleCheck = (delayMs) => {
       if (refreshPollTimer) clearTimeout(refreshPollTimer);
@@ -1210,9 +1292,19 @@
             headers: { Accept: "application/json" },
             credentials: "same-origin",
           });
-          if (!resp.ok || (resp.redirected && isLoginUrl(resp.url))) return;
+          if (resp.redirected && isLoginUrl(resp.url)) return;
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           const data = await resp.json();
+          consecutiveErrors = 0;
+          if (baselineUnread === null && Number.isFinite(data?.unread_items_count)) {
+            baselineUnread = data.unread_items_count;
+          }
           if (data?.is_refreshing) {
+            if (refreshHideTimer) {
+              clearTimeout(refreshHideTimer);
+              refreshHideTimer = null;
+            }
+            banner.classList.remove("is-complete");
             banner.hidden = false;
             banner.setAttribute("data-active", "1");
             if (label && Number.isFinite(data.active_refresh_count) && data.active_refresh_count > 1) {
@@ -1222,15 +1314,21 @@
             }
             scheduleCheck(1500);
           } else {
-            const wasActive = banner.getAttribute("data-active") === "1" || !banner.hidden;
-            banner.hidden = true;
+            const wasActive = banner.getAttribute("data-active") === "1";
+            const currentUnread = Number.isFinite(data?.unread_items_count)
+              ? data.unread_items_count
+              : (baselineUnread ?? 0);
+            const delta = baselineUnread !== null ? Math.max(0, currentUnread - baselineUnread) : 0;
+            if (!wasActive) {
+              banner.setAttribute("data-active", "0");
+              return;
+            }
             banner.setAttribute("data-active", "0");
-            if (
-              wasActive &&
+            const canAutoSwap =
               !hasDirtyFormOrOpenDetails() &&
-              ["/", "/inbox", "/feeds", "/queue"].includes(window.location.pathname)
-            ) {
-              const curUrl = `${window.location.pathname}${window.location.search}`;
+              ["/", "/inbox", "/feeds", "/queue"].includes(window.location.pathname);
+            if (canAutoSwap) {
+              const curUrl = cleanCurrentPathSearch();
               const r = await fetch(curUrl, { credentials: "same-origin" });
               if (r.redirected && isLoginUrl(r.url)) {
                 window.location.href = r.url;
@@ -1238,8 +1336,12 @@
               }
               if (r.ok) {
                 const html = await r.text();
-                const currentPathSearch = `${window.location.pathname}${window.location.search}`;
-                if (curUrl !== currentPathSearch || hasDirtyFormOrOpenDetails()) {
+                if (cleanCurrentPathSearch() !== curUrl) {
+                  banner.hidden = true;
+                  return;
+                }
+                if (hasDirtyFormOrOpenDetails()) {
+                  showCompletionCue(delta, true);
                   return;
                 }
                 const doc = new DOMParser().parseFromString(html, "text/html");
@@ -1250,16 +1352,26 @@
                   curMain.replaceChildren(...Array.from(nextMain.childNodes));
                   initPageWidgets();
                 }
+                showCompletionCue(delta, false);
+                return;
               }
             }
+            showCompletionCue(delta, true);
           }
         } catch {
-          // Ignore transient status poll errors.
+          consecutiveErrors += 1;
+          if (consecutiveErrors <= MAX_POLL_ERRORS) {
+            const backoffMs = Math.min(12000, 1500 * Math.pow(2, consecutiveErrors - 1));
+            scheduleCheck(backoffMs);
+          } else {
+            banner.hidden = true;
+            banner.setAttribute("data-active", "0");
+          }
         }
       }, delayMs);
     };
 
-    if (banner.getAttribute("data-active") === "1" || !banner.hidden) {
+    if (banner.getAttribute("data-active") === "1") {
       scheduleCheck(1200);
     }
   };
@@ -1276,6 +1388,11 @@
     ) {
       const banner = document.getElementById("roche-refresh-banner");
       if (banner) {
+        if (refreshHideTimer) {
+          clearTimeout(refreshHideTimer);
+          refreshHideTimer = null;
+        }
+        banner.classList.remove("is-complete");
         banner.hidden = false;
         banner.setAttribute("data-active", "1");
       }
@@ -1285,15 +1402,35 @@
   /* --- 6. Theme Toggle, Masthead Search & Sleeve Drawers --- */
   const THEME_STORAGE_KEY = "roche_theme_v1";
 
+  const persistThemeCookie = (theme) => {
+    if (theme !== "dark" && theme !== "light") return;
+    try {
+      const securePart = window.location.protocol === "https:" ? "; Secure" : "";
+      document.cookie = `roche_theme=${theme}; Path=/; Max-Age=31536000; SameSite=Lax${securePart}`;
+    } catch {}
+  };
+
   const applySavedTheme = () => {
     try {
       const saved = localStorage.getItem(THEME_STORAGE_KEY);
       if (saved === "dark" || saved === "light") {
         document.documentElement.setAttribute("data-theme", saved);
+        persistThemeCookie(saved);
       }
     } catch {}
   };
   applySavedTheme();
+
+  const scrollActiveNavIntoView = () => {
+    const nav = document.getElementById("roche-nav");
+    const activeLink = nav?.querySelector("a.is-active");
+    if (!nav || !activeLink || nav.scrollWidth <= nav.clientWidth) return;
+    const navRect = nav.getBoundingClientRect();
+    const linkRect = activeLink.getBoundingClientRect();
+    const targetLeft =
+      nav.scrollLeft + (linkRect.left - navRect.left) - (nav.clientWidth - linkRect.width) / 2;
+    nav.scrollLeft = Math.max(0, Math.min(targetLeft, nav.scrollWidth - nav.clientWidth));
+  };
 
   const initShellControls = () => {
     const themeBtn = document.getElementById("roche-theme-toggle");
@@ -1317,7 +1454,23 @@
         try {
           localStorage.setItem(THEME_STORAGE_KEY, next);
         } catch {}
+        persistThemeCookie(next);
         syncThemeLabel();
+      });
+    }
+
+    for (const toggleBtn of document.querySelectorAll(".js-toggle-password")) {
+      if (toggleBtn.dataset.bound === "1") continue;
+      toggleBtn.dataset.bound = "1";
+      toggleBtn.addEventListener("click", () => {
+        const targetId = toggleBtn.getAttribute("data-target");
+        const input = targetId ? document.getElementById(targetId) : null;
+        if (!input) return;
+        const showing = input.type === "password";
+        input.type = showing ? "text" : "password";
+        toggleBtn.textContent = showing ? "Hide" : "Show";
+        toggleBtn.setAttribute("aria-pressed", showing ? "true" : "false");
+        toggleBtn.setAttribute("aria-label", showing ? "Hide pairing code" : "Show pairing code");
       });
     }
 
@@ -1339,12 +1492,19 @@
         if (ev.key !== "/" || ev.metaKey || ev.ctrlKey || ev.altKey) return;
         const target = ev.target;
         if (target?.matches?.("input, textarea, select, [contenteditable]")) return;
-        if (document.getElementById("roche-rank-board")) return;
+        if (document.getElementById("roche-rank-board") || document.querySelector(".js-rank-form")) {
+          return;
+        }
         const input = document.getElementById("roche-global-search");
         if (!input) return;
         ev.preventDefault();
         const hdr = document.getElementById("roche-masthead");
-        if (hdr && window.getComputedStyle(input).display === "none") {
+        const searchWrap = document.getElementById("roche-masthead-search");
+        if (
+          hdr &&
+          ((searchWrap && window.getComputedStyle(searchWrap).display === "none") ||
+            window.getComputedStyle(input).display === "none")
+        ) {
           hdr.classList.add("is-search-open");
           document.getElementById("roche-search-toggle")?.setAttribute("aria-expanded", "true");
         }
@@ -1405,9 +1565,19 @@
     }
   };
 
+  let readerExtrasCleanup = null;
+
   const initReaderExtras = () => {
+    if (readerExtrasCleanup) {
+      readerExtrasCleanup();
+      readerExtrasCleanup = null;
+    }
     const root = document.querySelector(".js-reader-root");
-    if (!root) return;
+    if (!root) {
+      document.getElementById("roche-read-progress")?.remove();
+      return;
+    }
+    const cleanups = [];
 
     // 1. Hairline reading progress bar
     let bar = document.getElementById("roche-read-progress");
@@ -1474,25 +1644,60 @@
       }
     }
 
-    // 3. Auto-build Table of Contents from h2/h3 in prose
+    // 3. Auto-build Table of Contents from normalized h3/h4 (or h2/h3) headings in prose
     const tocList = document.getElementById("roche-reader-toc");
     const tocGroup = document.getElementById("roche-reader-toc-group");
     if (tocList && prose && tocList.dataset.built !== "1") {
       tocList.dataset.built = "1";
-      const headings = Array.from(prose.querySelectorAll("h2, h3")).filter(
+      const candidateHeadings = Array.from(prose.querySelectorAll("h2, h3, h4")).filter(
         (h) => (h.textContent || "").trim().length > 0
       );
+      const minLevel = candidateHeadings.reduce(
+        (acc, h) => Math.min(acc, Number.parseInt(h.tagName.slice(1), 10) || 6),
+        6
+      );
+      const headings = candidateHeadings.filter((h) => {
+        const lvl = Number.parseInt(h.tagName.slice(1), 10) || 6;
+        return lvl <= minLevel + 1;
+      });
       if (headings.length >= 2) {
+        const linkById = new Map();
         headings.forEach((h, i) => {
           if (!h.id) h.id = `sec-${i + 1}`;
+          const lvl = Number.parseInt(h.tagName.slice(1), 10) || minLevel;
           const li = document.createElement("li");
-          if (h.tagName === "H3") li.className = "toc-sub";
+          if (lvl > minLevel) li.className = "toc-sub";
           const a = document.createElement("a");
           a.href = `#${h.id}`;
           a.textContent = h.textContent.trim();
           li.appendChild(a);
           tocList.appendChild(li);
+          linkById.set(h.id, a);
         });
+        const markCurrentToc = (activeId) => {
+          for (const [id, anchor] of linkById.entries()) {
+            const isCur = id === activeId;
+            anchor.classList.toggle("is-current", isCur);
+            if (isCur) anchor.setAttribute("aria-current", "true");
+            else anchor.removeAttribute("aria-current");
+          }
+        };
+        markCurrentToc(headings[0].id);
+        if (typeof IntersectionObserver === "function") {
+          const io = new IntersectionObserver(
+            (entries) => {
+              const visible = entries
+                .filter((e) => e.isIntersecting)
+                .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+              if (visible.length > 0 && visible[0].target.id) {
+                markCurrentToc(visible[0].target.id);
+              }
+            },
+            { rootMargin: "0px 0px -70% 0px", threshold: 0.1 }
+          );
+          for (const h of headings) io.observe(h);
+          cleanups.push(() => io.disconnect());
+        }
         if (tocGroup) tocGroup.hidden = false;
       } else if (tocGroup) {
         tocGroup.hidden = true;
@@ -1554,51 +1759,50 @@
       }
     }
 
-    // 5. Auto-finish sync at bottom of article + click-to-toggle Finished state
+    // 5. Honest passive read-completion beacon at 92% scroll (never fakes Diary finish or rewrites form action)
     const finishForm = root.querySelector(".js-finish-toggle-form");
     const finishBtn = root.querySelector(".js-finish-toggle-btn, .js-proto-finish-toggle");
     if (finishBtn && finishBtn.dataset.bound !== "1") {
       finishBtn.dataset.bound = "1";
-      let userUntoggled = root.getAttribute("data-suppress-auto-finish") === "1";
+      const suppressAutoRead = root.getAttribute("data-suppress-auto-finish") === "1";
       const itemId = root.getAttribute("data-item-id") || "";
-      const setFinishedUi = (done) => {
-        finishBtn.classList.toggle("is-done", done);
-        finishBtn.setAttribute("aria-pressed", done ? "true" : "false");
-        finishBtn.textContent = done ? "✓ Finished" : "Mark Finished";
-        finishBtn.setAttribute(
-          "title",
-          done ? "Marked finished — click to unfinish" : "Mark this item as finished"
-        );
-        if (finishForm) {
-          const nextAction = done
-            ? finishForm.getAttribute("data-unfinish-action")
-            : finishForm.getAttribute("data-finish-action");
-          if (nextAction) finishForm.setAttribute("action", nextAction);
-        }
-      };
-      const checkBottomFinish = () => {
-        if (userUntoggled || !document.body.contains(finishBtn)) return;
+      let postedEndRead = false;
+      const checkBottomRead = () => {
+        if (suppressAutoRead || postedEndRead || !document.body.contains(finishBtn)) return;
         const kind = root.getAttribute("data-kind") || "article";
         if (kind !== "article" && kind !== "paper") return;
         const el = document.documentElement;
         const scrollable = el.scrollHeight - el.clientHeight;
         if (scrollable <= 8) return;
         if (window.scrollY / scrollable >= 0.92 && !finishBtn.classList.contains("is-done")) {
-          setFinishedUi(true);
+          postedEndRead = true;
           if (itemId && finishForm) {
             postProgress(itemId, 1.0, false);
           }
+          const endRight = finishBtn.closest(".reader-end-right");
+          if (endRight && !endRight.querySelector(".js-reader-read-cue")) {
+            const cue = document.createElement("span");
+            cue.className = "meta js-reader-read-cue";
+            cue.textContent = "Read ·";
+            endRight.prepend(cue);
+          }
         }
       };
-      window.addEventListener("scroll", checkBottomFinish, { passive: true });
+      window.addEventListener("scroll", checkBottomRead, { passive: true });
+      cleanups.push(() => window.removeEventListener("scroll", checkBottomRead));
       if (!finishForm) {
         finishBtn.addEventListener("click", () => {
           const next = !finishBtn.classList.contains("is-done");
-          userUntoggled = !next;
-          setFinishedUi(next);
+          finishBtn.classList.toggle("is-done", next);
+          finishBtn.setAttribute("aria-pressed", next ? "true" : "false");
+          finishBtn.textContent = next ? "✓ Finished" : "Mark Finished";
         });
       }
     }
+
+    readerExtrasCleanup = () => {
+      for (const fn of cleanups) fn();
+    };
   };
 
   const initOptimisticStars = () => {
@@ -1822,6 +2026,8 @@
   };
 
   const initPageWidgets = () => {
+    stripFlashParamsFromUrl();
+    scrollActiveNavIntoView();
     initReaderProgress();
     initReaderExtras();
     initRankBoard();

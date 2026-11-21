@@ -159,18 +159,21 @@ fn apply_web_security_headers(resp: &mut Response) {
 
 /// Renders a browser-friendly HTML 404 page with full web security headers.
 #[must_use]
-pub fn render_not_found_html() -> Response {
+pub fn render_not_found_html(headers: &axum::http::HeaderMap) -> Response {
+    let theme = auth::extract_theme_cookie(headers);
     let mut resp = html::render_error_page(
         StatusCode::NOT_FOUND,
         "Not Found",
         "The requested page could not be found.",
         None,
+        theme,
     );
     apply_web_security_headers(&mut resp);
     resp
 }
 
 async fn attach_web_security_headers(req: Request, next: Next) -> Response {
+    let theme = auth::extract_theme_cookie(req.headers());
     let mut resp = next.run(req).await;
     if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
         let is_html = resp
@@ -184,6 +187,7 @@ async fn attach_web_security_headers(req: Request, next: Next) -> Response {
                 "Payload Too Large",
                 "The submitted request exceeded the maximum allowed size.",
                 None,
+                theme,
             );
         }
     }

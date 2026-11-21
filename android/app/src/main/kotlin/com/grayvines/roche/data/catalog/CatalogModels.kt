@@ -41,20 +41,10 @@ enum class EntryKind(
         get() = this != ARTIST && this != PODCAST && this != PUBLICATION && this != CHANNEL
 
     companion object {
-        val loggableKinds: List<EntryKind> =
-            listOf(
-                ALBUM,
-                MOVIE,
-                BOOK,
-                TV,
-                GAME,
-                SONG,
-                ARTICLE,
-                PAPER,
-                VIDEO,
-                PODCAST_EPISODE,
-                PODCAST,
-            )
+        val quickLogKinds: List<EntryKind> =
+            listOf(ALBUM, MOVIE, BOOK, TV, GAME, SONG, ARTICLE, PAPER, VIDEO)
+
+        val loggableKinds: List<EntryKind> = quickLogKinds + listOf(PODCAST_EPISODE, PODCAST)
 
         val systemDynamicKinds: List<EntryKind> =
             listOf(
@@ -107,6 +97,37 @@ enum class EntryKind(
                     "lists" -> COLLECTION
                     else -> null
                 }
+        }
+
+        fun inferForCollection(summary: CatalogListSummary?): EntryKind? = summary?.let { item ->
+            listOfNotNull(item.slug, item.title).firstNotNullOfOrNull {
+                inferKindFromCollectionToken(it)
+            }
+        }
+
+        private fun inferKindFromCollectionToken(raw: String): EntryKind? {
+            val normalized = raw.trim().lowercase().replace('-', '_').replace(' ', '_')
+            val stripped =
+                normalized
+                    .removePrefix("want:")
+                    .trimStart('_', ' ')
+                    .removePrefix("want_to_")
+                    .removePrefix("want_")
+                    .trim('_', ' ')
+            val mapped =
+                when (stripped) {
+                    "watch",
+                    "to_watch" -> MOVIE
+                    "listen",
+                    "to_listen" -> ALBUM
+                    "play",
+                    "to_play" -> GAME
+                    "read_books" -> BOOK
+                    "read",
+                    "to_read" -> ARTICLE
+                    else -> fromFlexibleAlias(stripped) ?: fromFlexibleAlias(normalized)
+                }
+            return mapped?.takeIf { it in quickLogKinds }
         }
     }
 }

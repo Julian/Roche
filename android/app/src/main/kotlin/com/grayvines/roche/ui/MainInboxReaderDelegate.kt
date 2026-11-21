@@ -57,6 +57,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
             is MainAction.SkipPlayerBySeconds ->
                 host.playerController.skipBySeconds(action.deltaSeconds)
             MainAction.SkipToNextQueuedAudio -> performSkipToNextQueuedAudio()
+            MainAction.DismissMiniPlayer -> performDismissMiniPlayer()
             is MainAction.SetPlaybackSpeed ->
                 host.playbackOrchestrator.performSetPlaybackSpeed(
                     playerController = host.playerController,
@@ -74,6 +75,18 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
     private suspend fun performTogglePlayPause() {
         val smartRewind = host.settingsRepository.settings.first().smartRewindEnabled
         host.playerController.togglePlayPause(smartRewindEnabled = smartRewind)
+    }
+
+    private fun performDismissMiniPlayer() {
+        host.playerController.flushCurrentProgressIfNeeded()
+        host.playerController.stopAndClear()
+        host.updateTransient {
+            it.copy(
+                isPlayerFullscreenOpen = false,
+                isPlayerSpeedSheetOpen = false,
+                activePlayerDrawerTab = null,
+            )
+        }
     }
 
     private suspend fun performSetSkipSilence(enabled: Boolean) {

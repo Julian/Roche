@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -18,7 +20,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.core.normalizeTagName
@@ -62,6 +66,7 @@ internal fun TagChipsEditor(
                         label = chipLabel(tag),
                         selected = isChipSelected(tag),
                         onClick = { onChipClick(tag) },
+                        role = Role.Checkbox,
                     )
                 }
             }
@@ -87,6 +92,13 @@ private fun CustomTagInputRow(
     onSubmitCustomTag: (String) -> Unit,
 ) {
     var customTag by rememberSaveable(draftKey) { mutableStateOf("") }
+    val normalizedCustomTag = normalizeTagName(customTag)
+    val submitTag: () -> Unit = {
+        if (normalizedCustomTag.isNotBlank()) {
+            onSubmitCustomTag(normalizedCustomTag)
+            customTag = ""
+        }
+    }
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -102,17 +114,14 @@ private fun CustomTagInputRow(
             onValueChange = { customTag = it },
             placeholder = { Text(inputPlaceholder, fontSize = 12.sp) },
             singleLine = true,
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { submitTag() }),
             modifier = fieldMod,
         )
         HeaderActionButton(
             label = submitButtonLabel,
-            onClick = {
-                val clean = normalizeTagName(customTag)
-                if (clean.isNotBlank()) {
-                    onSubmitCustomTag(clean)
-                    customTag = ""
-                }
-            },
+            enabled = normalizedCustomTag.isNotBlank(),
+            onClick = submitTag,
             modifier = buttonMod,
         )
     }
@@ -136,6 +145,7 @@ internal fun PodcastSpeedStrip(
                 label = "Default",
                 selected = selectedSpeed == null,
                 onClick = onSelectDefault,
+                role = Role.RadioButton,
             )
         }
         PLAYBACK_SPEED_PRESETS.forEach { preset ->
@@ -153,6 +163,7 @@ internal fun PodcastSpeedStrip(
                 selected = isSelected,
                 onClick = { onSelectSpeed(preset) },
                 modifier = chipMod,
+                role = Role.RadioButton,
             )
         }
     }

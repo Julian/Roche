@@ -112,26 +112,41 @@ enum class AppTab(val label: String) {
         val defaultBottomTabs: List<AppTab> = listOf(HOME, INBOX, LISTS, FEEDS, STARRED)
         val defaultSideTabs: List<AppTab> = defaultBottomTabs
 
+        private val settingsReachableTabs: Set<AppTab> = setOf(HOME, SETTINGS)
+
+        fun hasSettingsAccessTab(tabs: List<AppTab>): Boolean = tabs.any {
+            it in settingsReachableTabs
+        }
+
         fun normalizeBottomTabs(tabs: List<AppTab>): List<AppTab> {
             val distinctValid = tabs.filter { it in bottomTabCandidates }.distinct()
-            if (distinctValid.size >= BOTTOM_TAB_COUNT) {
-                return distinctValid.take(BOTTOM_TAB_COUNT)
-            }
-            if (distinctValid.size == LEGACY_OUTER_SLOT_COUNT) {
-                val centerFill =
-                    (listOf(LISTS) + defaultBottomTabs + bottomTabCandidates).first {
-                        it !in distinctValid
+            val sized =
+                when {
+                    distinctValid.size >= BOTTOM_TAB_COUNT -> {
+                        distinctValid.take(BOTTOM_TAB_COUNT).toMutableList()
                     }
-                return distinctValid.toMutableList().apply { add(CENTER_SLOT_INDEX, centerFill) }
-            }
-            val result = distinctValid.toMutableList()
-            for (fallback in defaultBottomTabs + bottomTabCandidates) {
-                if (result.size >= BOTTOM_TAB_COUNT) break
-                if (fallback !in result) {
-                    result.add(fallback)
+                    distinctValid.size == LEGACY_OUTER_SLOT_COUNT -> {
+                        val centerFill =
+                            (listOf(LISTS) + defaultBottomTabs + bottomTabCandidates).first {
+                                it !in distinctValid
+                            }
+                        distinctValid.toMutableList().apply { add(CENTER_SLOT_INDEX, centerFill) }
+                    }
+                    else -> {
+                        val result = distinctValid.toMutableList()
+                        for (fallback in defaultBottomTabs + bottomTabCandidates) {
+                            if (result.size >= BOTTOM_TAB_COUNT) break
+                            if (fallback !in result) {
+                                result.add(fallback)
+                            }
+                        }
+                        result.take(BOTTOM_TAB_COUNT).toMutableList()
+                    }
                 }
+            if (!hasSettingsAccessTab(sized) && sized.isNotEmpty()) {
+                sized[sized.lastIndex] = SETTINGS
             }
-            return result.take(BOTTOM_TAB_COUNT)
+            return sized
         }
 
         fun normalizeSideTabs(tabs: List<AppTab>): List<AppTab> = normalizeBottomTabs(tabs)

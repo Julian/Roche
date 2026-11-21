@@ -55,6 +55,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
@@ -69,6 +70,7 @@ import com.grayvines.roche.media.PdfRendererSession
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.model.ThemeMode
 import com.grayvines.roche.reader.ArticleBlock
 import com.grayvines.roche.reader.extractPlainTextHeadings
 import com.grayvines.roche.reader.mapBlockHeadingIndices
@@ -234,6 +236,7 @@ fun ReaderView(
         ReaderScrollProgressBar(listState = listState, fallbackProgress = entry.readProgress)
         ReaderTypographySection(
             visible = showTypographyDrawer,
+            isPdf = pdfSession != null || entry.contentType == ContentType.PDF,
             onDismiss = { showTypographyDrawer = false },
             blocks = parsedState.blocks,
             settings = settings,
@@ -263,24 +266,28 @@ fun ReaderView(
 internal fun orderedHeadingBlockIndices(blocks: List<ArticleBlock>): List<Int> =
     mapBlockHeadingIndices(blocks).entries.sortedBy { it.value }.map { it.key }
 
+@Suppress("LongParameterList")
 @Composable
 internal fun ReaderTypographySection(
     visible: Boolean,
+    isPdf: Boolean = false,
     onDismiss: () -> Unit,
     blocks: List<ArticleBlock>,
     settings: Settings,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
 ) {
+    val coroutineScope = rememberCoroutineScope()
     PredictiveBackDrawerContainer(visible = visible, onDismiss = onDismiss) { drawerModifier ->
-        val coroutineScope = rememberCoroutineScope()
         val headingBlockIndices = remember(blocks) { orderedHeadingBlockIndices(blocks) }
         ReaderTypographyDrawer(
             blocks = blocks,
             settings = settings,
+            isPdf = isPdf,
             onAction = onAction,
             modifier = drawerModifier,
             onJumpToSection = { headingIndex ->
+                onDismiss()
                 headingBlockIndices.getOrNull(headingIndex)?.let { blockIdx ->
                     coroutineScope.launch {
                         listState.animateScrollToItem(HEADER_ITEM_COUNT + blockIdx)
@@ -372,6 +379,10 @@ internal fun ReaderScrollProgressEffect(
     }
 }
 
+internal fun shouldRestoreReaderScroll(entry: InboxEntry): Boolean =
+    !entry.isArchived &&
+        entry.readProgress in READER_RESTORE_MIN_PROGRESS..READER_RESTORE_MAX_PROGRESS
+
 @Suppress("LongParameterList")
 private suspend fun syncReaderInitialOrFitScroll(
     entry: InboxEntry,
@@ -384,7 +395,7 @@ private suspend fun syncReaderInitialOrFitScroll(
     onAction: (MainAction) -> Unit,
 ): Int {
     if (canScroll && !hasUserScrolled && restoredBodyBucket != bodyLengthBucket) {
-        if (entry.readProgress > 0.0) {
+        if (shouldRestoreReaderScroll(entry)) {
             val targetIndex =
                 (entry.readProgress.coerceIn(0.0, 1.0) * (totalItems - 1))
                     .roundToInt()
@@ -593,6 +604,7 @@ internal fun ReaderTypographyDrawer(
     onAction: (MainAction) -> Unit,
     onJumpToSection: (headingIndex: Int) -> Unit,
     modifier: Modifier = Modifier,
+    isPdf: Boolean = false,
 ) {
     val colors = LocalRocheColors.current
     val scale = settings.readerFontScale
@@ -607,13 +619,29 @@ internal fun ReaderTypographyDrawer(
                 .testTag("reader_typography_drawer"),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        if (!isPdf) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                ReaderFontSizeStepper(currentScale = scale, onAction = onAction)
+                ReaderFontFamilySwitch(currentFont = settings.headlineFont, onAction = onAction)
+            }
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            ReaderFontSizeStepper(currentScale = scale, onAction = onAction)
-            ReaderFontFamilySwitch(currentFont = settings.headlineFont, onAction = onAction)
+            Text(
+                text = "THEME",
+                color = colors.textMuted,
+                fontSize = 10.5.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.8.sp,
+            )
+            ReaderThemeSwitch(currentTheme = settings.themeMode, onAction = onAction)
         }
         if (headings.isNotEmpty()) {
             ReaderSectionsOutlineList(
@@ -626,12 +654,46 @@ internal fun ReaderTypographyDrawer(
 }
 
 @Composable
+private fun ReaderThemeSwitch(
+    currentTheme: ThemeMode,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(8.dp)
+    Row(
+        modifier =
+            Modifier.clip(shape)
+                .background(colors.background)
+                .border(1.dp, colors.border, shape)
+                .padding(2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        ReaderFontOptionTab(
+            label = "Dark",
+            selected = currentTheme == ThemeMode.DARK,
+            onClick = { onAction(MainAction.SetThemeMode(ThemeMode.DARK)) },
+            role = Role.RadioButton,
+            testTag = "reader_theme_dark_btn",
+        )
+        ReaderFontOptionTab(
+            label = "Light",
+            selected = currentTheme == ThemeMode.LIGHT,
+            onClick = { onAction(MainAction.SetThemeMode(ThemeMode.LIGHT)) },
+            role = Role.RadioButton,
+            testTag = "reader_theme_light_btn",
+        )
+    }
+}
+
+@Composable
 private fun ReaderFontSizeStepper(
     currentScale: Float,
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val pct = (currentScale * PERCENT_MULTIPLIER).roundToInt()
+    val canDecrease = currentScale > Settings.MIN_READER_FONT_SCALE + READER_SCALE_EPSILON
+    val canIncrease = currentScale < Settings.MAX_READER_FONT_SCALE - READER_SCALE_EPSILON
     val shape = RoundedCornerShape(8.dp)
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -646,6 +708,7 @@ private fun ReaderFontSizeStepper(
             label = "A−",
             contentDescription = "Decrease font size",
             testTag = "reader_font_smaller_btn",
+            enabled = canDecrease,
             onClick = {
                 onAction(
                     MainAction.SetReaderFontScale(
@@ -668,6 +731,7 @@ private fun ReaderFontSizeStepper(
             label = "A+",
             contentDescription = "Increase font size",
             testTag = "reader_font_larger_btn",
+            enabled = canIncrease,
             onClick = {
                 onAction(
                     MainAction.SetReaderFontScale(
@@ -686,24 +750,29 @@ private fun ReaderStepperButton(
     label: String,
     contentDescription: String,
     testTag: String,
+    enabled: Boolean,
     onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val labelColor = if (enabled) colors.textPrimary else colors.textMuted.copy(alpha = 0.45f)
     Box(
         contentAlignment = Alignment.Center,
         modifier =
             Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                 .clip(RoundedCornerShape(6.dp))
-                .clickable(onClick = onClick)
+                .clickable(enabled = enabled, onClick = onClick)
                 .semantics {
                     role = Role.Button
                     this.contentDescription = contentDescription
+                    if (!enabled) {
+                        disabled()
+                    }
                 }
                 .testTag(testTag),
     ) {
         Text(
             text = label,
-            color = colors.textPrimary,
+            color = labelColor,
             fontSize = 13.sp,
             fontWeight = FontWeight.Normal,
         )
@@ -729,11 +798,13 @@ private fun ReaderFontFamilySwitch(
             label = "Serif",
             selected = currentFont == HeadlineFont.SERIF,
             onClick = { onAction(MainAction.SetHeadlineFont(HeadlineFont.SERIF)) },
+            role = Role.RadioButton,
         )
         ReaderFontOptionTab(
             label = "Sans",
             selected = currentFont == HeadlineFont.SANS,
             onClick = { onAction(MainAction.SetHeadlineFont(HeadlineFont.SANS)) },
+            role = Role.RadioButton,
         )
     }
 }
@@ -743,21 +814,25 @@ private fun ReaderFontOptionTab(
     label: String,
     selected: Boolean,
     onClick: () -> Unit,
+    role: Role = Role.Tab,
+    testTag: String? = null,
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(6.dp)
     val bg = if (selected) colors.accentBlue.copy(alpha = 0.16f) else Color.Transparent
     val fg = if (selected) colors.accentBlue else colors.textSecondary
+    val baseModifier =
+        Modifier.minimumInteractiveComponentSize()
+            .clip(shape)
+            .clickable(onClick = onClick)
+            .semantics {
+                this.role = role
+                this.selected = selected
+            }
+            .let { mod -> if (testTag != null) mod.testTag(testTag) else mod }
     Box(
         contentAlignment = Alignment.Center,
-        modifier =
-            Modifier.minimumInteractiveComponentSize()
-                .clip(shape)
-                .clickable(onClick = onClick)
-                .semantics {
-                    role = Role.Tab
-                    this.selected = selected
-                },
+        modifier = baseModifier,
     ) {
         Box(
             contentAlignment = Alignment.Center,
@@ -1085,7 +1160,7 @@ private fun ReaderPlainParagraphItem(paragraph: String) {
     Text(
         text = paragraph,
         color = colors.textPrimary,
-        fontFamily = FontFamily.Serif,
+        fontFamily = currentHeadlineFontFamily(),
         fontSize = (16f * scale).sp,
         lineHeight = (26f * scale).sp,
     )
@@ -1270,3 +1345,6 @@ private const val READ_PROGRESS_MIN_DELTA = 0.05
 private const val ARCHIVE_COMPLETION_THRESHOLD = 0.90
 private const val PERCENT_MULTIPLIER = 100
 private const val READER_SCALE_STEP = 0.10f
+private const val READER_SCALE_EPSILON = 0.005f
+private const val READER_RESTORE_MIN_PROGRESS = 0.02
+private const val READER_RESTORE_MAX_PROGRESS = 0.95

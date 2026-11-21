@@ -23,12 +23,16 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -39,26 +43,31 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.CatalogSearchMatch
+import com.grayvines.roche.data.CatalogSearchResult
 import com.grayvines.roche.data.SearchScopeFilter
 import com.grayvines.roche.data.extractSearchMatchSnippet
 import com.grayvines.roche.data.matchesSearchScopeFilter
-import com.grayvines.roche.data.searchCatalogEntries
+import com.grayvines.roche.data.searchCatalogEntriesWithTotal
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.SearchIcon
@@ -117,6 +126,49 @@ private fun rememberSearchDisplayState(
     return display
 }
 
+private data class SearchOverlayComputed(
+    val visibleResults: List<InboxEntry>,
+    val shownCatalogMatches: List<CatalogSearchMatch>,
+    val catalogTotalCount: Int,
+    val scopeCounts: Map<SearchScopeFilter, Int>,
+)
+
+@Composable
+private fun rememberSearchOverlayComputed(
+    displayState: MainUiState,
+    scopeFilter: SearchScopeFilter,
+    catalogLimit: Int,
+): SearchOverlayComputed =
+    remember(
+        displayState.searchResults,
+        displayState.catalog,
+        displayState.searchQuery,
+        scopeFilter,
+        catalogLimit,
+    ) {
+        val visibleResults =
+            displayState.searchResults.filter { matchesSearchScopeFilter(it, scopeFilter) }
+        val catalogResult = resolveSearchCatalogResult(displayState, scopeFilter, catalogLimit)
+        val shownCatalogMatches =
+            if (scopeFilter == SearchScopeFilter.ALL || scopeFilter == SearchScopeFilter.CATALOG) {
+                catalogResult.matches
+            } else {
+                emptyList()
+            }
+        val scopeCounts =
+            computeSearchScopeCounts(
+                searchResults = displayState.searchResults,
+                catalogTotalCount = catalogResult.totalCount,
+                hasQuery = displayState.searchQuery.isNotBlank(),
+            )
+        SearchOverlayComputed(
+            visibleResults = visibleResults,
+            shownCatalogMatches = shownCatalogMatches,
+            catalogTotalCount = catalogResult.totalCount,
+            scopeCounts = scopeCounts,
+        )
+    }
+
 @Composable
 fun SearchOverlay(
     state: MainUiState,
@@ -129,14 +181,11 @@ fun SearchOverlay(
     val focusRequester = remember { FocusRequester() }
     val (displayState, canEditQuery) = rememberSearchDisplayState(state, isSearchActive)
     var scopeFilter by rememberSaveable { mutableStateOf(SearchScopeFilter.ALL) }
-    val visibleResults =
-        remember(displayState.searchResults, scopeFilter) {
-            displayState.searchResults.filter { matchesSearchScopeFilter(it, scopeFilter) }
+    var catalogLimit by
+        rememberSaveable(displayState.searchQuery) {
+            mutableIntStateOf(DEFAULT_CATALOG_SEARCH_LIMIT)
         }
-    val catalogMatches =
-        remember(displayState.catalog, displayState.searchQuery, scopeFilter) {
-            resolveSearchCatalogMatches(displayState, scopeFilter)
-        }
+    val computed = rememberSearchOverlayComputed(displayState, scopeFilter, catalogLimit)
 
     LaunchedEffect(isSearchActive) {
         if (isSearchActive && displayState.searchQuery.isBlank()) {
@@ -160,13 +209,17 @@ fun SearchOverlay(
         )
         SearchScopeFilterStrip(
             selectedScope = scopeFilter,
-            catalogMatchCount = catalogMatches.size,
+            catalogMatchCount = computed.catalogTotalCount,
+            scopeCounts = computed.scopeCounts,
             onSelectScope = { scopeFilter = it },
         )
         HorizontalDivider(color = colors.border, thickness = 1.dp)
         SearchResultsBody(
-            results = visibleResults,
-            catalogMatches = catalogMatches,
+            results = computed.visibleResults,
+            catalogMatches = computed.shownCatalogMatches,
+            catalogTotalCount = computed.catalogTotalCount,
+            onShowMoreCatalog = { catalogLimit += DEFAULT_CATALOG_SEARCH_LIMIT },
+            onSelectAllScope = { scopeFilter = SearchScopeFilter.ALL },
             state = displayState,
             selectedScope = scopeFilter,
             playingEntryId = activeAudioEntryId,
@@ -178,18 +231,44 @@ fun SearchOverlay(
     }
 }
 
-private fun resolveSearchCatalogMatches(
+private fun resolveSearchCatalogResult(
     state: MainUiState,
     scopeFilter: SearchScopeFilter,
-): List<CatalogSearchMatch> =
-    if (scopeFilter == SearchScopeFilter.ALL || scopeFilter == SearchScopeFilter.CATALOG) {
-        searchCatalogEntries(
-            catalog = state.catalog,
-            rawQuery = state.searchQuery,
-            includeWhenBlank = scopeFilter == SearchScopeFilter.CATALOG,
-        )
-    } else {
-        emptyList()
+    limit: Int,
+): CatalogSearchResult =
+    searchCatalogEntriesWithTotal(
+        catalog = state.catalog,
+        rawQuery = state.searchQuery,
+        includeWhenBlank = scopeFilter == SearchScopeFilter.CATALOG,
+        limit = limit,
+    )
+
+private fun computeSearchScopeCounts(
+    searchResults: List<InboxEntry>,
+    catalogTotalCount: Int,
+    hasQuery: Boolean,
+): Map<SearchScopeFilter, Int> {
+    if (!hasQuery) {
+        return if (catalogTotalCount > 0) {
+            mapOf(SearchScopeFilter.CATALOG to catalogTotalCount)
+        } else {
+            emptyMap()
+        }
+    }
+    return SearchScopeFilter.entries
+        .associateWith { scope -> countForSearchScope(scope, searchResults, catalogTotalCount) }
+        .filterValues { it > 0 }
+}
+
+private fun countForSearchScope(
+    scope: SearchScopeFilter,
+    searchResults: List<InboxEntry>,
+    catalogTotalCount: Int,
+): Int =
+    when (scope) {
+        SearchScopeFilter.CATALOG -> catalogTotalCount
+        SearchScopeFilter.ALL -> searchResults.size + catalogTotalCount
+        else -> searchResults.count { matchesSearchScopeFilter(it, scope) }
     }
 
 @Composable
@@ -265,6 +344,7 @@ private fun SearchPillTextField(
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
+    val keyboardController = LocalSoftwareKeyboardController.current
     BasicTextField(
         value = query,
         onValueChange = { next ->
@@ -273,6 +353,8 @@ private fun SearchPillTextField(
             }
         },
         singleLine = true,
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+        keyboardActions = KeyboardActions(onSearch = { keyboardController?.hide() }),
         textStyle = TextStyle(color = colors.textPrimary, fontSize = 14.sp),
         cursorBrush = SolidColor(colors.accentBlue),
         modifier = modifier.focusRequester(focusRequester).testTag("search_input"),
@@ -298,6 +380,7 @@ internal fun SearchScopeFilterStrip(
     selectedScope: SearchScopeFilter,
     onSelectScope: (SearchScopeFilter) -> Unit,
     catalogMatchCount: Int = 0,
+    scopeCounts: Map<SearchScopeFilter, Int> = emptyMap(),
 ) {
     Row(
         modifier =
@@ -308,12 +391,10 @@ internal fun SearchScopeFilterStrip(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         SearchScopeFilter.entries.forEach { scope ->
-            val label =
-                if (scope == SearchScopeFilter.CATALOG && catalogMatchCount > 0) {
-                    "${scope.label} ($catalogMatchCount)"
-                } else {
-                    scope.label
-                }
+            val count =
+                scopeCounts[scope]
+                    ?: if (scope == SearchScopeFilter.CATALOG) catalogMatchCount else 0
+            val label = if (count > 0) "${scope.label} ($count)" else scope.label
             SoftStripTab(
                 label = label,
                 selected = selectedScope == scope,
@@ -331,6 +412,9 @@ internal fun SearchResultsBody(
     catalogMatches: List<CatalogSearchMatch>,
     state: MainUiState,
     selectedScope: SearchScopeFilter = SearchScopeFilter.ALL,
+    catalogTotalCount: Int = catalogMatches.size,
+    onShowMoreCatalog: (() -> Unit)? = null,
+    onSelectAllScope: (() -> Unit)? = null,
     playingEntryId: String? = null,
     nextQueuedAudioEntryId: String? = null,
     onAction: (MainAction) -> Unit,
@@ -339,9 +423,14 @@ internal fun SearchResultsBody(
     val colors = LocalRocheColors.current
     val hasAnyResults = results.isNotEmpty() || catalogMatches.isNotEmpty()
     if (!hasAnyResults) {
+        val hasOtherScopeMatches =
+            selectedScope != SearchScopeFilter.ALL &&
+                (state.searchResults.isNotEmpty() || catalogTotalCount > 0)
         SearchEmptyState(
             searchQuery = state.searchQuery,
             selectedScope = selectedScope,
+            hasOtherScopeMatches = hasOtherScopeMatches,
+            onSelectAllScope = onSelectAllScope,
             state = state,
             onAction = onAction,
         )
@@ -361,6 +450,8 @@ internal fun SearchResultsBody(
             item(key = "search_catalog_section") {
                 SearchCatalogMatchesSection(
                     matches = catalogMatches,
+                    totalCount = catalogTotalCount,
+                    onShowMore = onShowMoreCatalog,
                     onOpenEntry = { onAction(MainAction.OpenCatalogDetailSheet(it)) },
                 )
             }
@@ -389,6 +480,8 @@ internal fun SearchResultsBody(
 private fun SearchEmptyState(
     searchQuery: String,
     selectedScope: SearchScopeFilter,
+    hasOtherScopeMatches: Boolean,
+    onSelectAllScope: (() -> Unit)?,
     state: MainUiState,
     onAction: (MainAction) -> Unit,
 ) {
@@ -408,7 +501,19 @@ private fun SearchEmptyState(
             modifier = Modifier.fillMaxSize().padding(32.dp),
             contentAlignment = Alignment.Center,
         ) {
-            Text(text = emptyMessage, color = colors.textMuted, fontSize = 13.sp)
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(text = emptyMessage, color = colors.textMuted, fontSize = 13.sp)
+                if (hasOtherScopeMatches && onSelectAllScope != null) {
+                    HeaderActionButton(
+                        label = "Show All Results",
+                        onClick = onSelectAllScope,
+                        modifier = Modifier.testTag("search_show_all_btn"),
+                    )
+                }
+            }
         }
     }
 }
@@ -416,20 +521,52 @@ private fun SearchEmptyState(
 @Composable
 private fun SearchCatalogMatchesSection(
     matches: List<CatalogSearchMatch>,
+    totalCount: Int,
+    onShowMore: (() -> Unit)?,
     onOpenEntry: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val isTruncated = totalCount > matches.size
+    val countLabel =
+        if (isTruncated) {
+            "Showing ${matches.size} of $totalCount"
+        } else {
+            totalCount.toString()
+        }
     Column(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(7.dp),
     ) {
-        SearchSectionLabelRow(title = "Catalog", count = matches.size, horizontalPadding = 2.dp)
+        SearchSectionLabelRow(
+            title = "Catalog",
+            countLabel = countLabel,
+            horizontalPadding = 2.dp,
+        )
         RocheSurfaceCard {
             matches.forEachIndexed { idx, match ->
                 if (idx > 0) {
                     HorizontalDivider(color = colors.border, thickness = 1.dp)
                 }
                 SearchCatalogMatchRow(match = match, onClick = { onOpenEntry(match.entry.id) })
+            }
+            if (isTruncated && onShowMore != null) {
+                HorizontalDivider(color = colors.border, thickness = 1.dp)
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier =
+                        Modifier.fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .clickable(onClick = onShowMore)
+                            .semantics { role = Role.Button }
+                            .testTag("search_catalog_show_more_btn"),
+                ) {
+                    Text(
+                        text = "Show more (${totalCount - matches.size} remaining)",
+                        color = colors.accentBlue,
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
             }
         }
     }
@@ -487,7 +624,8 @@ private fun SearchCatalogMatchRow(
 @Composable
 private fun SearchSectionLabelRow(
     title: String,
-    count: Int,
+    count: Int = 0,
+    countLabel: String = count.toString(),
     horizontalPadding: androidx.compose.ui.unit.Dp = 16.dp,
 ) {
     val colors = LocalRocheColors.current
@@ -505,7 +643,7 @@ private fun SearchSectionLabelRow(
             modifier = Modifier.semantics { heading() },
         )
         Text(
-            text = count.toString(),
+            text = countLabel,
             color = colors.textMuted,
             fontFamily = FontFamily.Monospace,
             fontSize = 11.sp,
@@ -634,19 +772,33 @@ private fun SearchQuickTagChip(
     val borderColor = if (isSelected) colors.accentBlue else colors.border
     val textColor = if (isSelected) colors.accentBlue else colors.textSecondary
     Box(
+        contentAlignment = Alignment.Center,
         modifier =
-            Modifier.clip(shape)
-                .background(bg)
-                .border(1.dp, borderColor, shape)
+            Modifier.minimumInteractiveComponentSize()
+                .clip(shape)
                 .clickable(onClick = onClick)
-                .semantics { role = Role.Button }
-                .padding(horizontal = 10.dp, vertical = 6.dp)
+                .semantics {
+                    role = Role.Checkbox
+                    selected = isSelected
+                },
     ) {
-        Text(
-            text = tagToken,
-            color = textColor,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-        )
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.heightIn(min = 30.dp)
+                    .clip(shape)
+                    .background(bg)
+                    .border(1.dp, borderColor, shape)
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+        ) {
+            Text(
+                text = tagToken,
+                color = textColor,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+            )
+        }
     }
 }
+
+private const val DEFAULT_CATALOG_SEARCH_LIMIT = 24

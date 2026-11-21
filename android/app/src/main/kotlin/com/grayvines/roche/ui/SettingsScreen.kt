@@ -710,12 +710,12 @@ internal fun RowScope.SegmentedOptionButton(
         modifier =
             modifier
                 .weight(1f)
-                .heightIn(min = 42.dp)
+                .heightIn(min = 48.dp)
                 .clip(shape)
                 .background(bg)
                 .clickable(onClick = onClick)
                 .semantics {
-                    role = Role.Tab
+                    role = Role.RadioButton
                     this.selected = selected
                 }
                 .padding(horizontal = 8.dp, vertical = 6.dp),

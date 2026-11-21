@@ -29,6 +29,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
@@ -518,16 +519,21 @@ private fun ClusterRankHeader(
                 fontWeight = FontWeight.Normal,
             )
         }
-        Text(
-            text = "Done",
-            color = colors.textSecondary,
-            fontSize = 13.5.sp,
+        Box(
+            contentAlignment = Alignment.Center,
             modifier =
-                Modifier.clip(RoundedCornerShape(8.dp))
+                Modifier.minimumInteractiveComponentSize()
+                    .clip(RoundedCornerShape(8.dp))
                     .clickable(onClick = onClose)
                     .semantics { role = Role.Button }
                     .padding(horizontal = 8.dp, vertical = 6.dp),
-        )
+        ) {
+            Text(
+                text = "Done",
+                color = colors.textSecondary,
+                fontSize = 13.5.sp,
+            )
+        }
     }
 }
 
@@ -1191,7 +1197,7 @@ private fun RankDragGripHandle(
     Box(
         contentAlignment = Alignment.Center,
         modifier =
-            Modifier.size(width = 22.dp, height = 36.dp)
+            Modifier.minimumInteractiveComponentSize()
                 .pointerInput(entryId) {
                     detectDragGestures(
                         onDragStart = { curStart() },
@@ -1295,10 +1301,8 @@ private fun RankQuickTieButton(
     Box(
         contentAlignment = Alignment.Center,
         modifier =
-            Modifier.size(34.dp)
+            Modifier.minimumInteractiveComponentSize()
                 .clip(shape)
-                .background(bg)
-                .border(1.dp, border, shape)
                 .clickable(onClick = onClick)
                 .semantics {
                     role = Role.Button
@@ -1306,13 +1310,18 @@ private fun RankQuickTieButton(
                 }
                 .testTag(testTag),
     ) {
-        Text(
-            text = "=",
-            color = tint,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 15.sp,
-            modifier = Modifier.clearAndSetSemantics {},
-        )
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.size(34.dp).clip(shape).background(bg).border(1.dp, border, shape),
+        ) {
+            Text(
+                text = "=",
+                color = tint,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 15.sp,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
+        }
     }
 }
 
@@ -1533,5 +1542,5 @@ internal fun buildOrderingGroups(
 ): List<List<String>> =
     RankBoardState.fromCandidates(orderedItems, tiedWithAboveIds).toOrderingGroups()
 
-private val RANK_WIDE_BREAKPOINT = 480.dp
+private val RANK_WIDE_BREAKPOINT = 600.dp
 private const val FOCUSED_ROUND_CAP = 8

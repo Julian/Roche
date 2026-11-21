@@ -30,8 +30,10 @@ internal fun matchesScope(
 ): Boolean =
     when {
         selectedTag != null ->
-            !entry.isArchived && entry.tags.any { it.equals(selectedTag, ignoreCase = true) }
-        selectedFeedId != null -> !entry.isArchived && entry.feedId == selectedFeedId
+            entry.tags.any { it.equals(selectedTag, ignoreCase = true) } &&
+                matchesInboxFilter(entry, filter)
+        selectedFeedId != null ->
+            entry.feedId == selectedFeedId && matchesInboxFilter(entry, filter)
         else -> entry.inFeedInbox && matchesInboxFilter(entry, filter)
     }
 
@@ -63,6 +65,11 @@ internal data class CatalogSearchMatch(
     val tier: Char? = null,
 )
 
+internal data class CatalogSearchResult(
+    val matches: List<CatalogSearchMatch>,
+    val totalCount: Int,
+)
+
 internal fun matchesSearchScopeFilter(entry: InboxEntry, scope: SearchScopeFilter): Boolean =
     when (scope) {
         SearchScopeFilter.ALL -> true
@@ -75,24 +82,42 @@ internal fun matchesSearchScopeFilter(entry: InboxEntry, scope: SearchScopeFilte
         SearchScopeFilter.PODCASTS -> entry.contentType == ContentType.AUDIO
     }
 
+internal fun searchCatalogEntriesWithTotal(
+    catalog: CatalogSnapshot,
+    rawQuery: String,
+    includeWhenBlank: Boolean = false,
+    limit: Int = MAX_CATALOG_SEARCH_RESULTS,
+): CatalogSearchResult {
+    val cleanQuery = rawQuery.trim().trimStart('#').trim()
+    if (cleanQuery.isEmpty() && !includeWhenBlank) {
+        return CatalogSearchResult(matches = emptyList(), totalCount = 0)
+    }
+    val tierById = buildCatalogTierIndex(catalog)
+    val filtered =
+        collectCatalogSearchEntries(catalog).filter { entry ->
+            cleanQuery.isEmpty() || matchesCatalogQuery(entry, cleanQuery)
+        }
+    val matches =
+        filtered.sortedWith(catalogSearchComparator(cleanQuery, tierById)).take(limit).map { entry
+            ->
+            CatalogSearchMatch(entry = entry, tier = tierById[entry.id])
+        }
+    return CatalogSearchResult(matches = matches, totalCount = filtered.size)
+}
+
 internal fun searchCatalogEntries(
     catalog: CatalogSnapshot,
     rawQuery: String,
     includeWhenBlank: Boolean = false,
     limit: Int = MAX_CATALOG_SEARCH_RESULTS,
-): List<CatalogSearchMatch> {
-    val cleanQuery = rawQuery.trim().trimStart('#').trim()
-    if (cleanQuery.isEmpty() && !includeWhenBlank) return emptyList()
-    val tierById = buildCatalogTierIndex(catalog)
-    val allCatalog = collectCatalogSearchEntries(catalog)
-    return allCatalog
-        .asSequence()
-        .filter { entry -> cleanQuery.isEmpty() || matchesCatalogQuery(entry, cleanQuery) }
-        .sortedWith(catalogSearchComparator(cleanQuery, tierById))
-        .take(limit)
-        .map { entry -> CatalogSearchMatch(entry = entry, tier = tierById[entry.id]) }
-        .toList()
-}
+): List<CatalogSearchMatch> =
+    searchCatalogEntriesWithTotal(
+            catalog = catalog,
+            rawQuery = rawQuery,
+            includeWhenBlank = includeWhenBlank,
+            limit = limit,
+        )
+        .matches
 
 private fun buildCatalogTierIndex(catalog: CatalogSnapshot): Map<String, Char> = buildMap {
     catalog.lists

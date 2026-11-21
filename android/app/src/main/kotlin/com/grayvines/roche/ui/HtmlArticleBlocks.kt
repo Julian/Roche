@@ -361,10 +361,11 @@ internal fun RenderBlockquoteBlock(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            val proseFontFamily = currentHeadlineFontFamily()
             Text(
                 text = annotated,
                 color = colors.textSecondary,
-                fontFamily = FontFamily.Serif,
+                fontFamily = proseFontFamily,
                 fontStyle = FontStyle.Italic,
                 fontSize = (15.5f * scale).sp,
                 lineHeight = (24.5f * scale).sp,
@@ -373,7 +374,7 @@ internal fun RenderBlockquoteBlock(
                 Text(
                     text = attributionAnnotated,
                     color = colors.textMuted,
-                    fontFamily = FontFamily.Serif,
+                    fontFamily = proseFontFamily,
                     fontStyle = FontStyle.Normal,
                     fontSize = (13.5f * scale).sp,
                     lineHeight = (20f * scale).sp,
@@ -392,6 +393,7 @@ internal fun RenderListBlock(
 ) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
+    val proseFontFamily = currentHeadlineFontFamily()
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         block.itemsHtml.forEachIndexed { index, itemHtml ->
             val marker = if (block.ordered) "${block.startIndex + index}." else "•"
@@ -416,7 +418,7 @@ internal fun RenderListBlock(
                 Text(
                     text = annotated,
                     color = colors.textPrimary,
-                    fontFamily = FontFamily.Serif,
+                    fontFamily = proseFontFamily,
                     fontSize = (16f * scale).sp,
                     lineHeight = (25f * scale).sp,
                     modifier = Modifier.weight(1f),
@@ -435,6 +437,7 @@ internal fun RenderParagraphBlock(
 ) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
+    val proseFontFamily = currentHeadlineFontFamily()
     val annotated =
         rememberRichHtmlText(
             html = html,
@@ -446,7 +449,7 @@ internal fun RenderParagraphBlock(
     Text(
         text = annotated,
         color = colors.textPrimary,
-        fontFamily = FontFamily.Serif,
+        fontFamily = proseFontFamily,
         fontSize = (16f * scale).sp,
         lineHeight = (26f * scale).sp,
     )
@@ -516,7 +519,7 @@ private fun RenderTableRow(
     onOpenUrl: ((String) -> Unit)?,
 ) {
     val colors = LocalRocheColors.current
-    val style = resolveTableRowStyle(isHeader, colors)
+    val style = resolveTableRowStyle(isHeader, colors, currentHeadlineFontFamily())
     Row(
         modifier =
             Modifier.background(style.background)
@@ -557,6 +560,7 @@ private data class TableRowStyle(
 private fun resolveTableRowStyle(
     isHeader: Boolean,
     colors: com.grayvines.roche.ui.theme.RocheColors,
+    proseFontFamily: FontFamily,
 ): TableRowStyle =
     if (isHeader) {
         TableRowStyle(
@@ -571,7 +575,7 @@ private fun resolveTableRowStyle(
             background = colors.surface,
             verticalPad = 7.dp,
             textColor = colors.textSecondary,
-            fontFamily = FontFamily.Serif,
+            fontFamily = proseFontFamily,
             fontWeight = FontWeight.Normal,
         )
     }

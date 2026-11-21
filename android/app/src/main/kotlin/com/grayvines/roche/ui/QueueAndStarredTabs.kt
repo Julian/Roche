@@ -610,7 +610,7 @@ private fun WantQueuesPane(
     }
 }
 
-private fun resolveActiveWantQueue(
+internal fun resolveActiveWantQueue(
     queues: List<CatalogListSummary>,
     selectedId: String?,
 ): CatalogListSummary? =
@@ -663,7 +663,12 @@ private fun WantQueueEmptySection(
             if (isWantToRead) {
                 onAction(MainAction.OpenAddSheet())
             } else {
-                onAction(MainAction.OpenQuickLogSheet(true))
+                onAction(
+                    MainAction.OpenQuickLogSheet(
+                        defaultToWant = true,
+                        prefillKind = EntryKind.inferForCollection(activeQueue),
+                    )
+                )
             }
         },
     )

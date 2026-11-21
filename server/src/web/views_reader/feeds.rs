@@ -156,6 +156,7 @@ pub(in crate::web) async fn feeds_get(
         csrf_token: &session.csrf_token,
         flash: &flash,
         is_refreshing: service.is_refreshing(),
+        theme: session.theme,
         body_html: &body,
     })
     .into_response())

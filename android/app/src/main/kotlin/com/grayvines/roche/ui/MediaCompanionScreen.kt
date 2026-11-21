@@ -739,6 +739,7 @@ private fun RankedDetailBody(
                         defaultToWant = false,
                         targetCollectionId = activeList.collectionId.takeIf { canEditManualList },
                         targetCollectionTitle = activeList.title.takeIf { canEditManualList },
+                        prefillKind = EntryKind.inferForCollection(activeList),
                     )
                 )
             },

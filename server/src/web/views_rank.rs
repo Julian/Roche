@@ -141,6 +141,7 @@ pub(super) async fn rank_session_get(
         csrf_token: &session.csrf_token,
         flash: &q.flash,
         is_refreshing: service.is_refreshing(),
+        theme: session.theme,
         body_html: &body,
     })
     .into_response())
@@ -289,7 +290,7 @@ fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
            <input type=\"hidden\" name=\"covered\" value=\"{covered}\">\n\
            <input type=\"hidden\" name=\"ordering_json\" value=\"{ord_json}\">\n\
            <div id=\"rank-live-status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\" aria-atomic=\"true\"></div>\n\
-           <ol class=\"rank-board js-rank-list\" aria-label=\"Ranking comparison board\">\n",
+           <ol id=\"roche-rank-board\" class=\"rank-board js-rank-list\" aria-label=\"Ranking comparison board\">\n",
         slug_enc = esc(&urlencode(ctx.slug)),
         csrf = esc(ctx.csrf),
         want = if ctx.is_want { "true" } else { "false" },

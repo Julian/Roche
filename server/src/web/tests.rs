@@ -2290,8 +2290,13 @@ async fn web_pages_include_core_accessibility_landmarks() {
     );
     assert_valid_heading_hierarchy("/login (401)", &login_err_html);
 
-    let unauthed_err_resp =
-        super::html::render_error_page(StatusCode::FORBIDDEN, "Forbidden", "Access denied", None);
+    let unauthed_err_resp = super::html::render_error_page(
+        StatusCode::FORBIDDEN,
+        "Forbidden",
+        "Access denied",
+        None,
+        None,
+    );
     assert_eq!(unauthed_err_resp.status(), StatusCode::FORBIDDEN);
     assert_valid_heading_hierarchy(
         "unauthenticated error page",
@@ -2953,4 +2958,188 @@ async fn test_album_tracklist_enrichment_and_artist_discography_render() {
         read_body_html(get_authed(&app, &format!("/entries/{beatles_id}"), &cookie).await).await;
     assert!(!after_add_html.contains("discography-card-external"));
     assert!(after_add_html.contains("Let It Be"));
+}
+
+#[tokio::test]
+async fn test_wave_1c_web_auth_theme_and_flash_regressions() {
+    let (_db, app) = setup_web_app(Config::default()).await;
+
+    // qw_4: redirect_with_flash strips stale duplicate notice/err query params
+    let flashed = super::html::redirect_with_flash(
+        "/inbox?status=unread&notice=Old+Banner&err=Old+Err#top",
+        "notice",
+        "Fresh Notice",
+    );
+    let flash_loc = flashed.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    assert_eq!(flash_loc, "/inbox?status=unread&notice=Fresh+Notice#top");
+
+    // qw_8 & a11y_8: unauthenticated deep-link preserves ?return_to, 401 CTA says "Sign in",
+    // login page supports show/hide toggle + preserves device_name on error + SSR data-theme cookie.
+    let deep_unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/lists/movies?page=2")
+                .header(header::COOKIE, "roche_theme=light")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deep_unauth.status(), StatusCode::SEE_OTHER);
+    let redir_loc = deep_unauth.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    assert!(redir_loc.starts_with("/login?return_to="), "got {redir_loc}");
+
+    let post_unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/web/items/save")
+                .header(header::COOKIE, "roche_theme=dark")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("url=https%3A%2F%2Fexample.com"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post_unauth.status(), StatusCode::UNAUTHORIZED);
+    let post_unauth_html = read_body_html(post_unauth).await;
+    assert!(post_unauth_html.contains(r#"<html lang="en" data-theme="dark">"#));
+    assert!(post_unauth_html.contains(r#"href="/login">Sign in</a>"#));
+
+    let bad_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header(header::HOST, "localhost:8080")
+                .header(header::ORIGIN, "http://localhost:8080")
+                .header(header::COOKIE, "roche_theme=light")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "pairing_code=wrong-code&device_name=Study+Laptop&return_to=%2Flists%2Fmovies",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_login.status(), StatusCode::UNAUTHORIZED);
+    let bad_login_html = read_body_html(bad_login).await;
+    assert!(bad_login_html.contains(r#"<html lang="en" data-theme="light">"#));
+    assert!(bad_login_html.contains("js-toggle-password"));
+    assert!(bad_login_html.contains(r#"value="Study Laptop""#));
+    assert!(bad_login_html.contains(r#"name="return_to" value="/lists/movies""#));
+    assert!(bad_login_html.contains("autofocus"));
+}
+
+#[tokio::test]
+async fn test_wave_1c_web_inbox_and_reader_regressions() {
+    use crate::domain::ReadAtPatch;
+
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    // qw_1, qw_2, web_2: Reader dynamic headings, archive preserves max progress, unfinish confirms,
+    // Resume pill, PDFs filter, clickable #tags, single-feed Unread default + inline toggle.
+    let feed_url = Url::parse("https://blog.example.com/feed.xml").unwrap();
+    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Tech Blog"), None).await.unwrap();
+    let item_url = Url::parse("https://blog.example.com/deep-dive").unwrap();
+    let item = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Deep Dive Essay",
+            url: &item_url,
+            author: Some("Ada"),
+            published_at: None,
+            summary: Some("Summary text"),
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE entry_content SET content_html = ? WHERE entry_id = ?")
+        .bind("<h2>Intro</h2><p>Body</p><h3>Details</h3>")
+        .bind(&item.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let pdf_url = Url::parse("https://blog.example.com/spec.pdf").unwrap();
+    let pdf_item = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Spec PDF",
+            url: &pdf_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Pdf,
+        })
+        .await
+        .unwrap();
+    let tag = db.tags().add_named_to_item(&item.id, "systems").await.unwrap();
+    db.items().update(&item.id, None, None, Some(0.42), ReadAtPatch::Unchanged).await.unwrap();
+
+    let inbox_html = read_body_html(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/inbox")
+                    .header(header::COOKIE, format!("{cookie}; roche_theme=dark"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(inbox_html.contains(r#"<html lang="en" data-theme="dark">"#));
+    assert!(inbox_html.contains("kind=pdf"));
+    assert!(inbox_html.contains(&format!("status=unread&amp;feed={}", feed.id)));
+    assert!(inbox_html.contains(&format!("/inbox?status=all&amp;tag={}", tag.id)));
+
+    let pdf_inbox_html =
+        read_body_html(get_authed(&app, "/inbox?status=unread&kind=pdf", &cookie).await).await;
+    assert!(pdf_inbox_html.contains("Spec PDF"));
+    assert!(!pdf_inbox_html.contains("Deep Dive Essay"));
+    assert!(pdf_inbox_html.contains("1 item"));
+
+    let scoped_feed_html = read_body_html(
+        get_authed(&app, &format!("/inbox?status=unread&feed={}", feed.id), &cookie).await,
+    )
+    .await;
+    assert!(scoped_feed_html.contains("inbox-feed-status-toggle"));
+
+    let reader_html =
+        read_body_html(get_authed(&app, &format!("/reader/{}", item.id), &cookie).await).await;
+    assert!(reader_html.contains("<h3>Intro</h3>"));
+    assert!(reader_html.contains("<h4>Details</h4>"));
+    assert!(reader_html.contains("Resume at 42%"));
+    assert!(reader_html.contains(&format!("/inbox?status=all&amp;tag={}", tag.id)));
+
+    // Archive with stale 0.0000 progress must retain existing 0.42 progress
+    let arch_resp = post_form(
+        &app,
+        &format!("/web/items/{}/archive", item.id),
+        &cookie,
+        &[("_csrf", &csrf), ("progress", "0.0000"), ("return_to", "/inbox")],
+    )
+    .await;
+    assert_eq!(arch_resp.status(), StatusCode::SEE_OTHER);
+    let reloaded = db.items().get(&item.id).await.unwrap().unwrap();
+    assert!((reloaded.read_progress - 0.42).abs() < 1e-4);
+
+    // Finished Reader page attaches data-confirm to unfinish form
+    let _ = post_form(
+        &app,
+        &format!("/web/items/{}/finish", pdf_item.id),
+        &cookie,
+        &[("_csrf", &csrf)],
+    )
+    .await;
+    let finished_reader =
+        read_body_html(get_authed(&app, &format!("/reader/{}", pdf_item.id), &cookie).await).await;
+    assert!(finished_reader.contains("data-confirm="));
 }

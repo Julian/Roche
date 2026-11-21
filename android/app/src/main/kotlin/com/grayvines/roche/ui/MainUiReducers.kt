@@ -75,11 +75,11 @@ private fun reduceNavigationUiAction(
             )
     }
 
-private fun resolveNextScopeOriginTab(state: TransientUiState, hasNewScope: Boolean): AppTab? =
+internal fun resolveNextScopeOriginTab(state: TransientUiState, hasNewScope: Boolean): AppTab? =
     when {
         !hasNewScope -> null
         state.activeTab != AppTab.INBOX -> state.activeTab
-        else -> state.scopeOriginTab
+        else -> state.scopeOriginTab ?: AppTab.INBOX
     }
 
 private fun reduceOverlayUiAction(

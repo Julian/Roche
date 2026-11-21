@@ -215,7 +215,7 @@ impl ApiRoutes {
         let path = parts.uri.path();
         let is_api_path = path == "/api" || path.starts_with("/api/");
         let resp = if !is_api_path && Self::accepts_html(&parts.headers) {
-            crate::web::render_not_found_html()
+            crate::web::render_not_found_html(&parts.headers)
         } else {
             ApiError::not_found("The requested endpoint does not exist").into_response()
         };

@@ -290,6 +290,8 @@ sealed interface MainAction {
 
     data object SkipToNextQueuedAudio : PlaybackMutation
 
+    data object DismissMiniPlayer : PlaybackMutation
+
     data class SetPlaybackSpeed(
         val speed: Float,
         val applyToCurrentPodcast: Boolean? = null,
@@ -643,18 +645,22 @@ internal fun updateBottomNavSlot(
     slotIndex: Int,
     newTab: AppTab,
 ): List<AppTab> {
-    if (newTab !in AppTab.bottomTabCandidates) {
-        return AppTab.normalizeBottomTabs(current)
+    val baseline = AppTab.normalizeBottomTabs(current)
+    if (newTab !in AppTab.bottomTabCandidates || slotIndex !in baseline.indices) {
+        return baseline
     }
-    val normalized = AppTab.normalizeBottomTabs(current).toMutableList()
-    if (slotIndex !in normalized.indices) return normalized
+    val normalized = baseline.toMutableList()
     val existingIndex = normalized.indexOf(newTab)
     val oldTab = normalized[slotIndex]
     normalized[slotIndex] = newTab
     if (existingIndex != -1 && existingIndex != slotIndex) {
         normalized[existingIndex] = oldTab
     }
-    return AppTab.normalizeBottomTabs(normalized)
+    return if (AppTab.hasSettingsAccessTab(normalized)) {
+        AppTab.normalizeBottomTabs(normalized)
+    } else {
+        baseline
+    }
 }
 
 internal fun buildMainUiState(
