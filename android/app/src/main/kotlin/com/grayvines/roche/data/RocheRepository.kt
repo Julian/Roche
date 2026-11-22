@@ -227,9 +227,10 @@ class RocheRepository(
                     .onStart { catalog.ensureSystemSeeded() }
                     .distinctUntilChanged(),
                 activePeersFlow,
-            ) { stamp, activePeers ->
-                stamp to activePeers
+            ) { stamp, _ ->
+                stamp to activePeersFlow.value
             }
+            .distinctUntilChanged()
             .conflate()
             .mapLatest { (stamp, activePeers) ->
                 unifiedSnapshotLoader.loadSnapshot(activePeers, observedStamp = stamp).also {

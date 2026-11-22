@@ -22,6 +22,8 @@ import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.ui.theme.DarkRocheColors
 import java.io.File
 import java.time.Instant
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -223,14 +225,28 @@ class FeatureModelsAndShellStateTest {
             }
         assertTrue(afterRemove.undoEvent?.message?.contains("Stars") == true)
 
-        viewModel.dispatch(MainAction.UndoLastArchive)
-        val restored =
-            viewModel.uiState.first {
-                it.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().any { r ->
-                    r.entry.id == albumId
+        val isRestored: (MainUiState) -> Boolean = { st ->
+            st.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().any { r ->
+                r.entry.id == albumId
+            }
+        }
+        val postUndoStates = CopyOnWriteArrayList<MainUiState>()
+        val restoredDeferred = CompletableDeferred<MainUiState>()
+        val undoTraceJob =
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                viewModel.uiState.collect { st ->
+                    postUndoStates.add(st)
+                    if (isRestored(st)) {
+                        restoredDeferred.complete(st)
+                    }
                 }
             }
+        viewModel.dispatch(MainAction.UndoLastArchive)
+        val restored = restoredDeferred.await()
+        undoTraceJob.cancel()
         assertNull(restored.undoEvent)
+        assertTrue(postUndoStates.any(isRestored))
+        assertTrue(postUndoStates.all { st -> !isRestored(st) || st.undoEvent == null })
         collectJob.cancel()
     }
 

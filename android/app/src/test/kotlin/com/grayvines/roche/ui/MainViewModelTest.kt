@@ -817,7 +817,14 @@ class MainViewModelTest {
             viewModel.playerState.first { it.currentEntryId == "ep-1" && !it.isBuffering }
             val afterEp2Completed =
                 viewModel.uiState.first {
-                    it.allEntries.first { e -> e.id == "ep-2" }.isArchived
+                    it.allEntries.first { e -> e.id == "ep-2" }.isArchived &&
+                        it.queueEntries.map { e -> e.id } == listOf("art-mid", "ep-1") &&
+                        it.listeningHistoryEntries.any { e ->
+                            e.id == "ep-1" && !e.readAt.isNullOrBlank()
+                        } &&
+                        it.listeningHistoryEntries.any { e ->
+                            e.id == "ep-2" && !e.readAt.isNullOrBlank()
+                        }
                 }
             val ep2History = afterEp2Completed.listeningHistoryEntries.first { it.id == "ep-2" }
             val ep1History = afterEp2Completed.listeningHistoryEntries.first { it.id == "ep-1" }
@@ -857,7 +864,8 @@ class MainViewModelTest {
             viewModel.playerState.first { it.currentEntryId == null }
             val afterExplicitFinish =
                 viewModel.uiState.first {
-                    it.queueEntries.map { e -> e.id } == listOf("art-mid")
+                    it.queueEntries.map { e -> e.id } == listOf("art-mid") &&
+                        it.allEntries.first { e -> e.id == "ep-1" }.isArchived
                 }
             assertTrue(afterExplicitFinish.allEntries.first { it.id == "ep-1" }.isArchived)
 
@@ -1225,10 +1233,13 @@ class MainViewModelTest {
             database.dao().upsertItems(listOf(episode, article))
 
             val collectJob = collectInBackground(viewModel.uiState)
-            viewModel.uiState.first { it.allEntries.size == 2 && it.feeds.size == 2 }
+            val seeded = viewModel.uiState.first { it.allEntries.size == 2 && it.feeds.size == 2 }
 
             viewModel.dispatch(MainAction.AddToQueue("ep-stage-1"))
             viewModel.dispatch(MainAction.AddToQueue("art-stage-2"))
+            viewModel.uiState.first {
+                it.queueEntries.size == 2 && it.messageSequence >= seeded.messageSequence + 2L
+            }
             viewModel.dispatch(MainAction.UpdateSearchQuery("Systems"))
             viewModel.dispatch(MainAction.PlayAudioEntry("ep-stage-1"))
             viewModel.awaitBackgroundUiWorkForTest()
@@ -1240,7 +1251,8 @@ class MainViewModelTest {
                         it.searchQuery == "Systems" &&
                         it.searchResults.size == 2 &&
                         it.listeningHistoryEntries.size == 1 &&
-                        it.activePlayerNotesContent != null
+                        it.activePlayerNotesContent != null &&
+                        it.isPlayerFullscreenOpen
                 }
             viewModel.playerController.cancelAutoTickerForTest()
             assertEquals(2, beforeState.visibleEntries.size)

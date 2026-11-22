@@ -93,15 +93,18 @@ internal class InboxFeedsFeatureModel(
             isManualRefreshing,
             repository.isSyncActive,
             repository.inFlightOfflineEntryIds,
-        ) { sizes, status, manualRefreshing, syncActive, inFlightOffline ->
-            SyncAndOfflineMeta(
-                offlineSizes = sizes,
-                syncStatus = status,
-                isManualRefreshing = manualRefreshing,
-                isSyncActive = syncActive,
-                inFlightOfflineEntryIds = inFlightOffline,
-            )
+        ) { _, _, _, _, _ ->
+            currentSyncAndOfflineMeta()
         }
+
+    fun currentSyncAndOfflineMeta(): SyncAndOfflineMeta =
+        SyncAndOfflineMeta(
+            offlineSizes = offlineSizes.value,
+            syncStatus = syncStatus.value,
+            isManualRefreshing = isManualRefreshing.value,
+            isSyncActive = repository.isSyncActive.value,
+            inFlightOfflineEntryIds = repository.inFlightOfflineEntryIds.value,
+        )
 
     fun startObservingOfflineSizes(snapshotFlow: Flow<RepositorySnapshot>) {
         scope.launch {

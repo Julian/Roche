@@ -121,8 +121,9 @@ class MainViewModel(
         combine(
             catalogRankFeature.resolvingMusicEntryId,
             settingsFeature.settingsHubResetTick,
-            ::AuxUiMeta,
-        )
+        ) { _, _ ->
+            currentAuxUiMeta()
+        }
 
     private val baseUiStateFlow =
         combine(
@@ -131,8 +132,19 @@ class MainViewModel(
                 transientState,
                 inboxFeedsFeature.syncAndOfflineMetaFlow,
                 auxUiMetaFlow,
-                ::RootUiStateInput,
-            )
+            ) { snapshot, settings, _, _, _ ->
+                // Sample live in-memory StateFlows rather than combine()'s channel-buffered copies
+                // so a background Room/DataStore emission cannot pair with a superseded transient
+                // state (for example, an UndoLastArchive restore arriving before transientState's
+                // undoEvent = null event drains from combine's internal channel).
+                RootUiStateInput(
+                    snapshot = snapshot,
+                    settings = settings,
+                    local = transientState.value,
+                    syncMeta = inboxFeedsFeature.currentSyncAndOfflineMeta(),
+                    auxMeta = currentAuxUiMeta(),
+                )
+            }
             .scan<RootUiStateInput, DerivedUiStateSlice?>(null, ::reduceDerivedUiStateSlice)
             .filterNotNull()
             .map { it.uiState }
@@ -173,6 +185,12 @@ class MainViewModel(
         observeSettledStars()
         restoredNavState?.let(::restoreNavigationSideEffects)
     }
+
+    private fun currentAuxUiMeta(): AuxUiMeta =
+        AuxUiMeta(
+            resolvingMusicEntryId = catalogRankFeature.resolvingMusicEntryId.value,
+            settingsHubResetTick = settingsFeature.settingsHubResetTick.value,
+        )
 
     private fun observeSettledStars() {
         viewModelScope.launch {
