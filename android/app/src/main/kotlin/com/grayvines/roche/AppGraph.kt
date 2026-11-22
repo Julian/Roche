@@ -18,12 +18,11 @@ import com.grayvines.roche.data.sync.PeerSyncScheduler
 import com.grayvines.roche.media.PdfDocumentStore
 import com.grayvines.roche.media.ThumbnailDiskCache
 import com.grayvines.roche.media.ThumbnailLoader
-import com.grayvines.roche.playback.AndroidPodcastMediaSessionBridge
-import com.grayvines.roche.playback.ExoPlayerAudioBackend
-import com.grayvines.roche.playback.PodcastMediaSessionBridge
+import com.grayvines.roche.playback.Media3AudioBackend
 import com.grayvines.roche.playback.PodcastPlaybackOrchestrator
 import com.grayvines.roche.playback.PodcastPlayerController
 import com.grayvines.roche.playback.createManagedPlayerController
+import com.grayvines.roche.playback.defaultAllowedLocalAudioDirs
 import com.grayvines.roche.reader.ArticleBlockCache
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
@@ -111,25 +110,18 @@ class AppGraph(context: Context) : AutoCloseable {
         )
     }
 
+    val allowedLocalAudioDirs: List<File> by lazy { defaultAllowedLocalAudioDirs(offlineCacheDir) }
+
     private val audioPlayerBackendDelegate = lazy {
-        ExoPlayerAudioBackend(
+        Media3AudioBackend(
             context = appContext,
-            allowedLocalDirs =
-                com.grayvines.roche.playback.defaultAllowedLocalAudioDirs(offlineCacheDir),
+            allowedLocalDirs = allowedLocalAudioDirs,
             parentScope = appScope,
-        )
-    }
-
-    val audioPlayerBackend: ExoPlayerAudioBackend by audioPlayerBackendDelegate
-
-    val mediaSessionBridge: PodcastMediaSessionBridge by lazy {
-        AndroidPodcastMediaSessionBridge(
-            context = appContext,
-            backend = audioPlayerBackend,
-            scope = appScope,
             artworkBitmapLoader = thumbnailLoader::loadBitmap,
         )
     }
+
+    val audioPlayerBackend: Media3AudioBackend by audioPlayerBackendDelegate
 
     val playbackOrchestrator: PodcastPlaybackOrchestrator by lazy {
         PodcastPlaybackOrchestrator(
@@ -145,7 +137,7 @@ class AppGraph(context: Context) : AutoCloseable {
             settingsRepository = settings,
             orchestrator = playbackOrchestrator,
             playerBackend = audioPlayerBackend,
-            mediaSessionBridge = mediaSessionBridge,
+            observerScope = appScope,
         )
     }
 
@@ -161,7 +153,7 @@ class AppGraph(context: Context) : AutoCloseable {
 
     override fun close() {
         if (audioPlayerBackendDelegate.isInitialized()) {
-            runCatching { audioPlayerBackend.shutdownPlayer() }
+            runCatching { audioPlayerBackend.shutdownBackend() }
         }
         appScope.cancel()
         if (httpTransportDelegate.isInitialized()) {

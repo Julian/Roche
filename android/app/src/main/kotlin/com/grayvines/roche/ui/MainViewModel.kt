@@ -19,13 +19,10 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.playback.AudioPlayerBackend
 import com.grayvines.roche.playback.NoOpAudioPlayerBackend
-import com.grayvines.roche.playback.NoOpPodcastMediaSessionBridge
-import com.grayvines.roche.playback.PodcastMediaSessionBridge
 import com.grayvines.roche.playback.PodcastPlaybackOrchestrator
 import com.grayvines.roche.playback.PodcastPlayerController
 import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.playback.createManagedPlayerController
-import com.grayvines.roche.playback.hasNextQueuedAudio
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -48,7 +45,6 @@ class MainViewModel(
     internal val repository: RocheRepository,
     internal val settingsRepository: SettingsRepository,
     playerBackend: AudioPlayerBackend = NoOpAudioPlayerBackend(),
-    private val mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
     sharedPlayerController: PodcastPlayerController? = null,
     private val savedStateHandle: SavedStateHandle? = null,
     sharedPlaybackOrchestrator: PodcastPlaybackOrchestrator? = null,
@@ -81,7 +77,7 @@ class MainViewModel(
                 settingsRepository = settingsRepository,
                 orchestrator = playbackOrchestrator,
                 playerBackend = playerBackend,
-                mediaSessionBridge = mediaSessionBridge,
+                observerScope = viewModelScope,
             )
 
     val playerState: StateFlow<PodcastPlayerState> = playerController.state
@@ -166,52 +162,13 @@ class MainViewModel(
             playerController.syncSkipSilenceFromSettings(cached.skipSilenceEnabled)
         }
         inboxFeedsFeature.startObservingOfflineSizes(sharedSnapshotFlow)
-        observePlayerControllerSync()
+        if (!playerController.hasBackgroundObserver) {
+            playbackOrchestrator.startBackgroundObservers(viewModelScope, playerController)
+        }
         observeActiveEpisodeNotes()
         observeActiveCollectionDraws()
         observeSettledStars()
         restoredNavState?.let(::restoreNavigationSideEffects)
-    }
-
-    private fun observePlayerControllerSync() {
-        viewModelScope.launch {
-            combine(
-                    sharedSnapshotFlow.map { it.entries }.distinctUntilChanged(),
-                    settingsFeature.settingsForUi
-                        .map { settings ->
-                            PlayerSettingsSlice(
-                                queueItemIds = settings.queueItemIds,
-                                smartRewindEnabled = settings.smartRewindEnabled,
-                                skipSilenceEnabled = settings.skipSilenceEnabled,
-                            )
-                        }
-                        .distinctUntilChanged(),
-                    playerController.state.map { it.currentEntryId }.distinctUntilChanged(),
-                ) { entries, slice, _ ->
-                    entries to slice
-                }
-                .collect { (entries, slice) ->
-                    val latestEntries = repository.latestSnapshot?.entries ?: entries
-                    val latestSettings = settingsRepository.latestSettings
-                    val effectiveQueueIds = latestSettings?.queueItemIds ?: slice.queueItemIds
-                    val target =
-                        PlayerControllerSyncTarget(
-                            hasNextQueuedAudio =
-                                hasNextQueuedAudio(
-                                    latestEntries,
-                                    effectiveQueueIds,
-                                    playerController.state.value.currentEntryId,
-                                ),
-                            smartRewindEnabled =
-                                latestSettings?.smartRewindEnabled ?: slice.smartRewindEnabled,
-                            skipSilenceEnabled =
-                                latestSettings?.skipSilenceEnabled ?: slice.skipSilenceEnabled,
-                        )
-                    playerController.updateHasNextQueuedAudio(target.hasNextQueuedAudio)
-                    playerController.updateSmartRewindEnabled(target.smartRewindEnabled)
-                    playerController.syncSkipSilenceFromSettings(target.skipSilenceEnabled)
-                }
-        }
     }
 
     private fun observeSettledStars() {
@@ -570,7 +527,6 @@ class MainViewModel(
     class Factory(
         private val repository: RocheRepository,
         private val settings: SettingsRepository,
-        private val mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
         private val sharedPlayerController: PodcastPlayerController? = null,
         private val sharedPlaybackOrchestrator: PodcastPlaybackOrchestrator? = null,
     ) : ViewModelProvider.Factory {
@@ -586,7 +542,6 @@ class MainViewModel(
             return MainViewModel(
                 repository = repository,
                 settingsRepository = settings,
-                mediaSessionBridge = mediaSessionBridge,
                 sharedPlayerController = sharedPlayerController,
                 savedStateHandle = savedStateHandle,
                 sharedPlaybackOrchestrator = sharedPlaybackOrchestrator,
@@ -876,15 +831,3 @@ private class MainViewModelHost(private val vm: MainViewModel) : InboxReaderHost
         vm.uiState.first { !it.isInitialLoading }
     }
 }
-
-private data class PlayerSettingsSlice(
-    val queueItemIds: List<String>,
-    val smartRewindEnabled: Boolean,
-    val skipSilenceEnabled: Boolean,
-)
-
-private data class PlayerControllerSyncTarget(
-    val hasNextQueuedAudio: Boolean,
-    val smartRewindEnabled: Boolean,
-    val skipSilenceEnabled: Boolean,
-)

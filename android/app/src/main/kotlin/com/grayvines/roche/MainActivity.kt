@@ -43,7 +43,6 @@ class MainActivity : ComponentActivity() {
         MainViewModel.Factory(
             repository = graph.repository,
             settings = graph.settings,
-            mediaSessionBridge = graph.mediaSessionBridge,
             sharedPlayerController = graph.playerController,
             sharedPlaybackOrchestrator = graph.playbackOrchestrator,
         )

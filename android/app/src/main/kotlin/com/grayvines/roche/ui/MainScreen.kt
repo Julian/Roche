@@ -59,6 +59,7 @@ import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.MusicTrackLaunchRequest
 import com.grayvines.roche.data.catalog.generatorFor
 import com.grayvines.roche.model.AppTab
+import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.ui.components.PlusIcon
@@ -738,11 +739,21 @@ private fun MainPlayerDestination(
         val resolvedFeed =
             state.resolveActivePlayerFeed(playerState.currentEntryId)
                 ?: targetEntry.feedId?.let { fid -> state.feeds.firstOrNull { it.id == fid } }
+        val upNextAudioEntries =
+            remember(state.settings.queueItemIds, state.entryById, targetEntry.id) {
+                state.settings.queueItemIds
+                    .asSequence()
+                    .filter { it != targetEntry.id }
+                    .mapNotNull { state.entryById[it] }
+                    .filter { !it.isArchived && it.contentType == ContentType.AUDIO }
+                    .toList()
+            }
         FullscreenPodcastPlayer(
             entry = targetEntry,
             feed = resolvedFeed,
             playerState = playerState,
-            nextQueuedAudioEntry = state.resolveNextQueuedAudioEntry(playerState.currentEntryId),
+            upNextAudioEntries = upNextAudioEntries,
+            isEntryDownloading = targetEntry.id in state.inFlightOfflineEntryIds,
             onAction = onAction,
             onShareEntry = onShareEntry,
             onOpenExternalUrl = onOpenExternalUrl,

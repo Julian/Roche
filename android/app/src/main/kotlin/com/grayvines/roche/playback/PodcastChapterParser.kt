@@ -10,7 +10,7 @@ import kotlin.math.roundToLong
 enum class PlayerDrawerTab(val label: String) {
     SHOW_NOTES("Show Notes"),
     CHAPTERS("Chapters"),
-    TRANSCRIPT("Transcript"),
+    UP_NEXT("Up Next"),
 }
 
 data class PodcastChapter(
@@ -51,6 +51,30 @@ internal fun formatPlaybackSpeedLabel(speed: Float): String {
     }
 }
 
+internal fun formatAdjustedRemaining(remMs: Long, speed: Float): String {
+    val safeSpeed = clampPlaybackSpeed(speed)
+    val adjustedSeconds =
+        (remMs.coerceAtLeast(0L) / MILLIS_PER_SEC.toDouble() / safeSpeed)
+            .roundToLong()
+            .coerceAtLeast(0L)
+    return when {
+        adjustedSeconds == 0L -> "0m left"
+        adjustedSeconds < SECS_PER_MIN -> "< 1m left"
+        else -> formatRemainingMinutes(adjustedSeconds)
+    }
+}
+
+private fun formatRemainingMinutes(adjustedSeconds: Long): String {
+    val totalMinutes = (adjustedSeconds + HALF_MINUTE_SECS) / SECS_PER_MIN
+    return if (totalMinutes >= MINS_PER_HOUR) {
+        val hours = totalMinutes / MINS_PER_HOUR
+        val mins = totalMinutes % MINS_PER_HOUR
+        "${hours}h ${mins}m left"
+    } else {
+        "${totalMinutes}m left"
+    }
+}
+
 internal fun parseChaptersFromEpisodeNotes(rawHtmlOrText: String): List<PodcastChapter> {
     if (rawHtmlOrText.isBlank()) return emptyList()
     val plainLines =
@@ -88,7 +112,9 @@ private fun parseSingleChapterLine(line: String): Pair<Long, String>? {
 }
 
 private const val MILLIS_PER_SEC = 1_000L
+private const val HALF_MINUTE_SECS = 30L
 private const val SECS_PER_MIN = 60L
+private const val MINS_PER_HOUR = 60L
 private const val SECS_PER_HOUR = 3_600L
 private const val HUNDREDTHS_SCALE = 100f
 private const val TENTHS_DIVISOR = 10L

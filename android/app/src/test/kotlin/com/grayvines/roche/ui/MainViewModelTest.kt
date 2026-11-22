@@ -40,11 +40,10 @@ import com.grayvines.roche.model.extractCleanDomain
 import com.grayvines.roche.model.isCrossPeerRescueError
 import com.grayvines.roche.model.resolveFallbackFaviconUrl
 import com.grayvines.roche.model.resolveOriginFaviconUrl
+import com.grayvines.roche.playback.AudioBackendListener
+import com.grayvines.roche.playback.AudioLoadRequest
+import com.grayvines.roche.playback.AudioPlaybackMetadata
 import com.grayvines.roche.playback.AudioPlayerBackend
-import com.grayvines.roche.playback.MediaSessionCommand
-import com.grayvines.roche.playback.MediaSessionMetadataSnapshot
-import com.grayvines.roche.playback.PodcastMediaSessionBridge
-import com.grayvines.roche.playback.PodcastMediaSessionCallbacks
 import com.grayvines.roche.playback.PodcastPlaybackOrchestrator
 import com.grayvines.roche.playback.PodcastPlayerController
 import com.grayvines.roche.playback.createManagedPlayerController
@@ -65,7 +64,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -101,7 +99,6 @@ class MainViewModelTest {
         get() = testEnv.repository
 
     private lateinit var playerBackend: FakeAudioPlayerBackend
-    private lateinit var mediaSessionBridge: RecordingMediaSessionBridge
     private lateinit var viewModel: MainViewModel
 
     @BeforeEach
@@ -109,13 +106,11 @@ class MainViewModelTest {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         testEnv = com.grayvines.roche.data.TestRocheEnv(tempDir, "vm_test_settings.preferences_pb")
         playerBackend = FakeAudioPlayerBackend()
-        mediaSessionBridge = RecordingMediaSessionBridge()
         viewModel =
             MainViewModel(
                 repository = repository,
                 settingsRepository = settings,
                 playerBackend = playerBackend,
-                mediaSessionBridge = mediaSessionBridge,
             )
     }
 
@@ -677,7 +672,6 @@ class MainViewModelTest {
                     repository = coldRepo,
                     settingsRepository = settings,
                     playerBackend = FakeAudioPlayerBackend(),
-                    mediaSessionBridge = RecordingMediaSessionBridge(),
                 )
             try {
                 assertTrue(coldViewModel.uiState.value.isInitialLoading)
@@ -855,7 +849,7 @@ class MainViewModelTest {
         }
 
     @Test
-    fun `mediaSessionBridge handles lock screen transport and playback speed commands`() = runTest {
+    fun `playback backend handles lock screen transport and playback speed events`() = runTest {
         val podcastFeed = testFeed("f-pod", "Systems Cast").copy(feedType = "podcast")
         val ep1 =
             testItem("ep-a", "Episode A", "f-pod")
@@ -884,36 +878,28 @@ class MainViewModelTest {
         viewModel.dispatch(MainAction.PlayAudioEntry("ep-a"))
 
         viewModel.playerState.first { it.currentEntryId == "ep-a" && it.hasNextQueuedAudio }
-        val epASnapshot =
-            mediaSessionBridge.snapshots.first {
-                it?.entryId == "ep-a" && it.hasNextQueuedAudio
-            }
-        assertEquals("Episode A", epASnapshot?.episodeTitle)
-        assertTrue(epASnapshot?.hasNextQueuedAudio == true)
+        assertEquals("Episode A", playerBackend.lastMetadata?.episodeTitle)
+        assertTrue(playerBackend.lastHasNextQueuedAudio)
 
-        // Seek, Fast-forward 30s, Rewind 15s, Pause & Play via MediaSession commands
-        mediaSessionBridge.callbacks?.onSeekToMs(60_000L)
+        // Seek, Pause & Play via Media3 Player.Listener external events
+        playerBackend.emitExternalSeek(60_000L)
         assertEquals(60_000L, viewModel.playerController.state.value.positionMs)
-        mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.FAST_FORWARD_30S)
+        playerBackend.emitExternalSeek(90_000L)
         assertEquals(90_000L, viewModel.playerController.state.value.positionMs)
-        mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.REWIND_15S)
+        playerBackend.emitExternalSeek(75_000L)
         assertEquals(75_000L, viewModel.playerController.state.value.positionMs)
-        mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.PAUSE)
+        playerBackend.emitExternalPlayState(false)
         assertFalse(viewModel.playerController.state.value.isPlaying)
-        mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.PLAY)
+        playerBackend.emitExternalPlayState(true)
         assertTrue(viewModel.playerController.state.value.isPlaying)
 
         // Lock-screen Skip to Next advances to ep-b even when uiState has zero active UI
         // subscribers (app in background).
         collectJob.cancel()
-        mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.SKIP_TO_NEXT)
+        viewModel.playerController.requestSkipToNext()
         viewModel.playerController.state.first { it.currentEntryId == "ep-b" }
-        val epBSnapshot =
-            mediaSessionBridge.snapshots.first {
-                it?.entryId == "ep-b" && it.hasNextQueuedAudio
-            }
-        assertEquals("Episode B", epBSnapshot?.episodeTitle)
-        assertTrue(epBSnapshot?.hasNextQueuedAudio == true)
+        assertEquals("Episode B", playerBackend.lastMetadata?.episodeTitle)
+        assertTrue(playerBackend.lastHasNextQueuedAudio)
         assertFalse(repository.snapshot.first().entries.first { it.id == "ep-a" }.isArchived)
 
         // Changing playback speed from MediaSession respects podcast customPlaybackSpeed
@@ -921,7 +907,7 @@ class MainViewModelTest {
         repository.snapshot.first { snap ->
             snap.feeds.firstOrNull { it.id == "f-pod" }?.customPlaybackSpeed != null
         }
-        mediaSessionBridge.callbacks?.onSetPlaybackSpeed(1.75f)
+        playerBackend.emitExternalSpeed(1.75f)
         val updatedSnap =
             repository.snapshot.first { snap ->
                 val spd = snap.feeds.firstOrNull { it.id == "f-pod" }?.customPlaybackSpeed ?: 0f
@@ -1088,7 +1074,6 @@ class MainViewModelTest {
                     repository = countingRepo,
                     settingsRepository = settings,
                     playerBackend = localBackend,
-                    mediaSessionBridge = RecordingMediaSessionBridge(),
                 )
             assertEquals(1, tierQueryCount)
 
@@ -1395,14 +1380,13 @@ class MainViewModelTest {
         runTest {
             val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             val sharedBackend = FakeAudioPlayerBackend()
-            val sharedBridge = RecordingMediaSessionBridge()
             val sharedController =
                 createManagedPlayerController(
                     scope = appScope,
                     repository = repository,
                     settingsRepository = settings,
                     playerBackend = sharedBackend,
-                    mediaSessionBridge = sharedBridge,
+                    observerScope = appScope,
                 )
             val store1 = ViewModelStore()
             val store2 = ViewModelStore()
@@ -1434,7 +1418,6 @@ class MainViewModelTest {
                     MainViewModel.Factory(
                         repository = repository,
                         settings = settings,
-                        mediaSessionBridge = sharedBridge,
                         sharedPlayerController = sharedController,
                     )
                 val firstVm = ViewModelProvider(store1, factory)[MainViewModel::class.java]
@@ -1631,7 +1614,6 @@ class MainViewModelTest {
                     repository = repository,
                     settingsRepository = settings,
                     playerBackend = playerBackend,
-                    mediaSessionBridge = mediaSessionBridge,
                 )
             try {
                 // Before even starting a collector, initialValue already has cached entries
@@ -2008,7 +1990,6 @@ class MainViewModelTest {
                     repository = localRepo,
                     settingsRepository = settings,
                     playerBackend = FakeAudioPlayerBackend(),
-                    mediaSessionBridge = RecordingMediaSessionBridge(),
                 )
             val collectJob = collectInBackground(localVm.uiState)
             try {
@@ -2061,37 +2042,56 @@ class MainViewModelTest {
     private class FakeAudioPlayerBackend : AudioPlayerBackend {
         var failNextLoad: Boolean = false
         var lastSkipSilence: Boolean = false
+        var lastHasNextQueuedAudio: Boolean = false
+        var lastMetadata: AudioPlaybackMetadata? = null
         private var positionMs: Long = 0L
         private var durationMs: Long = 1_800_000L
         private var playing: Boolean = false
         private var speed: Float = 1.0f
+        private var listener: AudioBackendListener? = null
 
         fun setSimulatedPositionMs(nextPositionMs: Long) {
             positionMs = nextPositionMs.coerceAtLeast(0L)
         }
 
-        override fun loadAndPlay(
-            source: String,
-            initialPositionMs: Long,
-            fallbackDurationMs: Long,
-            speed: Float,
-            skipSilenceEnabled: Boolean,
-            playWhenReady: Boolean,
-            onPrepared: (durationMs: Long) -> Unit,
-            onCompletion: () -> Unit,
-            onError: () -> Unit,
-        ) {
-            if (failNextLoad || source.isBlank()) {
+        fun emitExternalPlayState(isNowPlaying: Boolean) {
+            playing = isNowPlaying
+            listener?.onPlayStateChanged(
+                isPlaying = isNowPlaying,
+                isBuffering = false,
+                positionMs = positionMs,
+                durationMs = durationMs,
+            )
+        }
+
+        fun emitExternalSeek(nextPositionMs: Long) {
+            positionMs = nextPositionMs.coerceIn(0L, durationMs)
+            listener?.onPositionSeeked(positionMs)
+        }
+
+        fun emitExternalSpeed(nextSpeed: Float) {
+            speed = nextSpeed
+            listener?.onSpeedChanged(nextSpeed)
+        }
+
+        override fun bindListener(listener: AudioBackendListener?) {
+            this.listener = listener
+        }
+
+        override fun loadAndPlay(request: AudioLoadRequest) {
+            if (failNextLoad || request.source.isBlank()) {
                 playing = false
-                onError()
+                listener?.onError()
                 return
             }
-            durationMs = fallbackDurationMs.takeIf { it > 0L } ?: 1_800_000L
-            positionMs = initialPositionMs.coerceIn(0L, durationMs)
-            this.speed = speed
-            this.lastSkipSilence = skipSilenceEnabled
-            playing = playWhenReady
-            onPrepared(durationMs)
+            durationMs = request.fallbackDurationMs.takeIf { it > 0L } ?: 1_800_000L
+            positionMs = request.initialPositionMs.coerceIn(0L, durationMs)
+            speed = request.speed
+            lastSkipSilence = request.skipSilenceEnabled
+            lastHasNextQueuedAudio = request.hasNextQueuedAudio
+            lastMetadata = request.metadata
+            playing = request.playWhenReady
+            listener?.onPrepared(durationMs)
         }
 
         override fun play() {
@@ -2114,6 +2114,14 @@ class MainViewModelTest {
             lastSkipSilence = enabled
         }
 
+        override fun updateHasNextQueuedAudio(hasNext: Boolean) {
+            lastHasNextQueuedAudio = hasNext
+        }
+
+        override fun updateMetadata(metadata: AudioPlaybackMetadata?) {
+            lastMetadata = metadata
+        }
+
         override fun currentPositionMs(): Long = positionMs
 
         override fun durationMs(): Long = durationMs
@@ -2126,23 +2134,6 @@ class MainViewModelTest {
     }
 
     private class FakeImage(val width: Int, val height: Int)
-
-    private class RecordingMediaSessionBridge : PodcastMediaSessionBridge {
-        @Volatile var callbacks: PodcastMediaSessionCallbacks? = null
-        val snapshots = MutableStateFlow<MediaSessionMetadataSnapshot?>(null)
-
-        override fun bindCallbacks(callbacks: PodcastMediaSessionCallbacks) {
-            this.callbacks = callbacks
-        }
-
-        override fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?) {
-            snapshots.value = snapshot
-        }
-
-        override fun release() {
-            snapshots.value = null
-        }
-    }
 
     @Test
     fun `SaveUrlOrFeed closes add sheet immediately while slow network runs and separates Want to Read from Feed Inbox`() =
@@ -2183,7 +2174,6 @@ class MainViewModelTest {
                     repository = slowRepo,
                     settingsRepository = settings,
                     playerBackend = playerBackend,
-                    mediaSessionBridge = mediaSessionBridge,
                 )
             try {
                 val collectJob = collectInBackground(slowVm.uiState)
@@ -2306,7 +2296,6 @@ class MainViewModelTest {
                     repository = problemRepo,
                     settingsRepository = settings,
                     playerBackend = playerBackend,
-                    mediaSessionBridge = mediaSessionBridge,
                 )
             try {
                 val collectJob = collectInBackground(problemVm.uiState)

@@ -154,17 +154,7 @@ private fun reducePlayerChromeUiAction(
                 activePlayerDrawerTab = null,
             )
         is MainAction.SetPlayerSpeedSheetOpen -> state.copy(isPlayerSpeedSheetOpen = action.open)
-        is MainAction.SelectPlayerDrawerTab ->
-            state.copy(
-                activePlayerDrawerTab =
-                    if (state.activePlayerDrawerTab == action.tab) null else action.tab
-            )
-        MainAction.RequestAudioOutputCast ->
-            state.copy(
-                undoEvent = null,
-                statusBanner = "Use system output switcher for Cast / Bluetooth audio",
-                messageSequence = state.messageSequence + 1,
-            )
+        is MainAction.SelectPlayerDrawerTab -> state.copy(activePlayerDrawerTab = action.tab)
     }
 
 private fun reduceCatalogUiAction(

@@ -234,7 +234,8 @@ data class MainUiState(
                 rankSession != null ||
                 catalogDetailEntryId != null ||
                 isQuickLogSheetOpen ||
-                isPlayerSpeedSheetOpen
+                isPlayerSpeedSheetOpen ||
+                activePlayerDrawerTab != null
 }
 
 fun MainUiState.isUnpinnedDestination(tab: AppTab): Boolean =
@@ -390,8 +391,6 @@ sealed interface MainAction {
     data class SetPlayerSpeedSheetOpen(val open: Boolean) : PlayerChromeUi
 
     data class SelectPlayerDrawerTab(val tab: PlayerDrawerTab?) : PlayerChromeUi
-
-    data object RequestAudioOutputCast : PlayerChromeUi
 
     data class PlayAudioEntry(
         val entryId: String,

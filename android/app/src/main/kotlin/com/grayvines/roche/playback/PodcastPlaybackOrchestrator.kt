@@ -5,7 +5,11 @@ import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
 import com.grayvines.roche.model.InboxEntry
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 private const val UP_NEXT_TITLE_LIMIT = 36
@@ -68,6 +72,51 @@ class PodcastPlaybackOrchestrator(
             )
         playerController.updateHasNextQueuedAudio(hasNext)
         playerController.updateSmartRewindEnabled(latestSettings.smartRewindEnabled)
+    }
+
+    fun startBackgroundObservers(
+        scope: CoroutineScope,
+        playerController: PodcastPlayerController,
+    ): Job {
+        playerController.hasBackgroundObserver = true
+        return scope.launch {
+            combine(
+                    repository.snapshot.map { it.entries }.distinctUntilChanged(),
+                    settingsRepository.settings
+                        .map { settings ->
+                            Triple(
+                                settings.queueItemIds,
+                                settings.smartRewindEnabled,
+                                settings.skipSilenceEnabled,
+                            )
+                        }
+                        .distinctUntilChanged(),
+                    playerController.state.map { it.currentEntryId }.distinctUntilChanged(),
+                ) { entries, settingsSlice, currentEntryId ->
+                    Triple(entries, settingsSlice, currentEntryId)
+                }
+                .collect { (entries, settingsSlice, currentEntryId) ->
+                    val latestEntries = repository.latestSnapshot?.entries ?: entries
+                    val latestSettings = settingsRepository.latestSettings
+                    val effectiveQueueIds = latestSettings?.queueItemIds ?: settingsSlice.first
+                    val hasNext =
+                        hasNextQueuedAudio(
+                            latestEntries,
+                            effectiveQueueIds,
+                            excludeEntryId = currentEntryId,
+                        )
+                    playerController.updateHasNextQueuedAudio(hasNext)
+                    playerController.updateSmartRewindEnabled(
+                        latestSettings?.smartRewindEnabled ?: settingsSlice.second
+                    )
+                    playerController.syncSkipSilenceFromSettings(
+                        latestSettings?.skipSilenceEnabled ?: settingsSlice.third
+                    )
+                    currentEntryId
+                        ?.let { id -> latestEntries.firstOrNull { it.id == id } }
+                        ?.let(playerController::refreshChaptersFromEntry)
+                }
+        }
     }
 
     suspend fun handleAudioEpisodeCompleted(
@@ -181,30 +230,34 @@ internal fun createManagedPlayerController(
             settingsRepository = settingsRepository,
         ),
     playerBackend: AudioPlayerBackend = NoOpAudioPlayerBackend(),
-    mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
     clockMs: () -> Long = System::currentTimeMillis,
+    observerScope: CoroutineScope? = null,
 ): PodcastPlayerController =
     PodcastPlayerController(
-        scope = scope,
-        backend = playerBackend,
-        mediaSessionBridge = mediaSessionBridge,
-        onProgressSaved = buildProgressSaveHandler(scope, repository, clockMs),
-        onEpisodeCompleted = { active, completedEntryId ->
-            scope.launch { orchestrator.handleAudioEpisodeCompleted(active, completedEntryId) }
-        },
-        onSkipToNextRequested = { active ->
-            scope.launch { orchestrator.performSkipToNextQueuedAudio(active) }
-        },
-        onSpeedChangedFromSession = { active, speed ->
-            scope.launch {
-                orchestrator.performSetPlaybackSpeed(
-                    playerController = active,
-                    speed = speed,
-                    applyToCurrentPodcast = null,
-                )
+            scope = scope,
+            backend = playerBackend,
+            onProgressSaved = buildProgressSaveHandler(scope, repository, clockMs),
+            onEpisodeCompleted = { active, completedEntryId ->
+                scope.launch { orchestrator.handleAudioEpisodeCompleted(active, completedEntryId) }
+            },
+            onSkipToNextRequested = { active ->
+                scope.launch { orchestrator.performSkipToNextQueuedAudio(active) }
+            },
+            onSpeedChangedFromSession = { active, speed ->
+                scope.launch {
+                    orchestrator.performSetPlaybackSpeed(
+                        playerController = active,
+                        speed = speed,
+                        applyToCurrentPodcast = null,
+                    )
+                }
+            },
+        )
+        .also { controller ->
+            if (observerScope != null) {
+                orchestrator.startBackgroundObservers(observerScope, controller)
             }
-        },
-    )
+        }
 
 private fun buildProgressSaveHandler(
     scope: CoroutineScope,

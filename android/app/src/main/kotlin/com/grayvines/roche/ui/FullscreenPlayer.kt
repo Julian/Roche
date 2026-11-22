@@ -28,6 +28,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -70,6 +71,7 @@ import com.grayvines.roche.ui.components.MoreDotsIcon
 import com.grayvines.roche.ui.components.PlayPauseIcon
 import com.grayvines.roche.ui.components.PodcastArtworkBox
 import com.grayvines.roche.ui.components.RewindIcon
+import com.grayvines.roche.ui.components.RocheAlertDialog
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.SkipNextIcon
 import com.grayvines.roche.ui.components.StarIcon
@@ -271,39 +273,48 @@ fun FullscreenPodcastPlayer(
     entry: InboxEntry,
     feed: FeedItem?,
     playerState: PodcastPlayerState,
-    nextQueuedAudioEntry: InboxEntry?,
+    upNextAudioEntries: List<InboxEntry>,
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     modifier: Modifier = Modifier,
+    isEntryDownloading: Boolean = false,
     isSpeedSheetOpen: Boolean = false,
     activeDrawerTab: PlayerDrawerTab? = null,
 ) {
     val colors = LocalRocheColors.current
+    var pendingDownloadConfirm by rememberSaveable(entry.id) { mutableStateOf<String?>(null) }
 
     Column(
         modifier =
             modifier
                 .fillMaxSize()
                 .background(colors.background)
-                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp, vertical = 10.dp)
                 .testTag("fullscreen_podcast_player"),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.SpaceBetween,
     ) {
         FullscreenPlayerTopBar(
             entry = entry,
             playerState = playerState,
+            upNextCount = upNextAudioEntries.size,
+            isEntryDownloading = isEntryDownloading,
             onAction = onAction,
+            onRequestDeleteDownload = { pendingDownloadConfirm = CONFIRM_DELETE_DOWNLOAD },
+            onRequestArchiveDeleteDownload = { pendingDownloadConfirm = CONFIRM_ARCHIVE_DOWNLOAD },
             onShareEntry = onShareEntry,
             onOpenExternalUrl = onOpenExternalUrl,
         )
 
         Column(
-            modifier = Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(vertical = 8.dp),
+            modifier =
+                Modifier.weight(1f)
+                    .widthIn(max = 420.dp)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(vertical = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(18.dp),
+            verticalArrangement = Arrangement.spacedBy(18.dp, Alignment.CenterVertically),
         ) {
             FullscreenPlayerArtworkAndMeta(
                 entry = entry,
@@ -316,13 +327,17 @@ fun FullscreenPodcastPlayer(
             )
             FullscreenPlayerTransportRow(
                 playerState = playerState,
-                hasNextQueuedAudio = nextQueuedAudioEntry != null,
+                hasNextQueuedAudio = upNextAudioEntries.isNotEmpty(),
                 onAction = onAction,
             )
+        }
+
+        Box(modifier = Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(top = 6.dp)) {
             FullscreenPlayerDrawerBar(
                 playerState = playerState,
+                upNextCount = upNextAudioEntries.size,
                 activeDrawerTab = activeDrawerTab,
-                onAction = onAction,
+                onSelectTab = { tab -> onAction(MainAction.SelectPlayerDrawerTab(tab)) },
             )
         }
     }
@@ -330,7 +345,6 @@ fun FullscreenPodcastPlayer(
     if (isSpeedSheetOpen) {
         PlaybackSpeedAndPodcastSheet(
             feed = feed,
-            entry = entry,
             playerState = playerState,
             onAction = onAction,
         )
@@ -340,18 +354,80 @@ fun FullscreenPodcastPlayer(
         PlayerContentDrawerSheet(
             entry = entry,
             playerState = playerState,
+            upNextAudioEntries = upNextAudioEntries,
             activeTab = activeDrawerTab,
             onAction = onAction,
             onOpenExternalUrl = onOpenExternalUrl,
         )
     }
+
+    if (pendingDownloadConfirm == CONFIRM_DELETE_DOWNLOAD) {
+        PlayerConfirmDownloadDialog(
+            title = "Delete local download?",
+            body = "Remove the downloaded audio file for \"${entry.title}\" from this device?",
+            confirmLabel = "Delete",
+            confirmTestTag = "player_confirm_delete_download_btn",
+            onDismiss = { pendingDownloadConfirm = null },
+            onConfirm = {
+                pendingDownloadConfirm = null
+                onAction(MainAction.ToggleOfflineCache(entry.id))
+            },
+        )
+    } else if (pendingDownloadConfirm == CONFIRM_ARCHIVE_DOWNLOAD) {
+        PlayerConfirmDownloadDialog(
+            title = "Archive & delete download?",
+            body =
+                "Archive \"${entry.title}\" and delete its downloaded audio file from this device?",
+            confirmLabel = "Archive & Delete",
+            confirmTestTag = "player_confirm_archive_delete_btn",
+            onDismiss = { pendingDownloadConfirm = null },
+            onConfirm = {
+                pendingDownloadConfirm = null
+                onAction(MainAction.CloseFullscreenPlayer)
+                onAction(MainAction.ToggleArchive(entry))
+            },
+        )
+    }
 }
 
+private const val CONFIRM_DELETE_DOWNLOAD = "delete_download"
+private const val CONFIRM_ARCHIVE_DOWNLOAD = "archive_download"
+
+@Composable
+private fun PlayerConfirmDownloadDialog(
+    title: String,
+    body: String,
+    confirmLabel: String,
+    confirmTestTag: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    RocheAlertDialog(
+        title = title,
+        onDismissRequest = onDismiss,
+        text = { Text(text = body, color = colors.textSecondary) },
+        confirmButton = {
+            TextButton(onClick = onConfirm, modifier = Modifier.testTag(confirmTestTag)) {
+                Text(confirmLabel, color = colors.accentIndianRed)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = colors.textSecondary) }
+        },
+    )
+}
+
+@Suppress("LongParameterList")
 @Composable
 private fun FullscreenPlayerTopBar(
     entry: InboxEntry,
     playerState: PodcastPlayerState,
+    upNextCount: Int,
+    isEntryDownloading: Boolean,
     onAction: (MainAction) -> Unit,
+    onRequestDeleteDownload: () -> Unit,
+    onRequestArchiveDeleteDownload: () -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
@@ -393,7 +469,11 @@ private fun FullscreenPlayerTopBar(
             PlayerOverflowMenuButton(
                 entry = entry,
                 playerState = playerState,
+                upNextCount = upNextCount,
+                isEntryDownloading = isEntryDownloading,
                 onAction = onAction,
+                onRequestDeleteDownload = onRequestDeleteDownload,
+                onRequestArchiveDeleteDownload = onRequestArchiveDeleteDownload,
                 onShareEntry = onShareEntry,
                 onOpenExternalUrl = onOpenExternalUrl,
             )
@@ -470,11 +550,16 @@ private fun PlayerSleepTimerMenuButton(
     }
 }
 
+@Suppress("LongParameterList")
 @Composable
 private fun PlayerOverflowMenuButton(
     entry: InboxEntry,
     playerState: PodcastPlayerState,
+    upNextCount: Int,
+    isEntryDownloading: Boolean,
     onAction: (MainAction) -> Unit,
+    onRequestDeleteDownload: () -> Unit,
+    onRequestArchiveDeleteDownload: () -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
@@ -494,14 +579,32 @@ private fun PlayerOverflowMenuButton(
             expanded = showOverflowMenu,
             onDismissRequest = { showOverflowMenu = false },
         ) {
-            DropdownMenuItem(
-                text = { Text("Cast / Audio Output") },
-                onClick = {
-                    showOverflowMenu = false
-                    onAction(MainAction.RequestAudioOutputCast)
-                },
-                modifier = Modifier.testTag("player_cast_btn"),
-            )
+            if (!entry.isCachedOffline) {
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = if (isEntryDownloading) "Downloading…" else "Download Episode",
+                            color =
+                                if (isEntryDownloading) colors.textMuted else colors.textPrimary,
+                        )
+                    },
+                    enabled = !isEntryDownloading,
+                    onClick = {
+                        showOverflowMenu = false
+                        onAction(MainAction.ToggleOfflineCache(entry.id))
+                    },
+                    modifier = Modifier.testTag("player_download_btn"),
+                )
+            } else {
+                DropdownMenuItem(
+                    text = { Text("Delete Download", color = colors.accentIndianRed) },
+                    onClick = {
+                        showOverflowMenu = false
+                        onRequestDeleteDownload()
+                    },
+                    modifier = Modifier.testTag("player_delete_download_btn"),
+                )
+            }
             DropdownMenuItem(
                 text = { Text("Share Episode") },
                 onClick = {
@@ -549,11 +652,14 @@ private fun PlayerOverflowMenuButton(
                 },
             )
             DropdownMenuItem(
-                text = { Text("Show Transcript") },
+                text = {
+                    Text(if (upNextCount > 0) "Up Next Queue ($upNextCount)" else "Up Next Queue")
+                },
                 onClick = {
                     showOverflowMenu = false
-                    onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.TRANSCRIPT))
+                    onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.UP_NEXT))
                 },
+                modifier = Modifier.testTag("player_overflow_up_next_btn"),
             )
             DropdownMenuItem(
                 text = { Text("Share at ${playerState.formattedElapsed}…") },
@@ -564,15 +670,6 @@ private fun PlayerOverflowMenuButton(
                     )
                 },
             )
-            if (entry.isArchived && entry.isCachedOffline) {
-                DropdownMenuItem(
-                    text = { Text("Delete Download", color = colors.accentIndianRed) },
-                    onClick = {
-                        showOverflowMenu = false
-                        onAction(MainAction.ToggleOfflineCache(entry.id))
-                    },
-                )
-            }
             DropdownMenuItem(
                 text = { Text("Stop & Dismiss Player") },
                 onClick = {
@@ -585,10 +682,10 @@ private fun PlayerOverflowMenuButton(
                 text = {
                     Text(
                         text =
-                            if (entry.isArchived) {
-                                "Unarchive Episode"
-                            } else {
-                                "Archive & Delete Download"
+                            when {
+                                entry.isArchived -> "Unarchive Episode"
+                                entry.isCachedOffline -> "Archive & Delete Download"
+                                else -> "Archive Episode"
                             },
                         color =
                             if (entry.isArchived) {
@@ -600,10 +697,14 @@ private fun PlayerOverflowMenuButton(
                 },
                 onClick = {
                     showOverflowMenu = false
-                    if (!entry.isArchived) {
-                        onAction(MainAction.CloseFullscreenPlayer)
+                    if (!entry.isArchived && entry.isCachedOffline) {
+                        onRequestArchiveDeleteDownload()
+                    } else {
+                        if (!entry.isArchived) {
+                            onAction(MainAction.CloseFullscreenPlayer)
+                        }
+                        onAction(MainAction.ToggleArchive(entry))
                     }
-                    onAction(MainAction.ToggleArchive(entry))
                 },
             )
         }
@@ -742,7 +843,6 @@ private fun PlayerScrubberSection(
                     .coerceIn(0L, playerState.durationMs.coerceAtLeast(0L))
             playerState.copy(positionMs = previewPosMs)
         } ?: playerState
-    val speedLabel = formatPlaybackSpeedLabel(previewState.playbackSpeed)
 
     Column(modifier = Modifier.fillMaxWidth()) {
         RocheInteractiveSlider(
@@ -768,7 +868,7 @@ private fun PlayerScrubberSection(
                 fontSize = 11.5.sp,
             )
             Text(
-                text = "${previewState.formattedMiniRemaining} (at $speedLabel)",
+                text = previewState.formattedSpeedAdjustedRemaining,
                 color = colors.accentVerdigris,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.sp,
@@ -926,11 +1026,13 @@ private fun FullscreenPlayerTransportRow(
 @Composable
 internal fun FullscreenPlayerDrawerBar(
     playerState: PodcastPlayerState,
+    upNextCount: Int,
     activeDrawerTab: PlayerDrawerTab?,
-    onAction: (MainAction) -> Unit,
+    onSelectTab: (PlayerDrawerTab) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(10.dp)
+    val upNextLabel = if (upNextCount > 0) "Up Next ($upNextCount)" else "Up Next"
     Row(
         modifier =
             Modifier.fillMaxWidth()
@@ -943,20 +1045,20 @@ internal fun FullscreenPlayerDrawerBar(
         PlayerDrawerSegmentTab(
             label = "Show Notes",
             selected = activeDrawerTab == PlayerDrawerTab.SHOW_NOTES,
-            onClick = { onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.SHOW_NOTES)) },
+            onClick = { onSelectTab(PlayerDrawerTab.SHOW_NOTES) },
             modifier = Modifier.weight(1f).testTag("player_drawer_shownotes"),
         )
         PlayerDrawerSegmentTab(
             label = "Chapters (${playerState.chapters.size})",
             selected = activeDrawerTab == PlayerDrawerTab.CHAPTERS,
-            onClick = { onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.CHAPTERS)) },
+            onClick = { onSelectTab(PlayerDrawerTab.CHAPTERS) },
             modifier = Modifier.weight(1f).testTag("player_drawer_chapters"),
         )
         PlayerDrawerSegmentTab(
-            label = "Transcript",
-            selected = activeDrawerTab == PlayerDrawerTab.TRANSCRIPT,
-            onClick = { onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.TRANSCRIPT)) },
-            modifier = Modifier.weight(1f).testTag("player_drawer_transcript"),
+            label = upNextLabel,
+            selected = activeDrawerTab == PlayerDrawerTab.UP_NEXT,
+            onClick = { onSelectTab(PlayerDrawerTab.UP_NEXT) },
+            modifier = Modifier.weight(1f).testTag("player_drawer_up_next"),
         )
     }
 }

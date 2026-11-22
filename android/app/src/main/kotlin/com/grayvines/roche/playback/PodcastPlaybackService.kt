@@ -1,35 +1,46 @@
 package com.grayvines.roche.playback
 
 import android.app.PendingIntent
-import android.content.ComponentName
-import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.annotation.OptIn
+import androidx.core.graphics.scale
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.ForwardingPlayer
+import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
-import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.CommandButton
-import androidx.media3.session.MediaController
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
-import androidx.media3.session.SessionToken
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionError
+import androidx.media3.session.SessionResult
+import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
-import com.grayvines.roche.MainActivity
-import com.grayvines.roche.RocheApp
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.atomic.AtomicLong
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+
+/**
+ * Application-level host contract implemented by `RocheApp` so `playback` never depends on
+ * `MainActivity` or `RocheApp` directly.
+ */
+interface PodcastPlaybackHost {
+    val allowedLocalAudioDirs: List<File>
+
+    val playbackController: PodcastPlayerController
+
+    fun createOpenPlayerPendingIntent(): PendingIntent
+}
 
 internal data class SessionMetadataKey(
     val entryId: String,
@@ -40,7 +51,7 @@ internal data class SessionMetadataKey(
     val hasArtworkBytes: Boolean = false,
 )
 
-internal fun MediaSessionMetadataSnapshot.toMetadataKey(
+internal fun AudioPlaybackMetadata.toMetadataKey(
     hasArtworkBytes: Boolean = false
 ): SessionMetadataKey =
     SessionMetadataKey(
@@ -52,341 +63,111 @@ internal fun MediaSessionMetadataSnapshot.toMetadataKey(
         hasArtworkBytes = hasArtworkBytes,
     )
 
-@Suppress("TooManyFunctions")
-class AndroidPodcastMediaSessionBridge
-internal constructor(
-    internal val appContext: Context?,
-    internal val backend: ExoPlayerAudioBackend? = null,
-    scope: CoroutineScope? = null,
-    internal val artworkBitmapLoader: (suspend (String) -> Bitmap?)? = null,
-    private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
-) : PodcastMediaSessionBridge {
-    private val ownsScope: Boolean = scope == null
-    private val scope: CoroutineScope =
-        scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val sessionGeneration = AtomicLong(0L)
-
-    @Volatile private var released: Boolean = false
-    @Volatile private var callbacks: PodcastMediaSessionCallbacks? = null
-    @Volatile internal var latestSnapshot: MediaSessionMetadataSnapshot? = null
-    @Volatile internal var cachedArtworkUrl: String? = null
-    @Volatile internal var cachedArtworkBytes: ByteArray? = null
-    @Volatile private var activeMediaSession: MediaSession? = null
-    @Volatile private var activeForwardingPlayer: RocheSessionForwardingPlayer? = null
-
-    internal var lastMetadataKey: SessionMetadataKey? = null
-    internal var lastHasNextQueuedAudio: Boolean? = null
-    internal var loadingArtworkUrl: String? = null
-    internal var artworkLoadJob: Job? = null
-    internal var controllerFuture: ListenableFuture<MediaController>? = null
-
-    constructor(
-        context: Context,
-        backend: ExoPlayerAudioBackend? = null,
-        scope: CoroutineScope? = null,
-        artworkBitmapLoader: (suspend (String) -> Bitmap?)? = null,
-    ) : this(
-        appContext = context.applicationContext,
-        backend = backend,
-        scope = scope,
-        artworkBitmapLoader = artworkBitmapLoader,
-        mainDispatcher = Dispatchers.Main.immediate,
+@OptIn(UnstableApi::class)
+internal fun buildTransportButtons(hasNextQueuedAudio: Boolean): List<CommandButton> = buildList {
+    add(
+        CommandButton.Builder(CommandButton.ICON_SKIP_BACK_15)
+            .setDisplayName("Rewind 15s")
+            .setPlayerCommand(Player.COMMAND_SEEK_BACK)
+            .build()
     )
-
-    override fun bindCallbacks(callbacks: PodcastMediaSessionCallbacks) {
-        this.callbacks = callbacks
-    }
-
-    override fun unbindCallbacks(callbacks: PodcastMediaSessionCallbacks) {
-        if (this.callbacks === callbacks) {
-            this.callbacks = null
-        }
-    }
-
-    internal fun activeCallbacks(): PodcastMediaSessionCallbacks? = callbacks
-
-    internal fun currentSnapshot(): MediaSessionMetadataSnapshot? = latestSnapshot
-
-    override fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?) {
-        if (released) return
-        val generation = sessionGeneration.incrementAndGet()
-        scope.launch(mainDispatcher) {
-            if (!released && sessionGeneration.get() == generation) {
-                updateSessionOnMain(snapshot)
-            }
-        }
-    }
-
-    override fun release() {
-        val generationAtRelease =
-            if (ownsScope) {
-                released = true
-                sessionGeneration.incrementAndGet()
-            } else {
-                sessionGeneration.get()
-            }
-        scope.launch(mainDispatcher) {
-            if (ownsScope || sessionGeneration.get() == generationAtRelease) {
-                clearSessionStateOnMain()
-            }
-            if (ownsScope) {
-                scope.coroutineContext[Job]?.cancel()
-            }
-        }
-    }
-
-    private fun clearSessionStateOnMain() {
-        artworkLoadJob?.cancel()
-        artworkLoadJob = null
-        loadingArtworkUrl = null
-        cachedArtworkUrl = null
-        cachedArtworkBytes = null
-        latestSnapshot = null
-        lastMetadataKey = null
-        lastHasNextQueuedAudio = null
-        disconnectControllerOnMain()
-    }
-
-    internal fun attachServiceSessionOnMain(
-        session: MediaSession,
-        forwardingPlayer: RocheSessionForwardingPlayer? = null,
-    ) {
-        activeMediaSession = session
-        activeForwardingPlayer = forwardingPlayer
-        latestSnapshot?.let { snapshot ->
-            lastHasNextQueuedAudio = null
-            applyButtonPrefsOnMain(session, snapshot.hasNextQueuedAudio)
-        }
-    }
-
-    internal fun detachServiceSessionOnMain(session: MediaSession) {
-        if (activeMediaSession === session) {
-            activeMediaSession = null
-            activeForwardingPlayer = null
-            lastHasNextQueuedAudio = null
-            disconnectControllerOnMain()
-        }
-    }
-
-    internal fun updateSessionOnMain(snapshot: MediaSessionMetadataSnapshot?) {
-        if (released) return
-        latestSnapshot = snapshot
-        if (snapshot == null) {
-            artworkLoadJob?.cancel()
-            artworkLoadJob = null
-            loadingArtworkUrl = null
-            lastMetadataKey = null
-            lastHasNextQueuedAudio = null
-            disconnectControllerOnMain()
-            return
-        }
-        connectControllerOnMain()
-        val artworkBytes = resolveCachedArtworkBytes(snapshot.artworkUrl)
-        if (artworkBytes == null) {
-            requestArtworkLoadOnMain(snapshot.artworkUrl)
-        }
-        val key = snapshot.toMetadataKey(hasArtworkBytes = artworkBytes != null)
-        if (key != lastMetadataKey) {
-            lastMetadataKey = key
-            backend?.updateSessionMediaMetadata(buildMedia3Metadata(snapshot, artworkBytes))
-        }
-        activeMediaSession?.let { session ->
-            applyButtonPrefsOnMain(session, snapshot.hasNextQueuedAudio)
-        }
-    }
-
-    @OptIn(UnstableApi::class)
-    private fun applyButtonPrefsOnMain(
-        session: MediaSession,
-        hasNextQueuedAudio: Boolean,
-    ) {
-        if (lastHasNextQueuedAudio == hasNextQueuedAudio) return
-        lastHasNextQueuedAudio = hasNextQueuedAudio
-        session.setMediaButtonPreferences(buildTransportButtons(hasNextQueuedAudio))
-        activeForwardingPlayer?.notifyAvailableCommandsChanged()
-    }
-
-    internal fun createControllerListener(
-        futureProvider: () -> ListenableFuture<MediaController>?
-    ): MediaController.Listener =
-        object : MediaController.Listener {
-            override fun onDisconnected(controller: MediaController) {
-                clearControllerOnDisconnect(futureProvider())
-            }
-        }
-
-    internal fun clearControllerOnDisconnect(
-        disconnectedFuture: ListenableFuture<MediaController>?
-    ) {
-        val target = disconnectedFuture ?: controllerFuture ?: return
-        if (controllerFuture === target) {
-            controllerFuture = null
-            runCatching { MediaController.releaseFuture(target) }
-        }
-    }
-
-    private fun connectControllerOnMain() {
-        val context = appContext ?: return
-        if (controllerFuture != null || backend == null) return
-        runCatching {
-            val token =
-                SessionToken(
-                    context,
-                    ComponentName(context, PodcastPlaybackService::class.java),
-                )
-            var createdFuture: ListenableFuture<MediaController>? = null
-            val future =
-                MediaController.Builder(context, token)
-                    .setListener(createControllerListener { createdFuture })
-                    .buildAsync()
-            createdFuture = future
-            controllerFuture = future
-            future.addListener(
-                {
-                    val failedOrCancelled =
-                        future.isCancelled || runCatching { future.get() }.isFailure
-                    if (failedOrCancelled) {
-                        clearControllerOnDisconnect(future)
-                    }
-                },
-                context.mainExecutor,
-            )
-        }
-    }
-
-    internal fun disconnectControllerOnMain() {
-        val existing = controllerFuture ?: return
-        controllerFuture = null
-        runCatching { MediaController.releaseFuture(existing) }
-    }
-
-    private fun resolveCachedArtworkBytes(artworkUrl: String?): ByteArray? {
-        val cleanUrl = artworkUrl?.trim()?.takeIf { it.isNotBlank() } ?: return null
-        return if (cleanUrl == cachedArtworkUrl) cachedArtworkBytes else null
-    }
-
-    private fun requestArtworkLoadOnMain(artworkUrl: String?) {
-        val loader = artworkBitmapLoader ?: return
-        val cleanUrl = artworkUrl?.trim()?.takeIf { it.isNotBlank() }
-        if (cleanUrl == null) {
-            artworkLoadJob?.cancel()
-            artworkLoadJob = null
-            loadingArtworkUrl = null
-            return
-        }
-        if (loadingArtworkUrl == cleanUrl && artworkLoadJob?.isActive == true) return
-        artworkLoadJob?.cancel()
-        loadingArtworkUrl = cleanUrl
-        artworkLoadJob = scope.launch {
-            val pngBytes = runCatching {
-                loader(cleanUrl)?.let(::compressArtworkPng)
-            }
-                .onFailure { if (it is CancellationException) throw it }
-                .getOrNull()
-            withContext(mainDispatcher) {
-                if (pngBytes != null && pngBytes.isNotEmpty()) {
-                    cachedArtworkUrl = cleanUrl
-                    cachedArtworkBytes = pngBytes
-                    applyLoadedArtworkOnMain(cleanUrl, pngBytes)
-                }
-                if (loadingArtworkUrl == cleanUrl) {
-                    loadingArtworkUrl = null
-                }
-            }
-        }
-    }
-
-    internal fun applyLoadedArtworkOnMain(loadedUrl: String, pngBytes: ByteArray) {
-        val snapshot = latestSnapshot ?: return
-        if (snapshot.artworkUrl?.trim() != loadedUrl) return
-        lastMetadataKey = snapshot.toMetadataKey(hasArtworkBytes = true)
-        backend?.updateSessionMediaMetadata(buildMedia3Metadata(snapshot, pngBytes))
-    }
-
-    internal fun createOpenPlayerPendingIntent(): PendingIntent {
-        val context = checkNotNull(appContext) { "Context required for PendingIntent" }
-        return PendingIntent.getActivity(
-            context,
-            REQUEST_OPEN_PLAYER,
-            Intent(context, MainActivity::class.java).apply {
-                action = PodcastPlaybackService.ACTION_OPEN_PLAYER
-                putExtra(PodcastPlaybackService.EXTRA_OPEN_FULLSCREEN_PLAYER, true)
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    add(
+        CommandButton.Builder(CommandButton.ICON_SKIP_FORWARD_30)
+            .setDisplayName("Fast-forward 30s")
+            .setPlayerCommand(Player.COMMAND_SEEK_FORWARD)
+            .build()
+    )
+    if (hasNextQueuedAudio) {
+        add(
+            CommandButton.Builder(CommandButton.ICON_NEXT)
+                .setDisplayName("Next episode")
+                .setPlayerCommand(Player.COMMAND_SEEK_TO_NEXT)
+                .build()
         )
     }
+}
 
-    internal companion object {
-        internal const val REQUEST_OPEN_PLAYER = 400
-        internal const val PNG_QUALITY = 100
+internal fun buildMedia3Metadata(
+    metadata: AudioPlaybackMetadata,
+    artworkBytes: ByteArray?,
+): MediaMetadata {
+    val title = metadata.episodeTitle.ifBlank { "Podcast Episode" }
+    val podcast = metadata.podcastTitle.ifBlank { "Roche Podcasts" }
+    val builder =
+        MediaMetadata.Builder()
+            .setTitle(title)
+            .setDisplayTitle(title)
+            .setArtist(podcast)
+            .setAlbumTitle(podcast)
+            .setSubtitle(podcast)
+            .setIsBrowsable(false)
+            .setIsPlayable(true)
+    // Intentionally omit setArtworkUri so Media3/SystemUI never performs unvalidated or
+    // cleartext artwork fetches; artwork is delivered via artworkData after safe loading.
+    if (artworkBytes != null && artworkBytes.isNotEmpty()) {
+        builder.setArtworkData(artworkBytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+    }
+    return builder.build()
+}
 
-        @OptIn(UnstableApi::class)
-        internal fun buildTransportButtons(hasNextQueuedAudio: Boolean): List<CommandButton> =
-            buildList {
-                add(
-                    CommandButton.Builder(CommandButton.ICON_SKIP_BACK_15)
-                        .setDisplayName("Rewind 15s")
-                        .setPlayerCommand(Player.COMMAND_SEEK_BACK)
-                        .build()
-                )
-                add(
-                    CommandButton.Builder(CommandButton.ICON_SKIP_FORWARD_30)
-                        .setDisplayName("Fast-forward 30s")
-                        .setPlayerCommand(Player.COMMAND_SEEK_FORWARD)
-                        .build()
-                )
-                if (hasNextQueuedAudio) {
-                    add(
-                        CommandButton.Builder(CommandButton.ICON_NEXT)
-                            .setDisplayName("Next episode")
-                            .setPlayerCommand(Player.COMMAND_SEEK_TO_NEXT)
-                            .build()
-                    )
-                }
-            }
-
-        internal fun buildMedia3Metadata(
-            snapshot: MediaSessionMetadataSnapshot,
-            artworkBytes: ByteArray?,
-        ): MediaMetadata {
-            val title = snapshot.episodeTitle.ifBlank { "Podcast Episode" }
-            val podcast = snapshot.podcastTitle.ifBlank { "Roche Podcasts" }
-            val builder =
-                MediaMetadata.Builder()
-                    .setTitle(title)
-                    .setDisplayTitle(title)
-                    .setArtist(podcast)
-                    .setAlbumTitle(podcast)
-                    .setSubtitle(podcast)
-                    .setIsBrowsable(false)
-                    .setIsPlayable(true)
-            // Intentionally omit setArtworkUri so Media3/SystemUI never performs unvalidated or
-            // cleartext artwork fetches; artwork is delivered via artworkData after safe loading.
-            if (artworkBytes != null && artworkBytes.isNotEmpty()) {
-                builder.setArtworkData(artworkBytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
-            }
-            return builder.build()
+internal fun compressArtworkBytes(bitmap: Bitmap): ByteArray {
+    val maxDim = maxOf(bitmap.width, bitmap.height)
+    val scaled =
+        if (maxDim > MAX_NOTIFICATION_ARTWORK_PX && maxDim > 0) {
+            val scale = MAX_NOTIFICATION_ARTWORK_PX.toFloat() / maxDim.toFloat()
+            val targetW = (bitmap.width * scale).toInt().coerceAtLeast(1)
+            val targetH = (bitmap.height * scale).toInt().coerceAtLeast(1)
+            bitmap.scale(targetW, targetH)
+        } else {
+            null
         }
+    val candidate = scaled ?: bitmap
+    val softwareCopy =
+        if (candidate.config == Bitmap.Config.HARDWARE) {
+            candidate.copy(Bitmap.Config.ARGB_8888, false)
+        } else {
+            null
+        }
+    val targetBitmap = softwareCopy ?: candidate
+    return try {
+        ByteArrayOutputStream().use { out ->
+            targetBitmap.compress(Bitmap.CompressFormat.JPEG, ARTWORK_JPEG_QUALITY, out)
+            out.toByteArray()
+        }
+    } finally {
+        if (softwareCopy != null && softwareCopy !== candidate) {
+            softwareCopy.recycle()
+        }
+        if (scaled != null && scaled !== bitmap) {
+            scaled.recycle()
+        }
+    }
+}
 
-        internal fun compressArtworkPng(bitmap: Bitmap): ByteArray {
-            val softwareCopy =
-                if (bitmap.config == Bitmap.Config.HARDWARE) {
-                    bitmap.copy(Bitmap.Config.ARGB_8888, false)
-                } else {
-                    null
-                }
-            val targetBitmap = softwareCopy ?: bitmap
-            return try {
-                ByteArrayOutputStream().use { out ->
-                    targetBitmap.compress(Bitmap.CompressFormat.PNG, PNG_QUALITY, out)
-                    out.toByteArray()
-                }
-            } finally {
-                if (softwareCopy != null && softwareCopy !== bitmap) {
-                    softwareCopy.recycle()
-                }
-            }
+internal fun isAllowedServiceMediaUri(
+    isTrustedCaller: Boolean,
+    uriString: String?,
+    allowedLocalDirs: List<File>,
+): Boolean =
+    isTrustedCaller &&
+        !uriString.isNullOrBlank() &&
+        isSafeAudioPlaybackSource(uriString, allowedLocalDirs)
+
+internal fun resolveSafeServiceMediaItems(
+    isTrustedCaller: Boolean,
+    mediaItems: List<MediaItem>,
+    allowedLocalDirs: List<File>,
+): List<MediaItem> {
+    if (!isTrustedCaller) return emptyList()
+    return mediaItems.mapNotNull { item ->
+        val requestedUri = item.requestMetadata.mediaUri ?: item.localConfiguration?.uri
+        if (
+            requestedUri != null &&
+                isAllowedServiceMediaUri(isTrustedCaller, requestedUri.toString(), allowedLocalDirs)
+        ) {
+            item.buildUpon().setUri(requestedUri).build()
+        } else {
+            null
         }
     }
 }
@@ -395,7 +176,10 @@ internal constructor(
 @Suppress("TooManyFunctions")
 internal class RocheSessionForwardingPlayer(
     player: Player,
-    private val bridge: AndroidPodcastMediaSessionBridge,
+    private val hasNextProvider: () -> Boolean,
+    private val consumeSmartRewindTargetMs: () -> Long?,
+    private val onSkipToNextRequested: () -> Unit,
+    private val onStopRequested: () -> Unit,
 ) : ForwardingPlayer(player) {
     private val registeredListeners = CopyOnWriteArraySet<Player.Listener>()
 
@@ -417,7 +201,6 @@ internal class RocheSessionForwardingPlayer(
     }
 
     override fun getAvailableCommands(): Player.Commands {
-        val hasNext = bridge.currentSnapshot()?.hasNextQueuedAudio == true
         val builder =
             super.getAvailableCommands()
                 .buildUpon()
@@ -429,7 +212,7 @@ internal class RocheSessionForwardingPlayer(
                 .add(COMMAND_STOP)
                 .remove(COMMAND_SEEK_TO_PREVIOUS)
                 .remove(COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
-        if (hasNext) {
+        if (hasNextProvider()) {
             builder.add(COMMAND_SEEK_TO_NEXT).add(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
         } else {
             builder.remove(COMMAND_SEEK_TO_NEXT).remove(COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
@@ -441,122 +224,265 @@ internal class RocheSessionForwardingPlayer(
         getAvailableCommands().contains(command)
 
     override fun play() {
-        val cb = bridge.activeCallbacks()
-        if (cb != null) cb.onMediaCommand(MediaSessionCommand.PLAY) else super.play()
-    }
-
-    override fun pause() {
-        val cb = bridge.activeCallbacks()
-        if (cb != null) cb.onMediaCommand(MediaSessionCommand.PAUSE) else super.pause()
-    }
-
-    override fun seekBack() {
-        val cb = bridge.activeCallbacks()
-        if (cb != null) cb.onMediaCommand(MediaSessionCommand.REWIND_15S) else super.seekBack()
-    }
-
-    override fun seekForward() {
-        val cb = bridge.activeCallbacks()
-        if (cb != null) {
-            cb.onMediaCommand(MediaSessionCommand.FAST_FORWARD_30S)
-        } else {
-            super.seekForward()
-        }
+        consumeSmartRewindTargetMs()?.let { targetMs -> super.seekTo(targetMs) }
+        super.play()
     }
 
     override fun seekToPrevious() {
-        val cb = bridge.activeCallbacks()
-        if (cb != null) cb.onMediaCommand(MediaSessionCommand.REWIND_15S) else super.seekBack()
+        super.seekBack()
     }
 
     override fun seekToPreviousMediaItem() {
-        seekToPrevious()
+        super.seekBack()
     }
 
     override fun seekToNext() {
-        bridge.activeCallbacks()?.onMediaCommand(MediaSessionCommand.SKIP_TO_NEXT)
+        if (hasNextProvider()) {
+            onSkipToNextRequested()
+        }
     }
 
     override fun seekToNextMediaItem() {
         seekToNext()
     }
 
-    override fun seekTo(positionMs: Long) {
-        val cb = bridge.activeCallbacks()
-        if (cb != null) cb.onSeekToMs(positionMs) else super.seekTo(positionMs)
-    }
-
-    override fun seekTo(mediaItemIndex: Int, positionMs: Long) {
-        seekTo(positionMs)
-    }
-
-    override fun setPlaybackSpeed(speed: Float) {
-        val cb = bridge.activeCallbacks()
-        if (cb != null && speed > 0f) {
-            cb.onSetPlaybackSpeed(speed)
-        } else {
-            super.setPlaybackSpeed(speed)
-        }
-    }
-
-    override fun setPlaybackParameters(playbackParameters: PlaybackParameters) {
-        setPlaybackSpeed(playbackParameters.speed)
-    }
-
     override fun stop() {
-        val cb = bridge.activeCallbacks()
-        if (cb != null) cb.onMediaCommand(MediaSessionCommand.STOP) else super.stop()
+        onStopRequested()
     }
 }
 
-class PodcastPlaybackService : MediaSessionService() {
-    private var mediaSession: MediaSession? = null
+internal val EXTERNAL_BLOCKED_PLAYER_CMDS: Set<Int> =
+    setOf(Player.COMMAND_SET_MEDIA_ITEM, Player.COMMAND_CHANGE_MEDIA_ITEMS)
 
-    @OptIn(UnstableApi::class)
+internal fun isPlayerCmdAllowedForCaller(isTrustedCaller: Boolean, command: Int): Boolean =
+    isTrustedCaller || command !in EXTERNAL_BLOCKED_PLAYER_CMDS
+
+@OptIn(UnstableApi::class)
+internal fun resolveControllerPlayerCmds(isTrustedCaller: Boolean): Player.Commands =
+    if (isTrustedCaller) {
+        MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS
+    } else {
+        MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS.buildUpon()
+            .apply { EXTERNAL_BLOCKED_PLAYER_CMDS.forEach(::remove) }
+            .build()
+    }
+
+class PodcastPlaybackService : MediaSessionService() {
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+    private var exoPlayer: ExoPlayer? = null
+    private var forwardingPlayer: RocheSessionForwardingPlayer? = null
+    private var mediaSession: MediaSession? = null
+    private var hasNextQueuedAudio: Boolean = false
+
     override fun onCreate() {
         super.onCreate()
-        val graph = (application as? RocheApp)?.graph ?: return
-        val bridge = graph.mediaSessionBridge as? AndroidPodcastMediaSessionBridge ?: return
-        val exoPlayer = graph.audioPlayerBackend.getOrCreateExoPlayerOnMain()
-        val forwardingPlayer = RocheSessionForwardingPlayer(exoPlayer, bridge)
-        val hasNext = bridge.currentSnapshot()?.hasNextQueuedAudio == true
-        val session =
-            MediaSession.Builder(this, forwardingPlayer)
-                .setId(SESSION_ID)
-                .setSessionActivity(bridge.createOpenPlayerPendingIntent())
-                .setMediaButtonPreferences(
-                    AndroidPodcastMediaSessionBridge.buildTransportButtons(hasNext)
+        ensureSessionCreated()
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun ensureSessionCreated(): MediaSession? {
+        mainHandler.removeCallbacksAndMessages(null)
+        return mediaSession ?: (application as? PodcastPlaybackHost)?.let(::createSessionForHost)
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun createSessionForHost(host: PodcastPlaybackHost): MediaSession {
+        val player = buildExoPlayer()
+        exoPlayer = player
+        hasNextQueuedAudio = host.playbackController.state.value.hasNextQueuedAudio
+        val forwarding =
+            RocheSessionForwardingPlayer(
+                player = player,
+                hasNextProvider = { hasNextQueuedAudio },
+                consumeSmartRewindTargetMs = {
+                    host.playbackController.consumeSmartRewindTargetMs()
+                },
+                onSkipToNextRequested = { host.playbackController.requestSkipToNext() },
+                onStopRequested = {
+                    host.playbackController.flushCurrentProgressIfNeeded()
+                    host.playbackController.stopAndClear()
+                    scheduleStopAndRelease()
+                },
+            )
+        forwardingPlayer = forwarding
+        return MediaSession.Builder(this, forwarding)
+            .setId("${SESSION_ID}_${sessionSequence.incrementAndGet()}")
+            .setCallback(buildSessionCallback(host))
+            .setSessionActivity(host.createOpenPlayerPendingIntent())
+            .setMediaButtonPreferences(buildTransportButtons(hasNextQueuedAudio))
+            .build()
+            .also { mediaSession = it }
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun buildExoPlayer(): ExoPlayer {
+        val audioDataSourceFactory = createAudioDataSourceFactory(context = this)
+        return ExoPlayer.Builder(this)
+            .setMediaSourceFactory(
+                DefaultMediaSourceFactory(this).setDataSourceFactory(audioDataSourceFactory)
+            )
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
+                    .build(),
+                /* handleAudioFocus = */ true,
+            )
+            .setHandleAudioBecomingNoisy(true)
+            .setWakeMode(C.WAKE_MODE_NETWORK)
+            .setSeekBackIncrementMs(SEEK_BACK_INCREMENT_MS)
+            .setSeekForwardIncrementMs(SEEK_FORWARD_INCREMENT_MS)
+            .build()
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun buildSessionCallback(host: PodcastPlaybackHost): MediaSession.Callback =
+        object : MediaSession.Callback {
+            override fun onConnect(
+                session: MediaSession,
+                controller: MediaSession.ControllerInfo,
+            ): MediaSession.ConnectionResult {
+                val isTrusted = controller.packageName == packageName
+                val commandsBuilder =
+                    MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
+                if (isTrusted) {
+                    commandsBuilder
+                        .add(COMMAND_SET_SKIP_SILENCE)
+                        .add(COMMAND_SET_HAS_NEXT)
+                        .add(COMMAND_STOP_AND_RELEASE)
+                }
+                return MediaSession.ConnectionResult.accept(
+                    commandsBuilder.build(),
+                    resolveControllerPlayerCmds(isTrusted),
                 )
-                .build()
-        mediaSession = session
-        bridge.attachServiceSessionOnMain(session, forwardingPlayer)
+            }
+
+            override fun onAddMediaItems(
+                mediaSession: MediaSession,
+                controller: MediaSession.ControllerInfo,
+                mediaItems: MutableList<MediaItem>,
+            ): ListenableFuture<MutableList<MediaItem>> {
+                val resolved =
+                    resolveSafeServiceMediaItems(
+                        isTrustedCaller = controller.packageName == packageName,
+                        mediaItems = mediaItems,
+                        allowedLocalDirs = host.allowedLocalAudioDirs,
+                    )
+                return Futures.immediateFuture(resolved.toMutableList())
+            }
+
+            override fun onCustomCommand(
+                session: MediaSession,
+                controller: MediaSession.ControllerInfo,
+                customCommand: SessionCommand,
+                args: Bundle,
+            ): ListenableFuture<SessionResult> {
+                if (controller.packageName != packageName) {
+                    return Futures.immediateFuture(
+                        SessionResult(SessionError.ERROR_PERMISSION_DENIED)
+                    )
+                }
+                handleTrustedCustomCommand(session, customCommand.customAction, args)
+                return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+            }
+        }
+
+    @OptIn(UnstableApi::class)
+    internal fun handleTrustedCustomCommand(
+        session: MediaSession,
+        action: String,
+        args: Bundle,
+    ) {
+        when (action) {
+            ACTION_SET_SKIP_SILENCE -> {
+                exoPlayer?.skipSilenceEnabled = args.getBoolean(EXTRA_SKIP_SILENCE, false)
+            }
+            ACTION_SET_HAS_NEXT -> {
+                val hasNext = args.getBoolean(EXTRA_HAS_NEXT, false)
+                if (hasNextQueuedAudio != hasNext) {
+                    hasNextQueuedAudio = hasNext
+                    session.setMediaButtonPreferences(buildTransportButtons(hasNext))
+                    forwardingPlayer?.notifyAvailableCommandsChanged()
+                }
+            }
+            ACTION_STOP_AND_RELEASE -> {
+                scheduleStopAndRelease()
+            }
+        }
+    }
+
+    private fun scheduleStopAndRelease() {
+        val targetSession = mediaSession
+        exoPlayer?.let { player ->
+            player.stop()
+            player.clearMediaItems()
+        }
+        mainHandler.post {
+            if (mediaSession === targetSession) {
+                stopAndReleaseService()
+            }
+        }
+    }
+
+    private fun releaseSessionAndPlayer() {
+        mediaSession?.let { session ->
+            if (isSessionAdded(session)) {
+                removeSession(session)
+            }
+            session.release()
+        }
+        mediaSession = null
+        forwardingPlayer = null
+        exoPlayer?.let { player ->
+            player.stop()
+            player.clearMediaItems()
+            player.release()
+        }
+        exoPlayer = null
+    }
+
+    private fun stopAndReleaseService() {
+        releaseSessionAndPlayer()
+        stopSelf()
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =
-        mediaSession
+        ensureSessionCreated()
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        val player = mediaSession?.player
+        val player = exoPlayer
         if (player == null || !player.playWhenReady || player.mediaItemCount == 0) {
-            stopSelf()
+            stopAndReleaseService()
         }
     }
 
     override fun onDestroy() {
-        val bridge =
-            (application as? RocheApp)?.graph?.mediaSessionBridge
-                as? AndroidPodcastMediaSessionBridge
-        mediaSession?.let { session ->
-            bridge?.detachServiceSessionOnMain(session)
-            session.release()
-        }
-        mediaSession = null
+        mainHandler.removeCallbacksAndMessages(null)
+        releaseSessionAndPlayer()
         super.onDestroy()
     }
 
     companion object {
         private const val SESSION_ID = "RochePodcastMedia3Session"
+        private val sessionSequence = AtomicLong(0L)
+        internal const val SEEK_BACK_INCREMENT_MS = 15_000L
+        internal const val SEEK_FORWARD_INCREMENT_MS = 30_000L
         const val ACTION_OPEN_PLAYER = "com.grayvines.roche.action.OPEN_PLAYER"
         const val EXTRA_OPEN_FULLSCREEN_PLAYER = "extra_open_fullscreen_player"
+
+        internal const val ACTION_SET_SKIP_SILENCE = "com.grayvines.roche.session.SET_SKIP_SILENCE"
+        internal const val ACTION_SET_HAS_NEXT = "com.grayvines.roche.session.SET_HAS_NEXT"
+        internal const val ACTION_STOP_AND_RELEASE = "com.grayvines.roche.session.STOP_AND_RELEASE"
+        internal const val EXTRA_SKIP_SILENCE = "extra_skip_silence"
+        internal const val EXTRA_HAS_NEXT = "extra_has_next"
+
+        internal val COMMAND_SET_SKIP_SILENCE =
+            SessionCommand(ACTION_SET_SKIP_SILENCE, Bundle.EMPTY)
+        internal val COMMAND_SET_HAS_NEXT = SessionCommand(ACTION_SET_HAS_NEXT, Bundle.EMPTY)
+        internal val COMMAND_STOP_AND_RELEASE =
+            SessionCommand(ACTION_STOP_AND_RELEASE, Bundle.EMPTY)
     }
 }
+
+private const val MAX_NOTIFICATION_ARTWORK_PX = 512
+private const val ARTWORK_JPEG_QUALITY = 85

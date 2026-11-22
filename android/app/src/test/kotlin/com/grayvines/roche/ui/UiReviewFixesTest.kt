@@ -22,9 +22,9 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
-import com.grayvines.roche.playback.AndroidPodcastMediaSessionBridge
-import com.grayvines.roche.playback.MediaSessionMetadataSnapshot
+import com.grayvines.roche.playback.AudioPlaybackMetadata
 import com.grayvines.roche.playback.SafeRedirectHttpDataSource
+import com.grayvines.roche.playback.buildMedia3Metadata
 import com.grayvines.roche.playback.parseChaptersFromEpisodeNotes
 import com.grayvines.roche.playback.resolveSafeHttpPlaybackUrl
 import com.grayvines.roche.reader.formatLatexAltToHtml
@@ -391,20 +391,15 @@ class UiReviewFixesTest {
 
     @Test
     fun `buildMedia3Metadata omits artworkUri to prevent unvalidated fetches`() {
-        val snapshot =
-            MediaSessionMetadataSnapshot(
+        val metadataSnapshot =
+            AudioPlaybackMetadata(
                 entryId = "ep-1",
                 episodeTitle = "Ep 1",
                 podcastTitle = "Pod",
                 artworkUrl = "http://127.0.0.1/private.png",
                 durationMs = 60_000L,
-                positionMs = 0L,
-                isPlaying = true,
-                isBuffering = false,
-                playbackSpeed = 1.0f,
-                hasNextQueuedAudio = false,
             )
-        val metadata = AndroidPodcastMediaSessionBridge.buildMedia3Metadata(snapshot, null)
+        val metadata = buildMedia3Metadata(metadataSnapshot, null)
         assertNull(metadata.artworkUri)
     }
 

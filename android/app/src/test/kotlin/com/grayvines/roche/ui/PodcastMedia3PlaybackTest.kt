@@ -4,9 +4,9 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.session.MediaController
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
+import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.grayvines.roche.data.collectInBackground
 import com.grayvines.roche.data.local.FeedRow
@@ -19,13 +19,20 @@ import com.grayvines.roche.data.remote.HttpRequest
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.tailnetNetworkTierProvider
-import com.grayvines.roche.playback.AndroidPodcastMediaSessionBridge
+import com.grayvines.roche.playback.AudioBackendListener
+import com.grayvines.roche.playback.AudioLoadRequest
+import com.grayvines.roche.playback.AudioPlaybackMetadata
 import com.grayvines.roche.playback.AudioPlayerBackend
-import com.grayvines.roche.playback.ExoPlayerAudioBackend
-import com.grayvines.roche.playback.MediaSessionMetadataSnapshot
+import com.grayvines.roche.playback.Media3AudioBackend
+import com.grayvines.roche.playback.Media3SessionClient
+import com.grayvines.roche.playback.PlayerDrawerTab
 import com.grayvines.roche.playback.PodcastPlayerController
+import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.playback.SafeRedirectHttpDataSource
 import com.grayvines.roche.playback.createManagedPlayerController
+import com.grayvines.roche.playback.formatAdjustedRemaining
+import com.grayvines.roche.playback.isAllowedServiceMediaUri
+import com.grayvines.roche.playback.isPlayerCmdAllowedForCaller
 import com.grayvines.roche.playback.isSafeAudioPlaybackSource
 import com.grayvines.roche.playback.resolveSafeHttpPlaybackUrl
 import java.io.ByteArrayInputStream
@@ -317,122 +324,305 @@ class PodcastMedia3PlaybackTest {
     fun `off-Main release queued before Main-thread loadAndPlay does not stop newly started episode`() {
         val mainDispatcher = EventLoopMainDispatcher(mainThread = Thread.currentThread())
         val parentScope = CoroutineScope(SupervisorJob() + mainDispatcher)
-        val harness = FakeExoPlayerHarness(durationMs = 420_000L)
+        val harness = FakeSessionClientHarness(durationMs = 420_000L)
+        val preparedDurations = mutableListOf<Long>()
         val backend =
-            ExoPlayerAudioBackend(
-                    appContext = null,
-                    allowedLocalDirs = listOf(tempDir),
-                    parentScope = parentScope,
-                    mainDispatcher = mainDispatcher,
-                    uriResolver = { null },
-                )
-                .also { it.exoPlayer = harness.player }
-        val bridge =
-            AndroidPodcastMediaSessionBridge(
+            Media3AudioBackend(
                 appContext = null,
-                backend = null,
-                scope = parentScope,
+                allowedLocalDirs = listOf(tempDir),
+                parentScope = parentScope,
                 mainDispatcher = mainDispatcher,
+                uriResolver = { null },
+                customClientConnector = { Futures.immediateFuture(harness) },
             )
+        backend.bindListener(
+            object : AudioBackendListener {
+                override fun onPrepared(durationMs: Long) {
+                    preparedDurations.add(durationMs)
+                }
+
+                override fun onPlayStateChanged(
+                    isPlaying: Boolean,
+                    isBuffering: Boolean,
+                    positionMs: Long,
+                    durationMs: Long,
+                ) = Unit
+
+                override fun onPositionSeeked(positionMs: Long) = Unit
+
+                override fun onSpeedChanged(speed: Float) = Unit
+
+                override fun onCompletion() = Unit
+
+                override fun onError() = Unit
+            }
+        )
 
         try {
-            startEpisodeOnBackend(backend, "https://pod.example.com/ep1.mp3")
-            bridge.updatePlaybackSession(sampleSessionSnapshot("ep-1", "Episode One"))
-            runOffMain {
-                backend.release()
-                bridge.release()
-            }
-            assertEquals(0, harness.stopCalls.get())
+            startEpisodeOnBackend(backend, "https://pod.example.com/ep1.mp3", "ep-1", "Episode One")
+            runOffMain { backend.release() }
+            assertEquals(0, harness.stopAndReleaseCalls.get())
 
-            val preparedDurations = mutableListOf<Long>()
-            startEpisodeOnBackend(
-                backend,
-                "https://pod.example.com/ep2.mp3",
-                preparedDurations::add,
-            )
-            bridge.updatePlaybackSession(sampleSessionSnapshot("ep-2", "Episode Two"))
+            startEpisodeOnBackend(backend, "https://pod.example.com/ep2.mp3", "ep-2", "Episode Two")
             mainDispatcher.drainQueue()
 
             assertEquals(2, harness.prepareCalls.get())
-            assertEquals(0, harness.stopCalls.get())
-            assertEquals(0, harness.clearMediaItemsCalls.get())
+            assertEquals(0, harness.stopAndReleaseCalls.get())
             assertTrue(backend.isPlaying())
-            assertEquals("ep-2", bridge.currentSnapshot()?.entryId)
+            assertEquals("ep-2", backend.latestMetadata?.entryId)
             backend.handlePlayerReady(harness.player)
             assertEquals(listOf(420_000L), preparedDurations)
 
-            runOffMain {
-                backend.release()
-                bridge.release()
-            }
+            runOffMain { backend.release() }
             mainDispatcher.drainQueue()
-            assertEquals(1, harness.stopCalls.get())
+            assertEquals(1, harness.stopAndReleaseCalls.get())
+            assertEquals(1, harness.disconnectCalls.get())
             assertFalse(backend.isPlaying())
-            assertNull(bridge.currentSnapshot())
+            assertNull(backend.latestMetadata)
         } finally {
             parentScope.coroutineContext[Job]?.cancel()
         }
     }
 
     @Test
-    fun `owned-scope media session bridge release cleans up controllerFuture even when updatePlaybackSession races`() {
-        val mainDispatcher = EventLoopMainDispatcher(mainThread = Thread.currentThread())
-        val bridge =
-            AndroidPodcastMediaSessionBridge(
-                appContext = null,
-                backend = null,
-                scope = null,
-                mainDispatcher = mainDispatcher,
-            )
-        val controllerFuture = FakeControllerFuture()
-        bridge.updatePlaybackSession(sampleSessionSnapshot("ep-1", "Episode One"))
-        bridge.controllerFuture = controllerFuture
-
-        runOffMain {
-            bridge.release()
-            bridge.updatePlaybackSession(sampleSessionSnapshot("ep-2", "Episode Two"))
-        }
-        mainDispatcher.drainQueue()
-
-        assertNull(bridge.controllerFuture)
-        assertTrue(controllerFuture.isCancelled)
-        assertNull(bridge.currentSnapshot())
-
-        // Subsequent updates after terminal release on an owned-scope bridge are ignored.
-        bridge.updatePlaybackSession(sampleSessionSnapshot("ep-3", "Episode Three"))
-        mainDispatcher.drainQueue()
-        assertNull(bridge.currentSnapshot())
-    }
-
-    @Test
-    fun `controller disconnect clears and releases active controllerFuture without clobbering reconnect`() {
+    fun `controller disconnect clears and releases active clientFuture without clobbering reconnect`() {
         val mainDispatcher = EventLoopMainDispatcher(mainThread = Thread.currentThread())
         val parentScope = CoroutineScope(SupervisorJob() + mainDispatcher)
-        val bridge =
-            AndroidPodcastMediaSessionBridge(
+        val backend =
+            Media3AudioBackend(
                 appContext = null,
-                backend = null,
-                scope = parentScope,
+                allowedLocalDirs = listOf(tempDir),
+                parentScope = parentScope,
                 mainDispatcher = mainDispatcher,
+                uriResolver = { null },
             )
         try {
-            val firstFuture = FakeControllerFuture()
-            val secondFuture = FakeControllerFuture()
-            assertNotNull(bridge.createControllerListener { firstFuture })
-            bridge.controllerFuture = firstFuture
+            val firstFuture = FakeSessionClientFuture()
+            val secondFuture = FakeSessionClientFuture()
+            backend.clientFuture = firstFuture
 
-            bridge.clearControllerOnDisconnect(firstFuture)
-            assertNull(bridge.controllerFuture)
+            backend.clearClientOnDisconnect(firstFuture)
+            assertNull(backend.clientFuture)
             assertTrue(firstFuture.isCancelled)
 
-            bridge.controllerFuture = secondFuture
-            bridge.clearControllerOnDisconnect(firstFuture)
-            assertEquals(secondFuture, bridge.controllerFuture)
+            backend.clientFuture = secondFuture
+            backend.clearClientOnDisconnect(firstFuture)
+            assertEquals(secondFuture, backend.clientFuture)
             assertFalse(secondFuture.isCancelled)
         } finally {
             parentScope.coroutineContext[Job]?.cancel()
         }
     }
+
+    @Test
+    fun `formatAdjustedRemaining fixes zero and sub-minute remaining formatting`() {
+        assertEquals("0m left", formatAdjustedRemaining(0L, 1.0f))
+        assertEquals("< 1m left", formatAdjustedRemaining(20_000L, 1.0f))
+        assertEquals("2m left", formatAdjustedRemaining(95_000L, 1.0f))
+        assertEquals("50m left", formatAdjustedRemaining(4_500_000L, 1.5f))
+        assertEquals("2h 0m left", formatAdjustedRemaining(7_200_000L, 1.0f))
+
+        val finishedState =
+            PodcastPlayerState(
+                currentEntryId = "ep-1",
+                positionMs = 600_000L,
+                durationMs = 600_000L,
+                playbackSpeed = 1.0f,
+            )
+        assertEquals("-00:00", finishedState.formattedRemaining)
+        assertEquals("0m left", finishedState.formattedMiniRemaining)
+        assertEquals("0m left (at 1.0x)", finishedState.formattedSpeedAdjustedRemaining)
+    }
+
+    @Test
+    fun `isAllowedServiceMediaUri rejects untrusted callers and unsafe URIs`() {
+        val allowedDir = File(tempDir, "items").apply { mkdirs() }
+        val localFile = File(allowedDir, "ep.mp3").apply { writeText("mp3") }
+
+        assertFalse(
+            isAllowedServiceMediaUri(
+                isTrustedCaller = false,
+                uriString = "https://cdn.example.com/ep.mp3",
+                allowedLocalDirs = listOf(allowedDir),
+            )
+        )
+        assertFalse(
+            isAllowedServiceMediaUri(
+                isTrustedCaller = true,
+                uriString = "http://127.0.0.1/secret.mp3",
+                allowedLocalDirs = listOf(allowedDir),
+            )
+        )
+        assertFalse(
+            isAllowedServiceMediaUri(
+                isTrustedCaller = true,
+                uriString = null,
+                allowedLocalDirs = listOf(allowedDir),
+            )
+        )
+        assertTrue(
+            isAllowedServiceMediaUri(
+                isTrustedCaller = true,
+                uriString = "https://cdn.example.com/ep.mp3",
+                allowedLocalDirs = listOf(allowedDir),
+            )
+        )
+        assertTrue(
+            isAllowedServiceMediaUri(
+                isTrustedCaller = true,
+                uriString = localFile.toURI().toString(),
+                allowedLocalDirs = listOf(allowedDir),
+            )
+        )
+    }
+
+    @Test
+    fun `SelectPlayerDrawerTab keeps drawer open on active tab re-tap and closes on null`() {
+        val opened =
+            reduceUiAction(
+                TransientUiState(),
+                MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.UP_NEXT),
+            )
+        assertEquals(PlayerDrawerTab.UP_NEXT, opened.activePlayerDrawerTab)
+
+        val retapped =
+            reduceUiAction(
+                opened,
+                MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.UP_NEXT),
+            )
+        assertEquals(PlayerDrawerTab.UP_NEXT, retapped.activePlayerDrawerTab)
+
+        val closed = reduceUiAction(retapped, MainAction.SelectPlayerDrawerTab(null))
+        assertNull(closed.activePlayerDrawerTab)
+        assertTrue(MainUiState(activePlayerDrawerTab = PlayerDrawerTab.UP_NEXT).hasOpenModalSheet)
+        assertFalse(MainUiState(activePlayerDrawerTab = null).hasOpenModalSheet)
+    }
+
+    @Test
+    fun `isPlayerCmdAllowedForCaller strips playlist mutation commands for external callers`() {
+        assertTrue(isPlayerCmdAllowedForCaller(true, Player.COMMAND_SET_MEDIA_ITEM))
+        assertTrue(isPlayerCmdAllowedForCaller(true, Player.COMMAND_CHANGE_MEDIA_ITEMS))
+
+        assertFalse(isPlayerCmdAllowedForCaller(false, Player.COMMAND_SET_MEDIA_ITEM))
+        assertFalse(isPlayerCmdAllowedForCaller(false, Player.COMMAND_CHANGE_MEDIA_ITEMS))
+        assertTrue(isPlayerCmdAllowedForCaller(false, Player.COMMAND_PLAY_PAUSE))
+    }
+
+    @Test
+    fun `Media3AudioBackend preserves pending seek and speed while connecting and recovers from failed future`() {
+        val mainDispatcher = EventLoopMainDispatcher(mainThread = Thread.currentThread())
+        val parentScope = CoroutineScope(SupervisorJob() + mainDispatcher)
+        val pendingFuture = CompletableSessionFuture()
+        val harness = FakeSessionClientHarness(durationMs = 420_000L)
+        var connectAttempt = 0
+        val errorCount = AtomicInteger(0)
+        val playStateEvents = mutableListOf<Boolean>()
+        val backend =
+            Media3AudioBackend(
+                appContext = null,
+                allowedLocalDirs = listOf(tempDir),
+                parentScope = parentScope,
+                mainDispatcher = mainDispatcher,
+                uriResolver = { null },
+                customClientConnector = {
+                    connectAttempt++
+                    if (connectAttempt == 1) {
+                        Futures.immediateCancelledFuture()
+                    } else {
+                        pendingFuture
+                    }
+                },
+            )
+        backend.bindListener(
+            object : AudioBackendListener {
+                override fun onPrepared(durationMs: Long) = Unit
+
+                override fun onPlayStateChanged(
+                    isPlaying: Boolean,
+                    isBuffering: Boolean,
+                    positionMs: Long,
+                    durationMs: Long,
+                ) {
+                    playStateEvents.add(isPlaying)
+                }
+
+                override fun onPositionSeeked(positionMs: Long) = Unit
+
+                override fun onSpeedChanged(speed: Float) = Unit
+
+                override fun onCompletion() = Unit
+
+                override fun onError() {
+                    errorCount.incrementAndGet()
+                }
+            }
+        )
+        try {
+            // Attempt 1: cancelled future triggers onError and clears clientFuture for recovery
+            startEpisodeOnBackend(backend, "https://pod.example.com/ep1.mp3", "ep-1", "Ep 1")
+            mainDispatcher.drainQueue()
+            assertEquals(1, errorCount.get())
+            assertNull(backend.clientFuture)
+
+            // Attempt 2: seek and speed changes queued while connecting are applied on connect
+            startEpisodeOnBackend(backend, "https://pod.example.com/ep2.mp3", "ep-2", "Ep 2")
+            backend.seekTo(123_000L)
+            backend.setSpeed(1.85f)
+            pendingFuture.complete(harness)
+            mainDispatcher.drainQueue()
+
+            assertEquals(123_000L, harness.lastSetMediaItemPositionMs)
+            assertEquals(1.85f, harness.lastSpeed, 1e-3f)
+            assertEquals(123_000L, backend.currentPositionMs())
+            assertTrue(playStateEvents.isEmpty())
+
+            // Idle player with 0 items does not wipe cachedPositionMs
+            harness.playbackState = Player.STATE_IDLE
+            harness.mediaItemCount = 0
+            harness.currentPositionMs = 0L
+            backend.syncVolatileStateFromPlayer(harness.player)
+            assertEquals(123_000L, backend.currentPositionMs())
+        } finally {
+            parentScope.coroutineContext[Job]?.cancel()
+        }
+    }
+
+    @Test
+    fun `background playback observers sync settings and queue state without MainViewModel`() =
+        runTest {
+            seedPodcastEpisode()
+            val backend = InspectableAudioBackend()
+            val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+            val repo =
+                mockRepository(
+                    database = database,
+                    settings = settings,
+                    transport = { HttpResponse(statusCode = 200, body = PEER_SYNC_OK_BODY) },
+                    cacheDir = File(tempDir, "bg_observer_cache"),
+                    networkTierProvider = tailnetNetworkTierProvider(),
+                    backgroundScope = bgScope,
+                )
+            val controller =
+                createManagedPlayerController(
+                    scope = bgScope,
+                    repository = repo,
+                    settingsRepository = settings,
+                    playerBackend = backend,
+                    observerScope = bgScope,
+                )
+            try {
+                assertTrue(controller.hasBackgroundObserver)
+                controller.state.first { it.skipSilenceEnabled }
+                assertTrue(backend.skipSilenceEnabled)
+
+                settings.update { it.copy(skipSilenceEnabled = false, smartRewindEnabled = false) }
+                controller.state.first { !it.skipSilenceEnabled && !it.smartRewindEnabled }
+                assertFalse(backend.skipSilenceEnabled)
+            } finally {
+                controller.releaseController()
+                bgScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
 
     private suspend fun kotlinx.coroutines.test.TestScope.withPlayerHarness(
         syncRequests: CopyOnWriteArrayList<HttpRequest>,
@@ -558,33 +748,28 @@ class PodcastMedia3PlaybackTest {
         var simulatedPositionMs: Long = 0L
         private var durationMs: Long = 600_000L
         private var playing: Boolean = false
-        private var externalListener: ((Boolean) -> Unit)? = null
+        private var listener: AudioBackendListener? = null
 
         fun emitExternalPlayState(isNowPlaying: Boolean) {
             playing = isNowPlaying
-            externalListener?.invoke(isNowPlaying)
+            listener?.onPlayStateChanged(
+                isPlaying = isNowPlaying,
+                isBuffering = false,
+                positionMs = simulatedPositionMs,
+                durationMs = durationMs,
+            )
         }
 
-        override fun bindExternalPlayStateListener(listener: ((Boolean) -> Unit)?) {
-            externalListener = listener
+        override fun bindListener(listener: AudioBackendListener?) {
+            this.listener = listener
         }
 
-        override fun loadAndPlay(
-            source: String,
-            initialPositionMs: Long,
-            fallbackDurationMs: Long,
-            speed: Float,
-            skipSilenceEnabled: Boolean,
-            playWhenReady: Boolean,
-            onPrepared: (durationMs: Long) -> Unit,
-            onCompletion: () -> Unit,
-            onError: () -> Unit,
-        ) {
-            this.skipSilenceEnabled = skipSilenceEnabled
-            this.durationMs = fallbackDurationMs
-            this.simulatedPositionMs = initialPositionMs
-            this.playing = playWhenReady
-            onPrepared(durationMs)
+        override fun loadAndPlay(request: AudioLoadRequest) {
+            this.skipSilenceEnabled = request.skipSilenceEnabled
+            this.durationMs = request.fallbackDurationMs
+            this.simulatedPositionMs = request.initialPositionMs
+            this.playing = request.playWhenReady
+            listener?.onPrepared(durationMs)
         }
 
         override fun play() {
@@ -634,19 +819,39 @@ class PodcastMedia3PlaybackTest {
         }
     }
 
-    private class FakeExoPlayerHarness(private val durationMs: Long) {
+    private class FakeSessionClientHarness(private val durationMs: Long) : Media3SessionClient {
         val prepareCalls = AtomicInteger(0)
         val stopCalls = AtomicInteger(0)
         val clearMediaItemsCalls = AtomicInteger(0)
+        val stopAndReleaseCalls = AtomicInteger(0)
+        val disconnectCalls = AtomicInteger(0)
+        var playbackState: Int = Player.STATE_READY
+        var mediaItemCount: Int = 1
+        var currentPositionMs: Long = 0L
+        var lastSetMediaItemPositionMs: Long = -1L
+        var lastSpeed: Float = 1.0f
         private var playWhenReadyState: Boolean = false
 
-        val player: ExoPlayer =
+        override val player: ExoPlayer =
             Proxy.newProxyInstance(
                 ExoPlayer::class.java.classLoader,
                 arrayOf(ExoPlayer::class.java),
             ) { proxy, method, args ->
                 handleCall(proxy, method.name, method.returnType, args)
             } as ExoPlayer
+
+        override fun sendSkipSilence(enabled: Boolean) = Unit
+
+        override fun sendHasNextQueued(hasNext: Boolean) = Unit
+
+        override fun sendStopAndRelease() {
+            stopAndReleaseCalls.incrementAndGet()
+            playWhenReadyState = false
+        }
+
+        override fun disconnect() {
+            disconnectCalls.incrementAndGet()
+        }
 
         private fun handleCall(
             proxy: Any,
@@ -659,7 +864,9 @@ class PodcastMedia3PlaybackTest {
                 "getPlayWhenReady",
                 "isPlaying" -> playWhenReadyState
                 "getDuration" -> durationMs
-                "getPlaybackState" -> Player.STATE_READY
+                "getCurrentPosition" -> currentPositionMs
+                "getMediaItemCount" -> mediaItemCount
+                "getPlaybackState" -> playbackState
                 "getPlaybackSuppressionReason" -> Player.PLAYBACK_SUPPRESSION_REASON_NONE
                 "equals" -> proxy === args?.firstOrNull()
                 "hashCode" -> System.identityHashCode(proxy)
@@ -681,6 +888,22 @@ class PodcastMedia3PlaybackTest {
                 }
                 "clearMediaItems" -> {
                     clearMediaItemsCalls.incrementAndGet()
+                    mediaItemCount = 0
+                    true
+                }
+                "setMediaItem" -> {
+                    mediaItemCount = 1
+                    if (args != null && args.size >= 2 && args[1] is Long) {
+                        lastSetMediaItemPositionMs = args[1] as Long
+                        currentPositionMs = lastSetMediaItemPositionMs
+                    }
+                    true
+                }
+                "setPlaybackParameters" -> {
+                    val params = args?.firstOrNull() as? androidx.media3.common.PlaybackParameters
+                    if (params != null) {
+                        lastSpeed = params.speed
+                    }
                     true
                 }
                 "setPlayWhenReady" -> {
@@ -695,20 +918,29 @@ class PodcastMedia3PlaybackTest {
 }
 
 private fun startEpisodeOnBackend(
-    backend: ExoPlayerAudioBackend,
+    backend: Media3AudioBackend,
     source: String,
-    onPrepared: (Long) -> Unit = {},
+    entryId: String,
+    title: String,
 ) {
     backend.loadAndPlay(
-        source = source,
-        initialPositionMs = 0L,
-        fallbackDurationMs = 300_000L,
-        speed = 1.25f,
-        skipSilenceEnabled = true,
-        playWhenReady = true,
-        onPrepared = onPrepared,
-        onCompletion = {},
-        onError = {},
+        AudioLoadRequest(
+            source = source,
+            initialPositionMs = 0L,
+            fallbackDurationMs = 300_000L,
+            speed = 1.25f,
+            skipSilenceEnabled = true,
+            hasNextQueuedAudio = false,
+            metadata =
+                AudioPlaybackMetadata(
+                    entryId = entryId,
+                    episodeTitle = title,
+                    podcastTitle = "Deep Tech",
+                    artworkUrl = null,
+                    durationMs = 420_000L,
+                ),
+            playWhenReady = true,
+        )
     )
 }
 
@@ -717,23 +949,6 @@ private fun runOffMain(block: () -> Unit) {
     thread.start()
     thread.join()
 }
-
-private fun sampleSessionSnapshot(
-    entryId: String,
-    title: String,
-): MediaSessionMetadataSnapshot =
-    MediaSessionMetadataSnapshot(
-        entryId = entryId,
-        episodeTitle = title,
-        podcastTitle = "Deep Tech",
-        artworkUrl = null,
-        isPlaying = true,
-        isBuffering = false,
-        positionMs = 0L,
-        durationMs = 420_000L,
-        playbackSpeed = 1.25f,
-        hasNextQueuedAudio = false,
-    )
 
 private fun defaultPrimitiveReturn(returnType: Class<*>): Any? =
     when (returnType) {
@@ -748,7 +963,36 @@ private fun defaultPrimitiveReturn(returnType: Class<*>): Any? =
 private const val PEER_SYNC_OK_BODY =
     """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000000000-0001-server","sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[]}"""
 
-private class FakeControllerFuture : ListenableFuture<MediaController> {
+private class CompletableSessionFuture : ListenableFuture<Media3SessionClient> {
+    @Volatile private var value: Media3SessionClient? = null
+    private val listeners = CopyOnWriteArrayList<Pair<Runnable, Executor>>()
+
+    fun complete(client: Media3SessionClient) {
+        value = client
+        listeners.forEach { (r, exec) -> exec.execute(r) }
+        listeners.clear()
+    }
+
+    override fun cancel(mayInterruptIfRunning: Boolean): Boolean = false
+
+    override fun isCancelled(): Boolean = false
+
+    override fun isDone(): Boolean = value != null
+
+    override fun get(): Media3SessionClient = checkNotNull(value)
+
+    override fun get(timeout: Long, unit: TimeUnit): Media3SessionClient = checkNotNull(value)
+
+    override fun addListener(listener: Runnable, executor: Executor) {
+        if (value != null) {
+            executor.execute(listener)
+        } else {
+            listeners.add(listener to executor)
+        }
+    }
+}
+
+private class FakeSessionClientFuture : ListenableFuture<Media3SessionClient> {
     private val cancelled = AtomicBoolean(false)
 
     override fun cancel(mayInterruptIfRunning: Boolean): Boolean =
@@ -758,10 +1002,10 @@ private class FakeControllerFuture : ListenableFuture<MediaController> {
 
     override fun isDone(): Boolean = cancelled.get()
 
-    override fun get(): MediaController = error("FakeControllerFuture never resolves")
+    override fun get(): Media3SessionClient = error("FakeSessionClientFuture never resolves")
 
-    override fun get(timeout: Long, unit: TimeUnit): MediaController =
-        error("FakeControllerFuture never resolves")
+    override fun get(timeout: Long, unit: TimeUnit): Media3SessionClient =
+        error("FakeSessionClientFuture never resolves")
 
     override fun addListener(listener: Runnable, executor: Executor) = Unit
 }
