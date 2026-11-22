@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions")
+
 package com.grayvines.roche.data.catalog
 
 import com.grayvines.roche.core.ENTRY_KIND_PODCAST
@@ -22,6 +24,7 @@ import com.grayvines.roche.data.local.entryKindForItemWire
 import com.grayvines.roche.data.local.nextLocalHlc
 
 internal const val FLAG_REPAIRED_IMPLICIT_PODCASTS = "repaired_implicit_podcasts_v1"
+internal const val FLAG_DECOUPLED_RSS_AUDIO_ENTRIES = "decoupled_rss_audio_entries_v1"
 
 private const val CONTENT_TYPE_AUDIO = "audio"
 private const val CONTENT_TYPE_ARTICLE = "article"
@@ -166,11 +169,10 @@ private suspend fun repairPodcastFeedsInTx(
     nowIso: String,
     nodeId: String,
 ) {
-    val liveFeeds =
-        feedSources.filter { fs ->
-            val feedEntry = entriesById[fs.collectionId]
-            feedEntry != null && feedEntry.mergedIntoId.isNullOrEmpty()
-        }
+    val liveFeeds = feedSources.filter { fs ->
+        val feedEntry = entriesById[fs.collectionId]
+        feedEntry != null && feedEntry.mergedIntoId.isNullOrEmpty()
+    }
     if (liveFeeds.isEmpty()) return
 
     val previewsById = previews.associateBy { it.entryId }
@@ -276,4 +278,82 @@ private fun hasRealAudioContent(
             it.isNotEmpty() && !isBogusWebpageAudioUrl(it, entry.url, preview.duration)
         } == true
     return hasAudioUrl || isAudioContentType(preview.contentType)
+}
+
+internal suspend fun decoupleRssAudioEntriesInTx(
+    dao: RocheDao,
+    nowIso: String,
+    nodeId: String,
+) {
+    val entries = dao.getAllEntries()
+    val feedSources = dao.getAllFeedSources()
+    val maxExistingHlc =
+        (entries.asSequence().map { it.hlc } + feedSources.asSequence().map { it.hlc })
+            .mapNotNull { HlcTimestamp.parse(it) }
+            .maxOrNull()
+            ?.encode()
+    if (maxExistingHlc != null) {
+        dao.upsertLocalSyncFlagIfGreater(FLAG_LOCAL_HLC, maxExistingHlc)
+    }
+    val knownFeedIds = feedSources.mapTo(HashSet()) { it.collectionId }
+    val podcastFeedIds =
+        feedSources
+            .filter { it.sourceType.equals(ENTRY_KIND_PODCAST, ignoreCase = true) }
+            .mapTo(HashSet()) { it.collectionId }
+    val allMemberships = dao.getAllCollectionEntries()
+    val feedMemberIds =
+        allMemberships.filter { it.collectionId in knownFeedIds }.mapTo(HashSet()) { it.entryId }
+    val podcastMemberIds =
+        allMemberships.filter { it.collectionId in podcastFeedIds }.mapTo(HashSet()) { it.entryId }
+    val entriesById = entries.associateBy { it.id }
+    val candidateIds =
+        dao.getAllEntryContentPreviews()
+            .filter { row ->
+                val entry = entriesById[row.entryId]
+                entry != null &&
+                    entry.mergedIntoId.isNullOrEmpty() &&
+                    entry.id in feedMemberIds &&
+                    entry.id !in podcastMemberIds &&
+                    (entry.kind == ENTRY_KIND_PODCAST_EPISODE ||
+                        isAudioContentType(row.contentType))
+            }
+            .map { it.entryId }
+    if (candidateIds.isEmpty()) return
+
+    val fullContents =
+        candidateIds.chunked(SQLITE_IN_CHUNK_SIZE).flatMap { chunk ->
+            dao.getEntryContentsByIds(chunk)
+        }
+    for (content in fullContents) {
+        val entry = entriesById[content.entryId] ?: continue
+        decoupleSingleRssAudioItem(dao, entry, content, nowIso, nodeId)
+    }
+}
+
+private suspend fun decoupleSingleRssAudioItem(
+    dao: RocheDao,
+    entry: EntryEntity,
+    content: EntryContentEntity,
+    nowIso: String,
+    nodeId: String,
+) {
+    val inferredType =
+        entry.url?.trim()?.takeIf { it.isNotEmpty() }?.let(::inferContentTypeWireValue)
+            ?: CONTENT_TYPE_ARTICLE
+    val targetKind = entryKindForItemWire(inferredType, content.audioUrl, isPodcastFeed = false)
+    val contentChanged = content.contentType != inferredType
+    val kindChanged = entry.kind != targetKind
+    if (!contentChanged && !kindChanged) return
+    if (contentChanged) {
+        dao.upsertEntryContent(content.copy(contentType = inferredType))
+    }
+    val hlc = nextLocalHlc(dao, nodeId)
+    dao.upsertEntry(
+        entry.copy(
+            kind = targetKind,
+            updatedAt = nowIso,
+            hlc = hlc,
+            isLocalDirty = true,
+        )
+    )
 }

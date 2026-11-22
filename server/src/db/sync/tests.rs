@@ -766,7 +766,9 @@ async fn test_tombstone_resurrection_requires_newer_hlc_and_preserves_custom_fee
 
     // User renames feed on server; subsequent peer poll with older config HLC must NOT clobber custom title
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    assert!(db.feeds().update(&feed.id, Some("My Custom Feed Name"), None, None).await.unwrap());
+    assert!(
+        db.feeds().update(&feed.id, Some("My Custom Feed Name"), None, None, None).await.unwrap()
+    );
     let poll_bump_req = PeerSyncRequest {
         peer_id: "android-peer-1".to_string(),
         device_name: Some("Pixel".to_string()),
@@ -4587,7 +4589,9 @@ async fn test_rust_hlc_causal_monotonicity_under_peer_clock_skew() {
         .unwrap();
 
     // 2. Server locally updates feed title and deletes the item using normal wall clock (`now`).
-    assert!(db.feeds().update(&feed_id, Some("Server Renamed Feed"), None, None).await.unwrap());
+    assert!(
+        db.feeds().update(&feed_id, Some("Server Renamed Feed"), None, None, None).await.unwrap()
+    );
     assert!(db.items().delete(&item_id).await.unwrap());
 
     let local_feed_hlc: String =
@@ -4927,7 +4931,7 @@ async fn test_all_local_repo_writes_stamp_valid_causal_hlcs_and_single_insert_me
         .append_comparison(None, &[vec![b.id.clone()], vec![a.id.clone()]], None)
         .await
         .unwrap();
-    assert!(db.feeds().update(&feed.id, Some("HLC Feed 2"), Some(45), None).await.unwrap());
+    assert!(db.feeds().update(&feed.id, Some("HLC Feed 2"), Some(45), None, None).await.unwrap());
 
     let last_hlc: String = sqlx::query_scalar("SELECT last_hlc FROM sync_clock WHERE id = 1")
         .fetch_one(db.pool())
@@ -5570,4 +5574,164 @@ async fn test_sync_audio_reclassification_duration_paper_video_and_feed_split_br
         db.catalog().get_entry(&art_id).await.unwrap().unwrap().kind,
         EntryKind::PodcastEpisode
     );
+}
+
+#[tokio::test]
+async fn test_sync_narrated_article_preserves_article_kind_and_audio_enclosure() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let now = Utc::now();
+    let feed_url = Url::parse("https://substack.example.com/feed").unwrap();
+    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Essayist"), None).await.unwrap();
+    let item_url = "https://substack.example.com/p/read-aloud";
+    let item_id = deterministic_item_id(Some(feed_url.as_str()), item_url);
+
+    let hlc_t1 = "001794000000000-0001-phone".to_owned();
+    let hlc_t2 = "001795000000000-0001-phone".to_owned();
+
+    // 1. Syncing a narrated Article (kind=Article, content_type=Article, audio_url=Some(.mp3))
+    //    MUST NOT upgrade it to PodcastEpisode/Audio and MUST preserve audio_url + duration.
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![SyncEntryRecord {
+                id: item_id.clone(),
+                kind: EntryKind::Article,
+                title: "Read Aloud Essay".to_owned(),
+                creators: Vec::new(),
+                url: Some(item_url.to_owned()),
+                published_at: Some(now),
+                release_year: None,
+                summary: Some("Summary".to_owned()),
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(now),
+                updated_at: Some(now),
+                hlc: hlc_t1.clone(),
+                content: Some(SyncEntryContent {
+                    content_type: ContentType::Article,
+                    content_html: Some("<p>Essay prose</p>".to_owned()),
+                    audio_url: Some("https://cdn.substack.example.com/essay.mp3".to_owned()),
+                    duration: Some(1080),
+                }),
+                state: Some(SyncEntryState {
+                    inbox_state: InboxState::Unread,
+                    read_at: None,
+                    progress: 0.0,
+                    interaction_updated_at: Some(now),
+                    hlc: hlc_t1.clone(),
+                }),
+                collection_spec: None,
+                feed_source: None,
+            }],
+            collection_entries: vec![SyncCollectionEntryRecord {
+                collection_id: feed.id.clone(),
+                entry_id: item_id.clone(),
+                position: None,
+                added_at: now,
+                hlc: hlc_t1.clone(),
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let synced = db.items().get(&item_id).await.unwrap().unwrap();
+    assert_eq!(synced.entry_kind, EntryKind::Article);
+    assert_eq!(synced.content_type, ContentType::Article);
+    assert_eq!(synced.audio_url.as_deref(), Some("https://cdn.substack.example.com/essay.mp3"));
+    assert_eq!(synced.duration, Some(1080));
+
+    // Verify outbound sync delta preserves all decoupled fields
+    let out = db
+        .sync()
+        .collect_peer_sync_response_with_budget(0, 100, usize::MAX, String::new(), now)
+        .await
+        .unwrap();
+    let wire = out.entries.iter().find(|e| e.id == item_id).unwrap();
+    assert_eq!(wire.kind, EntryKind::Article);
+    assert_eq!(wire.content.as_ref().unwrap().content_type, ContentType::Article);
+    assert_eq!(
+        wire.content.as_ref().unwrap().audio_url.as_deref(),
+        Some("https://cdn.substack.example.com/essay.mp3")
+    );
+    assert_eq!(wire.content.as_ref().unwrap().duration, Some(1080));
+
+    // 2. Newer HLC removing audio_url clears remote-only entry_media; replaying stale t1 cannot re-attach.
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![SyncEntryRecord {
+                id: item_id.clone(),
+                kind: EntryKind::Article,
+                title: "Read Aloud Essay".to_owned(),
+                creators: Vec::new(),
+                url: Some(item_url.to_owned()),
+                published_at: Some(now),
+                release_year: None,
+                summary: Some("Summary".to_owned()),
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(now),
+                updated_at: Some(now),
+                hlc: hlc_t2,
+                content: Some(SyncEntryContent {
+                    content_type: ContentType::Article,
+                    content_html: Some("<p>Essay prose</p>".to_owned()),
+                    audio_url: None,
+                    duration: None,
+                }),
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let cleared = db.items().get(&item_id).await.unwrap().unwrap();
+    assert!(cleared.audio_url.is_none());
+    assert!(cleared.duration.is_none());
+
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-old".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![SyncEntryRecord {
+                id: item_id.clone(),
+                kind: EntryKind::Article,
+                title: "Read Aloud Essay".to_owned(),
+                creators: Vec::new(),
+                url: Some(item_url.to_owned()),
+                published_at: Some(now),
+                release_year: None,
+                summary: Some("Summary".to_owned()),
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(now),
+                updated_at: Some(now),
+                hlc: hlc_t1,
+                content: Some(SyncEntryContent {
+                    content_type: ContentType::Article,
+                    content_html: Some("<p>Essay prose</p>".to_owned()),
+                    audio_url: Some("https://cdn.substack.example.com/essay.mp3".to_owned()),
+                    duration: Some(1080),
+                }),
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let still_cleared = db.items().get(&item_id).await.unwrap().unwrap();
+    assert!(still_cleared.audio_url.is_none());
 }

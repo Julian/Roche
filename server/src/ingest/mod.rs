@@ -455,6 +455,7 @@ impl FeedIngester {
     pub(crate) fn parse_feed_content(feed_type: FeedType, content: &str) -> Result<PollBatch> {
         match feed_type {
             FeedType::Rss | FeedType::Podcast => {
+                let is_podcast_feed = feed_type == FeedType::Podcast;
                 let (rss_feed, items) = RssParser::parse(content)?;
                 let parsed_items = items
                     .into_iter()
@@ -462,16 +463,16 @@ impl FeedIngester {
                         let raw_url = item.link?;
                         let url = crate::util::media_urls::canonical_arxiv_abstract_url(&raw_url)
                             .unwrap_or(raw_url);
-                        let content_type = if item.audio_url.is_some() {
+                        let url_ct = classify_url(&url);
+                        let content_type = if is_podcast_feed && item.audio_url.is_some() {
                             ContentType::Audio
                         } else {
-                            classify_url(&url)
+                            url_ct
                         };
                         let audio_url = item.audio_url.map(String::from).or_else(|| {
                             (content_type == ContentType::Audio).then(|| url.as_str().to_owned())
                         });
-                        let duration =
-                            (content_type == ContentType::Audio).then_some(item.duration).flatten();
+                        let duration = audio_url.is_some().then_some(item.duration).flatten();
                         let clean_desc =
                             HtmlSanitizer::clean_with_base(&item.description, Some(&url));
                         let content_html = item
@@ -724,7 +725,9 @@ mod tests {
         assert_eq!(by_title["Video Link"].content_type, ContentType::Video);
         assert_eq!(by_title["Arxiv Link"].content_type, ContentType::Paper);
         assert_eq!(by_title["Direct PDF Link"].content_type, ContentType::Pdf);
-        assert_eq!(by_title["Podcast Episode"].content_type, ContentType::Audio);
+        // Audio enclosures on an RSS feed remain narrated Articles (explicit opt-in for Podcasts)
+        assert_eq!(by_title["Podcast Episode"].content_type, ContentType::Article);
+        assert_eq!(by_title["Podcast Episode"].entry_kind, crate::domain::EntryKind::Article);
         assert_eq!(
             by_title["Podcast Episode"].audio_url.as_deref(),
             Some("https://cdn.example.com/ep42.mp3")
@@ -871,5 +874,70 @@ mod tests {
 
         let item = db.items().get(item_id).await.unwrap().unwrap();
         assert_eq!(item.author.as_deref(), Some("Alice Smith, Bob Jones"));
+    }
+
+    #[tokio::test]
+    async fn test_podcast_vs_rss_feed_audio_enclosure_classification() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" ?>
+        <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+        <channel>
+            <title>Mixed Audio Show</title>
+            <link>https://show.example.com</link>
+            <description>Episodes and notes</description>
+            <item>
+                <title>Narrated Post</title>
+                <link>https://show.example.com/p/narrated</link>
+                <description>Post with audio</description>
+                <itunes:duration>15:00</itunes:duration>
+                <enclosure url="https://cdn.show.example.com/narrated.mp3" length="12345" type="audio/mpeg"/>
+            </item>
+            <item>
+                <title>Text Only Announcement</title>
+                <link>https://show.example.com/p/text-only</link>
+                <description>No enclosure</description>
+                <itunes:duration>05:00</itunes:duration>
+            </item>
+        </channel>
+        </rss>"#;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        // 1. RSS feed keeps narrated post as Article with preserved audio_url + duration
+        let rss_url = Url::parse("https://show.example.com/rss.xml").unwrap();
+        let rss_feed = db.feeds().create(FeedType::Rss, &rss_url, None, None).await.unwrap();
+        let rss_batch = FeedIngester::parse_feed_content(FeedType::Rss, xml).unwrap();
+        let rss_ids = db.feeds().record_poll_batch(&rss_feed.id, &rss_batch).await.unwrap();
+        assert_eq!(rss_ids.len(), 2);
+        let rss_narrated = db.items().get(&rss_ids[0].0).await.unwrap().unwrap();
+        assert_eq!(rss_narrated.content_type, ContentType::Article);
+        assert_eq!(rss_narrated.entry_kind, crate::domain::EntryKind::Article);
+        assert_eq!(
+            rss_narrated.audio_url.as_deref(),
+            Some("https://cdn.show.example.com/narrated.mp3")
+        );
+        assert_eq!(rss_narrated.duration, Some(900));
+        let rss_text = db.items().get(&rss_ids[1].0).await.unwrap().unwrap();
+        assert_eq!(rss_text.content_type, ContentType::Article);
+        assert!(rss_text.audio_url.is_none());
+        assert!(rss_text.duration.is_none());
+
+        // 2. Explicit Podcast feed classifies audio item as PodcastEpisode/Audio, text post stays Article
+        let pod_db = Db::connect("sqlite::memory:").await.unwrap();
+        let pod_url = Url::parse("https://show.example.com/podcast.xml").unwrap();
+        let pod_feed =
+            pod_db.feeds().create(FeedType::Podcast, &pod_url, None, None).await.unwrap();
+        let pod_batch = FeedIngester::parse_feed_content(FeedType::Podcast, xml).unwrap();
+        let pod_ids = pod_db.feeds().record_poll_batch(&pod_feed.id, &pod_batch).await.unwrap();
+        assert_eq!(pod_ids.len(), 2);
+        let pod_ep = pod_db.items().get(&pod_ids[0].0).await.unwrap().unwrap();
+        assert_eq!(pod_ep.content_type, ContentType::Audio);
+        assert_eq!(pod_ep.entry_kind, crate::domain::EntryKind::PodcastEpisode);
+        assert_eq!(pod_ep.audio_url.as_deref(), Some("https://cdn.show.example.com/narrated.mp3"));
+        assert_eq!(pod_ep.duration, Some(900));
+        let pod_text = pod_db.items().get(&pod_ids[1].0).await.unwrap().unwrap();
+        assert_eq!(pod_text.content_type, ContentType::Article);
+        assert_eq!(pod_text.entry_kind, crate::domain::EntryKind::Article);
+        assert!(pod_text.audio_url.is_none());
+        assert!(pod_text.duration.is_none());
     }
 }

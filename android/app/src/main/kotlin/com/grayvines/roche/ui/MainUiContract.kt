@@ -17,8 +17,8 @@ import com.grayvines.roche.data.remote.PeerNodeDto
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.redactedForUi
 import com.grayvines.roche.model.AppTab
-import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
+import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
@@ -489,11 +489,14 @@ sealed interface MainAction {
         val titleOverride: String?,
         val tagCsv: String,
         val mode: AddSheetMode? = null,
+        val feedType: FeedType? = null,
     ) : EntryMutation
 
     data class RefreshFeed(val feedId: String) : FeedSyncAction
 
     data class RenameFeed(val feedId: String, val newTitle: String) : FeedSyncAction
+
+    data class SetFeedType(val feedId: String, val feedType: FeedType) : FeedSyncAction
 
     data class ApplyTagToFeed(val feedId: String, val tagName: String) : FeedSyncAction
 
@@ -1054,7 +1057,7 @@ internal fun computeListeningHistory(allEntries: List<InboxEntry>): List<InboxEn
     if (allEntries.isEmpty()) return emptyList()
     return allEntries
         .filter { entry ->
-            entry.contentType == ContentType.AUDIO &&
+            entry.isPlayableAudio &&
                 (!entry.readAt.isNullOrBlank() || entry.readProgress > 0.0 || entry.isArchived)
         }
         .sortedByDescending { entry ->

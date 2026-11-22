@@ -9,8 +9,8 @@ use super::error::{ApiError, ProblemJson, ProblemPath, ProblemQuery};
 use crate::{
     db::{ItemFilter, ItemPage},
     domain::{
-        ContentType, ItemSortField, ItemStatus, ItemStatusFilter, READER_AUTO_READ_THRESHOLD,
-        ReadAtPatch, SortOrder,
+        ContentType, ItemSortField, ItemStatus, ItemStatusFilter, ProgressSource,
+        READER_AUTO_READ_THRESHOLD, ReadAtPatch, SortOrder,
     },
     service::{ItemDetail, RocheService},
     util::clock::now_utc,
@@ -55,6 +55,10 @@ pub(super) struct ItemListQuery {
     #[serde(default)]
     in_progress_only: Option<bool>,
     content_type: Option<ContentType>,
+    #[serde(default)]
+    has_audio: Option<bool>,
+    #[serde(default)]
+    podcast_only: Option<bool>,
     is_favorite: Option<bool>,
     is_read: Option<bool>,
     include_content: Option<bool>,
@@ -81,6 +85,8 @@ impl From<ItemListQuery> for ItemFilter {
             inbox_only: q.inbox_only,
             in_progress_only: q.in_progress_only,
             content_type: q.content_type,
+            has_audio: q.has_audio,
+            podcast_only: q.podcast_only,
             is_favorite: q.is_favorite,
             is_read: q.is_read,
             include_content: q.include_content,
@@ -118,6 +124,8 @@ pub(super) struct UpdateItemRequest {
     status: Option<ItemStatus>,
     is_favorite: Option<bool>,
     read_progress: Option<f64>,
+    #[serde(default)]
+    progress_source: Option<ProgressSource>,
     #[allow(clippy::option_option)]
     #[serde(default, deserialize_with = "deserialize_optional_nullable_datetime")]
     read_at: Option<Option<DateTime<Utc>>>,
@@ -183,7 +191,14 @@ pub(super) async fn items_update(
     };
     let detail = service
         .items()
-        .update(&id, req.status, req.is_favorite, req.read_progress, resolved_read_at)
+        .update_with_source(
+            &id,
+            req.status,
+            req.is_favorite,
+            req.read_progress,
+            resolved_read_at,
+            req.progress_source,
+        )
         .await?;
     Ok(Json(detail))
 }

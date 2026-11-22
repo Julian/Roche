@@ -66,6 +66,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.grayvines.roche.core.isLocalPdfUrl
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.media.PdfRendererSession
@@ -73,6 +74,7 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ThemeMode
+import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.reader.ArticleBlock
 import com.grayvines.roche.reader.ArticleBlockCache
 import com.grayvines.roche.reader.mapBlockHeadingIndices
@@ -91,6 +93,7 @@ import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 val LocalArticleBlockCache = staticCompositionLocalOf { ArticleBlockCache() }
@@ -156,6 +159,7 @@ private fun resolveInitialParsedBlocks(
 private data class ReaderLayoutMetrics(
     val isLocalPdf: Boolean,
     val hasPdfPages: Boolean,
+    val showAudioBar: Boolean,
     val showVideoHero: Boolean,
     val showUncachedPdfCard: Boolean,
     val sectionBlockOffset: Int,
@@ -171,9 +175,13 @@ private fun resolveReaderLayoutMetrics(
 ): ReaderLayoutMetrics {
     val isLocalPdf = isLocalPdfUrl(entry.url)
     val hasPdfPages = pdfSession != null && pdfSession.pageCount > 0
+    val showAudioBar = entry.isPlayableAudio
     val showVideoHero = entry.contentType == ContentType.VIDEO
     val showUncachedPdfCard = !hasPdfPages && isPdfLikeEntry(entry) && !isLocalPdf
-    val preBodyCount = (if (showVideoHero) 1 else 0) + if (showUncachedPdfCard) 1 else 0
+    val preBodyCount =
+        (if (showAudioBar) 1 else 0) +
+            (if (showVideoHero) 1 else 0) +
+            if (showUncachedPdfCard) 1 else 0
     val sectionBlockOffset = HEADER_ITEM_COUNT + preBodyCount
     val bodyItemCount =
         computeReaderBodyItemCount(
@@ -186,6 +194,7 @@ private fun resolveReaderLayoutMetrics(
     return ReaderLayoutMetrics(
         isLocalPdf = isLocalPdf,
         hasPdfPages = hasPdfPages,
+        showAudioBar = showAudioBar,
         showVideoHero = showVideoHero,
         showUncachedPdfCard = showUncachedPdfCard,
         sectionBlockOffset = sectionBlockOffset,
@@ -199,6 +208,9 @@ private data class ReaderArticleCallbacks(
     val onToggleArchive: () -> Unit,
     val onMarkFinished: () -> Unit,
     val onDownloadPdf: () -> Unit,
+    val onToggleAudio: () -> Unit,
+    val onOpenAudioPlayer: () -> Unit,
+    val onToggleOfflineAudio: () -> Unit,
     val onShare: () -> Unit,
     val onOpenExternalUrl: (String) -> Unit,
     val onZoomPdfPage: (Int) -> Unit,
@@ -251,6 +263,7 @@ private fun rememberReaderContentBundle(
 }
 
 @Composable
+@Suppress("LongParameterList")
 fun ReaderView(
     entry: InboxEntry,
     onAction: (MainAction) -> Unit,
@@ -260,6 +273,7 @@ fun ReaderView(
     settings: Settings = Settings(),
     isHydrating: Boolean = false,
     isDownloadingOffline: Boolean = false,
+    playerStateFlow: StateFlow<PodcastPlayerState>? = null,
 ) {
     var showTypographyDrawer by rememberSaveable(entry.id) { mutableStateOf(false) }
     var activeLightboxTarget by remember(entry.id) { mutableStateOf<ReaderLightboxTarget?>(null) }
@@ -286,6 +300,7 @@ fun ReaderView(
         settings = settings,
         content = content,
         isDownloadingOffline = isDownloadingOffline,
+        playerStateFlow = playerStateFlow,
         showTypographyDrawer = showTypographyDrawer,
         listState = listState,
         onToggleTypography = { showTypographyDrawer = !showTypographyDrawer },
@@ -332,6 +347,11 @@ private fun buildReaderArticleCallbacks(
         },
         onMarkFinished = { onAction(MainAction.MarkFeedEntryFinished(entry.id, false)) },
         onDownloadPdf = { onAction(MainAction.CacheEntryOffline(entry.id)) },
+        onToggleAudio = { onAction(MainAction.PlayAudioEntry(entry.id, openFullscreen = false)) },
+        onOpenAudioPlayer = {
+            onAction(MainAction.PlayAudioEntry(entry.id, openFullscreen = true))
+        },
+        onToggleOfflineAudio = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
         onShare = { onShareEntry(entry) },
         onOpenExternalUrl = onOpenExternalUrl,
         onZoomPdfPage = { pageIdx ->
@@ -351,12 +371,14 @@ private fun buildReaderArticleCallbacks(
     )
 
 @Composable
+@Suppress("LongParameterList")
 private fun ReaderViewScaffold(
     entry: InboxEntry,
     backLabel: String,
     settings: Settings,
     content: ReaderContentBundle,
     isDownloadingOffline: Boolean,
+    playerStateFlow: StateFlow<PodcastPlayerState>?,
     showTypographyDrawer: Boolean,
     listState: LazyListState,
     onToggleTypography: () -> Unit,
@@ -405,6 +427,7 @@ private fun ReaderViewScaffold(
             pdfSession = content.pdfSession,
             isHydrating = content.awaitingBlankHydration,
             isDownloadingOffline = isDownloadingOffline,
+            playerStateFlow = playerStateFlow,
             listState = listState,
             callbacks = callbacks,
             modifier = Modifier.weight(1f),
@@ -640,7 +663,9 @@ private fun shouldAutoCompleteViewportFit(
     canScroll: Boolean,
 ): Boolean {
     val isReadableText =
-        entry.contentType != ContentType.VIDEO && entry.contentType != ContentType.AUDIO
+        entry.contentType != ContentType.VIDEO &&
+            entry.contentType != ContentType.AUDIO &&
+            !entry.isPlayableAudio
     return isReadableText && bodyLengthBucket > 0 && !canScroll && entry.readProgress < 1.0
 }
 
@@ -649,6 +674,7 @@ private fun maybeCommitScrolledProgress(
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
 ) {
+    if (entry.contentType == ContentType.VIDEO || entry.contentType == ContentType.AUDIO) return
     val rawProgress = computeLazyListScrollFraction(listState) ?: return
     val crossedCompletion =
         rawProgress >= ARCHIVE_COMPLETION_THRESHOLD &&
@@ -669,7 +695,8 @@ internal fun computeLiveReaderProgress(
     val scrollFraction = computeLazyListScrollFraction(listState)
     return when {
         scrollFraction != null -> scrollFraction
-        !isAwaitingContent &&
+        !entry.isPlayableAudio &&
+            !isAwaitingContent &&
             listState.layoutInfo.totalItemsCount > 0 &&
             readerBodyCharCount(entry) > 0 -> 1.0
         else -> null
@@ -1108,6 +1135,7 @@ private fun ReaderSectionsOutlineList(
 }
 
 @Composable
+@Suppress("LongParameterList")
 private fun ReaderArticleBody(
     entry: InboxEntry,
     parsedState: ParsedArticleBlocksState,
@@ -1115,6 +1143,7 @@ private fun ReaderArticleBody(
     pdfSession: PdfRendererSession?,
     isHydrating: Boolean,
     isDownloadingOffline: Boolean,
+    playerStateFlow: StateFlow<PodcastPlayerState>?,
     listState: LazyListState,
     callbacks: ReaderArticleCallbacks,
     modifier: Modifier = Modifier,
@@ -1142,6 +1171,7 @@ private fun ReaderArticleBody(
                 isLocalPdf = isLocalPdf,
                 showUncachedPdfCard = showUncachedPdfCard,
                 isDownloadingOffline = isDownloadingOffline,
+                playerStateFlow = playerStateFlow,
                 dividerColor = colors.border,
                 proseModifier = proseModifier,
                 callbacks = callbacks,
@@ -1201,6 +1231,7 @@ private fun LazyListScope.readerPreBodyItems(
     isLocalPdf: Boolean,
     showUncachedPdfCard: Boolean,
     isDownloadingOffline: Boolean,
+    playerStateFlow: StateFlow<PodcastPlayerState>?,
     dividerColor: Color,
     proseModifier: Modifier,
     callbacks: ReaderArticleCallbacks,
@@ -1214,6 +1245,17 @@ private fun LazyListScope.readerPreBodyItems(
                 onSelectFeed = callbacks.onSelectFeed,
                 onSelectTag = callbacks.onSelectTag,
                 onOpenExternalUrl = callbacks.onOpenExternalUrl,
+            )
+        }
+    }
+    if (entry.isPlayableAudio) {
+        item(key = "reader_audio_bar") {
+            ReaderAudioBarSlot(
+                entry = entry,
+                playerStateFlow = playerStateFlow,
+                isDownloadingOffline = isDownloadingOffline,
+                callbacks = callbacks,
+                modifier = proseModifier,
             )
         }
     }
@@ -1238,6 +1280,26 @@ private fun LazyListScope.readerPreBodyItems(
             )
         }
     }
+}
+
+@Composable
+private fun ReaderAudioBarSlot(
+    entry: InboxEntry,
+    playerStateFlow: StateFlow<PodcastPlayerState>?,
+    isDownloadingOffline: Boolean,
+    callbacks: ReaderArticleCallbacks,
+    modifier: Modifier = Modifier,
+) {
+    val playerState = playerStateFlow?.collectAsStateWithLifecycle()?.value
+    ReaderAudioPlayerCard(
+        entry = entry,
+        playerState = playerState,
+        isDownloadingOffline = isDownloadingOffline,
+        onTogglePlay = callbacks.onToggleAudio,
+        onOpenPlayer = callbacks.onOpenAudioPlayer,
+        onToggleOffline = callbacks.onToggleOfflineAudio,
+        modifier = modifier,
+    )
 }
 
 internal fun resolveReaderHorizontalPadding(maxWidth: Dp, isPdf: Boolean): Dp =

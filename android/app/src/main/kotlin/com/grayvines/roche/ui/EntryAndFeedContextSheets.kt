@@ -218,14 +218,16 @@ private fun ContextSheetActionsList(
     onOpenExternalUrl: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val isAudio = entry.contentType == ContentType.AUDIO
+    val isPlayableAudio = entry.isPlayableAudio
+    val isAudioOnly = entry.contentType == ContentType.AUDIO
     val isLocalPdf = isLocalPdfUrl(entry.url)
     var confirmDeleteEntry by rememberSaveable(entry.id) { mutableStateOf(false) }
 
     val primaryGroup =
         buildEntryPrimaryActions(
             entry = entry,
-            isAudio = isAudio,
+            isPlayableAudio = isPlayableAudio,
+            isAudioOnly = isAudioOnly,
             isInQueue = isInQueue,
             isDownloadingOffline = isDownloadingOffline,
             accentBlue = colors.accentBlue,
@@ -279,21 +281,25 @@ private fun ContextSheetActionsList(
 @Suppress("LongParameterList")
 private fun buildEntryPrimaryActions(
     entry: InboxEntry,
-    isAudio: Boolean,
+    isPlayableAudio: Boolean,
+    isAudioOnly: Boolean,
     isInQueue: Boolean,
     isDownloadingOffline: Boolean,
     accentBlue: Color,
     accentVerdigris: Color,
     onAction: (MainAction) -> Unit,
 ): List<ContextActionSpec> = buildList {
-    if (isAudio) {
+    if (isPlayableAudio) {
+        val playLabel = if (entry.isPodcastEpisode) "Play Episode Now" else "Play Audio Now"
         add(
             ContextActionSpec(
-                "Play Episode Now",
+                playLabel,
                 { onAction(MainAction.PlayAudioEntry(entry.id, true)) },
                 accentBlue,
             )
         )
+    }
+    if (isAudioOnly) {
         add(
             ContextActionSpec(
                 "Open Full Show Notes in Reader",
@@ -335,7 +341,7 @@ private fun buildEntryPrimaryActions(
     add(
         buildOfflineActionSpec(
             entry = entry,
-            isAudio = isAudio,
+            isAudio = isPlayableAudio,
             isDownloadingOffline = isDownloadingOffline,
             accentBlue = accentBlue,
             onAction = onAction,
@@ -352,7 +358,7 @@ private fun buildOfflineActionSpec(
 ): ContextActionSpec {
     val label =
         if (isDownloadingOffline) {
-            if (isAudio) "Downloading Episode…" else "Saving Offline Copy…"
+            if (isAudio) "Downloading Audio…" else "Saving Offline Copy…"
         } else {
             resolveOfflineActionLabel(entry, isAudio)
         }
@@ -371,8 +377,8 @@ private fun buildOfflineActionSpec(
 
 private fun resolveOfflineActionLabel(entry: InboxEntry, isAudio: Boolean): String =
     when {
-        isAudio && entry.isCachedOffline -> "Delete Local Episode Download"
-        isAudio -> "Download Episode for Offline Playback"
+        isAudio && entry.isCachedOffline -> "Delete Local Audio Download"
+        isAudio -> "Download Audio for Offline Playback"
         entry.isCachedOffline -> "Remove Offline Copy"
         else -> "Save Offline Copy"
     }
@@ -402,6 +408,7 @@ fun FeedContextBottomSheet(
             FeedContextHeaderRow(feed = feed)
             FeedHealthDetailsCard(feed = feed, onAction = onAction)
             FeedRenameRow(feed = feed, onAction = onAction)
+            FeedTypeSelectorSection(feed = feed, onAction = onAction)
             FeedPodcastSettingsSection(feed = feed, onAction = onAction)
             FeedBulkTagRow(feed = feed, availableTags = availableTags, onAction = onAction)
             HorizontalDivider(color = colors.border, thickness = 1.dp)
@@ -480,6 +487,50 @@ internal fun FeedRenameRow(
             },
             modifier = Modifier.testTag("feed_rename_save_btn"),
         )
+    }
+}
+
+@Composable
+internal fun FeedTypeSelectorSection(
+    feed: FeedItem,
+    onAction: (MainAction) -> Unit,
+) {
+    if (feed.feedType != FeedType.RSS && feed.feedType != FeedType.PODCAST) return
+    val colors = LocalRocheColors.current
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            text = "FEED TYPE",
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            FilterChipPill(
+                label = "RSS / Newsletter",
+                selected = feed.feedType == FeedType.RSS,
+                onClick = {
+                    if (feed.feedType != FeedType.RSS) {
+                        onAction(MainAction.SetFeedType(feedId = feed.id, feedType = FeedType.RSS))
+                    }
+                },
+                modifier = Modifier.testTag("feed_type_rss_chip"),
+            )
+            FilterChipPill(
+                label = "Podcast",
+                selected = feed.feedType == FeedType.PODCAST,
+                onClick = {
+                    if (feed.feedType != FeedType.PODCAST) {
+                        onAction(
+                            MainAction.SetFeedType(feedId = feed.id, feedType = FeedType.PODCAST)
+                        )
+                    }
+                },
+                modifier = Modifier.testTag("feed_type_podcast_chip"),
+            )
+        }
     }
 }
 
@@ -796,7 +847,7 @@ fun AddUrlOrFeedBottomSheet(
     initialTitle: String = "",
     defaultMode: AddSheetMode = AddSheetMode.WANT_TO_READ,
     onDismiss: () -> Unit,
-    onSave: (String, String?, String, AddSheetMode) -> Unit,
+    onSave: (String, String?, String, AddSheetMode, FeedType?) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     var url by rememberSaveable(initialUrl, initialTitle) { mutableStateOf(initialUrl) }
@@ -806,14 +857,17 @@ fun AddUrlOrFeedBottomSheet(
         rememberSaveable(initialUrl, defaultMode) {
             mutableStateOf(resolveInitialAddMode(initialUrl, defaultMode))
         }
+    var feedType by rememberSaveable(initialUrl, defaultMode) { mutableStateOf(FeedType.RSS) }
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = colors.surface) {
         AddSheetFormBody(
             mode = mode,
+            feedType = feedType,
             url = url,
             title = title,
             tags = tags,
             onModeChange = { mode = it },
+            onFeedTypeChange = { feedType = it },
             onUrlChange = { next ->
                 url = next
                 if (isLikelyFeedUrl(next)) {
@@ -822,7 +876,15 @@ fun AddUrlOrFeedBottomSheet(
             },
             onTitleChange = { title = it },
             onTagsChange = { tags = it },
-            onSubmit = { onSave(url, title.takeIf { it.isNotBlank() }, tags, mode) },
+            onSubmit = {
+                onSave(
+                    url,
+                    title.takeIf { it.isNotBlank() },
+                    tags,
+                    mode,
+                    if (mode == AddSheetMode.SUBSCRIBE_FEED) feedType else null,
+                )
+            },
         )
     }
 }
@@ -834,10 +896,12 @@ private fun resolveInitialAddMode(initialUrl: String, defaultMode: AddSheetMode)
 @Composable
 private fun AddSheetFormBody(
     mode: AddSheetMode,
+    feedType: FeedType,
     url: String,
     title: String,
     tags: String,
     onModeChange: (AddSheetMode) -> Unit,
+    onFeedTypeChange: (FeedType) -> Unit,
     onUrlChange: (String) -> Unit,
     onTitleChange: (String) -> Unit,
     onTagsChange: (String) -> Unit,
@@ -847,7 +911,7 @@ private fun AddSheetFormBody(
     val isFeedMode = mode == AddSheetMode.SUBSCRIBE_FEED
     val urlHint =
         if (isFeedMode) {
-            "Blog Homepage, YouTube Channel, or RSS/Atom URL"
+            "Blog Homepage, Podcast, YouTube, or RSS/Atom URL"
         } else {
             "Article, PDF, Video, or Media URL"
         }
@@ -867,6 +931,9 @@ private fun AddSheetFormBody(
             fontWeight = FontWeight.Medium,
         )
         AddSheetModeSelectorRow(selectedMode = mode, onSelectMode = onModeChange)
+        if (isFeedMode) {
+            AddSheetFeedTypeRow(selectedFeedType = feedType, onSelectFeedType = onFeedTypeChange)
+        }
         OutlinedTextField(
             value = url,
             onValueChange = onUrlChange,
@@ -905,6 +972,30 @@ private fun AddSheetFormBody(
             modifier = Modifier.fillMaxWidth().testTag("add_sheet_submit_btn"),
         )
         Spacer(modifier = Modifier.height(16.dp))
+    }
+}
+
+@Composable
+private fun AddSheetFeedTypeRow(
+    selectedFeedType: FeedType,
+    onSelectFeedType: (FeedType) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        FilterChipPill(
+            label = "RSS / Blog",
+            selected = selectedFeedType == FeedType.RSS,
+            onClick = { onSelectFeedType(FeedType.RSS) },
+            modifier = Modifier.testTag("add_feed_type_rss"),
+        )
+        FilterChipPill(
+            label = "Podcast",
+            selected = selectedFeedType == FeedType.PODCAST,
+            onClick = { onSelectFeedType(FeedType.PODCAST) },
+            modifier = Modifier.testTag("add_feed_type_podcast"),
+        )
     }
 }
 

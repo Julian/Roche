@@ -59,7 +59,6 @@ import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.MusicTrackLaunchRequest
 import com.grayvines.roche.data.catalog.generatorFor
 import com.grayvines.roche.model.AppTab
-import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.ui.components.PlusIcon
@@ -105,6 +104,10 @@ fun MainScreen(
     val coroutineScope = rememberCoroutineScope()
     val activeAudioIdFlow = remember(playerStateFlow) { observeActiveAudioEntryId(playerStateFlow) }
     val activeAudioEntryId by activeAudioIdFlow.collectAsStateWithLifecycle(initialValue = null)
+    val isAudioPlayingFlow =
+        remember(playerStateFlow) { playerStateFlow.map { it.isPlaying }.distinctUntilChanged() }
+    val isAudioActuallyPlaying by
+        isAudioPlayingFlow.collectAsStateWithLifecycle(initialValue = false)
     val activePlayerEntry = state.resolveActivePlayerEntry(activeAudioEntryId)
     val activeReaderEntry = state.activeReaderEntry
     val currentState by rememberUpdatedState(state)
@@ -142,121 +145,131 @@ fun MainScreen(
             0.dp
         }
 
-    Box(
-        modifier =
-            modifier.fillMaxSize().background(colors.background).semantics {
-                testTagsAsResourceId = true
-            }
-    ) {
-        MainDestinationScaffold(
-            state = state,
-            activePlayerEntry = activePlayerEntry,
-            playerStateFlow = playerStateFlow,
-            showBottomBar = chromeFlags.showChrome,
-            hasFab = chromeFlags.hasFab,
-            showSearchFab = chromeFlags.showSearchFab,
-            showAddFab = chromeFlags.showAddFab,
-            activeTabForBar = activeTabForBar,
-            onChromeBottomHeightChange = { chromeBottomPx = it },
-            onSelectTab = { tappedTab ->
-                handleBottomBarTabSelect(
-                    tappedTab = tappedTab,
-                    activeTab = activeTabForBar,
-                    topKey = topKey,
-                    state = currentState,
-                    scrollStates = scrollStates,
-                    onAction = currentOnAction,
-                    launchScroll = { block -> coroutineScope.launch { block() } },
-                )
-            },
-            onAction = onAction,
+    CompositionLocalProvider(LocalIsAudioActuallyPlaying provides isAudioActuallyPlaying) {
+        Box(
+            modifier =
+                modifier.fillMaxSize().background(colors.background).semantics {
+                    testTagsAsResourceId = true
+                }
         ) {
-            NavDisplay(
-                backStack = navBackStack,
-                modifier = Modifier.fillMaxSize(),
-                onBack = {
-                    (navBackStack.lastOrNull() as? RocheNavKey)
-                        ?.let(::popActionForTopKey)
-                        ?.let(currentOnAction)
+            MainDestinationScaffold(
+                state = state,
+                activePlayerEntry = activePlayerEntry,
+                playerStateFlow = playerStateFlow,
+                showBottomBar = chromeFlags.showChrome,
+                hasFab = chromeFlags.hasFab,
+                showSearchFab = chromeFlags.showSearchFab,
+                showAddFab = chromeFlags.showAddFab,
+                activeTabForBar = activeTabForBar,
+                onChromeBottomHeightChange = { chromeBottomPx = it },
+                onSelectTab = { tappedTab ->
+                    handleBottomBarTabSelect(
+                        tappedTab = tappedTab,
+                        activeTab = activeTabForBar,
+                        topKey = topKey,
+                        state = currentState,
+                        scrollStates = scrollStates,
+                        onAction = currentOnAction,
+                        launchScroll = { block -> coroutineScope.launch { block() } },
+                    )
                 },
-                entryProvider =
-                    entryProvider {
-                        entry<RocheNavKey.Tab> { tabKey ->
-                            MainTabDestinationContent(
-                                tab = tabKey.tab,
-                                state = currentState,
-                                activeAudioEntryId = currentActiveAudioEntryId,
-                                scrollStates = scrollStates,
-                                onAction = currentOnAction,
-                                onOpenExternalUrl = currentOnOpenExternalUrl,
-                                onOpenCollectionDraw = currentOnOpenCollectionDraw,
-                                onImportOpml = currentOnImportOpml,
-                                onExportOpml = currentOnExportOpml,
-                                onRevealSavedBearerToken = currentOnRevealSavedBearerToken,
-                            )
-                        }
-
-                        entry<RocheNavKey.ScopedInbox> { scopedKey ->
-                            InboxTabContent(
-                                state = currentState,
-                                onAction = currentOnAction,
-                                listState =
-                                    scrollStates.lazyListState(scopedInboxScrollKey(scopedKey)),
-                                activeAudioEntryId = currentActiveAudioEntryId,
-                                entries =
-                                    currentState.entriesForScope(scopedKey.feedId, scopedKey.tag),
-                                selectedFeedId = scopedKey.feedId,
-                                selectedTag = scopedKey.tag,
-                            )
-                        }
-
-                        entry<RocheNavKey.Search> {
-                            MainSearchDestination(
-                                state = currentState,
-                                activeAudioEntryId = currentActiveAudioEntryId,
-                                scrollStates = scrollStates,
-                                onAction = currentOnAction,
-                            )
-                        }
-
-                        entry<RocheNavKey.Reader> { readerKey ->
-                            MainReaderDestination(
-                                readerKey = readerKey,
-                                state = currentState,
-                                activeReaderEntry = currentReaderEntry,
-                                onAction = currentOnAction,
-                                onShareEntry = currentOnShareEntry,
-                                onOpenExternalUrl = currentOnOpenExternalUrl,
-                            )
-                        }
-
-                        entry<RocheNavKey.FullscreenPlayer> { playerKey ->
-                            MainPlayerDestination(
-                                playerKey = playerKey,
-                                state = currentState,
-                                activePlayerEntry = currentPlayerEntry,
-                                playerStateFlow = currentPlayerStateFlow,
-                                onAction = currentOnAction,
-                                onShareEntry = currentOnShareEntry,
-                                onOpenExternalUrl = currentOnOpenExternalUrl,
-                            )
-                        }
+                onAction = onAction,
+            ) {
+                NavDisplay(
+                    backStack = navBackStack,
+                    modifier = Modifier.fillMaxSize(),
+                    onBack = {
+                        (navBackStack.lastOrNull() as? RocheNavKey)
+                            ?.let(::popActionForTopKey)
+                            ?.let(currentOnAction)
                     },
+                    entryProvider =
+                        entryProvider {
+                            entry<RocheNavKey.Tab> { tabKey ->
+                                MainTabDestinationContent(
+                                    tab = tabKey.tab,
+                                    state = currentState,
+                                    activeAudioEntryId = currentActiveAudioEntryId,
+                                    scrollStates = scrollStates,
+                                    onAction = currentOnAction,
+                                    onOpenExternalUrl = currentOnOpenExternalUrl,
+                                    onOpenCollectionDraw = currentOnOpenCollectionDraw,
+                                    onImportOpml = currentOnImportOpml,
+                                    onExportOpml = currentOnExportOpml,
+                                    onRevealSavedBearerToken = currentOnRevealSavedBearerToken,
+                                )
+                            }
+
+                            entry<RocheNavKey.ScopedInbox> { scopedKey ->
+                                InboxTabContent(
+                                    state = currentState,
+                                    onAction = currentOnAction,
+                                    listState =
+                                        scrollStates.lazyListState(scopedInboxScrollKey(scopedKey)),
+                                    activeAudioEntryId = currentActiveAudioEntryId,
+                                    entries =
+                                        currentState.entriesForScope(
+                                            scopedKey.feedId,
+                                            scopedKey.tag,
+                                        ),
+                                    selectedFeedId = scopedKey.feedId,
+                                    selectedTag = scopedKey.tag,
+                                )
+                            }
+
+                            entry<RocheNavKey.Search> {
+                                MainSearchDestination(
+                                    state = currentState,
+                                    activeAudioEntryId = currentActiveAudioEntryId,
+                                    scrollStates = scrollStates,
+                                    onAction = currentOnAction,
+                                )
+                            }
+
+                            entry<RocheNavKey.Reader> { readerKey ->
+                                MainReaderDestination(
+                                    readerKey = readerKey,
+                                    state = currentState,
+                                    activeReaderEntry = currentReaderEntry,
+                                    playerStateFlow = currentPlayerStateFlow,
+                                    onAction = currentOnAction,
+                                    onShareEntry = currentOnShareEntry,
+                                    onOpenExternalUrl = currentOnOpenExternalUrl,
+                                )
+                            }
+
+                            entry<RocheNavKey.FullscreenPlayer> { playerKey ->
+                                MainPlayerDestination(
+                                    playerKey = playerKey,
+                                    state = currentState,
+                                    activePlayerEntry = currentPlayerEntry,
+                                    playerStateFlow = currentPlayerStateFlow,
+                                    onAction = currentOnAction,
+                                    onShareEntry = currentOnShareEntry,
+                                    onOpenExternalUrl = currentOnOpenExternalUrl,
+                                )
+                            }
+                        },
+                )
+            }
+
+            MainSnackbarOverlay(
+                state = state,
+                chromeFlags = chromeFlags,
+                onAction = onAction,
+                modifier =
+                    Modifier.align(Alignment.BottomCenter)
+                        .then(
+                            if (!chromeFlags.showChrome) {
+                                Modifier.navigationBarsPadding()
+                            } else {
+                                Modifier
+                            }
+                        )
+                        .padding(bottom = snackbarBottomOffset)
+                        .imePadding(),
             )
         }
-
-        MainSnackbarOverlay(
-            state = state,
-            chromeFlags = chromeFlags,
-            onAction = onAction,
-            modifier =
-                Modifier.align(Alignment.BottomCenter)
-                    .then(
-                        if (!chromeFlags.showChrome) Modifier.navigationBarsPadding() else Modifier
-                    )
-                    .padding(bottom = snackbarBottomOffset)
-                    .imePadding(),
-        )
     }
 
     MainOverlaySheets(
@@ -610,13 +623,14 @@ internal fun MainOverlaySheets(
             initialTitle = state.prefilledShareTitle,
             defaultMode = defaultMode,
             onDismiss = { onAction(MainAction.CloseAddSheet) },
-            onSave = { url, title, tags, mode ->
+            onSave = { url, title, tags, mode, feedType ->
                 onAction(
                     MainAction.SaveUrlOrFeed(
                         url = url,
                         titleOverride = title,
                         tagCsv = tags,
                         mode = mode,
+                        feedType = feedType,
                     )
                 )
             },
@@ -694,10 +708,12 @@ private fun MainSearchDestination(
 }
 
 @Composable
+@Suppress("LongParameterList")
 private fun MainReaderDestination(
     readerKey: RocheNavKey.Reader,
     state: MainUiState,
     activeReaderEntry: InboxEntry?,
+    playerStateFlow: StateFlow<PodcastPlayerState>,
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
@@ -712,6 +728,7 @@ private fun MainReaderDestination(
                 settings = state.settings,
                 isHydrating = state.isReaderHydrating,
                 isDownloadingOffline = targetEntry.id in state.inFlightOfflineEntryIds,
+                playerStateFlow = playerStateFlow,
                 onAction = onAction,
                 onShareEntry = onShareEntry,
                 onOpenExternalUrl = onOpenExternalUrl,
@@ -745,7 +762,7 @@ private fun MainPlayerDestination(
                     .asSequence()
                     .filter { it != targetEntry.id }
                     .mapNotNull { state.entryById[it] }
-                    .filter { !it.isArchived && it.contentType == ContentType.AUDIO }
+                    .filter { !it.isArchived && it.isPlayableAudio }
                     .toList()
             }
         FullscreenPodcastPlayer(

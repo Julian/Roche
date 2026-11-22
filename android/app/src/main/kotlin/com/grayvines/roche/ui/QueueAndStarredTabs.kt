@@ -125,6 +125,7 @@ private enum class StarredFilterTab(
     PAPERS("Papers", "papers", "starred_filter_papers"),
     VIDEOS("Videos", "videos", "starred_filter_videos"),
     PODCASTS("Podcasts", "podcasts", "starred_filter_podcasts"),
+    AUDIO("Audio", "audio items", "starred_filter_audio"),
     CATALOG("Catalog", "catalog items", "starred_filter_catalog"),
 }
 
@@ -135,7 +136,20 @@ private fun matchesStarredFilter(row: StarredDisplayRow, filter: StarredFilterTa
         StarredFilterTab.ARTICLES -> matchesStarredContentType(row, ContentType.ARTICLE)
         StarredFilterTab.PAPERS -> matchesStarredContentType(row, ContentType.PDF)
         StarredFilterTab.VIDEOS -> matchesStarredContentType(row, ContentType.VIDEO)
-        StarredFilterTab.PODCASTS -> matchesStarredContentType(row, ContentType.AUDIO)
+        StarredFilterTab.PODCASTS ->
+            when (row) {
+                is StarredDisplayRow.ReaderRow -> row.entry.isPodcastEpisode
+                is StarredDisplayRow.CatalogRow ->
+                    row.item.entry.kind == EntryKind.PODCAST_EPISODE ||
+                        row.item.entry.kind == EntryKind.PODCAST
+            }
+        StarredFilterTab.AUDIO ->
+            when (row) {
+                is StarredDisplayRow.ReaderRow -> row.entry.isPlayableAudio
+                is StarredDisplayRow.CatalogRow ->
+                    row.item.entry.kind == EntryKind.PODCAST_EPISODE ||
+                        row.item.entry.kind == EntryKind.PODCAST
+            }
     }
 
 private fun matchesStarredContentType(row: StarredDisplayRow, target: ContentType): Boolean =
@@ -321,6 +335,11 @@ private fun StarredEntriesList(
                             onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
                             onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
                             onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                            onPlayAudio = {
+                                onAction(
+                                    MainAction.PlayAudioEntry(entry.id, openFullscreen = false)
+                                )
+                            },
                             onDownloadOffline = {
                                 onAction(MainAction.ToggleOfflineCache(entry.id))
                             },

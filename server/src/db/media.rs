@@ -160,6 +160,36 @@ impl<'a> MediaRepo<'a> {
         Ok(())
     }
 
+    pub(crate) async fn upsert_audio_enclosure_overwrite_in_tx(
+        conn: &mut SqliteConnection,
+        entry_id: &str,
+        audio_url: Option<&str>,
+        duration: Option<i64>,
+        created_at: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let clean_url = audio_url.map(str::trim).filter(|s| !s.is_empty());
+        let clean_dur = duration.filter(|&d| d > 0);
+        if clean_url.is_none() && clean_dur.is_none() {
+            return Ok(());
+        }
+        let enc_id = deterministic_enclosure_media_id(entry_id);
+        sqlx::query(
+            "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
+             VALUES (?, ?, 'audio', ?, NULL, NULL, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                 remote_url = COALESCE(excluded.remote_url, entry_media.remote_url),
+                 duration = COALESCE(excluded.duration, entry_media.duration)",
+        )
+        .bind(&enc_id)
+        .bind(entry_id)
+        .bind(clean_url)
+        .bind(clean_dur)
+        .bind(created_at)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     pub async fn create(
         &self,
         item_id: &str,

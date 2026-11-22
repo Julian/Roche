@@ -4,6 +4,7 @@ package com.grayvines.roche.data.local
 
 import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
 import com.grayvines.roche.core.ENTRY_KIND_COLLECTION
+import com.grayvines.roche.core.ENTRY_KIND_PODCAST_EPISODE
 import com.grayvines.roche.core.FLAG_LOCAL_HLC
 import com.grayvines.roche.core.HlcClock
 import com.grayvines.roche.core.HlcTimestamp
@@ -24,6 +25,7 @@ import com.grayvines.roche.core.encodeCreatorsJson
 import com.grayvines.roche.core.extractArxivIdentifier
 import com.grayvines.roche.core.extractYearPrefix
 import com.grayvines.roche.core.formatArticleMinutes
+import com.grayvines.roche.core.inferContentTypeWireValue
 import com.grayvines.roche.core.isLocalPdfUrl
 import com.grayvines.roche.core.isSyncableItemUrl
 import com.grayvines.roche.core.normalizeConsecutiveFailures
@@ -444,8 +446,19 @@ private suspend fun RocheDao.writeSingleInboxItemInTx(
             hlcOverride,
             nodeId,
         )
-    upsertEntry(buildUpsertInboxEntry(bounded, existingEntry, effectiveTs, hlc, markDirty))
-    val hasKnownFeed = bounded.feedId?.let { getFeedSourceById(it) != null } == true
+    val feedSource = bounded.feedId?.let { getFeedSourceById(it) }
+    val hasKnownFeed = feedSource != null
+    val isPodcastFeed = feedSource?.sourceType.equals(FEED_TYPE_PODCAST, ignoreCase = true) == true
+    upsertEntry(
+        buildUpsertInboxEntry(
+            bounded = bounded,
+            existingEntry = existingEntry,
+            effectiveTs = effectiveTs,
+            hlc = hlc,
+            markDirty = markDirty,
+            isPodcastFeed = isPodcastFeed,
+        )
+    )
     upsertEntryContent(
         EntryContentEntity(
             entryId = bounded.id,
@@ -498,12 +511,14 @@ private suspend fun RocheDao.resolveInboxItemEffectiveHlc(
                 ?: HlcTimestamp.fromIsoOrEpoch(effectiveTs, nodeId).encode()
         }
 
+@Suppress("LongParameterList")
 private fun buildUpsertInboxEntry(
     bounded: InboxItemRow,
     existingEntry: EntryEntity?,
     effectiveTs: String,
     hlc: String,
     markDirty: Boolean,
+    isPodcastFeed: Boolean = false,
 ): EntryEntity {
     val creatorsJson =
         bounded.author?.trim()?.takeIf { it.isNotEmpty() }?.let { encodeCreatorsJson(listOf(it)) }
@@ -511,7 +526,7 @@ private fun buildUpsertInboxEntry(
             ?: "[]"
     return EntryEntity(
         id = bounded.id,
-        kind = existingEntry?.kind ?: entryKindForItemWire(bounded.contentType, bounded.audioUrl),
+        kind = resolveUpsertInboxEntryKind(bounded, existingEntry, isPodcastFeed),
         title = bounded.title,
         creatorsJson = creatorsJson,
         url = bounded.url.ifBlank { existingEntry?.url },
@@ -526,6 +541,27 @@ private fun buildUpsertInboxEntry(
         hlc = hlc,
         isLocalDirty = markDirty || existingEntry?.isLocalDirty == true,
     )
+}
+
+private fun resolveUpsertInboxEntryKind(
+    bounded: InboxItemRow,
+    existingEntry: EntryEntity?,
+    isPodcastFeed: Boolean,
+): String {
+    val hasAudio =
+        !bounded.audioUrl.isNullOrBlank() ||
+            bounded.contentType.equals(CONTENT_TYPE_AUDIO, ignoreCase = true)
+    return when {
+        existingEntry == null ->
+            entryKindForItemWire(
+                contentType = bounded.contentType,
+                audioUrl = bounded.audioUrl,
+                isPodcastFeed = isPodcastFeed,
+            )
+        existingEntry.kind == DEFAULT_ENTRY_KIND && isPodcastFeed && hasAudio ->
+            ENTRY_KIND_PODCAST_EPISODE
+        else -> existingEntry.kind
+    }
 }
 
 private suspend fun RocheDao.syncInboxItemLinksInTx(
@@ -1069,6 +1105,179 @@ internal suspend fun RocheDao.updateFeedActiveGraph(
     }
 }
 
+internal suspend fun RocheDao.updateFeedTypeGraph(
+    feedId: String,
+    targetFeedType: String,
+    markDirty: Boolean = true,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+) {
+    val normalizedTarget = targetFeedType.trim().lowercase()
+    if (normalizedTarget != FEED_TYPE_RSS && normalizedTarget != FEED_TYPE_PODCAST) return
+    executeInTransaction {
+        val source = getFeedSourceById(feedId)
+        val feedEntry = getEntryById(feedId)
+        val currentType = source?.sourceType?.trim()?.lowercase()
+        val canToggle =
+            source != null &&
+                feedEntry != null &&
+                (currentType == FEED_TYPE_RSS || currentType == FEED_TYPE_PODCAST)
+        if (canToggle) {
+            val nowIso = nowUtcIso()
+            val expectedFeedKind = entryKindForFeedTypeWire(normalizedTarget)
+            if (currentType != normalizedTarget) {
+                val fsHlc = nextLocalHlc(this, nodeId)
+                upsertFeedSource(
+                    source.copy(
+                        sourceType = normalizedTarget,
+                        hlc = fsHlc,
+                        isLocalDirty = markDirty || source.isLocalDirty,
+                    )
+                )
+            }
+            if (feedEntry.kind != expectedFeedKind) {
+                val entryHlc = nextLocalHlc(this, nodeId)
+                upsertEntry(
+                    feedEntry.copy(
+                        kind = expectedFeedKind,
+                        updatedAt = nowIso,
+                        hlc = entryHlc,
+                        isLocalDirty = markDirty || feedEntry.isLocalDirty,
+                    )
+                )
+            }
+            reclassifyFeedItemsForType(
+                feedId = feedId,
+                targetFeedType = normalizedTarget,
+                markDirty = markDirty,
+                nowIso = nowIso,
+                nodeId = nodeId,
+            )
+        }
+    }
+}
+
+private suspend fun RocheDao.reclassifyFeedItemsForType(
+    feedId: String,
+    targetFeedType: String,
+    markDirty: Boolean,
+    nowIso: String,
+    nodeId: String,
+) {
+    val memberIds = getCollectionMemberships(feedId).map { it.entryId }.distinct()
+    if (memberIds.isEmpty()) return
+    val entriesById =
+        memberIds
+            .chunked(SQLITE_DELETE_CHUNK_SIZE)
+            .flatMap { getEntriesByIds(it) }
+            .associateBy {
+                it.id
+            }
+    val contents = memberIds.chunked(SQLITE_DELETE_CHUNK_SIZE).flatMap { getEntryContentsByIds(it) }
+    val otherPodcastIds =
+        if (targetFeedType == FEED_TYPE_RSS) {
+            getAllFeedSources()
+                .filter {
+                    it.collectionId != feedId &&
+                        it.sourceType.equals(FEED_TYPE_PODCAST, ignoreCase = true)
+                }
+                .mapTo(HashSet()) { it.collectionId }
+        } else {
+            emptySet()
+        }
+    for (content in contents) {
+        val entry = entriesById[content.entryId]
+        if (entry != null && entry.mergedIntoId.isNullOrEmpty()) {
+            reclassifyItemForFeedType(
+                entry = entry,
+                content = content,
+                targetFeedType = targetFeedType,
+                otherPodcastIds = otherPodcastIds,
+                markDirty = markDirty,
+                nowIso = nowIso,
+                nodeId = nodeId,
+            )
+        }
+    }
+}
+
+@Suppress("LongParameterList")
+private suspend fun RocheDao.reclassifyItemForFeedType(
+    entry: EntryEntity,
+    content: EntryContentEntity,
+    targetFeedType: String,
+    otherPodcastIds: Set<String>,
+    markDirty: Boolean,
+    nowIso: String,
+    nodeId: String,
+) {
+    val hasAudio =
+        !content.audioUrl.isNullOrBlank() ||
+            content.contentType.equals(CONTENT_TYPE_AUDIO, ignoreCase = true) ||
+            content.contentType.equals(FEED_TYPE_PODCAST, ignoreCase = true)
+    val targetPair =
+        resolveFeedItemTypeTarget(
+            entry = entry,
+            content = content,
+            hasAudio = hasAudio,
+            targetFeedType = targetFeedType,
+            otherPodcastIds = otherPodcastIds,
+        ) ?: return
+    val (targetCt, targetKind) = targetPair
+    if (content.contentType != targetCt) {
+        upsertEntryContent(content.copy(contentType = targetCt))
+    }
+    if (entry.kind != targetKind || content.contentType != targetCt) {
+        val itemHlc = nextLocalHlc(this, nodeId)
+        upsertEntry(
+            entry.copy(
+                kind = targetKind,
+                updatedAt = nowIso,
+                hlc = itemHlc,
+                isLocalDirty = markDirty || entry.isLocalDirty,
+            )
+        )
+    }
+}
+
+private suspend fun RocheDao.resolveFeedItemTypeTarget(
+    entry: EntryEntity,
+    content: EntryContentEntity,
+    hasAudio: Boolean,
+    targetFeedType: String,
+    otherPodcastIds: Set<String>,
+): Pair<String, String>? =
+    if (targetFeedType == FEED_TYPE_PODCAST) {
+        val promotableKind =
+            entry.kind == DEFAULT_ENTRY_KIND || entry.kind == ENTRY_KIND_PODCAST_EPISODE
+        if (hasAudio && promotableKind) CONTENT_TYPE_AUDIO to ENTRY_KIND_PODCAST_EPISODE else null
+    } else {
+        resolveDemotedFeedItemTarget(entry, content, hasAudio, otherPodcastIds)
+    }
+
+private suspend fun RocheDao.resolveDemotedFeedItemTarget(
+    entry: EntryEntity,
+    content: EntryContentEntity,
+    hasAudio: Boolean,
+    otherPodcastIds: Set<String>,
+): Pair<String, String>? {
+    val needsCheck = hasAudio || entry.kind == ENTRY_KIND_PODCAST_EPISODE
+    val sharedWithOtherPodcast =
+        needsCheck &&
+            otherPodcastIds.isNotEmpty() &&
+            getCollectionEntriesForEntry(entry.id).any { it.collectionId in otherPodcastIds }
+    if (!needsCheck || sharedWithOtherPodcast) return null
+    val inferred =
+        entry.url?.trim()?.takeIf { it.isNotEmpty() }?.let(::inferContentTypeWireValue)
+            ?: DEFAULT_ENTRY_KIND
+    val nextKind =
+        if (entry.kind == ENTRY_KIND_PODCAST_EPISODE) {
+            entryKindForItemWire(inferred, content.audioUrl, isPodcastFeed = false)
+        } else {
+            entry.kind
+        }
+    return inferred to nextKind
+}
+
 internal suspend fun RocheDao.entryHasCatalogHistory(entryId: String): Boolean =
     hasCatalogHistoryRaw(entryId, buildSqlContainsPattern("\"$entryId\"")) != 0
 
@@ -1280,6 +1489,9 @@ internal suspend fun RocheDao.deleteFeedPreservingHistory(
 }
 
 private const val MODE_MANUAL = "manual"
+private const val CONTENT_TYPE_AUDIO = "audio"
+private const val FEED_TYPE_RSS = "rss"
+private const val FEED_TYPE_PODCAST = "podcast"
 
 internal suspend fun attachTagsLocally(
     dao: RocheDao,

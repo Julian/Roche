@@ -357,7 +357,15 @@ internal object LocalFeedPoller {
             summary = candidate.summary.takeIf { it.isNotBlank() }?.take(MAX_SQLITE_SUMMARY_CHARS),
             contentText = null,
             contentHtml = candidate.contentHtml?.take(MAX_SQLITE_HTML_CHARS),
-            contentType = candidate.contentType,
+            contentType =
+                if (
+                    feed.feedType.equals(FEED_TYPE_PODCAST, ignoreCase = true) &&
+                        !candidate.audioUrl.isNullOrBlank()
+                ) {
+                    CONTENT_TYPE_AUDIO
+                } else {
+                    candidate.contentType
+                },
             status = ItemStatus.UNREAD.wireValue,
             isFavorite = false,
             isCachedOffline = false,
@@ -387,18 +395,17 @@ internal object LocalFeedPoller {
             pickRicherString(existing.contentHtml, candidate.contentHtml)
                 ?.take(MAX_SQLITE_HTML_CHARS)
         val mergedAudioUrl = existing.audioUrl?.takeIf { it.isNotBlank() } ?: candidate.audioUrl
+        val isPodcastFeed = feed.feedType.equals(FEED_TYPE_PODCAST, ignoreCase = true)
         val mergedContentType =
-            if (!mergedAudioUrl.isNullOrBlank()) "audio" else existing.contentType
+            if (isPodcastFeed && !mergedAudioUrl.isNullOrBlank()) {
+                CONTENT_TYPE_AUDIO
+            } else {
+                existing.contentType
+            }
         return existing.copy(
             feedId = existing.feedId ?: feed.id,
             feedUrl = existing.feedUrl ?: feed.url,
-            feedTitle =
-                existing.feedTitle.takeIf {
-                    it.isNotBlank() &&
-                        it != DEFAULT_SAVED_HOST &&
-                        !it.equals(extractHostTitle(feed.url), ignoreCase = true) &&
-                        it != "YouTube Channel"
-                } ?: feed.title,
+            feedTitle = resolveMergedFeedTitle(existing.feedTitle, feed),
             title = existing.title.ifBlank { candidate.title },
             author = existing.author?.takeIf { it.isNotBlank() } ?: candidate.author,
             publishedAt = existing.publishedAt?.takeIf { it.isNotBlank() } ?: candidate.publishedAt,
@@ -408,10 +415,28 @@ internal object LocalFeedPoller {
             thumbnailUrl =
                 existing.thumbnailUrl?.takeIf { it.isNotBlank() } ?: candidate.thumbnailUrl,
             audioUrl = mergedAudioUrl,
-            duration = existing.duration?.takeIf { it.isNotBlank() } ?: candidate.duration,
+            duration = resolveMergedDuration(existing.duration, candidate.duration),
             contentType = mergedContentType,
         )
     }
+
+    private fun resolveMergedFeedTitle(existingTitle: String, feed: FeedRow): String =
+        existingTitle.takeIf {
+            it.isNotBlank() &&
+                it != DEFAULT_SAVED_HOST &&
+                !it.equals(extractHostTitle(feed.url), ignoreCase = true) &&
+                it != "YouTube Channel"
+        } ?: feed.title
+
+    private fun resolveMergedDuration(
+        existingDuration: String?,
+        candidateDuration: String?,
+    ): String? =
+        when {
+            parseDurationToSecondsLong(existingDuration) != null -> existingDuration
+            parseDurationToSecondsLong(candidateDuration) != null -> candidateDuration
+            else -> existingDuration?.takeIf { it.isNotBlank() } ?: candidateDuration
+        }
 
     internal fun parseFeedXml(
         xml: String,
@@ -489,18 +514,14 @@ internal object LocalFeedPoller {
             extractItunesImageHref(entry, feedUrl)
                 ?: extractAtomThumbnail(entry, mediaGroup, sanitizedHtml, feedUrl, resolvedUrl)
         val effectiveAudioUrl = audioUrl ?: resolvedUrl.takeIf(::isDirectAudioUrl)
+        val isPodcastFeed = feedType.equals(FEED_TYPE_PODCAST, ignoreCase = true)
         val effectiveType =
-            if (effectiveAudioUrl != null) {
+            if (isPodcastFeed && effectiveAudioUrl != null) {
                 CONTENT_TYPE_AUDIO
             } else {
                 resolveCandidateContentType(feedType, resolvedUrl)
             }
-        val duration =
-            if (effectiveType == CONTENT_TYPE_AUDIO) {
-                extractPodcastDurationLabel(entry, mediaGroup)
-            } else {
-                null
-            }
+        val duration = effectiveAudioUrl?.let { extractPodcastDurationLabel(entry, mediaGroup) }
 
         return ParsedFeedCandidateItem(
             title = rawTitle.ifBlank { resolvedUrl },
@@ -579,18 +600,14 @@ internal object LocalFeedPoller {
         val summarySource = extractRssSummarySource(item, mediaGroup)
         val summaryText = summarySource?.let(::plainTextExcerpt).orEmpty().ifBlank { rawTitle }
         val effectiveAudioUrl = audioUrl ?: resolvedUrl.takeIf(::isDirectAudioUrl)
+        val isPodcastFeed = feedType.equals(FEED_TYPE_PODCAST, ignoreCase = true)
         val effectiveType =
-            if (effectiveAudioUrl != null) {
+            if (isPodcastFeed && effectiveAudioUrl != null) {
                 CONTENT_TYPE_AUDIO
             } else {
                 resolveCandidateContentType(feedType, resolvedUrl)
             }
-        val duration =
-            if (effectiveType == CONTENT_TYPE_AUDIO) {
-                extractPodcastDurationLabel(item, mediaGroup)
-            } else {
-                null
-            }
+        val duration = effectiveAudioUrl?.let { extractPodcastDurationLabel(item, mediaGroup) }
         val thumbnailUrl =
             extractRssThumbnailUrl(
                 item = item,
@@ -599,7 +616,7 @@ internal object LocalFeedPoller {
                 resolvedUrl = resolvedUrl,
                 sanitizedHtml = sanitizedHtml,
                 channelArtworkUrl = channelArtworkUrl,
-                isAudio = effectiveType == CONTENT_TYPE_AUDIO,
+                isAudio = effectiveAudioUrl != null,
             )
 
         return ParsedFeedCandidateItem(
@@ -1059,6 +1076,7 @@ private const val XML_TAG_AUTHOR = "author"
 private const val XML_TAG_ENCLOSURE = "enclosure"
 private const val XML_TAG_IMAGE = "image"
 private const val CONTENT_TYPE_AUDIO = "audio"
+private const val FEED_TYPE_PODCAST = "podcast"
 private const val MIME_AUDIO_PREFIX = "audio/"
 private const val MIME_IMAGE_PREFIX = "image/"
 private const val ATTR_URL = "url"

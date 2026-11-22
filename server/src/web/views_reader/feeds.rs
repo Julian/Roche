@@ -211,6 +211,15 @@ fn render_feeds_mobile_subscribe(out: &mut String, csrf: &str) {
                <label for=\"m-feed-title\">Custom Title (optional)</label>\n\
                <input id=\"m-feed-title\" name=\"title\" type=\"text\" placeholder=\"Auto-detected from feed\">\n\
              </div>\n\
+             <div class=\"field\">\n\
+               <label for=\"m-feed-type\">Source Kind</label>\n\
+               <select id=\"m-feed-type\" name=\"feed_type\">\n\
+                 <option value=\"rss\">Auto / RSS</option>\n\
+                 <option value=\"podcast\">Podcast</option>\n\
+                 <option value=\"youtube\">YouTube</option>\n\
+                 <option value=\"arxiv\">arXiv</option>\n\
+               </select>\n\
+             </div>\n\
              <button type=\"submit\" class=\"btn btn-primary btn-small\">Subscribe</button>\n\
            </form>\n\
          </details>\n",
@@ -391,6 +400,22 @@ fn render_feed_row_details(
             esc(raw_err),
         );
     }
+    let feed_type_field = if matches!(f.feed_type, FeedType::Rss | FeedType::Podcast) {
+        let rss_sel = if f.feed_type == FeedType::Rss { " selected" } else { "" };
+        let pod_sel = if f.feed_type == FeedType::Podcast { " selected" } else { "" };
+        format!(
+            "<div class=\"field\">\n\
+               <label for=\"fe-type-{id_enc}\">Feed Type</label>\n\
+               <select id=\"fe-type-{id_enc}\" name=\"feed_type\">\n\
+                 <option value=\"rss\"{rss_sel}>RSS / Newsletter</option>\n\
+                 <option value=\"podcast\"{pod_sel}>Podcast</option>\n\
+               </select>\n\
+             </div>\n",
+            id_enc = esc(id_enc),
+        )
+    } else {
+        String::new()
+    };
     let _ = write!(
         out,
         "<form method=\"post\" action=\"/web/feeds/{id_enc}/edit\" class=\"feed-edit-form js-feeds-preserve-form\">\n\
@@ -405,6 +430,7 @@ fn render_feed_row_details(
                <label for=\"fe-interval-{id_enc}\">Poll every (min)</label>\n\
                <input id=\"fe-interval-{id_enc}\" name=\"poll_interval\" type=\"number\" min=\"5\" max=\"10080\" value=\"{interval}\">\n\
              </div>\n\
+             {feed_type_field}\
              <button type=\"submit\" class=\"btn btn-primary btn-small\">Save</button>\n\
            </div>\n\
          </form>\n\
@@ -634,7 +660,18 @@ pub(in crate::web) async fn post_feed_edit(
             },
             None => None,
         };
-    if let Err(err) = service.feeds().update(&id, clean_title, parsed_interval, None).await {
+    let parsed_feed_type = match form.feed_type.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    {
+        Some("rss") => Some(FeedType::Rss),
+        Some("podcast") => Some(FeedType::Podcast),
+        Some(_) => {
+            return redirect_with_flash(&dest, "err", "Unsupported feed type change");
+        }
+        None => None,
+    };
+    if let Err(err) =
+        service.feeds().update(&id, clean_title, parsed_interval, None, parsed_feed_type).await
+    {
         return redirect_with_flash(&dest, "err", &safe_web_error_message(&err));
     }
     redirect_with_flash(&dest, "notice", "Updated feed settings")

@@ -8,6 +8,7 @@ import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.extractNormalizedServerHost
 import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.model.AppTab
+import com.grayvines.roche.model.FeedType
 import kotlinx.coroutines.flow.first
 
 @Suppress("TooManyFunctions")
@@ -24,6 +25,7 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
             is MainAction.ImportOpml -> performImportOpml(action.opmlXml)
             is MainAction.RefreshFeed -> performRefreshFeed(action.feedId)
             is MainAction.RenameFeed -> performRenameFeed(action.feedId, action.newTitle)
+            is MainAction.SetFeedType -> performSetFeedType(action.feedId, action.feedType)
             is MainAction.ApplyTagToFeed -> performApplyTagToFeed(action.feedId, action.tagName)
             is MainAction.ArchiveFeedUnread -> performArchiveFeedUnread(action.feedId)
             is MainAction.ToggleFeedArchive -> performToggleFeedArchive(action.feedId)
@@ -122,6 +124,20 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
         if (updatedTitle != null) {
             host.showStatusMessage("Renamed feed to \"${updatedTitle.take(SNACKBAR_TITLE_LIMIT)}\"")
         }
+    }
+
+    private suspend fun performSetFeedType(feedId: String, feedType: FeedType) {
+        host.repository
+            .setFeedType(feedId = feedId, targetType = feedType)
+            .onSuccess { updated ->
+                val label = if (updated == FeedType.PODCAST) "Podcast" else "RSS / Newsletter"
+                host.showStatusMessage("Updated feed type to $label")
+            }
+            .onFailure { error ->
+                host.showStatusMessage(
+                    "Feed type update failed (${formatErrorDetail(error, "error")})"
+                )
+            }
     }
 
     private suspend fun performApplyTagToFeed(feedId: String, tagName: String) {

@@ -226,6 +226,7 @@ pub(super) async fn resolve_dedup_entry_id(
 #[derive(sqlx::FromRow)]
 struct ExistingFeedPollMeta {
     feed_url: String,
+    source_type: FeedType,
     feed_title: Option<String>,
     summary: Option<String>,
     language: Option<String>,
@@ -252,17 +253,19 @@ impl<'a> FeedRepo<'a> {
         self.create_with_interval(feed_type, url, title, description, 30).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn reactivate_archived_feed_in_tx(
         tx: &mut WriteTx<'_>,
         url_str: &str,
         det_id: &str,
+        requested_feed_type: Option<FeedType>,
         title: Option<&str>,
         description: Option<&str>,
         prefer_incoming_title: bool,
         now: DateTime<Utc>,
     ) -> std::result::Result<Option<String>, sqlx::Error> {
-        let existing_archived_id: Option<String> = sqlx::query_scalar(
-            "SELECT collection_id FROM feed_sources
+        let existing_archived: Option<(String, FeedType)> = sqlx::query_as(
+            "SELECT collection_id, source_type FROM feed_sources
              WHERE (feed_url = ? OR collection_id = ?) AND is_active = 0
              LIMIT 1",
         )
@@ -271,14 +274,22 @@ impl<'a> FeedRepo<'a> {
         .fetch_optional(tx.conn())
         .await?;
 
-        let Some(existing_id) = existing_archived_id else {
+        let Some((existing_id, existing_type)) = existing_archived else {
             return Ok(None);
         };
+
+        let target_type = match (existing_type, requested_feed_type) {
+            (FeedType::Rss, Some(FeedType::Podcast)) => FeedType::Podcast,
+            (FeedType::Podcast, Some(FeedType::Rss)) => FeedType::Rss,
+            _ => existing_type,
+        };
+        let target_kind = entry_kind_for_feed_type(target_type);
 
         let feed_hlc = tx.next_hlc().await?;
         let feed_sql = if prefer_incoming_title {
             "UPDATE feed_sources
              SET is_active = 1,
+                 source_type = ?,
                  feed_title = COALESCE(?, feed_title),
                  consecutive_failures = 0,
                  last_error = NULL,
@@ -288,6 +299,7 @@ impl<'a> FeedRepo<'a> {
         } else {
             "UPDATE feed_sources
              SET is_active = 1,
+                 source_type = ?,
                  feed_title = COALESCE(feed_title, ?),
                  consecutive_failures = 0,
                  last_error = NULL,
@@ -296,6 +308,7 @@ impl<'a> FeedRepo<'a> {
              WHERE collection_id = ?"
         };
         sqlx::query(feed_sql)
+            .bind(target_type)
             .bind(title)
             .bind(&feed_hlc)
             .bind(&existing_id)
@@ -306,12 +319,14 @@ impl<'a> FeedRepo<'a> {
         if prefer_incoming_title {
             sqlx::query(
                 "UPDATE entries
-                 SET title = COALESCE(?, title),
+                 SET kind = ?,
+                     title = COALESCE(?, title),
                      summary = COALESCE(?, summary),
                      updated_at = ?,
                      hlc = ?
                  WHERE id = ?",
             )
+            .bind(target_kind)
             .bind(title)
             .bind(description)
             .bind(now)
@@ -322,17 +337,24 @@ impl<'a> FeedRepo<'a> {
         } else {
             sqlx::query(
                 "UPDATE entries
-                 SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
+                 SET kind = ?,
+                     title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
                      updated_at = ?,
                      hlc = ?
                  WHERE id = ?",
             )
+            .bind(target_kind)
             .bind(&existing_id)
             .bind(now)
             .bind(&entry_hlc)
             .bind(&existing_id)
             .execute(tx.conn())
             .await?;
+        }
+
+        if target_type != existing_type {
+            Self::reclassify_feed_items_for_type_change_in_tx(tx, &existing_id, target_type, now)
+                .await?;
         }
 
         SyncRepo::record_activity(
@@ -367,6 +389,7 @@ impl<'a> FeedRepo<'a> {
             &mut tx,
             url_str,
             &id,
+            Some(feed_type),
             title,
             description,
             true,
@@ -562,6 +585,7 @@ impl<'a> FeedRepo<'a> {
             tx,
             xml_url_str,
             &id,
+            (outline.feed_type == FeedType::Podcast).then_some(FeedType::Podcast),
             clean_title,
             None,
             false,
@@ -648,25 +672,30 @@ impl<'a> FeedRepo<'a> {
         Ok(rows.into_iter().map(Feed::try_from).collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn update(
         &self,
         id: &str,
         title: Option<&str>,
         poll_interval: Option<i64>,
         is_active: Option<bool>,
+        feed_type: Option<FeedType>,
     ) -> Result<bool> {
-        if title.is_none() && poll_interval.is_none() && is_active.is_none() {
+        if title.is_none() && poll_interval.is_none() && is_active.is_none() && feed_type.is_none()
+        {
             return Ok(self.get(id).await?.is_some());
         }
 
         let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
-        let existing_url: Option<String> =
-            sqlx::query_scalar!("SELECT feed_url FROM feed_sources WHERE collection_id = ?", id,)
-                .fetch_optional(tx.conn())
-                .await?;
-        let Some(feed_url) = existing_url else {
+        let existing_feed: Option<(String, FeedType)> = sqlx::query_as(
+            "SELECT feed_url, source_type FROM feed_sources WHERE collection_id = ?",
+        )
+        .bind(id)
+        .fetch_optional(tx.conn())
+        .await?;
+        let Some((feed_url, existing_type)) = existing_feed else {
             return Ok(false);
         };
 
@@ -723,6 +752,29 @@ impl<'a> FeedRepo<'a> {
                 .await?;
             }
         }
+        if let Some(new_type) = feed_type
+            && matches!(
+                (existing_type, new_type),
+                (FeedType::Rss, FeedType::Podcast) | (FeedType::Podcast, FeedType::Rss)
+            )
+        {
+            let target_kind = entry_kind_for_feed_type(new_type);
+            sqlx::query("UPDATE feed_sources SET source_type = ?, hlc = ? WHERE collection_id = ?")
+                .bind(new_type)
+                .bind(&feed_hlc)
+                .bind(id)
+                .execute(tx.conn())
+                .await?;
+            let entry_hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET kind = ?, updated_at = ?, hlc = ? WHERE id = ?")
+                .bind(target_kind)
+                .bind(now)
+                .bind(&entry_hlc)
+                .bind(id)
+                .execute(tx.conn())
+                .await?;
+            Self::reclassify_feed_items_for_type_change_in_tx(&mut tx, id, new_type, now).await?;
+        }
         sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, id)
             .execute(tx.conn())
             .await?;
@@ -739,12 +791,128 @@ impl<'a> FeedRepo<'a> {
         Ok(true)
     }
 
+    async fn reclassify_feed_items_for_type_change_in_tx(
+        tx: &mut WriteTx<'_>,
+        feed_id: &str,
+        new_type: FeedType,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        match new_type {
+            FeedType::Podcast => {
+                Self::promote_feed_audio_items_to_podcast_in_tx(tx, feed_id, now).await
+            }
+            FeedType::Rss => Self::demote_feed_podcast_items_to_rss_in_tx(tx, feed_id, now).await,
+            FeedType::Youtube | FeedType::Arxiv => Ok(()),
+        }
+    }
+
+    async fn promote_feed_audio_items_to_podcast_in_tx(
+        tx: &mut WriteTx<'_>,
+        feed_id: &str,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let rows: Vec<(String, EntryKind, ContentType)> = sqlx::query_as(
+            "SELECT DISTINCT e.id, e.kind, ec.content_type
+             FROM collection_entries ce
+             JOIN entries e ON e.id = ce.entry_id
+             JOIN entry_content ec ON ec.entry_id = e.id
+             WHERE ce.collection_id = ?
+               AND e.merged_into_id IS NULL
+               AND e.kind IN ('article', 'podcast_episode')
+               AND (ec.content_type = 'audio'
+                    OR EXISTS (
+                        SELECT 1 FROM entry_media em
+                        WHERE em.entry_id = e.id
+                          AND em.media_type = 'audio'
+                          AND (em.remote_url IS NOT NULL OR em.local_path IS NOT NULL)
+                    ))
+               AND (e.kind = 'article' OR ec.content_type != 'audio')",
+        )
+        .bind(feed_id)
+        .fetch_all(tx.conn())
+        .await?;
+        for (entry_id, existing_kind, existing_ct) in rows {
+            if existing_ct != ContentType::Audio {
+                sqlx::query("UPDATE entry_content SET content_type = 'audio' WHERE entry_id = ?")
+                    .bind(&entry_id)
+                    .execute(tx.conn())
+                    .await?;
+            }
+            let target_kind = if existing_kind == EntryKind::Article {
+                EntryKind::PodcastEpisode
+            } else {
+                existing_kind
+            };
+            let entry_hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET kind = ?, updated_at = ?, hlc = ? WHERE id = ?")
+                .bind(target_kind)
+                .bind(now)
+                .bind(&entry_hlc)
+                .bind(&entry_id)
+                .execute(tx.conn())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn demote_feed_podcast_items_to_rss_in_tx(
+        tx: &mut WriteTx<'_>,
+        feed_id: &str,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let rows: Vec<(String, EntryKind, ContentType, Option<String>)> = sqlx::query_as(
+            "SELECT DISTINCT e.id, e.kind, ec.content_type, e.url
+             FROM collection_entries ce
+             JOIN entries e ON e.id = ce.entry_id
+             JOIN entry_content ec ON ec.entry_id = e.id
+             WHERE ce.collection_id = ?
+               AND e.merged_into_id IS NULL
+               AND (e.kind = 'podcast_episode' OR ec.content_type = 'audio')
+               AND NOT EXISTS (
+                   SELECT 1 FROM collection_entries ce_other
+                   JOIN feed_sources fs_other ON fs_other.collection_id = ce_other.collection_id
+                   WHERE ce_other.entry_id = e.id
+                     AND ce_other.collection_id != ?
+                     AND fs_other.source_type = 'podcast'
+               )",
+        )
+        .bind(feed_id)
+        .bind(feed_id)
+        .fetch_all(tx.conn())
+        .await?;
+        for (entry_id, existing_kind, existing_ct, entry_url) in rows {
+            let target_ct = entry_url
+                .as_deref()
+                .and_then(|raw| Url::parse(raw.trim()).ok())
+                .map_or(ContentType::Article, |parsed| roche_core::classify::classify_url(&parsed));
+            let target_kind = EntryKind::for_feed_item(Some(FeedType::Rss), target_ct);
+            if existing_ct != target_ct {
+                sqlx::query("UPDATE entry_content SET content_type = ? WHERE entry_id = ?")
+                    .bind(target_ct)
+                    .bind(&entry_id)
+                    .execute(tx.conn())
+                    .await?;
+            }
+            if existing_kind != target_kind || existing_ct != target_ct {
+                let entry_hlc = tx.next_hlc().await?;
+                sqlx::query("UPDATE entries SET kind = ?, updated_at = ?, hlc = ? WHERE id = ?")
+                    .bind(target_kind)
+                    .bind(now)
+                    .bind(&entry_hlc)
+                    .bind(&entry_id)
+                    .execute(tx.conn())
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn archive(&self, id: &str) -> Result<bool> {
-        self.update(id, None, None, Some(false)).await
+        self.update(id, None, None, Some(false), None).await
     }
 
     pub async fn unarchive(&self, id: &str) -> Result<bool> {
-        self.update(id, None, None, Some(true)).await
+        self.update(id, None, None, Some(true), None).await
     }
 
     pub(crate) async fn delete_feed_preserving_history_in_tx(
@@ -873,7 +1041,7 @@ impl<'a> FeedRepo<'a> {
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         let existing_meta: Option<ExistingFeedPollMeta> = sqlx::query_as(
-            "SELECT fs.feed_url, fs.feed_title, e.summary, fs.language
+            "SELECT fs.feed_url, fs.source_type, fs.feed_title, e.summary, fs.language
              FROM feed_sources fs
              JOIN entries e ON e.id = fs.collection_id
              WHERE fs.collection_id = ?",
@@ -883,6 +1051,7 @@ impl<'a> FeedRepo<'a> {
         .await?;
 
         let feed_url = existing_meta.as_ref().map(|r| r.feed_url.clone());
+        let parent_feed_type = existing_meta.as_ref().map(|r| r.source_type);
         let feed_config_changed = existing_meta.as_ref().is_some_and(|meta| {
             (meta.feed_title.is_none() && new_title.is_some())
                 || (meta.language.is_none() && new_lang.is_some())
@@ -1065,6 +1234,7 @@ impl<'a> FeedRepo<'a> {
                     Self::backfill_existing_poll_item_in_tx(
                         &mut tx,
                         &existing_id,
+                        parent_feed_type,
                         item,
                         clean_duration,
                         now,
@@ -1084,6 +1254,7 @@ impl<'a> FeedRepo<'a> {
                     Self::backfill_existing_poll_item_in_tx(
                         &mut tx,
                         &existing_id,
+                        parent_feed_type,
                         item,
                         clean_duration,
                         now,
@@ -1091,7 +1262,13 @@ impl<'a> FeedRepo<'a> {
                     .await?;
                 }
             } else {
-                let entry_kind = EntryKind::from_content_type(item.content_type);
+                let resolved_ct =
+                    if parent_feed_type == Some(FeedType::Podcast) && item.audio_url.is_some() {
+                        ContentType::Audio
+                    } else {
+                        item.content_type
+                    };
+                let entry_kind = EntryKind::for_feed_item(parent_feed_type, resolved_ct);
                 let creators_json = crate::db::serialize_creators_json(&item.creators)
                     .unwrap_or_else(|| "[]".to_owned());
 
@@ -1113,7 +1290,7 @@ impl<'a> FeedRepo<'a> {
                         tx.conn(),
                         &det_id,
                         item_content_html,
-                        item.content_type,
+                        resolved_ct,
                     )
                     .await?;
 
@@ -1174,6 +1351,7 @@ impl<'a> FeedRepo<'a> {
     async fn backfill_existing_poll_item_in_tx(
         tx: &mut WriteTx<'_>,
         existing_id: &str,
+        parent_feed_type: Option<FeedType>,
         item: &PollItemCandidate,
         clean_duration: Option<i64>,
         now: DateTime<Utc>,
@@ -1189,8 +1367,13 @@ impl<'a> FeedRepo<'a> {
         let new_creators_json = crate::db::serialize_creators_json(&item.creators);
         let thumb_ref = item.thumbnail_url.as_deref();
         let creators_ref = new_creators_json.as_deref();
-        let audio_ref = item.audio_url.as_deref();
+        let podcast_audio_ref = if parent_feed_type == Some(FeedType::Podcast) {
+            item.audio_url.as_deref()
+        } else {
+            None
+        };
 
+        let mut entry_hlc_bumped = false;
         let mut changed = false;
 
         let entry_hlc = tx.next_hlc().await?;
@@ -1209,20 +1392,21 @@ impl<'a> FeedRepo<'a> {
         .bind(thumb_ref)
         .bind(creators_ref)
         .bind(creators_ref)
-        .bind(audio_ref)
+        .bind(podcast_audio_ref)
         .bind(now)
         .bind(&entry_hlc)
         .bind(existing_id)
         .bind(thumb_ref)
         .bind(creators_ref)
-        .bind(audio_ref)
+        .bind(podcast_audio_ref)
         .execute(tx.conn())
         .await?;
         if entry_res.rows_affected() > 0 {
+            entry_hlc_bumped = true;
             changed = true;
         }
 
-        if item.audio_url.is_some() {
+        if podcast_audio_ref.is_some() {
             let ct_res = sqlx::query!(
                 "UPDATE entry_content
                  SET content_type = 'audio'
@@ -1246,6 +1430,16 @@ impl<'a> FeedRepo<'a> {
             )
             .await?;
             changed |= enclosure_updated;
+        }
+
+        if changed && !entry_hlc_bumped {
+            let backfill_hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET updated_at = ?, hlc = ? WHERE id = ?")
+                .bind(now)
+                .bind(&backfill_hlc)
+                .bind(existing_id)
+                .execute(tx.conn())
+                .await?;
         }
 
         if changed {
@@ -1295,9 +1489,6 @@ impl<'a> FeedRepo<'a> {
             now,
         )
         .await?;
-        sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, existing_id)
-            .execute(&mut *conn)
-            .await?;
         Ok(true)
     }
 
@@ -1594,7 +1785,7 @@ mod tests {
                     thumbnail_url: None,
                     audio_url: Some("https://cdn.example.com/discussion.mp3".to_owned()),
                     duration: Some(900),
-                    content_type: ContentType::Audio,
+                    content_type: ContentType::Article,
                 },
             ],
         };
@@ -1607,7 +1798,173 @@ mod tests {
         assert_eq!(feed_entry.kind, EntryKind::Publication);
 
         let audio_item = db.items().get(&inserted[1].0).await.unwrap().unwrap();
-        assert_eq!(audio_item.content_type, ContentType::Audio);
+        assert_eq!(audio_item.content_type, ContentType::Article);
+        assert_eq!(audio_item.entry_kind, EntryKind::Article);
         assert_eq!(audio_item.audio_url.as_deref(), Some("https://cdn.example.com/discussion.mp3"));
+        assert_eq!(audio_item.duration, Some(900));
+    }
+
+    #[tokio::test]
+    async fn test_toggle_feed_type_rss_podcast_reclassifies_audio_items_only() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://hybrid.example.com/feed.xml").unwrap();
+        let feed =
+            db.feeds().create(FeedType::Rss, &feed_url, Some("Hybrid Feed"), None).await.unwrap();
+
+        let batch = PollBatch {
+            title: Some("Hybrid Feed".to_owned()),
+            description: None,
+            language: None,
+            items: vec![
+                PollItemCandidate {
+                    title: "Plain Text".to_owned(),
+                    url: Url::parse("https://hybrid.example.com/text").unwrap(),
+                    creators: Vec::new(),
+                    published_at: None,
+                    summary: "Text".to_owned(),
+                    content_html: Some("<p>Text</p>".to_owned()),
+                    thumbnail_url: None,
+                    audio_url: None,
+                    duration: None,
+                    content_type: ContentType::Article,
+                },
+                PollItemCandidate {
+                    title: "Narrated Essay".to_owned(),
+                    url: Url::parse("https://hybrid.example.com/audio-post").unwrap(),
+                    creators: Vec::new(),
+                    published_at: None,
+                    summary: "Narrated".to_owned(),
+                    content_html: Some("<p>Narrated</p>".to_owned()),
+                    thumbnail_url: None,
+                    audio_url: Some("https://cdn.hybrid.example.com/post.mp3".to_owned()),
+                    duration: Some(1200),
+                    content_type: ContentType::Article,
+                },
+                PollItemCandidate {
+                    title: "Video With Audio Track".to_owned(),
+                    url: Url::parse("https://youtube.com/watch?v=abc123def45").unwrap(),
+                    creators: Vec::new(),
+                    published_at: None,
+                    summary: "Video".to_owned(),
+                    content_html: Some("<p>Video</p>".to_owned()),
+                    thumbnail_url: None,
+                    audio_url: Some("https://cdn.hybrid.example.com/video-audio.mp3".to_owned()),
+                    duration: Some(600),
+                    content_type: ContentType::Video,
+                },
+            ],
+        };
+        let inserted = db.feeds().record_poll_batch(&feed.id, &batch).await.unwrap();
+        let text_id = &inserted[0].0;
+        let narrated_id = &inserted[1].0;
+        let video_id = &inserted[2].0;
+
+        // Toggle RSS -> Podcast
+        assert!(
+            db.feeds().update(&feed.id, None, None, None, Some(FeedType::Podcast)).await.unwrap()
+        );
+        assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().feed_type, FeedType::Podcast);
+        assert_eq!(
+            db.catalog().get_entry(&feed.id).await.unwrap().unwrap().kind,
+            EntryKind::Podcast
+        );
+
+        let ep = db.items().get(narrated_id).await.unwrap().unwrap();
+        assert_eq!(ep.entry_kind, EntryKind::PodcastEpisode);
+        assert_eq!(ep.content_type, ContentType::Audio);
+        assert_eq!(ep.audio_url.as_deref(), Some("https://cdn.hybrid.example.com/post.mp3"));
+        assert_eq!(ep.duration, Some(1200));
+
+        let text = db.items().get(text_id).await.unwrap().unwrap();
+        assert_eq!(text.entry_kind, EntryKind::Article);
+        assert_eq!(text.content_type, ContentType::Article);
+
+        // Non-article (Video) item must NOT be corrupted to content_type=audio on RSS -> Podcast
+        let video = db.items().get(video_id).await.unwrap().unwrap();
+        assert_eq!(video.entry_kind, EntryKind::Video);
+        assert_eq!(video.content_type, ContentType::Video);
+
+        // Toggle Podcast -> RSS: preserves audio_url + duration while reverting to Article
+        assert!(db.feeds().update(&feed.id, None, None, None, Some(FeedType::Rss)).await.unwrap());
+        assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().feed_type, FeedType::Rss);
+        assert_eq!(
+            db.catalog().get_entry(&feed.id).await.unwrap().unwrap().kind,
+            EntryKind::Publication
+        );
+
+        let reverted = db.items().get(narrated_id).await.unwrap().unwrap();
+        assert_eq!(reverted.entry_kind, EntryKind::Article);
+        assert_eq!(reverted.content_type, ContentType::Article);
+        assert_eq!(reverted.audio_url.as_deref(), Some("https://cdn.hybrid.example.com/post.mp3"));
+        assert_eq!(reverted.duration, Some(1200));
+    }
+
+    #[tokio::test]
+    async fn test_backfill_rss_audio_enclosure_bumps_entry_hlc() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://backfill.example.com/feed.xml").unwrap();
+        let feed =
+            db.feeds().create(FeedType::Rss, &feed_url, Some("Backfill Blog"), None).await.unwrap();
+        let item_url = Url::parse("https://backfill.example.com/p/post-1").unwrap();
+
+        let initial_batch = PollBatch {
+            title: Some("Backfill Blog".to_owned()),
+            description: None,
+            language: None,
+            items: vec![PollItemCandidate {
+                title: "Essay".to_owned(),
+                url: item_url.clone(),
+                creators: vec!["Author".to_owned()],
+                published_at: None,
+                summary: "Summary".to_owned(),
+                content_html: Some("<p>Body</p>".to_owned()),
+                thumbnail_url: Some("https://backfill.example.com/thumb.jpg".to_owned()),
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Article,
+            }],
+        };
+        let inserted = db.feeds().record_poll_batch(&feed.id, &initial_batch).await.unwrap();
+        let item_id = inserted[0].0.clone();
+        let hlc_before: String = sqlx::query_scalar("SELECT hlc FROM entries WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        let backfill_batch = PollBatch {
+            title: Some("Backfill Blog".to_owned()),
+            description: None,
+            language: None,
+            items: vec![PollItemCandidate {
+                title: "Essay".to_owned(),
+                url: item_url,
+                creators: vec!["Author".to_owned()],
+                published_at: None,
+                summary: "Summary".to_owned(),
+                content_html: Some("<p>Body</p>".to_owned()),
+                thumbnail_url: Some("https://backfill.example.com/thumb.jpg".to_owned()),
+                audio_url: Some("https://cdn.backfill.example.com/post-1.mp3".to_owned()),
+                duration: Some(1500),
+                content_type: ContentType::Article,
+            }],
+        };
+        let reinserted = db.feeds().record_poll_batch(&feed.id, &backfill_batch).await.unwrap();
+        assert!(reinserted.is_empty());
+
+        let hlc_after: String = sqlx::query_scalar("SELECT hlc FROM entries WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            hlc_after > hlc_before,
+            "backfilling RSS audio enclosure must advance entries.hlc ({hlc_after} > {hlc_before})"
+        );
+        let item = db.items().get(&item_id).await.unwrap().unwrap();
+        assert_eq!(item.entry_kind, EntryKind::Article);
+        assert_eq!(item.content_type, ContentType::Article);
+        assert_eq!(item.audio_url.as_deref(), Some("https://cdn.backfill.example.com/post-1.mp3"));
+        assert_eq!(item.duration, Some(1500));
     }
 }

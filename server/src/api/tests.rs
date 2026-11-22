@@ -2432,3 +2432,211 @@ async fn test_concurrency_503_and_timeout_408_json_vs_html() {
             .is_some()
     );
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_api_feed_type_toggle_item_audio_filters_and_progress_source() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let token = TokenManager::new(db.auth()).create("decouple-api", 32).await.unwrap();
+    let auth = format!("Bearer {token}");
+    let service = RocheService::new(db.clone(), FakeFeedFetcher, crate::config::Config::default());
+    let app = ApiRoutes::router_with_service(service);
+
+    let rss_url = Url::parse("https://api-decouple.example/rss.xml").unwrap();
+    let rss_feed = db
+        .feeds()
+        .create(crate::db::FeedType::Rss, &rss_url, Some("Essay Feed"), None)
+        .await
+        .unwrap();
+    let pod_url = Url::parse("https://api-decouple.example/pod.xml").unwrap();
+    let pod_feed = db
+        .feeds()
+        .create(crate::db::FeedType::Podcast, &pod_url, Some("Podcast Feed"), None)
+        .await
+        .unwrap();
+    let yt_url =
+        Url::parse("https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA")
+            .unwrap();
+    let yt_feed = db
+        .feeds()
+        .create(crate::db::FeedType::Youtube, &yt_url, Some("YT Channel"), None)
+        .await
+        .unwrap();
+
+    let narrated_url = Url::parse("https://api-decouple.example/narrated").unwrap();
+    let narrated = db
+        .items()
+        .create(&crate::db::NewItem {
+            feed_id: Some(&rss_feed.id),
+            title: "Narrated API Post",
+            url: &narrated_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: crate::domain::ContentType::Article,
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO entry_media (id, entry_id, media_type, remote_url, duration)
+         VALUES ('api-narrated-mp3', ?, 'audio', 'https://cdn.api-decouple.example/narrated.mp3', 600)",
+    )
+    .bind(&narrated.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let ep_url = Url::parse("https://api-decouple.example/ep1").unwrap();
+    let ep = db
+        .items()
+        .create(&crate::db::NewItem {
+            feed_id: Some(&pod_feed.id),
+            title: "API Podcast Ep 1",
+            url: &ep_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: crate::domain::ContentType::Audio,
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO entry_media (id, entry_id, media_type, remote_url, duration)
+         VALUES ('api-ep-mp3', ?, 'audio', 'https://cdn.api-decouple.example/ep1.mp3', 1800)",
+    )
+    .bind(&ep.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    // 1. GET /api/v1/items?podcast_only=true returns ONLY explicit podcast episode
+    let pod_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/items?podcast_only=true")
+                .header(header::AUTHORIZATION, &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pod_res.status(), StatusCode::OK);
+    let pod_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(pod_res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let pod_items = pod_json["items"].as_array().unwrap();
+    assert_eq!(pod_items.len(), 1);
+    assert_eq!(pod_items[0]["id"].as_str(), Some(ep.id.as_str()));
+
+    // 2. GET /api/v1/items?has_audio=true returns BOTH podcast episode and narrated RSS article
+    let audio_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/items?has_audio=true")
+                .header(header::AUTHORIZATION, &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(audio_res.status(), StatusCode::OK);
+    let audio_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(audio_res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(audio_json["items"].as_array().unwrap().len(), 2);
+
+    // 3. PATCH /api/v1/items/{id} progress_source="reader" does not auto-log narrated article
+    //    or podcast episode, whereas progress_source="audio" auto-logs even at same progress=1.0
+    let pod_scroll_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/items/{}", ep.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"read_progress":1.0,"progress_source":"reader"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pod_scroll_res.status(), StatusCode::OK);
+    assert_eq!(db.catalog().get_entry_detail(&ep.id).await.unwrap().unwrap().log_history.len(), 0);
+
+    let scroll_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/items/{}", narrated.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"read_progress":1.0,"progress_source":"reader"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scroll_res.status(), StatusCode::OK);
+    assert_eq!(
+        db.catalog().get_entry_detail(&narrated.id).await.unwrap().unwrap().log_history.len(),
+        0
+    );
+
+    let listen_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/items/{}", narrated.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"read_progress":1.0,"progress_source":"audio"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listen_res.status(), StatusCode::OK);
+    let after_listen = db.catalog().get_entry_detail(&narrated.id).await.unwrap().unwrap();
+    assert_eq!(after_listen.entry.kind, crate::domain::EntryKind::Article);
+    assert!(
+        after_listen
+            .log_history
+            .iter()
+            .any(|l| l.status == crate::domain::ConsumptionStatus::Consumed)
+    );
+
+    // 4. PATCH /api/v1/feeds/{id} toggles rss -> podcast and rejects youtube -> podcast
+    let toggle_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/feeds/{}", rss_feed.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"feed_type":"podcast"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_ok.status(), StatusCode::OK);
+    assert_eq!(
+        db.items().get(&narrated.id).await.unwrap().unwrap().entry_kind,
+        crate::domain::EntryKind::PodcastEpisode
+    );
+
+    let toggle_bad = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/feeds/{}", yt_feed.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"feed_type":"podcast"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_bad.status(), StatusCode::BAD_REQUEST);
+}

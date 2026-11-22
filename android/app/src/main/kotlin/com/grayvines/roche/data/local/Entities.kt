@@ -51,7 +51,7 @@ data class EntryEntity(
 )
 data class EntryContentEntity(
     @PrimaryKey val entryId: String,
-    val contentType: String = "article",
+    val contentType: String = DEFAULT_ENTRY_KIND,
     val contentText: String? = null,
     val contentHtml: String? = null,
     val audioUrl: String? = null,
@@ -379,6 +379,7 @@ data class InboxItemRow(
     val interactionUpdatedAt: String? = null,
     val audioUrl: String? = null,
     val inboxState: String = DEFAULT_INBOX_STATE,
+    val entryKind: String = DEFAULT_ENTRY_KIND,
 )
 
 @Suppress("LongParameterList")
@@ -392,6 +393,7 @@ data class ItemStateRow(
     val readProgress: Double,
     val audioUrl: String?,
     val inboxState: String = DEFAULT_INBOX_STATE,
+    val entryKind: String = DEFAULT_ENTRY_KIND,
 )
 
 data class TagRow(
@@ -459,3 +461,4 @@ internal fun RepositoryStampRow.toCatalogStamp(): CatalogStampRow =
     )
 
 internal const val DEFAULT_INBOX_STATE = "unread"
+internal const val DEFAULT_ENTRY_KIND = "article"

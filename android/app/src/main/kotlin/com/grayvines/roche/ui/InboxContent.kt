@@ -38,6 +38,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -72,6 +73,7 @@ import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.FilterFunnelIcon
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.PlayPauseIcon
 import com.grayvines.roche.ui.components.PredictiveBackDrawerContainer
 import com.grayvines.roche.ui.components.RocheAlertDialog
 import com.grayvines.roche.ui.components.RocheIconActionButton
@@ -218,6 +220,9 @@ internal fun InboxEntryListBody(
                         onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
                         onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
                         onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                        onPlayAudio = {
+                            onAction(MainAction.PlayAudioEntry(entry.id, openFullscreen = false))
+                        },
                         onDownloadOffline = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
                     )
                     HorizontalDivider(color = colors.border, thickness = 1.dp)
@@ -576,15 +581,15 @@ internal fun resolveInboxStripFilters(
     selectedFeedId: String? = state.selectedFeedId,
 ): List<InboxFilter> {
     val feedId = selectedFeedId ?: return InboxFilter.inboxStripFilters
-    val distinctTypes =
+    val distinctShapes =
         state.allEntries
             .asSequence()
             .filter { it.feedId == feedId }
-            .map { it.contentType }
+            .map { it.contentType to it.isPlayableAudio }
             .distinct()
             .take(2)
             .count()
-    if (distinctTypes > 1) return InboxFilter.inboxStripFilters
+    if (distinctShapes > 1) return InboxFilter.inboxStripFilters
     val base = listOf(InboxFilter.ALL, InboxFilter.UNREAD, InboxFilter.ARCHIVED)
     return if (state.activeFilter in base) base else base + state.activeFilter
 }
@@ -631,6 +636,7 @@ internal fun InboxEntryRowItem(
     isPlayingAudio: Boolean = false,
     isQueuedNextAudio: Boolean = false,
     isDownloadingOffline: Boolean = false,
+    onPlayAudio: (() -> Unit)? = null,
     onDownloadOffline: (() -> Unit)? = null,
 ) {
     val layout = resolveInboxRowLayout(isCompactWidth, swipeToArchiveEnabled)
@@ -646,6 +652,7 @@ internal fun InboxEntryRowItem(
             onLongPress = onLongPress,
             onToggleStar = onToggleStar,
             onToggleArchive = onToggleArchive,
+            onPlayAudio = onPlayAudio,
             onDownloadOffline = onDownloadOffline,
         )
     }
@@ -721,6 +728,7 @@ private fun InboxEntryRowSurface(
     onLongPress: () -> Unit,
     onToggleStar: () -> Unit,
     onToggleArchive: () -> Unit,
+    onPlayAudio: (() -> Unit)?,
     onDownloadOffline: (() -> Unit)?,
 ) {
     val colors = LocalRocheColors.current
@@ -766,8 +774,10 @@ private fun InboxEntryRowSurface(
         )
         EntryTrailingActionButtons(
             entry = entry,
+            isPlayingAudio = isPlayingAudio,
             showArchiveButton = layout.showTrailingArchiveButton,
             isDownloadingOffline = isDownloadingOffline,
+            onPlayAudio = onPlayAudio,
             onDownloadOffline = onDownloadOffline,
             onToggleArchive = onToggleArchive,
         )
@@ -889,19 +899,22 @@ private fun EntryLeadingStarButton(
 }
 
 @Composable
+@Suppress("LongParameterList")
 private fun EntryTrailingActionButtons(
     entry: InboxEntry,
+    isPlayingAudio: Boolean,
     showArchiveButton: Boolean,
     isDownloadingOffline: Boolean,
+    onPlayAudio: (() -> Unit)?,
     onDownloadOffline: (() -> Unit)?,
     onToggleArchive: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val showInlinePlay =
+        entry.isPlayableAudio && entry.contentType != ContentType.AUDIO && onPlayAudio != null
     val showAudioDownload =
-        entry.contentType == ContentType.AUDIO &&
-            !entry.isCachedOffline &&
-            onDownloadOffline != null
-    if (!showAudioDownload && !showArchiveButton) return
+        entry.isPlayableAudio && !entry.isCachedOffline && onDownloadOffline != null
+    if (!showInlinePlay && !showAudioDownload && !showArchiveButton) return
 
     val archiveDescription =
         if (entry.isArchived) "Unarchive ${entry.title}" else "Archive ${entry.title}"
@@ -910,28 +923,19 @@ private fun EntryTrailingActionButtons(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(0.dp),
     ) {
+        if (showInlinePlay) {
+            EntryInlinePlayActionButton(
+                entry = entry,
+                isPlayingAudio = isPlayingAudio,
+                onPlayAudio = onPlayAudio,
+            )
+        }
         if (showAudioDownload) {
-            if (isDownloadingOffline) {
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier.size(48.dp).testTag("download_spinner_${entry.id}"),
-                ) {
-                    CircularProgressIndicator(
-                        color = colors.accentBlue,
-                        strokeWidth = 2.dp,
-                        modifier = Modifier.size(16.dp),
-                    )
-                }
-            } else {
-                RocheIconActionButton(
-                    contentDescription = "Download ${entry.title}",
-                    onClick = onDownloadOffline,
-                    outlined = false,
-                    modifier = Modifier.testTag("download_btn_${entry.id}"),
-                ) {
-                    DownloadTrayIcon(tint = colors.accentBlue, size = 16.dp)
-                }
-            }
+            EntryDownloadActionButton(
+                entry = entry,
+                isDownloadingOffline = isDownloadingOffline,
+                onDownloadOffline = onDownloadOffline,
+            )
         }
         if (showArchiveButton) {
             RocheIconActionButton(
@@ -951,6 +955,57 @@ private fun EntryTrailingActionButtons(
 }
 
 @Composable
+private fun EntryInlinePlayActionButton(
+    entry: InboxEntry,
+    isPlayingAudio: Boolean,
+    onPlayAudio: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val playingFlag = LocalIsAudioActuallyPlaying.current ?: true
+    val showPause = isPlayingAudio && playingFlag
+    RocheIconActionButton(
+        contentDescription = if (showPause) "Pause ${entry.title}" else "Play ${entry.title}",
+        onClick = onPlayAudio,
+        outlined = false,
+        modifier = Modifier.testTag("play_audio_btn_${entry.id}"),
+    ) {
+        PlayPauseIcon(isPlaying = showPause, tint = colors.accentBlue, size = 15.dp)
+    }
+}
+
+internal val LocalIsAudioActuallyPlaying = compositionLocalOf<Boolean?> { null }
+
+@Composable
+private fun EntryDownloadActionButton(
+    entry: InboxEntry,
+    isDownloadingOffline: Boolean,
+    onDownloadOffline: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    if (isDownloadingOffline) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.size(48.dp).testTag("download_spinner_${entry.id}"),
+        ) {
+            CircularProgressIndicator(
+                color = colors.accentBlue,
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(16.dp),
+            )
+        }
+    } else {
+        RocheIconActionButton(
+            contentDescription = "Download ${entry.title}",
+            onClick = onDownloadOffline,
+            outlined = false,
+            modifier = Modifier.testTag("download_btn_${entry.id}"),
+        ) {
+            DownloadTrayIcon(tint = colors.accentBlue, size = 16.dp)
+        }
+    }
+}
+
+@Composable
 private fun InboxEntryTextColumn(
     entry: InboxEntry,
     ultraDense: Boolean,
@@ -965,10 +1020,14 @@ private fun InboxEntryTextColumn(
 
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(3.dp)) {
         InboxEntryHeadlineRow(entry = entry, ultraDense = ultraDense)
+        val audioBadge =
+            if (entry.contentType != ContentType.AUDIO && entry.isPlayableAudio) "AUDIO" else null
         EntrySourceMetadataRow(
             entry = entry,
             trailingMetaText = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
             trailingMetaFontSize = 11.sp,
+            trailingBadge = audioBadge,
+            trailingBadgeColor = colors.accentBlue,
             showOfflineIndicator = true,
             showStarDot = showCompactStarDot && entry.isFavorite,
         )
@@ -983,16 +1042,18 @@ private fun InboxEntryTextColumn(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        entry.formattedListeningHistoryLabel?.let { historyLabel ->
-            Text(
-                text = historyLabel,
-                color = colors.accentVerdigris,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 10.5.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.testTag("listening_history_badge_${entry.id}"),
-            )
+        if (entry.contentType == ContentType.AUDIO) {
+            entry.formattedListeningHistoryLabel?.let { historyLabel ->
+                Text(
+                    text = historyLabel,
+                    color = colors.accentVerdigris,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 10.5.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.testTag("listening_history_badge_${entry.id}"),
+                )
+            }
         }
     }
 }

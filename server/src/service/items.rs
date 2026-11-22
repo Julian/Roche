@@ -7,7 +7,10 @@ use super::{ActiveRefreshGuard, AppError, RocheService};
 use crate::{
     content::{HtmlSanitizer, MAX_SUMMARY_CHARS, classify_url},
     db::{ConsumptionLogView, Db, Item, ItemFilter, ItemPage, ManualItemInput, Media, Tag},
-    domain::{ArchiveBatchScope, ContentType, ItemStatus, READER_AUTO_READ_THRESHOLD, ReadAtPatch},
+    domain::{
+        ArchiveBatchScope, ContentType, ItemStatus, ProgressSource, READER_AUTO_READ_THRESHOLD,
+        ReadAtPatch,
+    },
     feeds::ArxivParser,
     ingest::{FeedFetcher, FeedIngester},
     util::{
@@ -203,20 +206,27 @@ impl<'a> ItemService<'a> {
         FeedIngester::ingest_item_media(&ctx, item_id, content_type, item_url).await;
     }
 
-    pub async fn update(
+    pub async fn update_with_source(
         &self,
         id: &str,
         status: Option<ItemStatus>,
         is_favorite: Option<bool>,
         read_progress: Option<f64>,
         read_at: ReadAtPatch,
+        progress_source: Option<ProgressSource>,
     ) -> Result<ItemDetail, AppError> {
         if let Some(p) = read_progress
             && (!p.is_finite() || !(0.0..=1.0).contains(&p))
         {
             return Err(AppError::bad_request("read_progress must be between 0.0 and 1.0"));
         }
-        if !self.service.db.items().update(id, status, is_favorite, read_progress, read_at).await? {
+        if !self
+            .service
+            .db
+            .items()
+            .update_with_source(id, status, is_favorite, read_progress, read_at, progress_source)
+            .await?
+        {
             return Err(AppError::not_found("Item not found"));
         }
         self.get(id).await
@@ -256,12 +266,13 @@ impl<'a> ItemService<'a> {
             .ok_or_else(|| AppError::not_found("Item not found"))
     }
 
-    /// Persists clamped reading progress and marks `read_at` once progress reaches
+    /// Persists clamped reading/listening progress and marks `read_at` once progress reaches
     /// `READER_AUTO_READ_THRESHOLD`.
-    pub async fn update_progress_with_auto_read(
+    pub async fn update_progress_with_auto_read_source(
         &self,
         id: &str,
         raw_progress: f64,
+        progress_source: Option<ProgressSource>,
     ) -> Result<ItemDetail, AppError> {
         let p = if raw_progress.is_finite() { raw_progress.clamp(0.0, 1.0) } else { 0.0 };
         let patch = if p >= READER_AUTO_READ_THRESHOLD {
@@ -269,7 +280,7 @@ impl<'a> ItemService<'a> {
         } else {
             ReadAtPatch::Unchanged
         };
-        self.update(id, None, None, Some(p), patch).await
+        self.update_with_source(id, None, None, Some(p), patch, progress_source).await
     }
 
     /// Archives an item atomically while retaining at least `max(existing_progress, submitted_progress)`

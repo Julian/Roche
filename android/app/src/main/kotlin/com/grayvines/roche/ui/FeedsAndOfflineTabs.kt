@@ -1264,7 +1264,14 @@ private fun OfflineVaultMetaColumn(
     val sizePart =
         cachedBytes?.takeIf { it > 0L }?.let { " · ${formatHumanByteSize(it)}" }.orEmpty()
     val playedLabel =
-        if (entry.contentType == com.grayvines.roche.model.ContentType.AUDIO) "Played" else "Read"
+        if (
+            entry.contentType == com.grayvines.roche.model.ContentType.AUDIO ||
+                entry.isPlayableAudio && !entry.isArchived
+        ) {
+            "Played"
+        } else {
+            "Read"
+        }
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(3.dp)) {
         Text(
             text = entry.title,

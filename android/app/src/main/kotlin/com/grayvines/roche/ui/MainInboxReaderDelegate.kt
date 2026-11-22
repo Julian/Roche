@@ -6,7 +6,7 @@ import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.SaveUrlResult
 import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
-import com.grayvines.roche.model.ContentType
+import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.extractCleanDomain
@@ -39,12 +39,15 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
             is MainAction.ToggleTagOnEntry ->
                 host.repository.toggleTagOnItem(itemId = action.entryId, tagName = action.tagName)
             is MainAction.UpdateReadProgress ->
-                host.repository.updateReadProgress(
-                    itemId = action.entryId,
-                    progress = action.progress,
-                )
+                performUpdateReadProgress(action.entryId, action.progress)
             is MainAction.SaveUrlOrFeed ->
-                performSaveUrl(action.url, action.titleOverride, action.tagCsv, action.mode)
+                performSaveUrl(
+                    url = action.url,
+                    titleOverride = action.titleOverride,
+                    tagCsv = action.tagCsv,
+                    explicitMode = action.mode,
+                    feedType = action.feedType,
+                )
             is MainAction.DeleteEntry -> performDeleteEntry(action.entryId)
         }
     }
@@ -256,9 +259,9 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
             }
         }
         val entry = host.latestEntries().firstOrNull { it.id == entryId } ?: prevEntry
-        val isAudio = entry?.contentType == ContentType.AUDIO
+        val isAudio = entry?.isPlayableAudio == true
         if (wasCached && !cached) {
-            val evictedLabel = if (isAudio) "Removed episode download" else "Removed offline copy"
+            val evictedLabel = if (isAudio) "Removed audio download" else "Removed offline copy"
             val titlePart = entry?.title?.take(SNACKBAR_TITLE_LIMIT)?.let { " · $it" }.orEmpty()
             host.showUndoAction(
                 UndoActionEvent(
@@ -270,9 +273,9 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         }
         val msg =
             when {
-                cached && isAudio -> "Downloaded episode for offline playback"
+                cached && isAudio -> "Downloaded audio for offline playback"
                 cached -> "Cached local copy"
-                isAudio -> "Failed to download episode for offline playback"
+                isAudio -> "Failed to download audio for offline playback"
                 else -> "Failed to cache offline copy"
             }
         host.showStatusMessage(msg)
@@ -288,14 +291,14 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
             }
         }
         val entry = host.latestEntries().firstOrNull { it.id == entryId } ?: prevEntry
-        val isAudio = entry?.contentType == ContentType.AUDIO
+        val isAudio = entry?.isPlayableAudio == true
         val isPdf = entry != null && isPdfLikeEntry(entry)
         val msg =
             when {
-                cached && isAudio -> "Downloaded episode for offline playback"
+                cached && isAudio -> "Downloaded audio for offline playback"
                 cached && isPdf -> "Downloaded PDF for offline reading"
                 cached -> "Cached local copy"
-                isAudio -> "Failed to download episode for offline playback"
+                isAudio -> "Failed to download audio for offline playback"
                 isPdf -> "Failed to download PDF"
                 else -> "Failed to cache offline copy"
             }
@@ -307,8 +310,8 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         liveReadProgress: Double?,
     ) {
         val targetArchived = !entry.isArchived
-        if (targetArchived && liveReadProgress != null && liveReadProgress > entry.readProgress) {
-            host.repository.updateReadProgress(itemId = entry.id, progress = liveReadProgress)
+        if (targetArchived) {
+            flushArchiveReadProgress(entry, liveReadProgress)
         }
         val snapshot =
             host.repository.setArchiveStateWithSnapshot(
@@ -443,11 +446,39 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         )
     }
 
+    private suspend fun flushArchiveReadProgress(entry: InboxEntry, liveReadProgress: Double?) {
+        if (liveReadProgress == null || liveReadProgress <= entry.readProgress) return
+        val activePlayer = host.playerController.state.value
+        val isAudioActiveForEntry =
+            activePlayer.currentEntryId == entry.id && activePlayer.hasActiveEpisode
+        if (!isAudioActiveForEntry) {
+            host.repository.updateReadProgress(
+                itemId = entry.id,
+                progress = liveReadProgress,
+                fromAudioPlayback = false,
+            )
+        }
+    }
+
+    private suspend fun performUpdateReadProgress(entryId: String, progress: Double) {
+        val activePlayer = host.playerController.state.value
+        val isAudioActiveForEntry =
+            activePlayer.currentEntryId == entryId && activePlayer.hasActiveEpisode
+        if (!isAudioActiveForEntry) {
+            host.repository.updateReadProgress(
+                itemId = entryId,
+                progress = progress,
+                fromAudioPlayback = false,
+            )
+        }
+    }
+
     private suspend fun performSaveUrl(
         url: String,
         titleOverride: String?,
         tagCsv: String,
         explicitMode: AddSheetMode?,
+        feedType: FeedType? = null,
     ) {
         val cleanUrl = normalizeUserSubmittedUrl(url)
         if (cleanUrl.isBlank()) return
@@ -472,7 +503,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                 )
         }
         if (resolvedMode == AddSheetMode.SUBSCRIBE_FEED) {
-            performSubscribeFeedAction(cleanUrl, titleOverride)
+            performSubscribeFeedAction(cleanUrl, titleOverride, feedType)
         } else {
             val created =
                 host.repository.addUrlToWantToRead(
@@ -486,13 +517,19 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         }
     }
 
-    private suspend fun performSubscribeFeedAction(url: String, titleOverride: String?) {
+    private suspend fun performSubscribeFeedAction(
+        url: String,
+        titleOverride: String?,
+        feedType: FeedType? = null,
+    ) {
         val hostLabel = extractCleanDomain(url).ifBlank { url }.take(SNACKBAR_TITLE_LIMIT)
-        host.showStatusMessage("Finding RSS feed for $hostLabel…")
+        val kindLabel = if (feedType == FeedType.PODCAST) "podcast" else "RSS"
+        host.showStatusMessage("Finding $kindLabel feed for $hostLabel…")
         if (host.repository.hasBackgroundScope) {
             host.repository.subscribeFeedInBackground(
                 inputUrl = url,
                 titleOverride = titleOverride,
+                feedType = feedType,
                 onComplete = ::handleSubscribeFeedResult,
             )
         } else {
@@ -500,6 +537,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                 host.repository.discoverAndSubscribeFeed(
                     inputUrl = url,
                     titleOverride = titleOverride,
+                    feedType = feedType,
                 )
             handleSubscribeFeedResult(result)
         }
@@ -677,6 +715,6 @@ internal suspend fun performEvictPlayedOffline(host: InboxReaderHost) {
 internal fun isPlayedOrReadOfflineEntry(entry: InboxEntry): Boolean =
     entry.isArchived ||
         entry.isRead ||
-        entry.contentType == ContentType.AUDIO && entry.readProgress >= PLAYED_OFFLINE_THRESHOLD
+        entry.isPlayableAudio && entry.readProgress >= PLAYED_OFFLINE_THRESHOLD
 
 private const val PLAYED_OFFLINE_THRESHOLD = 0.90

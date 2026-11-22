@@ -419,6 +419,7 @@ internal fun buildProjectedInboxItem(
         interactionUpdatedAt = state?.interactionUpdatedAt,
         audioUrl = content?.audioUrl,
         inboxState = inboxState,
+        entryKind = entry.kind,
     )
 }
 

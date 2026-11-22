@@ -6,7 +6,9 @@ import com.grayvines.roche.core.inferContentTypeWireValue
 import com.grayvines.roche.core.isHttpOrHttpsUrl
 import com.grayvines.roche.core.isPublicHost
 import com.grayvines.roche.core.isPublicIpAddress
+import com.grayvines.roche.core.parseDurationToSecondsLong
 import com.grayvines.roche.core.parseIsoInstant
+import com.grayvines.roche.data.catalog.EntryKind
 import java.net.URI
 import java.time.Duration
 import java.time.Instant
@@ -77,13 +79,14 @@ enum class InboxFilter(val label: String) {
     PAPERS("Papers"),
     VIDEOS("Videos"),
     PODCASTS("Podcasts"),
+    AUDIO("Audio"),
     STARRED("Starred"),
     ARCHIVED("Archived");
 
     companion object {
         /** Filters shown in the Inbox strip (Starred lives on the dedicated Stars tab). */
         val inboxStripFilters: List<InboxFilter> =
-            listOf(ALL, UNREAD, ARTICLES, PAPERS, VIDEOS, PODCASTS, ARCHIVED)
+            listOf(ALL, UNREAD, ARTICLES, PAPERS, VIDEOS, PODCASTS, AUDIO, ARCHIVED)
     }
 }
 
@@ -236,7 +239,14 @@ data class InboxEntry(
     val thumbnailUrl: String? = null,
     val audioUrl: String? = null,
     val inFeedInbox: Boolean = feedId != null,
+    val entryKind: EntryKind = EntryKind.ARTICLE,
 ) {
+    val isPlayableAudio: Boolean
+        get() = contentType == ContentType.AUDIO || !audioUrl.isNullOrBlank()
+
+    val isPodcastEpisode: Boolean
+        get() = entryKind == EntryKind.PODCAST_EPISODE
+
     val isRead: Boolean
         get() = !readAt.isNullOrBlank()
 
@@ -273,7 +283,7 @@ data class InboxEntry(
 
     val formattedListeningHistoryLabel: String?
         get() {
-            if (contentType != ContentType.AUDIO) return null
+            if (!isPlayableAudio) return null
             val hasPlayed = !readAt.isNullOrBlank() || readProgress > 0.0 || isArchived
             if (!hasPlayed) return null
             val whenLabel = formattedReadAtLabel
@@ -302,11 +312,22 @@ data class InboxEntry(
                 ContentType.VIDEO -> duration ?: "Video"
                 ContentType.PDF -> duration ?: "PDF"
                 ContentType.AUDIO -> formatAudioDurationEstimate(duration) ?: "Audio"
-                ContentType.ARTICLE ->
-                    duration?.takeIf { it.isNotBlank() }
-                        ?: formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
+                ContentType.ARTICLE -> formatArticleReadEstimate(this)
             }
         }
+}
+
+internal fun formatArticleReadEstimate(entry: InboxEntry): String {
+    val rawDuration = entry.duration?.takeIf { it.isNotBlank() }
+    return when {
+        rawDuration != null &&
+            entry.isPlayableAudio &&
+            parseDurationToSecondsLong(rawDuration) != null ->
+            formatAudioDurationEstimate(rawDuration) ?: rawDuration
+        rawDuration != null -> rawDuration
+        else ->
+            formatArticleMinutes(entry.contentText ?: entry.contentHtml ?: entry.summary.orEmpty())
+    }
 }
 
 internal fun extractCleanDomain(rawUrl: String): String {

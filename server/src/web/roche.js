@@ -30,11 +30,14 @@
     return true;
   };
 
-  const postProgress = (itemId, progress, keepalive = false) => {
+  const postProgress = (itemId, progress, keepalive = false, source = null) => {
     if (!itemId || !Number.isFinite(progress)) return;
     const clamped = Math.max(0, Math.min(1, progress));
     const csrf = getCsrfToken();
-    const body = `_csrf=${encodeURIComponent(csrf)}&progress=${clamped.toFixed(4)}`;
+    let body = `_csrf=${encodeURIComponent(csrf)}&progress=${clamped.toFixed(4)}`;
+    if (source) {
+      body += `&source=${encodeURIComponent(source)}`;
+    }
     try {
       fetch(`/web/items/${encodeURIComponent(itemId)}/progress`, {
         method: "POST",
@@ -81,6 +84,7 @@
 
   const WANT_TO_READ_COLLECTION_ID = "2ef71101-a716-5331-9515-cb7b5ce8b3c3";
   let syncPlayButtonsFn = null;
+  let isAudioActiveForItemFn = null;
   let navigateViaPjaxFn = null;
 
   const showToast = (message, opts = {}) => {
@@ -200,7 +204,7 @@
     const flushActiveProgress = (keepalive) => {
       if (!activeItem?.itemId || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
       const frac = audio.currentTime / audio.duration;
-      postProgress(activeItem.itemId, frac >= 0.98 ? 1.0 : frac, keepalive);
+      postProgress(activeItem.itemId, frac >= 0.98 ? 1.0 : frac, keepalive, "audio");
     };
 
     const saveSession = () => {
@@ -241,6 +245,7 @@
       }
     };
     syncPlayButtonsFn = syncPlayButtons;
+    isAudioActiveForItemFn = (id) => Boolean(activeItem?.itemId && id && activeItem.itemId === id);
 
     const safePlay = () => {
       const p = audio.play?.();
@@ -264,11 +269,11 @@
       bar.hidden = false;
       document.body?.classList.add("has-player-bar");
       document.documentElement?.classList.add("has-player-bar");
-      if (titleEl) titleEl.textContent = meta.title || "Episode";
-      if (subEl) subEl.textContent = meta.feed || "Podcast";
+      if (titleEl) titleEl.textContent = meta.title || "Audio";
+      if (subEl) subEl.textContent = meta.feed || "Audio";
       if (readerLink) {
         readerLink.href = `/reader/${encodeURIComponent(meta.itemId)}`;
-        readerLink.setAttribute("aria-label", `Open notes for ${meta.title || "Episode"}`);
+        readerLink.setAttribute("aria-label", `Open ${meta.title || "item"}`);
       }
 
       const nextRate = meta.rate || desiredRate || 1;
@@ -320,11 +325,11 @@
       const now = Date.now();
       if (frac >= 0.98 && !completionSent) {
         completionSent = true;
-        postProgress(activeItem.itemId, 1.0, true);
+        postProgress(activeItem.itemId, 1.0, true, "audio");
         saveSession();
       } else if (now - lastSentAt >= 5000) {
         lastSentAt = now;
-        postProgress(activeItem.itemId, frac, false);
+        postProgress(activeItem.itemId, frac, false, "audio");
         saveSession();
       }
     });
@@ -353,7 +358,7 @@
     audio.addEventListener("ended", () => {
       if (!activeItem) return;
       completionSent = true;
-      postProgress(activeItem.itemId, 1.0, true);
+      postProgress(activeItem.itemId, 1.0, true, "audio");
       saveSession();
       syncPlayButtons();
     });
@@ -813,7 +818,10 @@
       });
     }
 
-    if (kind === "article" || kind === "paper") {
+    const contentType = root.getAttribute("data-content-type") || "";
+    const hasAudio = root.getAttribute("data-has-audio") === "1";
+
+    if ((kind === "article" || kind === "paper") && contentType !== "audio") {
       let best = Number.parseFloat(root.getAttribute("data-progress") || "0") || 0;
       let lastPosted = best;
       let timer = null;
@@ -828,13 +836,14 @@
       };
 
       const checkProgress = (forceFlush) => {
+        if (isAudioActiveForItemFn?.(itemId)) return;
         if (!forceFlush && maxScrollablePixels() <= 8) return;
         const frac = measureFraction();
         if (frac > best) best = frac;
         const crossedNinety = lastPosted < 0.9 && best >= 0.9;
         if (forceFlush || crossedNinety || best - lastPosted >= 0.05) {
           lastPosted = best;
-          postProgress(itemId, best, Boolean(forceFlush));
+          postProgress(itemId, best, Boolean(forceFlush), "reader");
         }
       };
 
@@ -851,6 +860,8 @@
       const layoutScope = root.closest(".reader-layout") || document;
       const archiveForms = Array.from(layoutScope.querySelectorAll(".js-reader-archive-form"));
       const onArchiveSubmit = (ev) => {
+        if (isAudioActiveForItemFn?.(itemId)) return;
+        if (hasAudio && maxScrollablePixels() <= 8) return;
         const formEl = ev.currentTarget;
         const hiddenProg = formEl?.querySelector("input[name='progress']");
         const live = Math.max(best, measureFraction());
@@ -2716,15 +2727,17 @@
       let postedEndRead = false;
       const checkBottomRead = () => {
         if (suppressAutoRead || postedEndRead || !document.body.contains(finishBtn)) return;
+        if (isAudioActiveForItemFn?.(itemId)) return;
         const kind = root.getAttribute("data-kind") || "article";
-        if (kind !== "article" && kind !== "paper") return;
+        const contentType = root.getAttribute("data-content-type") || "";
+        if ((kind !== "article" && kind !== "paper") || contentType === "audio") return;
         const el = document.documentElement;
         const scrollable = el.scrollHeight - el.clientHeight;
         if (scrollable <= 8) return;
         if (window.scrollY / scrollable >= 0.92 && !finishBtn.classList.contains("is-done")) {
           postedEndRead = true;
           if (itemId && finishForm) {
-            postProgress(itemId, 1.0, false);
+            postProgress(itemId, 1.0, false, "reader");
           }
           const endRight = finishBtn.closest(".reader-end-right");
           if (endRight && !endRight.querySelector(".js-reader-read-cue")) {

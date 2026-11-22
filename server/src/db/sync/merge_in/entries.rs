@@ -1037,19 +1037,37 @@ impl SyncRepo<'_> {
             .await?;
         }
 
-        let should_write_audio = merged_ct == ContentType::Audio
-            && (prep.clean_audio_url.is_some() || prep.clean_duration.is_some());
+        let has_incoming_audio = prep.clean_audio_url.is_some()
+            || (merged_ct == ContentType::Audio && prep.clean_duration.is_some());
+        let should_write_audio = has_incoming_audio
+            && (existing_content.is_none()
+                || incoming_won_entry_hlc
+                || merged_ct == ContentType::Audio);
         if should_write_audio {
             let safe_created = clamp_incoming_timestamp(rec.created_at.unwrap_or(now), now);
-            MediaRepo::upsert_audio_enclosure_in_tx(
-                tx,
-                target_id,
-                prep.clean_audio_url.as_deref(),
-                prep.clean_duration,
-                safe_created,
-            )
-            .await?;
-        } else if incoming_won_entry_hlc && rec.content.is_some() && merged_ct != ContentType::Audio
+            if incoming_won_entry_hlc && prep.clean_audio_url.is_some() {
+                MediaRepo::upsert_audio_enclosure_overwrite_in_tx(
+                    tx,
+                    target_id,
+                    prep.clean_audio_url.as_deref(),
+                    prep.clean_duration,
+                    safe_created,
+                )
+                .await?;
+            } else {
+                MediaRepo::upsert_audio_enclosure_in_tx(
+                    tx,
+                    target_id,
+                    prep.clean_audio_url.as_deref(),
+                    prep.clean_duration,
+                    safe_created,
+                )
+                .await?;
+            }
+        } else if incoming_won_entry_hlc
+            && rec.content.is_some()
+            && prep.clean_audio_url.is_none()
+            && (merged_ct != ContentType::Audio || prep.clean_duration.is_none())
         {
             sqlx::query(
                 "DELETE FROM entry_media
@@ -1400,13 +1418,7 @@ fn resolve_work_hlcs(rec: &SyncEntryRecord, ctx: &MergeContext<'_>) -> (String, 
 }
 
 const fn resolve_work_target_kind(prep: &PreparedSyncEntry) -> EntryKind {
-    if matches!(prep.resolved_content_type, ContentType::Audio)
-        && matches!(prep.record.kind, EntryKind::Article)
-    {
-        EntryKind::PodcastEpisode
-    } else {
-        prep.record.kind
-    }
+    prep.record.kind
 }
 
 fn build_work_identifiers(prep: &PreparedSyncEntry) -> Vec<EntryIdentifier> {

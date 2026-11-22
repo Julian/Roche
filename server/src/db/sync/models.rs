@@ -307,8 +307,7 @@ impl PreparedSyncEntry {
             });
 
         let clean_duration = rec.content.as_ref().and_then(|c| c.duration).filter(|&d| d > 0);
-        let resolved_content_type =
-            if clean_audio_url.is_some() { ContentType::Audio } else { base_content_type };
+        let resolved_content_type = base_content_type;
 
         Self {
             record: rec,

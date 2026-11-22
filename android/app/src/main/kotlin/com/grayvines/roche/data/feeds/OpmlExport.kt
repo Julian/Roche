@@ -12,11 +12,17 @@ internal fun buildLocalOpmlXml(feeds: List<FeedRow>): String = buildString {
     for (feed in feeds) {
         val titleAttr = escapeXmlAttr(feed.title)
         val xmlUrlAttr = escapeXmlAttr(feed.url)
+        val rocheTypePart =
+            if (feed.feedType.equals("podcast", ignoreCase = true)) {
+                """ rocheFeedType="podcast""""
+            } else {
+                ""
+            }
         val htmlUrlPart =
             feed.siteUrl?.takeIf { it.isNotBlank() }?.let { """ htmlUrl="${escapeXmlAttr(it)}"""" }
                 ?: ""
         appendLine(
-            """    <outline type="rss" text="$titleAttr" title="$titleAttr" xmlUrl="$xmlUrlAttr"$htmlUrlPart/>"""
+            """    <outline type="rss"$rocheTypePart text="$titleAttr" title="$titleAttr" xmlUrl="$xmlUrlAttr"$htmlUrlPart/>"""
         )
     }
     appendLine("  </body>")

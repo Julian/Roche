@@ -576,17 +576,24 @@ private fun String?.nonBlankOr(fallback: String?): String? =
 internal fun mergeHydratedItemDetail(local: InboxItemRow, detail: RemoteItemDto): InboxItemRow {
     val authoritativeDetail = detail.id.isNotBlank() && detail.id == local.id
     val mergedContentType =
-        if (authoritativeDetail) detail.contentType.ifBlank { local.contentType } else local.contentType
+        if (authoritativeDetail) {
+            detail.contentType.ifBlank { local.contentType }
+        } else {
+            local.contentType
+        }
     val isAudio =
         mergedContentType.equals(CONTENT_TYPE_AUDIO, ignoreCase = true) ||
             mergedContentType.equals(CONTENT_TYPE_PODCAST, ignoreCase = true)
-    val wasAudio =
+    val hadAudio =
         local.contentType.equals(CONTENT_TYPE_AUDIO, ignoreCase = true) ||
-            local.contentType.equals(CONTENT_TYPE_PODCAST, ignoreCase = true)
+            local.contentType.equals(CONTENT_TYPE_PODCAST, ignoreCase = true) ||
+            !local.audioUrl.isNullOrBlank()
     val mergedAudioUrl =
-        detail.audioUrl?.trim()?.takeIf { it.isNotEmpty() } ?: local.audioUrl.takeIf { isAudio }
+        detail.audioUrl?.trim()?.takeIf { it.isNotEmpty() }
+            ?: local.audioUrl.takeIf { !authoritativeDetail || isAudio }
+    val hasMergedAudio = isAudio || !mergedAudioUrl.isNullOrBlank()
     val mergedDuration =
-        detail.duration.nonBlankOr(if (wasAudio && !isAudio) null else local.duration)
+        detail.duration.nonBlankOr(if (hadAudio && !hasMergedAudio) null else local.duration)
     return local.copy(
         title = detail.title.ifBlank { local.title },
         author = detail.author.nonBlankOr(local.author),

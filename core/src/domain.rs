@@ -11,8 +11,17 @@ use crate::{
 };
 
 /// Reader scroll / playback progress threshold (`>= 0.98`) at which an item is automatically
-/// marked read (and podcast episodes auto-log completion).
+/// marked read (and playable audio items auto-log completion).
 pub const READER_AUTO_READ_THRESHOLD: f64 = 0.98;
+
+/// Origin of a reading or playback progress update so audio playback completion can be
+/// distinguished from article scrolling on items that have both text and playable audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProgressSource {
+    Reader,
+    Audio,
+}
 
 /// Canonical focused-placement ranking round budget shared across Web and Android.
 pub const MAX_FOCUSED_ROUNDS: usize = 5;
@@ -148,6 +157,19 @@ pub enum ContentType {
     #[serde(alias = "podcast")]
     Audio,
     Pdf,
+}
+
+impl ContentType {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Article => "article",
+            Self::Video => "video",
+            Self::Paper => "paper",
+            Self::Audio => "audio",
+            Self::Pdf => "pdf",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -326,6 +348,19 @@ impl EntryKind {
             ContentType::Video => Self::Video,
             ContentType::Paper | ContentType::Pdf => Self::Paper,
             ContentType::Audio => Self::PodcastEpisode,
+        }
+    }
+
+    #[must_use]
+    pub const fn for_feed_item(feed_type: Option<FeedType>, ct: ContentType) -> Self {
+        match ct {
+            ContentType::Article => Self::Article,
+            ContentType::Video => Self::Video,
+            ContentType::Paper | ContentType::Pdf => Self::Paper,
+            ContentType::Audio => match feed_type {
+                Some(FeedType::Podcast) => Self::PodcastEpisode,
+                _ => Self::Article,
+            },
         }
     }
 

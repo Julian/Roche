@@ -1,6 +1,5 @@
 package com.grayvines.roche.playback
 
-import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 
 internal fun findNextQueuedAudioEntry(
@@ -22,7 +21,7 @@ internal fun findNextQueuedAudioEntry(
         .asSequence()
         .filter { it != excludeEntryId }
         .mapNotNull { entriesById[it] }
-        .firstOrNull { !it.isArchived && it.contentType == ContentType.AUDIO }
+        .firstOrNull { !it.isArchived && it.isPlayableAudio }
 
 internal fun hasNextQueuedAudio(
     entries: List<InboxEntry>,

@@ -931,6 +931,7 @@ private fun SearchInboxMatchRow(
         onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
         onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
         onDownloadOffline = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
+        onPlayAudio = { onAction(MainAction.PlayAudioEntry(entry.id, openFullscreen = false)) },
     )
     val ftsSnippet = state.workspaceSearch.snippetsByEntryId[entry.id]
     val matchSnippet =

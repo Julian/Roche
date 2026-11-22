@@ -40,12 +40,15 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.core.formatAudioDurationEstimate
 import com.grayvines.roche.core.isArxivPaperUrl
 import com.grayvines.roche.core.isLocalPdfUrl
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.PlayPauseIcon
 import com.grayvines.roche.ui.components.RocheButtonStyle
@@ -332,6 +335,107 @@ internal fun ReaderUncachedPdfCard(
                 }
             }
         }
+    }
+}
+
+@Composable
+@Suppress("LongParameterList")
+internal fun ReaderAudioPlayerCard(
+    entry: InboxEntry,
+    playerState: PodcastPlayerState?,
+    isDownloadingOffline: Boolean,
+    onTogglePlay: () -> Unit,
+    onOpenPlayer: () -> Unit,
+    onToggleOffline: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val isCurrent = playerState != null && playerState.currentEntryId == entry.id
+    val isPlaying = isCurrent && playerState.isPlaying
+    val heading = if (entry.isPodcastEpisode) "Podcast episode" else "Audio version"
+    val subtitle = resolveReaderAudioSubtitle(entry, playerState, isCurrent)
+    RocheSurfaceCard(modifier = modifier.fillMaxWidth().testTag("reader_audio_card")) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            ReaderAudioPlayButton(isPlaying = isPlaying, onClick = onTogglePlay)
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    text = heading,
+                    color = colors.textPrimary,
+                    fontSize = 13.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = subtitle,
+                    color = colors.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.5.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (isDownloadingOffline) {
+                Text(
+                    text = "Saving…",
+                    color = colors.textMuted,
+                    fontSize = 11.5.sp,
+                    modifier = Modifier.testTag("reader_audio_saving_indicator"),
+                )
+            } else if (!entry.isCachedOffline) {
+                HeaderActionButton(
+                    label = "Save",
+                    style = RocheButtonStyle.SECONDARY,
+                    onClick = onToggleOffline,
+                    modifier = Modifier.testTag("reader_audio_offline_btn"),
+                )
+            }
+            HeaderActionButton(
+                label = "Player",
+                style = RocheButtonStyle.SECONDARY,
+                onClick = onOpenPlayer,
+                modifier = Modifier.testTag("reader_open_player_btn"),
+            )
+        }
+    }
+}
+
+private fun resolveReaderAudioSubtitle(
+    entry: InboxEntry,
+    playerState: PodcastPlayerState?,
+    isCurrent: Boolean,
+): String =
+    if (isCurrent && playerState != null && playerState.durationMs > 0L) {
+        "${playerState.formattedElapsed} · ${playerState.formattedMiniRemaining}"
+    } else {
+        formatAudioDurationEstimate(entry.duration)
+            ?: if (entry.isCachedOffline) "Saved offline" else "Listen in player"
+    }
+
+@Composable
+private fun ReaderAudioPlayButton(isPlaying: Boolean, onClick: () -> Unit) {
+    val colors = LocalRocheColors.current
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.size(40.dp)
+                .clip(CircleShape)
+                .background(colors.accentBlueFilled)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    contentDescription = if (isPlaying) "Pause audio" else "Play audio"
+                }
+                .testTag("reader_audio_play_btn"),
+    ) {
+        PlayPauseIcon(isPlaying = isPlaying, tint = VIDEO_LIGHT_INK, size = 18.dp)
     }
 }
 

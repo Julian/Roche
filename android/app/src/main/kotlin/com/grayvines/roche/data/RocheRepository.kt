@@ -1,6 +1,7 @@
 package com.grayvines.roche.data
 
 import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
+import com.grayvines.roche.core.ENTRY_KIND_PODCAST_EPISODE
 import com.grayvines.roche.core.RocheLog
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
@@ -61,6 +62,7 @@ import com.grayvines.roche.data.local.setItemReadProgress
 import com.grayvines.roche.data.local.setItemStatusAndReadAt
 import com.grayvines.roche.data.local.updateFeedActiveGraph
 import com.grayvines.roche.data.local.updateFeedTitleGraph
+import com.grayvines.roche.data.local.updateFeedTypeGraph
 import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.local.upsertTag
@@ -86,6 +88,7 @@ import com.grayvines.roche.media.ThumbnailDiskCache
 import com.grayvines.roche.media.resolveCachedAudioFile
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
+import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
@@ -713,6 +716,7 @@ class RocheRepository(
         progress: Double,
         recordPlayedTimestamp: Boolean = false,
         syncRemote: Boolean = true,
+        fromAudioPlayback: Boolean? = null,
     ) {
         if (!progress.isFinite()) return
         val updated = itemMutationMutex.withLock {
@@ -722,7 +726,7 @@ class RocheRepository(
                 val clamped = progress.coerceIn(MIN_READ_PROGRESS, MAX_READ_PROGRESS)
                 val explicitReadAt = if (recordPlayedTimestamp) nowUtcIso() else null
                 dao.setItemReadProgress(itemId, clamped, explicitReadAt, currentLocalPeerId())
-                maybeAutoLogFeedItemCompletion(itemId)
+                maybeAutoLogFeedItemCompletion(itemId, fromAudioPlayback = fromAudioPlayback)
                 true
             }
         }
@@ -807,10 +811,39 @@ class RocheRepository(
         return cleanTitle
     }
 
+    internal suspend fun setFeedType(feedId: String, targetType: FeedType): Result<FeedType> =
+        runSuspendCatching {
+            require(targetType == FeedType.RSS || targetType == FeedType.PODCAST) {
+                "Feeds can only be switched between RSS and Podcast"
+            }
+            val changed = itemMutationMutex.withLock {
+                val existing = dao.getFeedById(feedId) ?: missingFeedError(feedId)
+                val currentType = FeedType.fromWireValue(existing.feedType)
+                require(currentType == FeedType.RSS || currentType == FeedType.PODCAST) {
+                    "Only RSS and Podcast feeds can switch type"
+                }
+                if (currentType == targetType) {
+                    false
+                } else {
+                    dao.updateFeedTypeGraph(
+                        feedId = feedId,
+                        targetFeedType = targetType.wireValue,
+                        markDirty = isSyncablePublicUrl(existing.url),
+                        nodeId = currentLocalPeerId(),
+                    )
+                    true
+                }
+            }
+            if (changed) {
+                triggerBackgroundSync()
+            }
+            targetType
+        }
+
     suspend fun toggleFeedArchive(feedId: String): Result<Pair<String, Boolean>> =
         runSuspendCatching {
             val outcome = itemMutationMutex.withLock {
-                val existing = dao.getFeedById(feedId) ?: error("Feed not found: $feedId")
+                val existing = dao.getFeedById(feedId) ?: missingFeedError(feedId)
                 val nextIsActive = !existing.isActive
                 dao.updateFeedActiveGraph(
                     feedId = feedId,
@@ -865,7 +898,7 @@ class RocheRepository(
             runSuspendCatching {
                 catalog.ensureSystemSeeded()
                 val currentSettings = settings.settings.first()
-                val localFeed = dao.getFeedById(feedId) ?: error("Feed not found: $feedId")
+                val localFeed = dao.getFeedById(feedId) ?: missingFeedError(feedId)
                 val existingTitle = localFeed.title
                 val localPoll =
                     LocalFeedPoller.pollFeed(
@@ -1008,6 +1041,7 @@ class RocheRepository(
         inputUrl: String,
         titleOverride: String?,
         tagCsv: String,
+        feedType: FeedType? = null,
     ): SaveUrlResult =
         withContext(Dispatchers.Default) {
             val trimmedUrl = normalizeUserSubmittedUrl(inputUrl)
@@ -1016,6 +1050,7 @@ class RocheRepository(
                     subscribeFeedLocal(
                         url = trimmedUrl,
                         titleOverride = titleOverride,
+                        requestedFeedType = feedType,
                     )
                 triggerBackgroundSync()
                 SaveUrlResult(title = feedTitle, kind = SavedResourceKind.FEED)
@@ -1284,16 +1319,25 @@ class RocheRepository(
     suspend fun discoverAndSubscribeFeed(
         inputUrl: String,
         titleOverride: String? = null,
+        feedType: FeedType? = null,
     ): Result<SaveUrlResult> = withSyncIndicator {
         withContext(Dispatchers.Default) {
             runSuspendCatching {
-                val discovered = discoverFeedFromUrl(publicWebFetcher, inputUrl).getOrThrow()
+                val explicitWireType = feedType?.takeIf { it == FeedType.PODCAST }?.wireValue
+                val discovered =
+                    discoverFeedFromUrl(
+                            publicWebFetcher = publicWebFetcher,
+                            rawInputUrl = inputUrl,
+                            requestedFeedType = explicitWireType,
+                        )
+                        .getOrThrow()
                 val subscribedTitle =
                     subscribeFeedLocal(
                         url = discovered.feedUrl,
                         titleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() },
                         prefetchedBatch = discovered.prefetchedBatch,
                         discoveredSiteTitle = discovered.siteTitle,
+                        requestedFeedType = feedType,
                     )
                 triggerBackgroundSync()
                 SaveUrlResult(title = subscribedTitle, kind = SavedResourceKind.FEED)
@@ -1306,6 +1350,7 @@ class RocheRepository(
         titleOverride: String?,
         prefetchedBatch: ParsedFeedBatch? = null,
         discoveredSiteTitle: String? = null,
+        requestedFeedType: FeedType? = null,
     ): String {
         val cleanTitleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() }
         val canonicalUrl = canonicalizeFeedUrl(url)
@@ -1324,6 +1369,7 @@ class RocheRepository(
                 fallbackTitle = fallbackTitle,
                 nodeId = nodeId,
                 hasPrefetchedBatch = prefetchedBatch != null,
+                requestedFeedType = requestedFeedType,
             )
         val subscribedEntity = prepared.first ?: return prepared.second
         LocalFeedPoller.pollFeed(
@@ -1348,39 +1394,37 @@ class RocheRepository(
         fallbackTitle: String,
         nodeId: String,
         hasPrefetchedBatch: Boolean,
+        requestedFeedType: FeedType? = null,
     ): Pair<FeedRow?, String> = itemMutationMutex.withLock {
         val isPublic = isSyncablePublicUrl(canonicalUrl)
+        val resolvedNewType = resolveNewFeedTypeWire(rawUrl, requestedFeedType)
         dao.deleteTombstone("feed", feedNaturalKey(canonicalUrl))
         val existingLocal =
             dao.getFeedByUrl(canonicalUrl) ?: dao.getFeedById(deterministicFeedId(canonicalUrl))
         if (existingLocal != null && !existingLocal.isActive) {
-            val syncable = isSyncablePublicUrl(existingLocal.url)
-            dao.updateFeedActiveGraph(
-                feedId = existingLocal.id,
-                isActive = true,
-                markDirty = syncable,
+            reactivateArchivedFeedLocked(
+                existingLocal = existingLocal,
+                cleanTitleOverride = cleanTitleOverride,
+                requestedFeedType = requestedFeedType,
                 nodeId = nodeId,
+                hasPrefetchedBatch = hasPrefetchedBatch,
             )
-            if (cleanTitleOverride != null && cleanTitleOverride != existingLocal.title) {
-                dao.updateFeedTitleGraph(
-                    feedId = existingLocal.id,
-                    cleanTitle = cleanTitleOverride,
-                    markDirty = syncable,
-                    nodeId = nodeId,
-                )
-            }
-            val nextTitle = cleanTitleOverride ?: existingLocal.title
-            val entityToPoll =
-                if (hasPrefetchedBatch) {
-                    existingLocal.copy(title = nextTitle, isActive = true)
-                } else {
-                    null
-                }
-            entityToPoll to nextTitle
         } else {
+            val nextFeedType =
+                if (existingLocal != null) {
+                    applyFeedTypeIfToggleable(
+                        existingLocal = existingLocal,
+                        requestedFeedType = requestedFeedType?.takeIf { it == FeedType.PODCAST },
+                        markDirty = isPublic,
+                        nodeId = nodeId,
+                    )
+                } else {
+                    resolvedNewType
+                }
             val entity =
                 existingLocal?.copy(
                     title = cleanTitleOverride ?: existingLocal.title,
+                    feedType = nextFeedType,
                     isActive = true,
                 )
                     ?: FeedRow(
@@ -1388,7 +1432,7 @@ class RocheRepository(
                         title = fallbackTitle,
                         url = canonicalUrl,
                         siteUrl = null,
-                        feedType = inferFeedTypeWireValue(rawUrl),
+                        feedType = resolvedNewType,
                         lastPolled = null,
                     )
             val hlc = nextLocalHlc(dao, nodeId)
@@ -1402,15 +1446,90 @@ class RocheRepository(
         }
     }
 
+    private fun resolveNewFeedTypeWire(rawUrl: String, requestedFeedType: FeedType?): String {
+        val inferredType = inferFeedTypeWireValue(rawUrl)
+        return if (requestedFeedType == FeedType.PODCAST && inferredType == "rss") {
+            FeedType.PODCAST.wireValue
+        } else {
+            inferredType
+        }
+    }
+
+    private suspend fun reactivateArchivedFeedLocked(
+        existingLocal: FeedRow,
+        cleanTitleOverride: String?,
+        requestedFeedType: FeedType?,
+        nodeId: String,
+        hasPrefetchedBatch: Boolean,
+    ): Pair<FeedRow?, String> {
+        val syncable = isSyncablePublicUrl(existingLocal.url)
+        dao.updateFeedActiveGraph(
+            feedId = existingLocal.id,
+            isActive = true,
+            markDirty = syncable,
+            nodeId = nodeId,
+        )
+        if (cleanTitleOverride != null && cleanTitleOverride != existingLocal.title) {
+            dao.updateFeedTitleGraph(
+                feedId = existingLocal.id,
+                cleanTitle = cleanTitleOverride,
+                markDirty = syncable,
+                nodeId = nodeId,
+            )
+        }
+        val nextFeedType =
+            applyFeedTypeIfToggleable(
+                existingLocal = existingLocal,
+                requestedFeedType = requestedFeedType,
+                markDirty = syncable,
+                nodeId = nodeId,
+            )
+        val nextTitle = cleanTitleOverride ?: existingLocal.title
+        val entityToPoll =
+            if (hasPrefetchedBatch) {
+                existingLocal.copy(title = nextTitle, feedType = nextFeedType, isActive = true)
+            } else {
+                null
+            }
+        return entityToPoll to nextTitle
+    }
+
+    private suspend fun applyFeedTypeIfToggleable(
+        existingLocal: FeedRow,
+        requestedFeedType: FeedType?,
+        markDirty: Boolean,
+        nodeId: String,
+    ): String {
+        val currentType = FeedType.fromWireValue(existingLocal.feedType)
+        val canToggle =
+            requestedFeedType != null &&
+                (requestedFeedType == FeedType.RSS || requestedFeedType == FeedType.PODCAST) &&
+                (currentType == FeedType.RSS || currentType == FeedType.PODCAST) &&
+                currentType != requestedFeedType
+        if (!canToggle) return existingLocal.feedType
+        dao.updateFeedTypeGraph(
+            feedId = existingLocal.id,
+            targetFeedType = requestedFeedType.wireValue,
+            markDirty = markDirty,
+            nodeId = nodeId,
+        )
+        return requestedFeedType.wireValue
+    }
+
     fun subscribeFeedInBackground(
         inputUrl: String,
         titleOverride: String? = null,
+        feedType: FeedType? = null,
         onComplete: (Result<SaveUrlResult>) -> Unit = {},
     ) {
         val scope = backgroundScope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO)
         scope.launch {
             val result =
-                discoverAndSubscribeFeed(inputUrl = inputUrl, titleOverride = titleOverride)
+                discoverAndSubscribeFeed(
+                    inputUrl = inputUrl,
+                    titleOverride = titleOverride,
+                    feedType = feedType,
+                )
             onComplete(result)
         }
     }
@@ -1739,16 +1858,26 @@ class RocheRepository(
         return resolvedId to kind
     }
 
-    private suspend fun maybeAutoLogFeedItemCompletion(itemId: String) {
+    private suspend fun maybeAutoLogFeedItemCompletion(
+        itemId: String,
+        fromAudioPlayback: Boolean? = null,
+    ) {
         val state = dao.getItemStateById(itemId) ?: return
-        val isAudio =
-            state.contentType.equals(AUDIO_CONTENT_TYPE, ignoreCase = true) ||
-                !state.audioUrl.isNullOrBlank()
-        val isVideo = !isAudio && state.contentType.equals("video", ignoreCase = true)
+        val isPodcastOrAudioOnly =
+            state.entryKind.equals(ENTRY_KIND_PODCAST_EPISODE, ignoreCase = true) ||
+                state.contentType.equals(AUDIO_CONTENT_TYPE, ignoreCase = true)
+        val hasAudio = isPodcastOrAudioOnly || !state.audioUrl.isNullOrBlank()
+        val isVideo = !hasAudio && state.contentType.equals("video", ignoreCase = true)
         if (isVideo) return
         val isArchived = ItemStatus.fromWireValue(state.status) == ItemStatus.ARCHIVED
+        val allowAudioAutoComplete =
+            when (fromAudioPlayback) {
+                false -> false
+                true -> hasAudio
+                null -> isPodcastOrAudioOnly
+            }
         val shouldLog =
-            if (isAudio) {
+            if (allowAudioAutoComplete) {
                 state.readProgress >= AUDIO_COMPLETE_PROGRESS_THRESHOLD ||
                     isArchived && state.readProgress >= ARCHIVE_COMPLETE_PROGRESS_THRESHOLD
             } else {
@@ -1777,6 +1906,9 @@ class RocheRepository(
 }
 
 private const val LOG_TAG = "RocheRepository"
+
+internal fun missingFeedError(feedId: String): Nothing = error("Feed not found: $feedId")
+
 private const val FLAG_LAST_SYNCED_AT_ISO = "last_synced_at_iso"
 private const val FLAG_LAST_SYNC_ERROR = "last_sync_error"
 private const val FLAG_LAST_SYNC_AUTH_ERROR = "last_sync_auth_error"

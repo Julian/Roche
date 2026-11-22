@@ -17,23 +17,67 @@ use crate::{
         auth::WebSession,
         html::{
             ARCHIVE_BOX_SVG, NavSection, PageShell, RESTORE_BOX_SVG, WebError, WithWebCsrf as _,
-            content_type_badge_class, content_type_label, esc, format_audio_duration,
-            parse_csv_list, redirect_see_other, redirect_with_flash, render_feed_favicon,
-            render_inline_csrf_form, render_page, render_triage_form, safe_local_redirect,
-            urlencode,
+            esc, format_audio_duration, item_kind_badge, parse_csv_list, redirect_see_other,
+            redirect_with_flash, render_feed_favicon, render_inline_csrf_form, render_page,
+            render_triage_form, safe_local_redirect, urlencode,
         },
         links::sanitize_non_local_href,
     },
 };
 
-fn parse_inbox_kind_filter(raw: Option<&str>) -> (Option<ContentType>, Option<&'static str>) {
+#[derive(Default)]
+struct ParsedInboxKind {
+    content_type: Option<ContentType>,
+    has_audio: Option<bool>,
+    podcast_only: Option<bool>,
+    slug: Option<&'static str>,
+}
+
+fn parse_inbox_kind_filter(raw: Option<&str>) -> ParsedInboxKind {
     match raw.map(str::trim) {
-        Some("article") => (Some(ContentType::Article), Some("article")),
-        Some("audio") => (Some(ContentType::Audio), Some("audio")),
-        Some("video") => (Some(ContentType::Video), Some("video")),
-        Some("paper") => (Some(ContentType::Paper), Some("paper")),
-        Some("pdf") => (Some(ContentType::Pdf), Some("pdf")),
-        _ => (None, None),
+        Some("article") => ParsedInboxKind {
+            content_type: Some(ContentType::Article),
+            slug: Some("article"),
+            ..ParsedInboxKind::default()
+        },
+        Some("podcast") => ParsedInboxKind {
+            podcast_only: Some(true),
+            slug: Some("podcast"),
+            ..ParsedInboxKind::default()
+        },
+        Some("audio") => ParsedInboxKind {
+            has_audio: Some(true),
+            slug: Some("audio"),
+            ..ParsedInboxKind::default()
+        },
+        Some("video") => ParsedInboxKind {
+            content_type: Some(ContentType::Video),
+            slug: Some("video"),
+            ..ParsedInboxKind::default()
+        },
+        Some("paper") => ParsedInboxKind {
+            content_type: Some(ContentType::Paper),
+            slug: Some("paper"),
+            ..ParsedInboxKind::default()
+        },
+        Some("pdf") => ParsedInboxKind {
+            content_type: Some(ContentType::Pdf),
+            slug: Some("pdf"),
+            ..ParsedInboxKind::default()
+        },
+        _ => ParsedInboxKind::default(),
+    }
+}
+
+fn inbox_kind_display_label(slug: &str) -> &str {
+    match slug {
+        "article" => "Articles",
+        "podcast" => "Podcasts",
+        "audio" => "Audio",
+        "paper" => "Papers",
+        "pdf" => "PDFs",
+        "video" => "Videos",
+        other => other,
     }
 }
 
@@ -52,7 +96,8 @@ pub(in crate::web) async fn inbox_get(
         ItemStatusFilter::Archived => "archived",
         ItemStatusFilter::Unread => "unread",
     };
-    let (content_type, clean_kind) = parse_inbox_kind_filter(q.kind.as_deref());
+    let parsed_kind = parse_inbox_kind_filter(q.kind.as_deref());
+    let clean_kind = parsed_kind.slug;
     let clean_feed = q.feed.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let clean_tag = q.tag.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let clean_search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -62,7 +107,9 @@ pub(in crate::web) async fn inbox_get(
         feed_id: clean_feed.map(ToOwned::to_owned),
         tag_id: clean_tag.map(ToOwned::to_owned),
         inbox_only: Some(true),
-        content_type,
+        content_type: parsed_kind.content_type,
+        has_audio: parsed_kind.has_audio,
+        podcast_only: parsed_kind.podcast_only,
         include_content: Some(false),
         search: clean_search.map(ToOwned::to_owned),
         page: Some(page_num),
@@ -296,7 +343,8 @@ fn render_inbox_sidebar(
     // TODO(backend): include per-format unread counts in inbox sidebar
     for (k_slug, label) in [
         ("article", "Articles"),
-        ("audio", "Podcasts"),
+        ("podcast", "Podcasts"),
+        ("audio", "Audio"),
         ("paper", "Papers"),
         ("pdf", "PDFs"),
         ("video", "Videos"),
@@ -372,7 +420,8 @@ fn render_inbox_mobile_pills(out: &mut String, p: &InboxNavParams<'_>, feeds: &[
     }
     for (k_slug, label) in [
         ("article", "Articles"),
-        ("audio", "Podcasts"),
+        ("podcast", "Podcasts"),
+        ("audio", "Audio"),
         ("video", "Videos"),
         ("paper", "Papers"),
         ("pdf", "PDFs"),
@@ -555,7 +604,7 @@ fn render_inbox_active_filters(
             out,
             "<a class=\"pill is-active\" href=\"{}\">Kind: {} <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear kind filter)</span></a>",
             esc(&clear_href),
-            esc(k),
+            esc(inbox_kind_display_label(k)),
         );
     }
     if let Some(search) = p.q {
@@ -804,13 +853,8 @@ fn render_inbox_row_byline(
     tag_id_by_lower_name: &HashMap<String, String>,
 ) {
     out.push_str("<div class=\"item-byline\">");
-    if item.content_type != ContentType::Article {
-        let _ = write!(
-            out,
-            "<span class=\"badge badge-kind{}\">{}</span>",
-            content_type_badge_class(item.content_type),
-            esc(content_type_label(item.content_type)),
-        );
+    if let Some((badge_cls, label)) = item_kind_badge(item) {
+        let _ = write!(out, "<span class=\"badge badge-kind{badge_cls}\">{}</span>", esc(label));
     }
     if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
         let icon_url = item.feed_url.as_deref().or(Some(item.url.as_str()));
@@ -828,7 +872,7 @@ fn render_inbox_row_byline(
             let _ = write!(out, "<span>{}</span></span>", esc(ft));
         }
     }
-    if item.content_type == ContentType::Audio
+    if item.has_audio()
         && let Some(dur) = item.duration.filter(|&d| d > 0)
     {
         if item.read_progress >= 0.03 && item.read_progress < 0.98 {

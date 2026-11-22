@@ -181,6 +181,21 @@ impl ItemRepo<'_> {
             )
             .push_bind(ct);
         }
+        if let Some(podcast_only) = filter.podcast_only {
+            if podcast_only {
+                qb.push(" AND i.kind = 'podcast_episode'");
+            } else {
+                qb.push(" AND i.kind != 'podcast_episode'");
+            }
+        }
+        if let Some(has_audio) = filter.has_audio {
+            let audio_expr = "(COALESCE(ec.content_type, CASE i.kind WHEN 'podcast_episode' THEN 'audio' ELSE 'article' END) = 'audio' OR EXISTS (SELECT 1 FROM entry_media m_aud WHERE m_aud.entry_id = i.id AND m_aud.media_type = 'audio' AND (m_aud.remote_url IS NOT NULL OR m_aud.local_path IS NOT NULL)))";
+            if has_audio {
+                qb.push(" AND ").push(audio_expr);
+            } else {
+                qb.push(" AND NOT ").push(audio_expr);
+            }
+        }
         if let Some(fav) = filter.is_favorite {
             if fav {
                 qb.push(" AND ce_fav.entry_id IS NOT NULL");

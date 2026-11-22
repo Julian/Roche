@@ -14,7 +14,7 @@ use crate::{
     content::HtmlSanitizer,
     db::WANT_TO_READ_COLLECTION_ID,
     domain::{
-        ConsumptionStatus, ContentType, EntryKind, ItemStatus, MediaType,
+        ConsumptionStatus, ContentType, EntryKind, ItemStatus, MediaType, ProgressSource,
         READER_AUTO_READ_THRESHOLD,
     },
     service::{AppError, ItemDetail, RocheService},
@@ -161,7 +161,7 @@ fn render_reader_article(
     csrf: &str,
 ) {
     let item = &detail.item;
-    let entry_kind = EntryKind::from_content_type(item.content_type);
+    let entry_kind = item.entry_kind;
     let id_enc = urlencode(&item.id);
     let reader_path = if return_to == "/inbox" || return_to == "/queue" {
         format!("/reader/{id_enc}")
@@ -173,9 +173,11 @@ fn render_reader_article(
     let _ = writeln!(
         out,
         "<div class=\"reader-layout\">\n\
-         <article class=\"reader-article js-reader-root\" data-item-id=\"{}\" data-kind=\"{}\" data-progress=\"{:.4}\" data-finished=\"{}\" data-back-href=\"{}\"{suppress_attr}>",
+         <article class=\"reader-article js-reader-root\" data-item-id=\"{}\" data-kind=\"{}\" data-content-type=\"{}\" data-has-audio=\"{}\" data-progress=\"{:.4}\" data-finished=\"{}\" data-back-href=\"{}\"{suppress_attr}>",
         esc(&item.id),
         entry_kind.as_str(),
+        item.content_type.as_str(),
+        if item.has_audio() { "1" } else { "0" },
         item.read_progress.clamp(0.0, 1.0),
         if is_finished { "1" } else { "0" },
         esc(return_to),
@@ -201,17 +203,26 @@ fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail, return_to: &st
         esc(return_to),
     );
     let mut wrote_meta = false;
-    if item.content_type == ContentType::Audio {
-        if let Some(dur) = item.duration.filter(|&d| d > 0) {
-            let _ = write!(out, "{} listen", esc(&format_audio_duration(dur)));
-            wrote_meta = true;
-            if item.read_progress >= 0.03 && item.read_progress < 0.98 {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let pct = (item.read_progress * 100.0).round().clamp(1.0, 99.0) as u32;
-                let _ = write!(out, " &middot; {pct}% listened");
-            }
+    if item.has_audio()
+        && let Some(dur) = item.duration.filter(|&d| d > 0)
+    {
+        let _ = write!(out, "{} listen", esc(&format_audio_duration(dur)));
+        wrote_meta = true;
+        if item.content_type == ContentType::Audio
+            && item.read_progress >= 0.03
+            && item.read_progress < 0.98
+        {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pct = (item.read_progress * 100.0).round().clamp(1.0, 99.0) as u32;
+            let _ = write!(out, " &middot; {pct}% listened");
         }
-    } else if let Some(mins) = estimate_reading_minutes(detail) {
+    }
+    if item.content_type != ContentType::Audio
+        && let Some(mins) = estimate_reading_minutes(detail)
+    {
+        if wrote_meta {
+            out.push_str(" &middot; ");
+        }
         let _ = write!(out, "{mins} min read");
         wrote_meta = true;
     }
@@ -723,9 +734,14 @@ pub(in crate::web) async fn post_item_progress(
     Path(id): Path<String>,
     Form(form): Form<ProgressForm>,
 ) -> Result<Response, WebError> {
+    let source = match form.source.as_deref().map(str::trim) {
+        Some("audio") => Some(ProgressSource::Audio),
+        Some("reader") => Some(ProgressSource::Reader),
+        _ => None,
+    };
     let _ = service
         .items()
-        .update_progress_with_auto_read(&id, form.progress)
+        .update_progress_with_auto_read_source(&id, form.progress, source)
         .await
         .web_err(&session)?;
     Ok(StatusCode::NO_CONTENT.into_response())

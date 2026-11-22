@@ -110,7 +110,8 @@ private const val INBOX_SELECT_LIST_PREFIX =
         "$FEED_URL_SUBQUERY AS feedUrl, " +
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
         "ec.audioUrl AS audioUrl, " +
-        "COALESCE(es.inboxState, 'none') AS inboxState " +
+        "COALESCE(es.inboxState, 'none') AS inboxState, " +
+        "e.kind AS entryKind " +
         INBOX_FROM_WHERE
 
 private const val INBOX_SELECT_FULL_PREFIX =
@@ -137,7 +138,8 @@ private const val INBOX_SELECT_FULL_PREFIX =
         "$FEED_URL_SUBQUERY AS feedUrl, " +
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
         "ec.audioUrl AS audioUrl, " +
-        "COALESCE(es.inboxState, 'none') AS inboxState " +
+        "COALESCE(es.inboxState, 'none') AS inboxState, " +
+        "e.kind AS entryKind " +
         INBOX_FROM_WHERE
 
 private const val INBOX_SELECT_SEARCH_PREFIX =
@@ -164,7 +166,8 @@ private const val INBOX_SELECT_SEARCH_PREFIX =
         "$FEED_URL_SUBQUERY AS feedUrl, " +
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
         "ec.audioUrl AS audioUrl, " +
-        "COALESCE(es.inboxState, 'none') AS inboxState " +
+        "COALESCE(es.inboxState, 'none') AS inboxState, " +
+        "e.kind AS entryKind " +
         INBOX_FROM_WHERE
 
 private const val CATALOG_STAMP_SELECT =
@@ -416,7 +419,8 @@ interface RocheDao {
             "es.readAt AS readAt, " +
             "COALESCE(es.progress, 0.0) AS readProgress, " +
             "ec.audioUrl AS audioUrl, " +
-            "COALESCE(es.inboxState, 'none') AS inboxState " +
+            "COALESCE(es.inboxState, 'none') AS inboxState, " +
+            "e.kind AS entryKind " +
             "$INBOX_FROM_WHERE AND e.id = :id LIMIT 1"
     )
     suspend fun getItemStateById(id: String): ItemStateRow?
@@ -430,7 +434,8 @@ interface RocheDao {
             "es.readAt AS readAt, " +
             "es.progress AS readProgress, " +
             "ec.audioUrl AS audioUrl, " +
-            "es.inboxState AS inboxState " +
+            "es.inboxState AS inboxState, " +
+            "e.kind AS entryKind " +
             "FROM entries e " +
             "INNER JOIN entry_state es ON es.entryId = e.id " +
             "LEFT JOIN entry_content ec ON ec.entryId = e.id " +

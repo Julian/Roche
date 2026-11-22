@@ -158,6 +158,7 @@ class PodcastPlaybackOrchestrator(
             progress = 1.0,
             recordPlayedTimestamp = true,
             syncRemote = true,
+            fromAudioPlayback = true,
         )
         repository.setArchiveStateWithSnapshot(itemId = completedEntryId, archived = true)
         settingsRepository.update { current ->
@@ -315,6 +316,7 @@ private fun buildProgressSaveHandler(
                 progress = progress,
                 recordPlayedTimestamp = shouldRecordPlayedAt,
                 syncRemote = shouldSyncRemote,
+                fromAudioPlayback = true,
             )
         }
     }

@@ -33,6 +33,7 @@ import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.core.normalizeIdentifierScheme
 import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.core.nowUtcIso
+import com.grayvines.roche.core.parseDurationToSecondsLong
 import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.core.resolveArticleDuration
 import com.grayvines.roche.core.sanitizeHttpUrl
@@ -1548,25 +1549,30 @@ private suspend fun mergeEntryContentRowInDao(
         pickRicherString(existingContent?.contentHtml, contentDto?.contentHtml)
             ?.take(MAX_SQLITE_HTML_CHARS)
     val mergedAudio = resolveMergedAudioUrl(existingContent, contentDto, entryIncomingWins)
-    val rawType =
-        resolveMergedContentType(existingContent, contentDto, mergedAudio, entryIncomingWins)
-    val revertedFromAudio =
-        entryIncomingWins &&
-            contentDto != null &&
-            isAudioContentWire(existingContent?.contentType) &&
-            !isAudioContentWire(rawType)
+    val rawType = resolveMergedContentType(existingContent, contentDto, entryIncomingWins)
+    val hasMergedAudio = !mergedAudio.isNullOrBlank() || isAudioContentWire(rawType)
+    val hadExistingAudio =
+        isAudioContentWire(existingContent?.contentType) ||
+            !existingContent?.audioUrl.isNullOrBlank()
+    val lostAudio = entryIncomingWins && contentDto != null && hadExistingAudio && !hasMergedAudio
+    val canUseIncomingDuration =
+        existingContent == null ||
+            entryIncomingWins ||
+            parseDurationToSecondsLong(existingContent.duration) == null
     val effectiveWireDuration =
-        contentDto?.duration
+        contentDto
+            ?.duration
             ?.takeIf {
-                isAudioContentWire(rawType) ||
-                    rawType.equals(ContentType.VIDEO.wireValue, ignoreCase = true)
+                canUseIncomingDuration &&
+                    (hasMergedAudio ||
+                        rawType.equals(ContentType.VIDEO.wireValue, ignoreCase = true))
             }
             ?.let(::formatDurationSecondsLabel)
     val mergedDuration =
         resolveSyncedContentDuration(
             contentType = rawType,
             wireDuration = effectiveWireDuration,
-            existingDuration = if (revertedFromAudio) null else existingContent?.duration,
+            existingDuration = if (lostAudio) null else existingContent?.duration,
             summary = summary,
             contentText = existingContent?.contentText,
             contentHtml = richerHtml,
@@ -1609,10 +1615,8 @@ private fun resolveMergedAudioUrl(
 private fun resolveMergedContentType(
     existingContent: EntryContentEntity?,
     contentDto: SyncEntryContentDto?,
-    mergedAudio: String?,
     entryIncomingWins: Boolean,
 ): String {
-    if (!mergedAudio.isNullOrBlank()) return ContentType.AUDIO.wireValue
     val incomingType = contentDto?.contentType?.takeIf { it.isNotBlank() }
     val existingType = existingContent?.contentType?.takeIf { it.isNotBlank() }
     return if (existingContent == null || entryIncomingWins) {

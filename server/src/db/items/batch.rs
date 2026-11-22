@@ -162,8 +162,11 @@ impl ItemRepo<'_> {
                         &mut tx,
                         &id,
                         kind,
+                        kind.default_content_type(),
+                        false,
                         InboxState::Dismissed,
                         progress,
+                        None,
                         read_at.unwrap_or(now),
                     )
                     .await?;

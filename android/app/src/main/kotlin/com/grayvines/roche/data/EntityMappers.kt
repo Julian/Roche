@@ -5,6 +5,7 @@ package com.grayvines.roche.data
 import com.grayvines.roche.core.deterministicItemId
 import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.core.nowUtcIso
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.ItemTagRow
@@ -174,6 +175,7 @@ internal fun toInboxEntry(entity: InboxItemRow, tags: List<String>): InboxEntry 
         thumbnailUrl = entity.thumbnailUrl,
         audioUrl = entity.audioUrl,
         inFeedInbox = entity.feedId != null && !entity.inboxState.equals("none", ignoreCase = true),
+        entryKind = EntryKind.fromWireValue(entity.entryKind),
     )
 
 internal fun createSavedItemEntity(
@@ -192,7 +194,7 @@ internal fun createSavedItemEntity(
             when (type) {
                 ContentType.PDF -> "arXiv / PDF"
                 ContentType.VIDEO -> "YouTube"
-                ContentType.AUDIO -> "Podcast / Audio"
+                ContentType.AUDIO -> "Audio"
                 ContentType.ARTICLE -> hostTitle
             },
         title = title,

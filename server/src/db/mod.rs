@@ -172,6 +172,7 @@ impl Db {
     async fn run_startup_maintenance(&self) {
         const CANONICALIZE_URL_IDENTIFIERS_TASK: &str = "canonicalize_entry_url_identifiers";
         const REPAIR_IMPLICIT_PODCASTS_TASK: &str = "repair_implicit_podcast_misclassifications_v1";
+        const DECOUPLE_RSS_AUDIO_ENTRIES_TASK: &str = "decouple_rss_audio_entries_v1";
 
         self.run_maintenance_task_once(CANONICALIZE_URL_IDENTIFIERS_TASK, async {
             self.canonicalize_entry_url_identifiers().await
@@ -181,6 +182,61 @@ impl Db {
             self.repair_implicit_podcast_misclassifications().await
         })
         .await;
+        self.run_maintenance_task_once(DECOUPLE_RSS_AUDIO_ENTRIES_TASK, async {
+            self.decouple_rss_audio_entries().await
+        })
+        .await;
+    }
+
+    async fn decouple_rss_audio_entries(&self) -> Result<()> {
+        let mut tx = begin_write(&self.pool).await?;
+        let now = crate::util::clock::now_utc();
+        let rows: Vec<(String, EntryKind, ContentType, Option<String>)> = sqlx::query_as(
+            "SELECT e.id, e.kind, ec.content_type, e.url
+             FROM entries e
+             JOIN entry_content ec ON ec.entry_id = e.id
+             WHERE e.merged_into_id IS NULL
+               AND (e.kind = 'podcast_episode' OR ec.content_type = 'audio')
+               AND EXISTS (
+                   SELECT 1 FROM collection_entries ce_f
+                   JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
+                   WHERE ce_f.entry_id = e.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM collection_entries ce_p
+                   JOIN feed_sources fs_p ON fs_p.collection_id = ce_p.collection_id
+                   WHERE ce_p.entry_id = e.id AND fs_p.source_type = 'podcast'
+               )",
+        )
+        .fetch_all(tx.conn())
+        .await?;
+
+        for (entry_id, existing_kind, existing_ct, entry_url) in rows {
+            let target_ct = entry_url
+                .as_deref()
+                .and_then(|raw| url::Url::parse(raw.trim()).ok())
+                .map_or(ContentType::Article, |parsed| roche_core::classify::classify_url(&parsed));
+            let target_kind = EntryKind::for_feed_item(Some(FeedType::Rss), target_ct);
+            if existing_ct != target_ct {
+                sqlx::query("UPDATE entry_content SET content_type = ? WHERE entry_id = ?")
+                    .bind(target_ct)
+                    .bind(&entry_id)
+                    .execute(tx.conn())
+                    .await?;
+            }
+            if existing_kind != target_kind || existing_ct != target_ct {
+                let entry_hlc = tx.next_hlc().await?;
+                sqlx::query("UPDATE entries SET kind = ?, updated_at = ?, hlc = ? WHERE id = ?")
+                    .bind(target_kind)
+                    .bind(now)
+                    .bind(&entry_hlc)
+                    .bind(&entry_id)
+                    .execute(tx.conn())
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn repair_implicit_podcast_misclassifications(&self) -> Result<()> {
@@ -691,7 +747,7 @@ mod tests {
                 .fetch_one(db1.pool())
                 .await
                 .unwrap();
-        assert_eq!(recorded_count, 2);
+        assert_eq!(recorded_count, 3);
 
         // Simulate a legacy database needing one-shot task execution
         let url1 = Url::parse("https://example.com/legacy-post").unwrap();
@@ -733,7 +789,7 @@ mod tests {
         assert_eq!(normalized_item.thumbnail_url.as_deref(), Some("https://example.com/hero.jpg"));
 
         let first_runs = list_maintenance_runs(&db2).await;
-        assert_eq!(first_runs.len(), 3);
+        assert_eq!(first_runs.len(), 4);
 
         // Inject raw unnormalized state while maintenance_runs already marks tasks completed
         let url2 = Url::parse("https://example.com/post-after-maint").unwrap();
@@ -1663,5 +1719,124 @@ mod tests {
             emitted_ids.contains(orphan_item.id.as_str()),
             "reverted orphan audio item must propagate via sync"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_decouple_rss_audio_entries_reclassifies_rss_narrated_posts_only() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        let rss_url = Url::parse("https://substack.example.com/feed").unwrap();
+        let rss_feed =
+            db.feeds().create(FeedType::Rss, &rss_url, Some("Substack"), None).await.unwrap();
+        let pod_url = Url::parse("https://realpod.example.com/rss").unwrap();
+        let pod_feed =
+            db.feeds().create(FeedType::Podcast, &pod_url, Some("Real Pod"), None).await.unwrap();
+
+        let rss_post_url = Url::parse("https://substack.example.com/p/narrated").unwrap();
+        let rss_item = db
+            .items()
+            .create(&NewItem {
+                feed_id: Some(&rss_feed.id),
+                title: "Narrated Substack Post",
+                url: &rss_post_url,
+                author: None,
+                published_at: None,
+                summary: None,
+                content_type: ContentType::Audio,
+            })
+            .await
+            .unwrap();
+        // Simulate pre-decoupling state: RSS narrated post stored as podcast_episode + audio
+        sqlx::query("UPDATE entries SET kind = 'podcast_episode' WHERE id = ?")
+            .bind(&rss_item.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO entry_media (id, entry_id, media_type, remote_url, duration)
+             VALUES ('rss-mp3', ?, 'audio', 'https://cdn.substack.example.com/p.mp3', 1800)",
+        )
+        .bind(&rss_item.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let pod_ep_url = Url::parse("https://realpod.example.com/ep1").unwrap();
+        let pod_item = db
+            .items()
+            .create(&NewItem {
+                feed_id: Some(&pod_feed.id),
+                title: "Real Podcast Episode",
+                url: &pod_ep_url,
+                author: None,
+                published_at: None,
+                summary: None,
+                content_type: ContentType::Audio,
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO entry_media (id, entry_id, media_type, remote_url, duration)
+             VALUES ('pod-mp3', ?, 'audio', 'https://cdn.realpod.example.com/ep1.mp3', 2400)",
+        )
+        .bind(&pod_item.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let manual_ep = db
+            .catalog()
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::PodcastEpisode),
+                title: "Manual Logged Episode".to_owned(),
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+
+        let seq_before: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(sync_seq), 0) FROM entries")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        db.decouple_rss_audio_entries().await.unwrap();
+
+        // RSS narrated post becomes Article/Article while preserving audio_url + duration
+        let rss_after = db.items().get(&rss_item.id).await.unwrap().unwrap();
+        assert_eq!(rss_after.entry_kind, EntryKind::Article);
+        assert_eq!(rss_after.content_type, ContentType::Article);
+        assert_eq!(rss_after.audio_url.as_deref(), Some("https://cdn.substack.example.com/p.mp3"));
+        assert_eq!(rss_after.duration, Some(1800));
+
+        // Real podcast episode & manual logged episode untouched
+        let pod_after = db.items().get(&pod_item.id).await.unwrap().unwrap();
+        assert_eq!(pod_after.entry_kind, EntryKind::PodcastEpisode);
+        assert_eq!(pod_after.content_type, ContentType::Audio);
+        assert_eq!(
+            db.catalog().get_entry(&manual_ep.id).await.unwrap().unwrap().kind,
+            EntryKind::PodcastEpisode
+        );
+
+        // Reclassified RSS narrated post propagates via incremental sync
+        let sync_resp = db
+            .sync()
+            .collect_peer_sync_response_with_budget(
+                seq_before,
+                100,
+                usize::MAX,
+                String::new(),
+                crate::util::clock::now_utc(),
+            )
+            .await
+            .unwrap();
+        let emitted = sync_resp.entries.iter().find(|e| e.id == rss_item.id).unwrap();
+        assert_eq!(emitted.kind, EntryKind::Article);
+        assert_eq!(emitted.content.as_ref().unwrap().content_type, ContentType::Article);
+        assert_eq!(
+            emitted.content.as_ref().unwrap().audio_url.as_deref(),
+            Some("https://cdn.substack.example.com/p.mp3")
+        );
+        assert_eq!(emitted.content.as_ref().unwrap().duration, Some(1800));
     }
 }

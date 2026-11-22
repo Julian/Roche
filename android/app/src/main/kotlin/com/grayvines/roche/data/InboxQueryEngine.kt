@@ -41,12 +41,19 @@ internal fun matchesInboxFilter(entry: InboxEntry, filter: InboxFilter): Boolean
     when (filter) {
         InboxFilter.ALL -> !entry.isArchived
         InboxFilter.UNREAD -> entry.isUnread
-        InboxFilter.ARTICLES -> !entry.isArchived && entry.contentType == ContentType.ARTICLE
-        InboxFilter.PAPERS -> !entry.isArchived && entry.contentType == ContentType.PDF
-        InboxFilter.VIDEOS -> !entry.isArchived && entry.contentType == ContentType.VIDEO
-        InboxFilter.PODCASTS -> !entry.isArchived && entry.contentType == ContentType.AUDIO
         InboxFilter.STARRED -> entry.isFavorite
         InboxFilter.ARCHIVED -> entry.isArchived
+        else -> !entry.isArchived && matchesActiveMediaFilter(entry, filter)
+    }
+
+private fun matchesActiveMediaFilter(entry: InboxEntry, filter: InboxFilter): Boolean =
+    when (filter) {
+        InboxFilter.ARTICLES -> entry.contentType == ContentType.ARTICLE
+        InboxFilter.PAPERS -> entry.contentType == ContentType.PDF
+        InboxFilter.VIDEOS -> entry.contentType == ContentType.VIDEO
+        InboxFilter.PODCASTS -> entry.isPodcastEpisode
+        InboxFilter.AUDIO -> entry.isPlayableAudio
+        else -> false
     }
 
 internal enum class SearchScopeFilter(val label: String) {
@@ -60,6 +67,7 @@ internal enum class SearchScopeFilter(val label: String) {
     PAPERS("Papers"),
     VIDEOS("Videos"),
     PODCASTS("Podcasts"),
+    AUDIO("Audio"),
 }
 
 internal data class CatalogSearchMatch(
@@ -83,7 +91,8 @@ internal fun matchesSearchScopeFilter(entry: InboxEntry, scope: SearchScopeFilte
         SearchScopeFilter.ARTICLES -> entry.contentType == ContentType.ARTICLE
         SearchScopeFilter.PAPERS -> entry.contentType == ContentType.PDF
         SearchScopeFilter.VIDEOS -> entry.contentType == ContentType.VIDEO
-        SearchScopeFilter.PODCASTS -> entry.contentType == ContentType.AUDIO
+        SearchScopeFilter.PODCASTS -> entry.isPodcastEpisode
+        SearchScopeFilter.AUDIO -> entry.isPlayableAudio
     }
 
 internal fun searchCatalogEntriesWithTotal(

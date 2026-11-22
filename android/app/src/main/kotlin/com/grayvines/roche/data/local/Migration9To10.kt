@@ -1279,11 +1279,16 @@ internal fun entryKindForFeedTypeWire(feedType: String): String =
         else -> ENTRY_KIND_PUBLICATION
     }
 
-internal fun entryKindForItemWire(contentType: String, audioUrl: String?): String =
+internal fun entryKindForItemWire(
+    contentType: String,
+    audioUrl: String?,
+    isPodcastFeed: Boolean = false,
+): String =
     when {
-        !audioUrl.isNullOrBlank() ||
-            contentType.equals("audio", ignoreCase = true) ||
-            contentType.equals("podcast", ignoreCase = true) -> ENTRY_KIND_PODCAST_EPISODE
+        contentType.equals("podcast", ignoreCase = true) ||
+            isPodcastFeed &&
+                (!audioUrl.isNullOrBlank() || contentType.equals("audio", ignoreCase = true)) ->
+            ENTRY_KIND_PODCAST_EPISODE
         contentType.equals("pdf", ignoreCase = true) ||
             contentType.equals("paper", ignoreCase = true) -> ENTRY_KIND_PAPER
         contentType.equals("video", ignoreCase = true) -> ENTRY_KIND_VIDEO

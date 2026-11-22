@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use super::{auth::WebSession, links::render_creator_links};
 use crate::{
-    db::ConsumptionLogView,
+    db::{ConsumptionLogView, Item},
     domain::{ConsumptionStatus, ContentType},
     service::AppError,
 };
@@ -261,6 +261,21 @@ pub(super) const fn content_type_badge_class(ct: ContentType) -> &'static str {
         ContentType::Paper => " badge-paper",
         ContentType::Pdf => " badge-pdf",
         ContentType::Video => " badge-video",
+    }
+}
+
+/// Returns the `(extra_badge_class, label)` for an inbox/home/search item row,
+/// distinguishing explicit podcast episodes from narrated articles and standalone audio.
+#[must_use]
+pub(super) fn item_kind_badge(item: &Item) -> Option<(&'static str, &'static str)> {
+    if item.is_podcast_episode() {
+        Some((" badge-podcast", "Podcast"))
+    } else if item.content_type != ContentType::Article {
+        Some((content_type_badge_class(item.content_type), content_type_label(item.content_type)))
+    } else if item.has_audio() {
+        Some((" badge-podcast", "Audio"))
+    } else {
+        None
     }
 }
 
@@ -615,18 +630,18 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
          <aside id=\"roche-player-bar\" class=\"player-bar\" aria-label=\"Audio player\" hidden>\n\
            <div class=\"player-inner\">\n\
              <div class=\"player-meta\">\n\
-               <div id=\"roche-player-title\" class=\"player-title\">Episode</div>\n\
-               <div id=\"roche-player-sub\" class=\"player-sub\">Podcast</div>\n\
+               <div id=\"roche-player-title\" class=\"player-title\">Audio</div>\n\
+               <div id=\"roche-player-sub\" class=\"player-sub\">Player</div>\n\
                <div id=\"roche-player-err\" class=\"player-err\" role=\"alert\" hidden></div>\n\
              </div>\n\
              <div class=\"player-seek-group\">\n\
                <button type=\"button\" id=\"roche-player-back\" class=\"btn btn-small btn-ghost\" aria-label=\"Rewind 15 seconds\">&minus;15s</button>\n\
                <button type=\"button\" id=\"roche-player-fwd\" class=\"btn btn-small btn-ghost\" aria-label=\"Forward 30 seconds\">+30s</button>\n\
              </div>\n\
-             <audio id=\"roche-audio\" controls preload=\"metadata\" aria-label=\"Podcast audio player\"></audio>\n\
+             <audio id=\"roche-audio\" controls preload=\"metadata\" aria-label=\"Audio player\"></audio>\n\
              <div class=\"player-util-controls\">\n\
                <button type=\"button\" id=\"roche-player-speed\" class=\"btn btn-small\" aria-label=\"Playback speed: 1x\">1x</button>\n\
-               <a id=\"roche-player-link\" href=\"/\" class=\"btn btn-small\" aria-label=\"Open episode notes\">Notes</a>\n\
+               <a id=\"roche-player-link\" href=\"/\" class=\"btn btn-small\" aria-label=\"Open item\">Open</a>\n\
                <button type=\"button\" id=\"roche-player-close\" class=\"btn btn-small btn-ghost\" aria-label=\"Close player\"><span aria-hidden=\"true\">&times;</span></button>\n\
              </div>\n\
            </div>\n\

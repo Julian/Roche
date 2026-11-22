@@ -1391,11 +1391,24 @@ class RocheCatalogAndSyncTest {
                     """</rss>""",
                 )
                 .joinToString("\n")
-        val podBatch =
+        val rssNarratedBatch =
             LocalFeedPoller.parseFeedXml(
                 xml = itunesXml,
                 feedUrl = "https://pod.example.com/feed.xml",
                 feedType = "rss",
+            )
+        val rssNarratedItem = rssNarratedBatch.items.single()
+        assertEquals("article", rssNarratedItem.contentType)
+        assertEquals("https://pod.example.com/ep9.mp3", rssNarratedItem.audioUrl)
+        assertEquals("65:30", rssNarratedItem.duration)
+        assertEquals("https://pod.example.com/ep9-art.jpg", rssNarratedItem.thumbnailUrl)
+        assertEquals("Linus & Friends", rssNarratedItem.author)
+
+        val podBatch =
+            LocalFeedPoller.parseFeedXml(
+                xml = itunesXml,
+                feedUrl = "https://pod.example.com/feed.xml",
+                feedType = "podcast",
             )
         val podItem = podBatch.items.single()
         assertEquals("audio", podItem.contentType)

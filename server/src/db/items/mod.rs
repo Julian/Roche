@@ -15,8 +15,8 @@ mod tests;
 pub use fts::SearchTerm;
 
 use super::{
-    ContentType, InboxState, ItemSortField, ItemStatus, ItemStatusFilter, STARRED_COLLECTION_ID,
-    SortOrder, WANT_TO_READ_COLLECTION_ID,
+    ContentType, EntryKind, InboxState, ItemSortField, ItemStatus, ItemStatusFilter,
+    STARRED_COLLECTION_ID, SortOrder, WANT_TO_READ_COLLECTION_ID,
 };
 
 /// Canonical SQL predicate defining the read-only `Item` projection boundary over unified `entries`.
@@ -77,6 +77,7 @@ pub(super) fn item_select_query_builder(proj: ItemContentProjection) -> QueryBui
 
     let mut qb = QueryBuilder::<Sqlite>::new(
         "SELECT i.id,
+       i.kind AS entry_kind,
        fs_primary.collection_id AS feed_id,
        fs_primary.feed_url AS feed_url,
        fs_primary.feed_title AS feed_title,
@@ -168,6 +169,10 @@ impl TryFrom<&str> for TagNames {
     }
 }
 
+const fn default_item_entry_kind() -> EntryKind {
+    EntryKind::Article
+}
+
 /// Read-only reader/inbox item projection over unified `entries` and satellite tables
 /// (`entry_state`, `entry_content`, `entry_media`, `collection_entries`, `feed_sources`).
 ///
@@ -175,6 +180,8 @@ impl TryFrom<&str> for TagNames {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Item {
     pub id: String,
+    #[serde(default = "default_item_entry_kind")]
+    pub entry_kind: EntryKind,
     pub feed_id: Option<String>,
     #[serde(default)]
     pub feed_url: Option<String>,
@@ -206,6 +213,21 @@ pub struct Item {
     #[serde(default)]
     #[sqlx(try_from = "&'a str")]
     pub tag_names: TagNames,
+}
+
+impl Item {
+    /// Whether this item has playable audio (either audio-only content or an attached audio enclosure).
+    #[must_use]
+    pub fn has_audio(&self) -> bool {
+        self.content_type == ContentType::Audio
+            || self.audio_url.as_deref().is_some_and(|u| !u.trim().is_empty())
+    }
+
+    /// Whether this item is an explicit podcast episode (`entries.kind == 'podcast_episode'`).
+    #[must_use]
+    pub const fn is_podcast_episode(&self) -> bool {
+        matches!(self.entry_kind, EntryKind::PodcastEpisode)
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +272,8 @@ pub struct ItemFilter {
     pub inbox_only: Option<bool>,
     pub in_progress_only: Option<bool>,
     pub content_type: Option<ContentType>,
+    pub has_audio: Option<bool>,
+    pub podcast_only: Option<bool>,
     pub is_favorite: Option<bool>,
     pub is_read: Option<bool>,
     pub include_content: Option<bool>,

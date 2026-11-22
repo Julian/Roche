@@ -14,11 +14,10 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        ARCHIVE_BOX_SVG, CreatorYearStyle, NavSection, PageShell, WebError, WithWebCsrf as _,
-        content_type_badge_class, content_type_label, esc, format_audio_duration, parse_form_bool,
-        redirect_with_flash, render_creator_year_meta, render_diary_row_with_tier,
-        render_feed_favicon, render_inline_csrf_form, render_page, render_triage_form,
-        safe_local_redirect, urlencode,
+        ARCHIVE_BOX_SVG, CreatorYearStyle, NavSection, PageShell, WebError, WithWebCsrf as _, esc,
+        format_audio_duration, item_kind_badge, parse_form_bool, redirect_with_flash,
+        render_creator_year_meta, render_diary_row_with_tier, render_feed_favicon,
+        render_inline_csrf_form, render_page, render_triage_form, safe_local_redirect, urlencode,
     },
     links::{
         WebLinkIcon, collect_web_external_links, extract_entry_tags, load_artist_id_by_lower_name,
@@ -31,7 +30,7 @@ use crate::{
         CatalogEntry, CollectionGeneratorState, ConsumptionLogView, Item, ItemFilter,
         WANT_TO_READ_COLLECTION_ID,
     },
-    domain::{CollectionRole, ConsumptionStatus, ContentType, EntryKind, ItemStatusFilter},
+    domain::{CollectionRole, ConsumptionStatus, EntryKind, ItemStatusFilter},
     service::{AppError, RocheService},
 };
 
@@ -397,7 +396,7 @@ fn render_in_progress_section(out: &mut String, in_progress_items: &[Item], csrf
                 let _ = write!(out, "<span class=\"byline-item\">{}</span>", esc(ft));
             }
         }
-        if item.content_type == ContentType::Audio
+        if item.has_audio()
             && let Some(dur) = item.duration.filter(|&d| d > 0)
         {
             let _ = write!(
@@ -491,12 +490,11 @@ fn render_want_to_read_section(
                 raw_id = esc(&item.id),
                 title = esc(&item.title),
             );
-            if item.content_type != ContentType::Article {
+            if let Some((badge_cls, label)) = item_kind_badge(item) {
                 let _ = write!(
                     out,
-                    "<span class=\"badge badge-kind{}\">{}</span>",
-                    content_type_badge_class(item.content_type),
-                    esc(content_type_label(item.content_type))
+                    "<span class=\"badge badge-kind{badge_cls}\">{}</span>",
+                    esc(label)
                 );
             }
             if let Some(author) = item.author.as_deref().filter(|s| !s.is_empty()) {
@@ -615,13 +613,8 @@ fn render_home_inbox_row(out: &mut String, item: &Item, csrf: &str) {
          <div class=\"item-byline\">",
         esc(&item.title),
     );
-    if item.content_type != ContentType::Article {
-        let _ = write!(
-            out,
-            "<span class=\"badge badge-kind{}\">{}</span>",
-            content_type_badge_class(item.content_type),
-            esc(content_type_label(item.content_type)),
-        );
+    if let Some((badge_cls, label)) = item_kind_badge(item) {
+        let _ = write!(out, "<span class=\"badge badge-kind{badge_cls}\">{}</span>", esc(label));
     }
     if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
         let icon_url = item.feed_url.as_deref().or(Some(item.url.as_str()));
@@ -639,7 +632,7 @@ fn render_home_inbox_row(out: &mut String, item: &Item, csrf: &str) {
             let _ = write!(out, "<span>{}</span></span>", esc(ft));
         }
     }
-    if item.content_type == ContentType::Audio
+    if item.has_audio()
         && let Some(dur) = item.duration.filter(|&d| d > 0)
     {
         let _ =

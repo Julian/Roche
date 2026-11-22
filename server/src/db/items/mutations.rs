@@ -22,6 +22,8 @@ pub struct ItemDeleteOutcome {
 #[derive(sqlx::FromRow)]
 struct ExistingItemStateRow {
     kind: EntryKind,
+    content_type: ContentType,
+    has_audio_media: bool,
     inbox_state: InboxState,
     is_favorite: bool,
     in_want_to_read: bool,
@@ -46,11 +48,13 @@ impl EntryMetadataBackfill<'_> {
             && self.thumbnail_url.is_none()
     }
 }
+#[cfg(test)]
+use crate::domain::FeedType;
 use crate::{
     db::{
         ActivityAction, ActivityEntityType, CatalogError, CatalogRepo, CatalogResult,
-        ConsumptionLogView, ConsumptionStatus, EntryKind, InboxState, ItemStatus, MediaRepo,
-        ReadAtPatch, SyncRepo, Tag, TagRepo, WriteTx,
+        ConsumptionLogView, ConsumptionStatus, ContentType, EntryKind, InboxState, ItemStatus,
+        MediaRepo, ReadAtPatch, SyncRepo, Tag, TagRepo, WriteTx,
         entries_core::{self, EntryInsertParams, EntryStateUpsert},
         feeds::resolve_dedup_entry_id,
         sync::{
@@ -58,32 +62,45 @@ use crate::{
             canonicalize_sync_url, deterministic_item_id, item_natural_key,
         },
     },
-    domain::READER_AUTO_READ_THRESHOLD,
+    domain::{ProgressSource, READER_AUTO_READ_THRESHOLD},
     util::{clock::now_utc, media_urls::extract_arxiv_id},
 };
 
 /// Auto-logs feed / reader completion (`consumed`) when:
-/// - a `podcast_episode` reaches audio playback completion (`progress >= READER_AUTO_READ_THRESHOLD`,
-///   or archived/finished with `>= 0.9`), or
+/// - a `podcast_episode` or audio-only item reaches playback completion
+///   (`progress >= READER_AUTO_READ_THRESHOLD`, or archived/finished with `>= 0.9`),
+/// - an `article` or `paper` with playable audio reaches `>= READER_AUTO_READ_THRESHOLD`
+///   from audio playback (`progress_source == Some(ProgressSource::Audio)`), or
 /// - an `article` or `paper` is archived/finished with `progress >= 0.9`.
 ///
 /// Delegates to `CatalogRepo::ensure_auto_consumed_with_parents_in_tx` so auto-completion uses
 /// `deterministic_auto_consumption_log_id`, removes from `Want` queues, engages parent
 /// `podcast`/`publication`/`channel` collections, and records sync activity without duplicate SQL.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn maybe_auto_log_feed_completion_in_tx(
     tx: &mut WriteTx<'_>,
     entry_id: &str,
     entry_kind: EntryKind,
+    content_type: ContentType,
+    has_audio_media: bool,
     inbox_state: InboxState,
     progress: f64,
+    progress_source: Option<ProgressSource>,
     ts: DateTime<Utc>,
 ) -> std::result::Result<(), sqlx::Error> {
     let is_dismissed_or_done = matches!(inbox_state, InboxState::Dismissed | InboxState::None);
+    let is_audio_only = content_type == ContentType::Audio;
+    let has_audio = is_audio_only || has_audio_media;
+    let allow_audio_auto_complete = match progress_source {
+        Some(ProgressSource::Reader) => false,
+        Some(ProgressSource::Audio) => has_audio,
+        None => matches!(entry_kind, EntryKind::PodcastEpisode) || is_audio_only,
+    };
     let should_log = match entry_kind {
-        EntryKind::PodcastEpisode => {
-            progress >= READER_AUTO_READ_THRESHOLD || (is_dismissed_or_done && progress >= 0.9)
+        EntryKind::PodcastEpisode | EntryKind::Article | EntryKind::Paper => {
+            (allow_audio_auto_complete && progress >= READER_AUTO_READ_THRESHOLD)
+                || (is_dismissed_or_done && progress >= 0.9)
         }
-        EntryKind::Article | EntryKind::Paper => is_dismissed_or_done && progress >= 0.9,
         _ => false,
     };
     if !should_log {
@@ -146,22 +163,24 @@ pub(super) async fn set_favorite_membership_in_tx(
 impl ItemRepo<'_> {
     #[cfg(test)]
     pub async fn create(&self, new_item: &NewItem<'_>) -> Result<Item> {
-        let feed_url: Option<String> = match new_item.feed_id {
+        let feed_meta: Option<(String, FeedType)> = match new_item.feed_id {
             Some(fid) => {
-                sqlx::query_scalar!(
-                    "SELECT feed_url FROM feed_sources WHERE collection_id = ?",
-                    fid,
+                sqlx::query_as(
+                    "SELECT feed_url, source_type FROM feed_sources WHERE collection_id = ?",
                 )
+                .bind(fid)
                 .fetch_optional(self.pool)
                 .await?
             }
             None => None,
         };
+        let feed_url = feed_meta.as_ref().map(|(u, _)| u.clone());
+        let feed_type = feed_meta.as_ref().map(|(_, ft)| *ft);
         let url_str = new_item.url.as_str();
         let id = deterministic_item_id(feed_url.as_deref(), url_str);
         let canon_url = canonicalize_sync_url(url_str);
         let now = now_utc();
-        let entry_kind = EntryKind::from_content_type(new_item.content_type);
+        let entry_kind = EntryKind::for_feed_item(feed_type, new_item.content_type);
         let creators_json = new_item
             .author
             .map(str::trim)
@@ -184,6 +203,7 @@ impl ItemRepo<'_> {
 
         Ok(Item {
             id,
+            entry_kind,
             feed_id: new_item.feed_id.map(String::from),
             feed_url,
             feed_title: None,
@@ -285,7 +305,7 @@ impl ItemRepo<'_> {
         let arxiv_id = extract_arxiv_id(url_str);
         let now = now_utc();
         let clean_duration = input.duration.filter(|&d| d > 0);
-        let entry_kind = EntryKind::from_content_type(input.content_type);
+        let entry_kind = EntryKind::for_feed_item(None, input.content_type);
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         SyncRepo::clear_tombstone(
@@ -513,11 +533,32 @@ impl ItemRepo<'_> {
         read_progress: Option<f64>,
         read_at: ReadAtPatch,
     ) -> Result<bool> {
+        self.update_with_source(id, status, is_favorite, read_progress, read_at, None).await
+    }
+
+    pub async fn update_with_source(
+        &self,
+        id: &str,
+        status: Option<ItemStatus>,
+        is_favorite: Option<bool>,
+        read_progress: Option<f64>,
+        read_at: ReadAtPatch,
+        progress_source: Option<ProgressSource>,
+    ) -> Result<bool> {
         let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
-        let found =
-            Self::update_in_tx(&mut tx, id, status, is_favorite, read_progress, read_at, now, true)
-                .await?;
+        let found = Self::update_in_tx(
+            &mut tx,
+            id,
+            status,
+            is_favorite,
+            read_progress,
+            read_at,
+            progress_source,
+            now,
+            true,
+        )
+        .await?;
         if found {
             tx.commit().await?;
         }
@@ -553,6 +594,7 @@ impl ItemRepo<'_> {
             None,
             Some(1.0),
             ReadAtPatch::MarkRead(now),
+            None,
             now,
             false,
         )
@@ -602,6 +644,7 @@ impl ItemRepo<'_> {
             None,
             Some(0.0),
             ReadAtPatch::MarkUnread,
+            None,
             now,
             false,
         )
@@ -659,6 +702,7 @@ impl ItemRepo<'_> {
             Some(next),
             None,
             ReadAtPatch::Unchanged,
+            None,
             now,
             true,
         )
@@ -707,6 +751,7 @@ impl ItemRepo<'_> {
             None,
             merged_prog,
             ReadAtPatch::Unchanged,
+            None,
             now,
             true,
         )
@@ -726,11 +771,24 @@ impl ItemRepo<'_> {
         is_favorite: Option<bool>,
         read_progress: Option<f64>,
         read_at: ReadAtPatch,
+        progress_source: Option<ProgressSource>,
         now: DateTime<Utc>,
         allow_auto_log: bool,
     ) -> std::result::Result<bool, sqlx::Error> {
         let mut check_qb = QueryBuilder::<Sqlite>::new(
             "SELECT i.kind,
+                    COALESCE(ec.content_type, CASE i.kind
+                        WHEN 'video' THEN 'video'
+                        WHEN 'paper' THEN 'paper'
+                        WHEN 'podcast_episode' THEN 'audio'
+                        ELSE 'article'
+                    END) AS content_type,
+                    EXISTS (
+                        SELECT 1 FROM entry_media m_aud
+                        WHERE m_aud.entry_id = i.id
+                          AND m_aud.media_type = 'audio'
+                          AND (m_aud.remote_url IS NOT NULL OR m_aud.local_path IS NOT NULL)
+                    ) AS has_audio_media,
                     COALESCE(es.inbox_state, 'none') AS inbox_state,
                     EXISTS (
                         SELECT 1 FROM collection_entries ce_fav
@@ -765,6 +823,8 @@ impl ItemRepo<'_> {
 
         let Some(ExistingItemStateRow {
             kind: entry_kind,
+            content_type,
+            has_audio_media,
             inbox_state: cur_inbox,
             is_favorite: current_favorite,
             in_want_to_read: current_in_wtr,
@@ -827,6 +887,28 @@ impl ItemRepo<'_> {
 
         if !status_changed && !wtr_changed && !read_at_changed && !fav_changed && !progress_changed
         {
+            if allow_auto_log
+                && progress_source == Some(ProgressSource::Audio)
+                && target_progress >= READER_AUTO_READ_THRESHOLD
+            {
+                let completion_signal = if target_status == ItemStatus::Archived {
+                    InboxState::Dismissed
+                } else {
+                    InboxState::Unread
+                };
+                maybe_auto_log_feed_completion_in_tx(
+                    tx,
+                    id,
+                    entry_kind,
+                    content_type,
+                    has_audio_media,
+                    completion_signal,
+                    target_progress,
+                    progress_source,
+                    target_read_at.unwrap_or(now),
+                )
+                .await?;
+            }
             return Ok(true);
         }
 
@@ -873,8 +955,11 @@ impl ItemRepo<'_> {
                 tx,
                 id,
                 entry_kind,
+                content_type,
+                has_audio_media,
                 completion_signal,
                 target_progress,
+                progress_source,
                 target_read_at.unwrap_or(now),
             )
             .await?;

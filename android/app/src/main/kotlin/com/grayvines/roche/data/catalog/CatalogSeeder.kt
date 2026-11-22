@@ -86,11 +86,12 @@ internal class CatalogSeeder(
             if (wasEmptyDatabase) {
                 dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_MIGRATED_MANUAL_WANT_READ, "1"))
                 dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_REPAIRED_IMPLICIT_PODCASTS, "1"))
+                dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_DECOUPLED_RSS_AUDIO_ENTRIES, "1"))
             }
         }
         if (!wasEmptyDatabase) {
             migrateManualInboxOnce()
-            repairPodcastDataOnce()
+            runPodcastRepairsOnce()
         }
     }
 
@@ -195,13 +196,21 @@ internal class CatalogSeeder(
         dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_MIGRATED_MANUAL_WANT_READ, "1"))
     }
 
-    private suspend fun repairPodcastDataOnce() {
-        if (dao.getLocalSyncFlag(FLAG_REPAIRED_IMPLICIT_PODCASTS) != null) return
+    private suspend fun runPodcastRepairsOnce() {
+        val needsImplicitRepair = dao.getLocalSyncFlag(FLAG_REPAIRED_IMPLICIT_PODCASTS) == null
+        val needsAudioDecouple = dao.getLocalSyncFlag(FLAG_DECOUPLED_RSS_AUDIO_ENTRIES) == null
+        if (!needsImplicitRepair && !needsAudioDecouple) return
         val nowIso = nowUtcIso()
         val nodeId = localPeerIdProvider().ifBlank { DEFAULT_LOCAL_HLC_NODE }
         dao.executeInTransaction {
-            repairPodcastDataInTx(dao, nowIso, nodeId)
-            dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_REPAIRED_IMPLICIT_PODCASTS, "1"))
+            if (needsImplicitRepair) {
+                repairPodcastDataInTx(dao, nowIso, nodeId)
+                dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_REPAIRED_IMPLICIT_PODCASTS, "1"))
+            }
+            if (needsAudioDecouple) {
+                decoupleRssAudioEntriesInTx(dao, nowIso, nodeId)
+                dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_DECOUPLED_RSS_AUDIO_ENTRIES, "1"))
+            }
         }
     }
 

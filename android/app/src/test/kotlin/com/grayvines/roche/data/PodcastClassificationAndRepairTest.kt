@@ -89,7 +89,8 @@ class PodcastClassificationAndRepairTest {
                 assertEquals("rss", dao.getFeedById(rssFeed.id)?.feedType)
                 val blogItems =
                     dao.getItemsForFeed(rssFeed.id, rssFeed.url).associateBy { it.title }
-                assertEquals("audio", blogItems.getValue("Audio Interview").contentType)
+                assertEquals("article", blogItems.getValue("Audio Interview").contentType)
+                assertEquals("article", blogItems.getValue("Audio Interview").entryKind)
                 assertEquals(
                     "https://cdn.example.com/interview.mp3",
                     blogItems.getValue("Audio Interview").audioUrl,
@@ -206,7 +207,8 @@ class PodcastClassificationAndRepairTest {
 
                 assertEquals("rss", dao.getFeedSourceById("f-blog")?.sourceType)
                 assertEquals("publication", dao.getEntryById("f-blog")?.kind)
-                assertEquals("audio", dao.getEntryContentById("i-real-audio")?.contentType)
+                assertEquals("article", dao.getEntryById("i-real-audio")?.kind)
+                assertEquals("article", dao.getEntryContentById("i-real-audio")?.contentType)
                 assertEquals(
                     "https://cdn.example.com/ep.mp3",
                     dao.getEntryContentById("i-real-audio")?.audioUrl,
@@ -265,7 +267,8 @@ class PodcastClassificationAndRepairTest {
                     contentHtml = longBody,
                 )
 
-                // Genuine podcast with 1 linkless extensionless episode + 3 deleted-with-history rows
+                // Genuine podcast with 1 linkless extensionless episode + 3 deleted-with-history
+                // rows
                 seedPodcastFeedFixture(
                     dao,
                     "f-pod-hist",
@@ -422,8 +425,10 @@ class PodcastClassificationAndRepairTest {
                     duration = "42:15",
                 )
 
-                // Feed source HLC (t3 > t1) wins while entry HLC (t2 < t4) loses -> kind still aligns!
-                // Item reverts audio -> article even with leftover wire duration=600 -> duration cleared!
+                // Feed source HLC (t3 > t1) wins while entry HLC (t2 < t4) loses -> kind still
+                // aligns!
+                // Item reverts audio -> article even with leftover wire duration=600 -> duration
+                // cleared!
                 reconcilePeerSyncResponse(
                     dao = dao,
                     response =
@@ -531,8 +536,7 @@ class PodcastClassificationAndRepairTest {
                 assertNull(hydrated.duration)
 
                 // A blank-id / non-authoritative response must not clobber valid audio metadata
-                val validAudio =
-                    bogusAudioRow.copy(audioUrl = "https://cdn.example.com/track.mp3")
+                val validAudio = bogusAudioRow.copy(audioUrl = "https://cdn.example.com/track.mp3")
                 val nonAuthHydrated =
                     mergeHydratedItemDetail(
                         local = validAudio,

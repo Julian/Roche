@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use serde::Deserialize;
 
 use super::html::{de_opt_from_str, esc, urlencode};
-use crate::{db::Item, domain::ContentType};
+use crate::db::Item;
 
 pub(super) use feeds::{
     export_opml_get, feeds_get, post_feed_create, post_feed_delete, post_feed_edit, post_feed_opml,
@@ -78,6 +78,8 @@ pub(super) struct ItemReturnForm {
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ProgressForm {
     pub progress: f64,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -123,14 +125,17 @@ pub(super) struct EditFeedForm {
     #[serde(default)]
     pub poll_interval: Option<String>,
     #[serde(default)]
+    pub feed_type: Option<String>,
+    #[serde(default)]
     pub return_to: Option<String>,
 }
 
 pub(super) fn render_audio_play_button(out: &mut String, item: &Item) {
-    if item.content_type != ContentType::Audio && item.audio_url.is_none() {
+    if !item.has_audio() {
         return;
     }
-    let feed_label = item.feed_title.as_deref().unwrap_or("Podcast");
+    let fallback_label = if item.is_podcast_episode() { "Podcast" } else { "Audio" };
+    let feed_label = item.feed_title.as_deref().unwrap_or(fallback_label);
     let dur = item.duration.unwrap_or(0);
     let _ = write!(
         out,

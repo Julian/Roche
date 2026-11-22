@@ -4057,3 +4057,157 @@ async fn test_web_rank_noscript_min_k_and_keep_refining_preserves_excluded() {
     assert!(settled_html.contains("Keep Refining"));
     assert!(settled_html.contains(&format!("excluded={dropped_tok}")));
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_web_audio_podcast_decoupling_filters_feed_toggle_and_progress_source() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    let rss_url = Url::parse("https://decouple.example/rss.xml").unwrap();
+    let rss_feed =
+        db.feeds().create(FeedType::Rss, &rss_url, Some("Essay Substack"), None).await.unwrap();
+    let pod_url = Url::parse("https://decouple.example/podcast.xml").unwrap();
+    let pod_feed =
+        db.feeds().create(FeedType::Podcast, &pod_url, Some("True Podcast"), None).await.unwrap();
+
+    // Seed plain RSS article, narrated RSS article (Article + audio_url), and explicit Podcast episode
+    let plain_url = Url::parse("https://decouple.example/plain").unwrap();
+    let _plain = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&rss_feed.id),
+            title: "Plain Written Essay",
+            url: &plain_url,
+            author: None,
+            published_at: Some(chrono::Utc::now()),
+            summary: Some("Just prose"),
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+
+    let narrated_url = Url::parse("https://decouple.example/narrated").unwrap();
+    let narrated = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&rss_feed.id),
+            title: "Narrated Essay With Audio",
+            url: &narrated_url,
+            author: None,
+            published_at: Some(chrono::Utc::now()),
+            summary: Some("Written prose with narration"),
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO entry_media (id, entry_id, media_type, remote_url, duration)
+         VALUES ('decouple-narrated-mp3', ?, 'audio', 'https://cdn.decouple.example/narrated.mp3', 1500)",
+    )
+    .bind(&narrated.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let ep_url = Url::parse("https://decouple.example/ep1").unwrap();
+    let ep = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&pod_feed.id),
+            title: "Explicit Podcast Ep 1",
+            url: &ep_url,
+            author: None,
+            published_at: Some(chrono::Utc::now()),
+            summary: Some("Episode notes"),
+            content_type: ContentType::Audio,
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO entry_media (id, entry_id, media_type, remote_url, duration)
+         VALUES ('decouple-ep-mp3', ?, 'audio', 'https://cdn.decouple.example/ep1.mp3', 2700)",
+    )
+    .bind(&ep.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    // 1. Inbox ?kind=podcast shows ONLY explicit podcast episode (not narrated article!)
+    let pod_html = read_body_html(get_authed(&app, "/inbox?kind=podcast", &cookie).await).await;
+    assert!(pod_html.contains("Explicit Podcast Ep 1"));
+    assert!(!pod_html.contains("Narrated Essay With Audio"));
+    assert!(!pod_html.contains("Plain Written Essay"));
+    assert!(pod_html.contains("Kind: Podcasts"));
+
+    // 2. Inbox ?kind=audio shows BOTH explicit podcast episode AND narrated RSS article
+    let audio_html = read_body_html(get_authed(&app, "/inbox?kind=audio", &cookie).await).await;
+    assert!(audio_html.contains("Explicit Podcast Ep 1"));
+    assert!(audio_html.contains("Narrated Essay With Audio"));
+    assert!(!audio_html.contains("Plain Written Essay"));
+    assert!(audio_html.contains("Kind: Audio"));
+
+    // 3. Inbox ?kind=article includes narrated RSS article with Play button & Audio badge + duration
+    let art_html = read_body_html(get_authed(&app, "/inbox?kind=article", &cookie).await).await;
+    assert!(art_html.contains("Plain Written Essay"));
+    assert!(art_html.contains("Narrated Essay With Audio"));
+    assert!(!art_html.contains("Explicit Podcast Ep 1"));
+    assert!(art_html.contains("js-play-audio"));
+    assert!(art_html.contains("25m"));
+
+    // 4. Reader for narrated article shows BOTH listen duration & reading estimate, and Play button
+    let narrated_reader =
+        read_body_html(get_authed(&app, &format!("/reader/{}", narrated.id), &cookie).await).await;
+    assert!(narrated_reader.contains("25m listen"));
+    assert!(narrated_reader.contains("min read"));
+    assert!(narrated_reader.contains("data-kind=\"article\""));
+    assert!(narrated_reader.contains("data-content-type=\"article\""));
+    assert!(narrated_reader.contains("data-has-audio=\"1\""));
+    assert!(narrated_reader.contains("js-play-audio"));
+
+    // 5. Progress source guard on narrated article:
+    //    Reader scroll to 1.0 while unread must NOT auto-log; Audio playback at 0.99 DOES auto-log as Article!
+    let reader_prog = post_form(
+        &app,
+        &format!("/web/items/{}/progress", narrated.id),
+        &cookie,
+        &[("_csrf", &csrf), ("progress", "1.0"), ("source", "reader")],
+    )
+    .await;
+    assert_eq!(reader_prog.status(), StatusCode::NO_CONTENT);
+    let detail_after_scroll = db.catalog().get_entry_detail(&narrated.id).await.unwrap().unwrap();
+    assert!(
+        detail_after_scroll.log_history.is_empty(),
+        "passive reader scroll on unread narrated article must not auto-log consumed"
+    );
+
+    let audio_prog = post_form(
+        &app,
+        &format!("/web/items/{}/progress", narrated.id),
+        &cookie,
+        &[("_csrf", &csrf), ("progress", "0.99"), ("source", "audio")],
+    )
+    .await;
+    assert_eq!(audio_prog.status(), StatusCode::NO_CONTENT);
+    let detail_after_audio = db.catalog().get_entry_detail(&narrated.id).await.unwrap().unwrap();
+    assert_eq!(detail_after_audio.entry.kind, EntryKind::Article);
+    assert!(
+        detail_after_audio.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed),
+        "audio completion on narrated article must auto-log consumed under Article kind"
+    );
+
+    // 6. Toggling feed RSS -> Podcast via /web/feeds/{id}/edit reclassifies narrated item
+    let toggle_resp = post_form(
+        &app,
+        &format!("/web/feeds/{}/edit", rss_feed.id),
+        &cookie,
+        &[("_csrf", &csrf), ("title", "Essay Substack"), ("feed_type", "podcast")],
+    )
+    .await;
+    assert_eq!(toggle_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(db.feeds().get(&rss_feed.id).await.unwrap().unwrap().feed_type, FeedType::Podcast);
+    assert_eq!(
+        db.items().get(&narrated.id).await.unwrap().unwrap().entry_kind,
+        EntryKind::PodcastEpisode
+    );
+}

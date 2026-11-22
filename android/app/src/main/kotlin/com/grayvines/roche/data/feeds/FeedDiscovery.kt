@@ -6,6 +6,7 @@ import com.grayvines.roche.core.encodeQueryValue
 import com.grayvines.roche.core.extractArxivIdentifier
 import com.grayvines.roche.core.extractHostTitle
 import com.grayvines.roche.core.extractYoutubeChannelId
+import com.grayvines.roche.core.inferFeedTypeWireValue
 import com.grayvines.roche.core.isHttpOrHttpsUrl
 import com.grayvines.roche.core.isLikelyFeedUrl
 import com.grayvines.roche.core.isLocalPdfUrl
@@ -53,18 +54,20 @@ internal fun normalizeUserSubmittedUrl(rawInput: String): String {
 internal suspend fun discoverFeedFromUrl(
     publicWebFetcher: PublicWebFetcher,
     rawInputUrl: String,
+    requestedFeedType: String? = null,
 ): Result<DiscoveredFeedResult> =
     withContext(Dispatchers.Default) {
         runSuspendCatching {
             val normalizedUrl = canonicalizeFeedUrl(normalizeUserSubmittedUrl(rawInputUrl))
             check(normalizedUrl.isNotBlank()) { "Enter a valid site or feed URL" }
-            probeSiteForRssFeed(publicWebFetcher, normalizedUrl)
+            probeSiteForRssFeed(publicWebFetcher, normalizedUrl, requestedFeedType)
         }
     }
 
 private suspend fun probeSiteForRssFeed(
     publicWebFetcher: PublicWebFetcher,
     siteUrl: String,
+    requestedFeedType: String? = null,
 ): DiscoveredFeedResult {
     val pageBody =
         publicWebFetcher.fetchFeedXml(siteUrl).getOrElse { error ->
@@ -77,7 +80,11 @@ private suspend fun probeSiteForRssFeed(
             )
         }
     val directFeed = runCatching {
-        LocalFeedPoller.parseFeedXml(xml = pageBody, feedUrl = siteUrl)
+        LocalFeedPoller.parseFeedXml(
+            xml = pageBody,
+            feedUrl = siteUrl,
+            feedType = requestedFeedType ?: inferFeedTypeWireValue(siteUrl),
+        )
     }
         .getOrNull()
     if (directFeed != null) {
@@ -94,7 +101,13 @@ private suspend fun probeSiteForRssFeed(
     for (candidateUrl in candidates.take(MAX_DISCOVERY_PROBES)) {
         val probed =
             publicWebFetcher.fetchFeedXml(candidateUrl).getOrNull()?.let { xml ->
-                runCatching { LocalFeedPoller.parseFeedXml(xml = xml, feedUrl = candidateUrl) }
+                runCatching {
+                    LocalFeedPoller.parseFeedXml(
+                        xml = xml,
+                        feedUrl = candidateUrl,
+                        feedType = requestedFeedType ?: inferFeedTypeWireValue(candidateUrl),
+                    )
+                }
                     .getOrNull()
             }
         if (probed != null) {

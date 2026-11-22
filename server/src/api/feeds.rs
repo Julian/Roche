@@ -29,6 +29,7 @@ pub(super) struct UpdateFeedRequest {
     title: Option<String>,
     poll_interval: Option<i64>,
     is_active: Option<bool>,
+    feed_type: Option<FeedType>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,8 +69,10 @@ pub(super) async fn feeds_update(
     ProblemPath(id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<UpdateFeedRequest>,
 ) -> Result<Json<Feed>, ApiError> {
-    let updated =
-        service.feeds().update(&id, req.title.as_deref(), req.poll_interval, req.is_active).await?;
+    let updated = service
+        .feeds()
+        .update(&id, req.title.as_deref(), req.poll_interval, req.is_active, req.feed_type)
+        .await?;
     Ok(Json(updated))
 }
 

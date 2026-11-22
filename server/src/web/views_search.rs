@@ -10,13 +10,13 @@ use super::{
     auth::WebSession,
     html::{
         CreatorYearStyle, NavSection, PageShell, WebError, WithWebCsrf as _,
-        consumption_status_label, content_type_badge_class, content_type_label, esc,
-        render_creator_year_meta, render_page, urlencode,
+        consumption_status_label, esc, item_kind_badge, render_creator_year_meta, render_page,
+        urlencode,
     },
     links::load_artist_id_by_lower_name,
 };
 use crate::{
-    domain::{ConsumptionStatus, ContentType, ItemStatus},
+    domain::{ConsumptionStatus, ItemStatus},
     service::{RocheService, WorkspaceSearchResults},
 };
 
@@ -293,13 +293,9 @@ fn render_search_inbox_section(out: &mut String, res: &WorkspaceSearchResults, r
             esc(&reader_href),
             esc(&item.title),
         );
-        if item.content_type != ContentType::Article {
-            let _ = write!(
-                out,
-                "<span class=\"badge badge-kind{}\">{}</span>",
-                content_type_badge_class(item.content_type),
-                esc(content_type_label(item.content_type)),
-            );
+        if let Some((badge_cls, label)) = item_kind_badge(item) {
+            let _ =
+                write!(out, "<span class=\"badge badge-kind{badge_cls}\">{}</span>", esc(label));
         }
         if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
             let _ = write!(out, "<span class=\"byline-item\">{}</span>", esc(ft));

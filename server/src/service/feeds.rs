@@ -191,6 +191,7 @@ impl FeedService<'_> {
         title: Option<&str>,
         poll_interval: Option<i64>,
         is_active: Option<bool>,
+        feed_type: Option<FeedType>,
     ) -> Result<Feed, AppError> {
         let clean_title = match title {
             Some(t) => {
@@ -214,7 +215,22 @@ impl FeedService<'_> {
         }
 
         let repo = self.service.db.feeds();
-        if !repo.update(id, clean_title, poll_interval, is_active).await? {
+        if let Some(target_type) = feed_type {
+            let existing = self.get(id).await?;
+            if existing.feed_type != target_type {
+                let valid_toggle = matches!(
+                    (existing.feed_type, target_type),
+                    (FeedType::Rss, FeedType::Podcast) | (FeedType::Podcast, FeedType::Rss)
+                );
+                if !valid_toggle {
+                    return Err(AppError::bad_request(
+                        "Only RSS and Podcast feed types can be toggled between each other",
+                    ));
+                }
+            }
+        }
+
+        if !repo.update(id, clean_title, poll_interval, is_active, feed_type).await? {
             return Err(AppError::not_found("Feed not found"));
         }
 

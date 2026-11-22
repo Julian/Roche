@@ -35,6 +35,7 @@ impl OpmlDocument {
                     let mut xml_url = None;
                     let mut title = None;
                     let mut text = None;
+                    let mut explicit_podcast = false;
 
                     for (key, val) in xml_util::iter_attrs(&tag) {
                         if key.eq_ignore_ascii_case("xmlurl") {
@@ -43,12 +44,20 @@ impl OpmlDocument {
                             title = Some(val);
                         } else if key.eq_ignore_ascii_case("text") {
                             text = Some(val);
+                        } else if (key.eq_ignore_ascii_case("type")
+                            || key.eq_ignore_ascii_case("rochefeedtype")
+                            || key.eq_ignore_ascii_case("feedtype"))
+                            && val.trim().eq_ignore_ascii_case("podcast")
+                        {
+                            explicit_podcast = true;
                         }
                     }
 
+                    let requested_type =
+                        if explicit_podcast { FeedType::Podcast } else { FeedType::Rss };
                     if let Some((feed_type, normalized_url)) = xml_url
                         .and_then(|u| parse_public_url(&u).ok())
-                        .and_then(Self::normalize_outline_url)
+                        .and_then(|url| Self::normalize_outline_url(url, requested_type))
                     {
                         results.push(OpmlOutline {
                             feed_type,
@@ -85,6 +94,9 @@ impl OpmlDocument {
             let title = item.title.as_deref().unwrap_or_else(|| item.xml_url.as_str());
             let mut outline = BytesStart::new("outline");
             outline.push_attribute(("type", "rss"));
+            if item.feed_type == FeedType::Podcast {
+                outline.push_attribute(("rocheFeedType", "podcast"));
+            }
             outline.push_attribute(("text", title));
             outline.push_attribute(("title", title));
             outline.push_attribute(("xmlUrl", item.xml_url.as_str()));
@@ -98,12 +110,13 @@ impl OpmlDocument {
         out
     }
 
-    fn normalize_outline_url(url: Url) -> Option<(FeedType, Url)> {
-        super::FeedSource::Url(url).into_feed_url(FeedType::Rss).ok()
+    fn normalize_outline_url(url: Url, requested_type: FeedType) -> Option<(FeedType, Url)> {
+        super::FeedSource::Url(url).into_feed_url(requested_type).ok()
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -150,5 +163,35 @@ mod tests {
             outlines[2].xml_url.as_str(),
             "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA"
         );
+    }
+
+    #[test]
+    fn test_opml_roundtrip_preserves_podcast_feed_type() {
+        let exported = OpmlDocument::to_xml(&[
+            OpmlOutline {
+                feed_type: FeedType::Rss,
+                xml_url: Url::parse("https://blog.example.com/feed.xml").unwrap(),
+                title: Some("Essay Blog".to_owned()),
+            },
+            OpmlOutline {
+                feed_type: FeedType::Podcast,
+                xml_url: Url::parse("https://shows.example.com/pod.xml").unwrap(),
+                title: Some("Deep Dive Pod".to_owned()),
+            },
+        ]);
+        assert!(exported.contains(r#"rocheFeedType="podcast""#));
+
+        let reparsed = OpmlDocument::parse(&exported);
+        assert_eq!(reparsed.len(), 2);
+        assert_eq!(reparsed[0].feed_type, FeedType::Rss);
+        assert_eq!(reparsed[1].feed_type, FeedType::Podcast);
+
+        let podcatcher = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <opml version="2.0"><body>
+          <outline type="podcast" text="Third-Party Pod" xmlUrl="https://casts.example.com/rss" />
+        </body></opml>"#;
+        let parsed_podcatcher = OpmlDocument::parse(podcatcher);
+        assert_eq!(parsed_podcatcher.len(), 1);
+        assert_eq!(parsed_podcatcher[0].feed_type, FeedType::Podcast);
     }
 }
