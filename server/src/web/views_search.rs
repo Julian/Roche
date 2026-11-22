@@ -9,7 +9,7 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        CreatorYearStyle, FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _,
+        CreatorYearStyle, NavSection, PageShell, WebError, WithWebCsrf as _,
         consumption_status_label, content_type_badge_class, content_type_label, esc,
         render_creator_year_meta, render_page, urlencode,
     },
@@ -23,8 +23,6 @@ use crate::{
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct SearchQuery {
     pub q: Option<String>,
-    #[serde(flatten)]
-    pub flash: FlashQuery,
 }
 
 pub(super) async fn search_get(
@@ -62,7 +60,7 @@ pub(super) async fn search_get(
         title: &title,
         active: NavSection::None,
         csrf_token: &session.csrf_token,
-        flash: &query.flash,
+        flash: &session.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
         search_query: (!results.query.is_empty()).then_some(results.query.as_str()),

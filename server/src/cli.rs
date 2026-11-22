@@ -8,14 +8,12 @@ use figment::{
 
 use crate::{
     config::Config,
-    db::{
-        CatalogBatchInput, CatalogEntry, CollectionGeneratorState, Db, EntryIdentifier,
-        UpsertEntryInput,
-    },
+    db::{CatalogBatchInput, CatalogEntry, CollectionGeneratorState, Db, UpsertEntryInput},
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::RANDOM_SEED_EVERY,
     service::{CatalogService, ClusterSelectFilter},
     tui_rank::{ClusterRankOutcome, open_system_browser, prompt_cluster_tty},
+    util::terminal::sanitize_terminal_text,
 };
 
 #[derive(Parser, Debug, Clone, PartialEq, Eq)]
@@ -699,7 +697,7 @@ async fn run_rank_cmd(db: &Db, args: &RankArgs) -> anyhow::Result<()> {
             if iteration == 0 && summary.member_count < 2 {
                 anyhow::bail!(
                     "Need at least 2 items in '{}' to rank (found {}).",
-                    summary.title,
+                    sanitize_terminal_text(&summary.title),
                     summary.member_count
                 );
             }
@@ -755,7 +753,11 @@ async fn resolve_target_generator_collection(
         many => {
             let names: Vec<String> = many
                 .iter()
-                .map(|g| g.collection_slug.as_deref().unwrap_or(&g.collection_title).to_owned())
+                .map(|g| {
+                    sanitize_terminal_text(
+                        g.collection_slug.as_deref().unwrap_or(&g.collection_title),
+                    )
+                })
                 .collect();
             anyhow::bail!(
                 "Multiple list draws are active ({}); specify which collection to target.",
@@ -803,11 +805,14 @@ async fn run_draw_cmd(db: &Db, action: DrawCommand) -> anyhow::Result<()> {
             let Some(active) = state.current_entry else {
                 anyhow::bail!(
                     "No active entry is currently drawn for '{}'.",
-                    state.collection_title
+                    sanitize_terminal_text(&state.collection_title)
                 );
             };
             let Some(url) = active.primary_open_url() else {
-                anyhow::bail!("No external URL available for '{}'.", active.title);
+                anyhow::bail!(
+                    "No external URL available for '{}'.",
+                    sanitize_terminal_text(&active.title)
+                );
             };
             open_system_browser(&url)?;
             println!("Opened {}", sanitize_terminal_text(&url));
@@ -863,7 +868,10 @@ async fn run_draw_finish_cmd(
                 from: None,
             };
             if let Err(err) = run_rank_cmd(db, &rank_args).await {
-                eprintln!("Skipped interactive ranking ({err})");
+                eprintln!(
+                    "Skipped interactive ranking ({})",
+                    sanitize_terminal_text(&err.to_string())
+                );
             }
         }
     }
@@ -916,18 +924,18 @@ fn print_active_draw_card(entry: &CatalogEntry) {
     if let Some(open_url) = entry.primary_open_url() {
         println!("Open:        {}", sanitize_terminal_text(&open_url));
     }
-    let providers: Vec<&str> =
-        entry.sorted_external_identifiers().into_iter().map(EntryIdentifier::label).collect();
+    let providers: Vec<String> = entry
+        .sorted_external_identifiers()
+        .into_iter()
+        .map(|id| sanitize_terminal_text(id.label()))
+        .filter(|s| !s.is_empty())
+        .collect();
     if !providers.is_empty() {
         println!("Sources:     {}", providers.join(" · "));
     }
     if let Some(spotify_uri) = entry.identifier("spotify") {
         println!("Spotify URI: {}", sanitize_terminal_text(spotify_uri));
     }
-}
-
-fn sanitize_terminal_text(input: &str) -> String {
-    input.chars().filter(|c| !c.is_control()).collect()
 }
 
 #[cfg(test)]

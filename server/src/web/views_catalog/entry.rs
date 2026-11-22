@@ -173,7 +173,7 @@ pub(in crate::web) async fn entry_detail_get(
         title: &detail.entry.title,
         active: NavSection::Lists,
         csrf_token: &session.csrf_token,
-        flash: &query.flash,
+        flash: &session.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
         search_query: None,

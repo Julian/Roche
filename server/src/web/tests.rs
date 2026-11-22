@@ -74,6 +74,14 @@ fn extract_cookie_header(set_cookie: &str) -> String {
     set_cookie.split(';').next().unwrap().trim().to_string()
 }
 
+fn find_set_cookie<'a>(resp: &'a Response, prefix: &str) -> Option<&'a str> {
+    resp.headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|s| s.starts_with(prefix))
+}
+
 fn extract_csrf_token(html: &str) -> String {
     let needle = "data-csrf=\"";
     let start = html.find(needle).expect("body data-csrf attribute present") + needle.len();
@@ -135,10 +143,12 @@ async fn login_browser(db: &Db, app: &Router) -> (String, String) {
     assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/");
 
     let set_cookie = resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
-    assert!(set_cookie.contains("roche_session="));
+    assert!(set_cookie.starts_with("__Host-roche_session="), "got: {set_cookie}");
+    assert!(set_cookie.contains("Path=/"));
     assert!(set_cookie.contains("HttpOnly"));
     assert!(set_cookie.contains("SameSite=Lax"));
     assert!(set_cookie.contains("Secure"));
+    assert!(!set_cookie.contains("Domain="));
     let cookie = extract_cookie_header(set_cookie);
 
     let home_resp = get_authed(app, "/", &cookie).await;
@@ -340,8 +350,12 @@ async fn test_tailscale_auto_auth_blocks_subresource_dup_headers_and_accepts_map
     assert_eq!(mapped_v6_resp.status(), StatusCode::OK);
     let set_cookie_str =
         mapped_v6_resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
-    assert!(set_cookie_str.contains("roche_session="));
+    assert!(set_cookie_str.starts_with("__Host-roche_session="), "got: {set_cookie_str}");
     assert!(set_cookie_str.contains("; Secure"));
+    assert_eq!(
+        mapped_v6_resp.headers().get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
+        "max-age=31536000"
+    );
 }
 
 async fn seed_album_queue_pool(db: &crate::db::Db) {
@@ -399,15 +413,9 @@ async fn test_web_collection_generator_finish_rank_and_abandon_flows() {
     )
     .await;
     assert_eq!(finish1_resp.status(), StatusCode::SEE_OTHER);
-    assert!(
-        finish1_resp
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("/?notice=")
-    );
+    assert_eq!(finish1_resp.headers().get(header::LOCATION).unwrap(), "/");
+    let finish1_flash = find_set_cookie(&finish1_resp, "roche_flash=n:").unwrap();
+    assert!(finish1_flash.contains("HttpOnly"));
 
     let state2 = db.catalog().get_collection_generator("album_queue").await.unwrap();
     let second_id = state2.current_entry.as_ref().unwrap().id.clone();
@@ -860,13 +868,15 @@ async fn test_web_cache_control_tailscale_session_reuse_and_explicit_logout() {
         String::from_utf8(to_bytes(r1.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
     let csrf = extract_csrf_token(&html1);
 
-    // Second unauthenticated Tailscale GET reuses the cached session token instead of minting duplicates
+    // Second unauthenticated Tailscale GET reuses the cached web session instead of minting duplicates
+    // and keeps API `device_tokens` completely isolated from browser sessions.
     let r2 = app.clone().oneshot(ts_get(None)).await.unwrap();
     assert_eq!(r2.status(), StatusCode::OK);
     let cookie2 =
         extract_cookie_header(r2.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap());
     assert_eq!(cookie1, cookie2);
-    assert_eq!(db.auth().list_devices().await.unwrap().len(), 1);
+    assert_eq!(db.auth().list_devices().await.unwrap().len(), 0);
+    assert_eq!(db.auth().count_web_sessions().await.unwrap(), 1);
 
     // Explicit POST /logout revokes the session AND sets `roche_logged_out=1`
     let logout_resp = post_form(&app, "/logout", &cookie1, &[("_csrf", &csrf)]).await;
@@ -2365,23 +2375,35 @@ fn test_safe_local_redirect_ascii_fallback_and_fragment_preserving_flash() {
     assert_eq!(non_ascii_resp.status(), StatusCode::SEE_OTHER);
     assert_eq!(non_ascii_resp.headers().get(header::LOCATION).unwrap(), "/");
 
-    // `redirect_with_flash` preserves `#fragment` after query parameters
+    // `redirect_with_flash` keeps clean `Location` (preserving query + `#fragment`) and attaches `PendingFlash`
     let frag_only = redirect_with_flash("/entries/abc#notes", "notice", "Saved ok");
+    assert_eq!(frag_only.headers().get(header::LOCATION).unwrap(), "/entries/abc#notes");
     assert_eq!(
-        frag_only.headers().get(header::LOCATION).unwrap(),
-        "/entries/abc?notice=Saved+ok#notes"
+        frag_only.extensions().get::<super::html::PendingFlash>(),
+        Some(&super::html::PendingFlash {
+            kind: super::html::FlashKind::Notice,
+            message: "Saved ok".to_owned(),
+        })
     );
 
     let query_and_frag = redirect_with_flash("/inbox?status=all#row-5", "err", "Failed");
+    assert_eq!(query_and_frag.headers().get(header::LOCATION).unwrap(), "/inbox?status=all#row-5");
     assert_eq!(
-        query_and_frag.headers().get(header::LOCATION).unwrap(),
-        "/inbox?status=all&err=Failed#row-5"
+        query_and_frag.extensions().get::<super::html::PendingFlash>(),
+        Some(&super::html::PendingFlash {
+            kind: super::html::FlashKind::Err,
+            message: "Failed".to_owned(),
+        })
     );
 
     let question_in_frag = redirect_with_flash("/inbox#frag?x=1", "notice", "Hi");
+    assert_eq!(question_in_frag.headers().get(header::LOCATION).unwrap(), "/inbox#frag?x=1");
     assert_eq!(
-        question_in_frag.headers().get(header::LOCATION).unwrap(),
-        "/inbox?notice=Hi#frag?x=1"
+        question_in_frag.extensions().get::<super::html::PendingFlash>(),
+        Some(&super::html::PendingFlash {
+            kind: super::html::FlashKind::Notice,
+            message: "Hi".to_owned(),
+        })
     );
 }
 
@@ -2483,15 +2505,8 @@ async fn test_web_body_limits_standard_128kib_vs_opml_4mib() {
         post_form(&app, "/web/feeds/opml", &cookie, &[("_csrf", &csrf), ("opml_xml", &opml_xml)])
             .await;
     assert_eq!(opml_resp.status(), StatusCode::SEE_OTHER);
-    assert!(
-        opml_resp
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("/feeds?notice=")
-    );
+    assert_eq!(opml_resp.headers().get(header::LOCATION).unwrap(), "/feeds");
+    assert!(find_set_cookie(&opml_resp, "roche_flash=n:").is_some());
 }
 
 #[tokio::test]
@@ -2647,7 +2662,9 @@ async fn test_round2_web_security_reader_origin_and_rank_redirect() {
     assert!(bad_rank_loc.contains("want=true"), "got {bad_rank_loc}");
     assert!(bad_rank_loc.contains("focus=entry-xyz"), "got {bad_rank_loc}");
     assert!(bad_rank_loc.contains("round=2"), "got {bad_rank_loc}");
-    assert!(bad_rank_loc.contains("err=Invalid+comparison+ordering"), "got {bad_rank_loc}");
+    assert!(!bad_rank_loc.contains("err="), "flash must use cookie not URL: {bad_rank_loc}");
+    let rank_err_cookie = find_set_cookie(&bad_rank_resp, "roche_flash=e:").unwrap();
+    assert!(rank_err_cookie.contains("Invalid+comparison+ordering"), "got {rank_err_cookie}");
 }
 
 #[tokio::test]
@@ -2752,24 +2769,21 @@ async fn test_load_existing_reader_item_ids_batched_lookup_and_catalog_links() {
 }
 
 #[test]
-fn test_flattened_flash_query_deserialization() {
+fn test_web_query_deserialization_with_optional_numbers_and_booleans() {
     use axum::{extract::Query, http::Uri};
 
     let Query(lists) = Query::<super::views_catalog::ListsOverviewQuery>::try_from_uri(
-        &Uri::from_static("/lists?q=bjork&kind=album&notice=Saved&err=Oops"),
+        &Uri::from_static("/lists?q=bjork&kind=album&notice=Ignored&err=Ignored"),
     )
     .unwrap();
     assert_eq!(lists.q.as_deref(), Some("bjork"));
     assert_eq!(lists.kind.as_deref(), Some("album"));
-    assert_eq!(lists.flash.notice.as_deref(), Some("Saved"));
-    assert_eq!(lists.flash.err.as_deref(), Some("Oops"));
 
     let Query(list_page) = Query::<super::views_catalog::ListPageQuery>::try_from_uri(
-        &Uri::from_static("/lists/movies?page=3&notice=Added"),
+        &Uri::from_static("/lists/movies?page=3"),
     )
     .unwrap();
     assert_eq!(list_page.page, Some(3));
-    assert_eq!(list_page.flash.notice.as_deref(), Some("Added"));
 
     let Query(list_page_empty) = Query::<super::views_catalog::ListPageQuery>::try_from_uri(
         &Uri::from_static("/lists/movies?page="),
@@ -2778,32 +2792,28 @@ fn test_flattened_flash_query_deserialization() {
     assert_eq!(list_page_empty.page, None);
 
     let Query(diary) = Query::<super::views_catalog::DiaryFilterQuery>::try_from_uri(
-        &Uri::from_static("/diary?year=2025&status=consumed&err=Bad"),
+        &Uri::from_static("/diary?year=2025&status=consumed"),
     )
     .unwrap();
     assert_eq!(diary.year, Some(2025));
     assert_eq!(diary.status.as_deref(), Some("consumed"));
-    assert_eq!(diary.flash.err.as_deref(), Some("Bad"));
 
     let Query(inbox) = Query::<super::views_reader::InboxQuery>::try_from_uri(&Uri::from_static(
-        "/inbox?status=all&page=2&notice=Done",
+        "/inbox?status=all&page=2",
     ))
     .unwrap();
     assert_eq!(inbox.status.as_deref(), Some("all"));
     assert_eq!(inbox.page, Some(2));
-    assert_eq!(inbox.flash.notice.as_deref(), Some("Done"));
 
-    let Query(rank) =
-        Query::<super::views_rank::RankSessionQuery>::try_from_uri(&Uri::from_static(
-            "/rank/movies?want=true&focus=abc&round=2&random=4&covered=x&notice=Saved",
-        ))
-        .unwrap();
+    let Query(rank) = Query::<super::views_rank::RankSessionQuery>::try_from_uri(
+        &Uri::from_static("/rank/movies?want=true&focus=abc&round=2&random=4&covered=x"),
+    )
+    .unwrap();
     assert!(rank.want);
     assert_eq!(rank.focus.as_deref(), Some("abc"));
     assert_eq!(rank.round, Some(2));
     assert_eq!(rank.random, Some(4));
     assert_eq!(rank.covered.as_deref(), Some("x"));
-    assert_eq!(rank.flash.notice.as_deref(), Some("Saved"));
 
     let Query(rank_defaults) = Query::<super::views_rank::RankSessionQuery>::try_from_uri(
         &Uri::from_static("/rank/movies"),
@@ -2812,7 +2822,6 @@ fn test_flattened_flash_query_deserialization() {
     assert!(!rank_defaults.want);
     assert_eq!(rank_defaults.round, None);
     assert_eq!(rank_defaults.random, None);
-    assert_eq!(rank_defaults.flash.notice, None);
 }
 
 #[tokio::test]
@@ -2965,14 +2974,21 @@ async fn test_album_tracklist_enrichment_and_artist_discography_render() {
 async fn test_web_auth_theme_and_flash_regressions() {
     let (_db, app) = setup_web_app(Config::default()).await;
 
-    // qw_4: redirect_with_flash strips stale duplicate notice/err query params
+    // redirect_with_flash strips stale notice/err query params and delivers flash via HttpOnly cookie
     let flashed = super::html::redirect_with_flash(
         "/inbox?status=unread&notice=Old+Banner&err=Old+Err#top",
         "notice",
         "Fresh Notice",
     );
     let flash_loc = flashed.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert_eq!(flash_loc, "/inbox?status=unread&notice=Fresh+Notice#top");
+    assert_eq!(flash_loc, "/inbox?status=unread#top");
+    assert_eq!(
+        flashed.extensions().get::<super::html::PendingFlash>(),
+        Some(&super::html::PendingFlash {
+            kind: super::html::FlashKind::Notice,
+            message: "Fresh Notice".to_owned(),
+        })
+    );
 
     // qw_8 & a11y_8: unauthenticated deep-link preserves ?return_to, 401 CTA says "Sign in",
     // login page supports show/hide toggle + preserves device_name on error + SSR data-theme cookie.
@@ -3294,7 +3310,8 @@ async fn test_web_search_diary_entry_feeds_rank_and_reader_flows() {
     .await;
     assert_eq!(edit_feed_resp.status(), StatusCode::SEE_OTHER);
     let edit_loc = edit_feed_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert!(edit_loc.starts_with("/feeds?status=active&q=Flow&notice="));
+    assert_eq!(edit_loc, "/feeds?status=active&q=Flow");
+    assert!(find_set_cookie(&edit_feed_resp, "roche_flash=n:").is_some());
     let updated_feed = db.feeds().get(&feed.id).await.unwrap().unwrap();
     assert_eq!(updated_feed.title.as_deref(), Some("Flow Renamed"));
     assert_eq!(updated_feed.poll_interval, 120);
@@ -3348,7 +3365,9 @@ async fn test_web_search_diary_entry_feeds_rank_and_reader_flows() {
     .await;
     assert_eq!(add_existing_resp.status(), StatusCode::SEE_OTHER);
     let add_loc = add_existing_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert!(add_loc.contains("Linked+existing+Book"));
+    assert_eq!(add_loc, "/lists/favorites");
+    let add_flash = find_set_cookie(&add_existing_resp, "roche_flash=n:").unwrap();
+    assert!(add_flash.contains("Linked+existing+Book"), "got: {add_flash}");
 
     let rem_resp = post_form(
         &app,
@@ -3425,15 +3444,8 @@ async fn test_web_search_diary_entry_feeds_rank_and_reader_flows() {
     )
     .await;
     assert_eq!(log_resp.status(), StatusCode::SEE_OTHER);
-    assert!(
-        log_resp
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("/lists?notice=")
-    );
+    assert_eq!(log_resp.headers().get(header::LOCATION).unwrap(), "/lists");
+    assert!(find_set_cookie(&log_resp, "roche_flash=n:").is_some());
 
     let diary_logs = db.catalog().list_diary(None, None, 10).await.unwrap();
     assert_eq!(diary_logs.len(), 1);
@@ -3532,4 +3544,335 @@ async fn test_web_search_diary_entry_feeds_rank_and_reader_flows() {
     assert!(settled_html.contains("Placement Settled"));
     assert!(settled_html.contains("Keep Refining"));
     assert!(settled_html.contains("max_rounds=10"));
+}
+
+#[tokio::test]
+async fn test_web_session_isolation_expiry_and_masked_csrf() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (web_cookie, csrf_first) = login_browser(&db, &app).await;
+
+    // 1. Browser login mints a `web_sessions` row, NEVER a `device_tokens` row
+    assert_eq!(db.auth().count_web_sessions().await.unwrap(), 1);
+    assert_eq!(db.auth().count_devices().await.unwrap(), 0);
+
+    // 2. Web session raw token CANNOT authenticate `/api/v1/*` bearer endpoints
+    let web_raw_token = web_cookie.split_once('=').unwrap().1;
+    let api_with_web_token = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/items")
+                .header(header::AUTHORIZATION, format!("Bearer {web_raw_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(api_with_web_token.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. API device token CANNOT authenticate browser web routes
+    let pair_code = PairingManager::new(db.auth()).create_code(300).await.unwrap();
+    let pair_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/pair")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "device_name": "Android Phone",
+                        "pairing_code": pair_code,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pair_resp.status(), StatusCode::OK);
+    let pair_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(pair_resp.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    let api_token = pair_json["token"].as_str().unwrap();
+
+    let web_with_api_token = get_authed(&app, "/", &format!("roche_session={api_token}")).await;
+    assert_eq!(web_with_api_token.status(), StatusCode::SEE_OTHER);
+    assert_eq!(web_with_api_token.headers().get(header::LOCATION).unwrap(), "/login");
+
+    // 4. Per-request masked CSRF tokens differ across GETs, are 128 hex chars, and both verify
+    let home2_html = read_body_html(get_authed(&app, "/", &web_cookie).await).await;
+    let csrf_second = extract_csrf_token(&home2_html);
+    assert_eq!(csrf_first.len(), 128);
+    assert_eq!(csrf_second.len(), 128);
+    assert_ne!(csrf_first, csrf_second, "CSRF token must be freshly masked per request");
+
+    let post_first = post_form(
+        &app,
+        "/web/lists/create",
+        &web_cookie,
+        &[("_csrf", &csrf_first), ("title", "One")],
+    )
+    .await;
+    assert_eq!(post_first.status(), StatusCode::SEE_OTHER);
+    let post_second = post_form(
+        &app,
+        "/web/lists/create",
+        &web_cookie,
+        &[("_csrf", &csrf_second), ("title", "Two")],
+    )
+    .await;
+    assert_eq!(post_second.status(), StatusCode::SEE_OTHER);
+
+    // 5. Expired web sessions are rejected immediately and pruned by WorkerManager
+    sqlx::query(
+        "UPDATE web_sessions SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 minute')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let expired_get = get_authed(&app, "/", &web_cookie).await;
+    assert_eq!(expired_get.status(), StatusCode::SEE_OTHER);
+    assert_eq!(expired_get.headers().get(header::LOCATION).unwrap(), "/login");
+
+    let workers =
+        crate::workers::WorkerManager::new(db.clone(), 30, "/tmp/roche-test-session-prune");
+    workers.run_once().await.unwrap();
+    assert_eq!(db.auth().count_web_sessions().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_security_headers_breach_and_host_cookie_enforcement() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (host_cookie, _csrf) = login_browser(&db, &app).await;
+    let raw_token = host_cookie.split_once('=').unwrap().1;
+
+    // 1. HTML responses are never compressed (BREACH mitigation) and carry Permissions-Policy + HSTS over forwarded HTTPS
+    let mut https_home_req = Request::builder()
+        .uri("/")
+        .header(header::COOKIE, &host_cookie)
+        .header(header::ACCEPT_ENCODING, "gzip, br, deflate")
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
+        .unwrap();
+    https_home_req
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42001)));
+    let https_home = app.clone().oneshot(https_home_req).await.unwrap();
+    assert_eq!(https_home.status(), StatusCode::OK);
+    assert!(
+        https_home.headers().get(header::CONTENT_ENCODING).is_none(),
+        "text/html must not be compressed"
+    );
+    assert_eq!(
+        https_home.headers().get("permissions-policy").unwrap(),
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+    );
+    assert_eq!(
+        https_home.headers().get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
+        "max-age=31536000"
+    );
+
+    // 2. Over forwarded HTTPS, unprefixed `roche_session` cookie is rejected (blocks HTTP cookie-tossing)
+    let mut tossed_req = Request::builder()
+        .uri("/")
+        .header(header::COOKIE, format!("roche_session={raw_token}"))
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
+        .unwrap();
+    tossed_req
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42002)));
+    let tossed_resp = app.clone().oneshot(tossed_req).await.unwrap();
+    assert_eq!(tossed_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(tossed_resp.headers().get(header::LOCATION).unwrap(), "/login");
+
+    // 3. Direct non-loopback peer spoofing X-Forwarded-Proto: https does NOT receive HSTS
+    let mut spoofed_https_req = Request::builder()
+        .uri("/health")
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
+        .unwrap();
+    spoofed_https_req
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 55)), 42003)));
+    let spoofed_health = app.clone().oneshot(spoofed_https_req).await.unwrap();
+    assert_eq!(spoofed_health.status(), StatusCode::OK);
+    assert_eq!(spoofed_health.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    assert_eq!(spoofed_health.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert!(spoofed_health.headers().get(header::STRICT_TRANSPORT_SECURITY).is_none());
+
+    // 4. API endpoints emit nosniff, no-store, and HSTS over trusted forwarded HTTPS
+    let mut https_api_401 = Request::builder()
+        .uri("/api/v1/items")
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
+        .unwrap();
+    https_api_401
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42004)));
+    let api_401_resp = app.clone().oneshot(https_api_401).await.unwrap();
+    assert_eq!(api_401_resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(api_401_resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    assert_eq!(api_401_resp.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(
+        api_401_resp.headers().get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
+        "max-age=31536000"
+    );
+}
+
+#[tokio::test]
+async fn test_httponly_flash_cookie_lifecycle_and_query_rejection() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (host_cookie, csrf) = login_browser(&db, &app).await;
+
+    // POST sets __Host-roche_flash over HTTPS with clean Location
+    let mut https_create = Request::builder()
+        .method("POST")
+        .uri("/web/lists/create")
+        .header(header::COOKIE, &host_cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("x-forwarded-proto", "https")
+        .body(Body::from(encode_form(&[("_csrf", &csrf), ("title", "Flash Test List")])))
+        .unwrap();
+    https_create
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42005)));
+    let create_resp = app.clone().oneshot(https_create).await.unwrap();
+    assert_eq!(create_resp.status(), StatusCode::SEE_OTHER);
+    let create_loc =
+        create_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
+    assert!(!create_loc.contains("notice="), "Location must not leak flash in query: {create_loc}");
+    let flash_set = find_set_cookie(&create_resp, "__Host-roche_flash=n:").unwrap();
+    assert!(flash_set.contains("HttpOnly"));
+    assert!(flash_set.contains("Secure"));
+    assert!(flash_set.contains("Max-Age=60"));
+    let flash_pair = extract_cookie_header(flash_set);
+    let combined_cookie = format!("{host_cookie}; {flash_pair}");
+
+    // Background AJAX poll must NOT clear the flash cookie
+    let mut ajax_req = Request::builder()
+        .uri("/web/refresh-status")
+        .header(header::COOKIE, &combined_cookie)
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
+        .unwrap();
+    ajax_req
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42006)));
+    let ajax_resp = app.clone().oneshot(ajax_req).await.unwrap();
+    assert_eq!(ajax_resp.status(), StatusCode::OK);
+    assert!(find_set_cookie(&ajax_resp, "__Host-roche_flash=").is_none());
+
+    // 303 redirect route (/starred -> /lists/starred) must NOT clear the flash cookie
+    let mut redir_req = Request::builder()
+        .uri("/starred")
+        .header(header::COOKIE, &combined_cookie)
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
+        .unwrap();
+    redir_req
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42007)));
+    let redir_resp = app.clone().oneshot(redir_req).await.unwrap();
+    assert_eq!(redir_resp.status(), StatusCode::SEE_OTHER);
+    assert!(find_set_cookie(&redir_resp, "__Host-roche_flash=").is_none());
+
+    // Follow-up 200 HTML GET renders the banner and emits Max-Age=0 clear cookie
+    let mut page_req = Request::builder()
+        .uri(&create_loc)
+        .header(header::COOKIE, &combined_cookie)
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
+        .unwrap();
+    page_req
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42008)));
+    let page_resp = app.clone().oneshot(page_req).await.unwrap();
+    assert_eq!(page_resp.status(), StatusCode::OK);
+    let clear_flash = find_set_cookie(&page_resp, "__Host-roche_flash=;").unwrap();
+    assert!(clear_flash.contains("Max-Age=0"));
+    assert!(clear_flash.contains("Secure"));
+    let page_html = read_body_html(page_resp).await;
+    assert!(page_html.contains("Created manual list"));
+
+    // Spoofed URL query parameters `?notice=` / `?err=` are completely ignored
+    let spoofed_flash_html = read_body_html(
+        get_authed(&app, "/inbox?notice=Injected+Notice&err=Spoofed+Error", &host_cookie).await,
+    )
+    .await;
+    assert!(!spoofed_flash_html.contains("Injected Notice"));
+    assert!(!spoofed_flash_html.contains("Spoofed Error"));
+
+    // Multibyte UTF-8 flash messages are byte-capped so percent-encoded Set-Cookie stays < 4096 bytes
+    let big_cjk = "漢".repeat(512);
+    let sanitized_cjk = super::html::sanitize_flash_message(&big_cjk);
+    assert!(sanitized_cjk.len() <= 1024);
+    let encoded_cjk = super::html::urlencode(&sanitized_cjk);
+    assert!(encoded_cjk.len() + "__Host-roche_flash=n:".len() < 4096);
+}
+
+#[tokio::test]
+async fn test_mixed_https_http_localhost_cookie_precedence_and_cleanup() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (dead_host_cookie, csrf1) = login_browser(&db, &app).await;
+
+    // 1. HTTP logout while carrying __Host-roche_session and __Host-roche_flash clears BOTH __Host-* and unprefixed cookies
+    let logout_resp = post_form(
+        &app,
+        "/logout",
+        &format!("{dead_host_cookie}; __Host-roche_flash=n:Leftover"),
+        &[("_csrf", &csrf1)],
+    )
+    .await;
+    assert_eq!(logout_resp.status(), StatusCode::SEE_OTHER);
+    assert!(find_set_cookie(&logout_resp, "__Host-roche_session=;").unwrap().contains("Max-Age=0"));
+    assert!(find_set_cookie(&logout_resp, "roche_session=;").unwrap().contains("Max-Age=0"));
+    assert!(find_set_cookie(&logout_resp, "__Host-roche_flash=;").unwrap().contains("Max-Age=0"));
+    assert!(find_set_cookie(&logout_resp, "roche_flash=;").unwrap().contains("Max-Age=0"));
+
+    // 2. HTTP login while browser still sends stale __Host-roche_session and __Host-roche_logged_out=1
+    //    clears both stale __Host-* cookies and mints a fresh unprefixed roche_session
+    let code = PairingManager::new(db.auth()).create_code(300).await.unwrap();
+    let http_login_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("sec-fetch-site", "same-origin")
+                .header(header::COOKIE, format!("{dead_host_cookie}; __Host-roche_logged_out=1"))
+                .body(Body::from(encode_form(&[("pairing_code", &code)])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(http_login_resp.status(), StatusCode::SEE_OTHER);
+    assert!(
+        find_set_cookie(&http_login_resp, "__Host-roche_session=;").unwrap().contains("Max-Age=0")
+    );
+    assert!(
+        find_set_cookie(&http_login_resp, "__Host-roche_logged_out=;")
+            .unwrap()
+            .contains("Max-Age=0")
+    );
+    let fresh_plain_cookie =
+        extract_cookie_header(find_set_cookie(&http_login_resp, "roche_session=").unwrap());
+
+    // 3. Even if a browser sends revoked __Host-roche_session alongside valid roche_session over HTTP,
+    //    authentication succeeds without looping to /login, and fresh roche_flash beats stale __Host-roche_flash
+    let mixed_resp = get_authed(
+        &app,
+        "/",
+        &format!(
+            "{dead_host_cookie}; {fresh_plain_cookie}; __Host-roche_flash=n:Stale; roche_flash=n:Fresh+HTTP"
+        ),
+    )
+    .await;
+    assert_eq!(mixed_resp.status(), StatusCode::OK);
+    assert!(find_set_cookie(&mixed_resp, "__Host-roche_flash=;").unwrap().contains("Max-Age=0"));
+    assert!(find_set_cookie(&mixed_resp, "roche_flash=;").unwrap().contains("Max-Age=0"));
+    let mixed_html = read_body_html(mixed_resp).await;
+    assert!(mixed_html.contains("Fresh HTTP"));
+    assert!(!mixed_html.contains("Stale"));
 }

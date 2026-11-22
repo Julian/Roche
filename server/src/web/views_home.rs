@@ -6,7 +6,7 @@ use std::{
 
 use axum::{
     Form,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, State},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -14,9 +14,9 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        ARCHIVE_BOX_SVG, CreatorYearStyle, FlashQuery, NavSection, PageShell, WebError,
-        WithWebCsrf as _, content_type_badge_class, content_type_label, esc, format_audio_duration,
-        parse_form_bool, redirect_with_flash, render_creator_year_meta, render_diary_row_with_tier,
+        ARCHIVE_BOX_SVG, CreatorYearStyle, NavSection, PageShell, WebError, WithWebCsrf as _,
+        content_type_badge_class, content_type_label, esc, format_audio_duration, parse_form_bool,
+        redirect_with_flash, render_creator_year_meta, render_diary_row_with_tier,
         render_feed_favicon, render_inline_csrf_form, render_page, render_triage_form,
         safe_local_redirect, urlencode,
     },
@@ -59,15 +59,13 @@ pub(super) struct GeneratorNotesForm {
 pub(super) async fn home_get(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
-    Query(flash): Query<FlashQuery>,
 ) -> Result<Response, WebError> {
-    render_home_inner(&service, &session, &flash).await.web_err(&session)
+    render_home_inner(&service, &session).await.web_err(&session)
 }
 
 async fn render_home_inner(
     service: &RocheService,
     session: &WebSession,
-    flash: &FlashQuery,
 ) -> Result<Response, AppError> {
     let unread_filter = ItemFilter {
         status: Some(ItemStatusFilter::Unread),
@@ -144,7 +142,7 @@ async fn render_home_inner(
         title: "Roche",
         active: NavSection::Home,
         csrf_token: &session.csrf_token,
-        flash,
+        flash: &session.flash,
         is_refreshing: sync_status.is_refreshing,
         theme: session.theme,
         search_query: None,

@@ -87,11 +87,12 @@ pub(in crate::web) async fn lists_get(
     render_lists_rail(&mut body, &collections, clean_q, parsed_kind, is_searching);
     body.push_str("</div>\n");
 
-    let err = query
+    let err = session
         .flash
         .err
+        .clone()
         .or_else(|| invalid_kind.map(|bad| format!("Unknown entry kind filter '{bad}'")));
-    let flash = FlashQuery { notice: query.flash.notice, err };
+    let flash = FlashQuery { notice: session.flash.notice.clone(), err };
     Ok(render_page(&PageShell {
         title: "Lists",
         active: NavSection::Lists,
@@ -704,7 +705,7 @@ pub(in crate::web) async fn list_detail_get(
         title: &view.collection.title,
         active: active_nav,
         csrf_token: &session.csrf_token,
-        flash: &q.flash,
+        flash: &session.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
         search_query: None,

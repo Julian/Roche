@@ -6,7 +6,7 @@ use std::{collections::HashSet, fmt::Write as _};
 
 use serde::Deserialize;
 
-use super::html::{FlashQuery, de_opt_from_str, esc};
+use super::html::{de_opt_from_str, esc};
 use crate::{
     db::CatalogEntry,
     domain::{ConsumptionStatus, EntryKind},
@@ -29,8 +29,6 @@ pub(super) use lists::{
 pub(super) struct ListsOverviewQuery {
     pub q: Option<String>,
     pub kind: Option<String>,
-    #[serde(flatten)]
-    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -40,8 +38,6 @@ pub(super) struct ListPageQuery {
     pub tier: Option<String>,
     pub q: Option<String>,
     pub undo_remove: Option<String>,
-    #[serde(flatten)]
-    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -51,23 +47,17 @@ pub(super) struct DiaryFilterQuery {
     pub status: Option<String>,
     #[serde(default, deserialize_with = "de_opt_from_str")]
     pub page: Option<usize>,
-    #[serde(flatten)]
-    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct EntryDetailQuery {
     pub merge_preview: Option<String>,
-    #[serde(flatten)]
-    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct QueuePageQuery {
     pub undo_entry: Option<String>,
     pub undo_queue: Option<String>,
-    #[serde(flatten)]
-    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Deserialize)]

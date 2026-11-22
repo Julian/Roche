@@ -1040,7 +1040,7 @@ mod tests {
         pre_pool.close().await;
         drop(pre_pool);
 
-        // 2. Connect via Db::connect and verify (a) all 17 regular tables end with STRICT,
+        // 2. Connect via Db::connect and verify (a) all 19 regular tables end with STRICT,
         //    (b) wrong storage class is rejected, and (c) FK check + FTS + sequence work end-to-end.
         let db = Db::connect(&db_path).await.unwrap();
 
@@ -1055,7 +1055,7 @@ mod tests {
         .fetch_all(db.pool())
         .await
         .unwrap();
-        assert_eq!(regular_tables.len(), 18, "Expected all 18 regular tables in schema");
+        assert_eq!(regular_tables.len(), 19, "Expected all 19 regular tables in schema");
         for tbl in &regular_tables {
             let trimmed_ddl = tbl.sql.trim().trim_end_matches(';').trim_end();
             assert!(

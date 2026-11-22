@@ -67,12 +67,19 @@ impl WorkerManager {
     }
 
     pub async fn run_once(&self) -> Result<()> {
-        let (op_res, peer_res, media_res) =
-            tokio::join!(self.run_op_pruner(), self.run_peer_pruner(), self.run_media_cleaner());
+        let (op_res, peer_res, media_res, session_res) = tokio::join!(
+            self.run_op_pruner(),
+            self.run_peer_pruner(),
+            self.run_media_cleaner(),
+            self.run_session_pruner(),
+        );
         let mut first_err: Option<anyhow::Error> = None;
-        for (worker, res) in
-            [("op_pruner", op_res), ("peer_pruner", peer_res), ("media_cleaner", media_res)]
-        {
+        for (worker, res) in [
+            ("op_pruner", op_res),
+            ("peer_pruner", peer_res),
+            ("media_cleaner", media_res),
+            ("session_pruner", session_res),
+        ] {
             if let Err(e) = res {
                 tracing::error!(worker = worker, error = %e, "WorkerManager task failed");
                 if first_err.is_none() {
@@ -93,6 +100,11 @@ impl WorkerManager {
 
     async fn run_peer_pruner(&self) -> Result<()> {
         let _ = self.db.sync().prune_stale_peer_nodes(self.op_log_prune_after_days.max(30)).await?;
+        Ok(())
+    }
+
+    async fn run_session_pruner(&self) -> Result<()> {
+        let _ = self.db.auth().prune_expired_web_sessions().await?;
         Ok(())
     }
 

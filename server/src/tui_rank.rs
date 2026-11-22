@@ -26,6 +26,7 @@ use ratatui::{
 use crate::{
     db::CatalogEntry,
     ranking::{RankBoard, RankBoardRow},
+    util::terminal::sanitize_terminal_text,
 };
 
 const ACCENT_COPPER: Color = Color::Indexed(130);
@@ -173,7 +174,10 @@ impl ClusterRankState {
                     Style::default().fg(ACCENT_COPPER).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" — "),
-                Span::styled(sanitize_line(title), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    sanitize_terminal_text(title),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(
                     format!("  (round {}, saved {appended})", iteration + 1),
                     Style::default().fg(Color::DarkGray),
@@ -219,8 +223,10 @@ impl ClusterRankState {
         let help_text = if area.width < 90 { COMPACT_HELP_LINE } else { HELP_LINE };
         let mut footer_lines = vec![Line::styled(help_text, Style::default().fg(Color::DarkGray))];
         if let Some(note) = &self.status_note {
-            footer_lines
-                .push(Line::styled(sanitize_line(note), Style::default().fg(Color::Yellow)));
+            footer_lines.push(Line::styled(
+                sanitize_terminal_text(note),
+                Style::default().fg(Color::Yellow),
+            ));
         }
         let footer = Paragraph::new(footer_lines).wrap(Wrap { trim: true });
         frame.render_widget(footer, chunks[2]);
@@ -233,7 +239,7 @@ impl ClusterRankState {
         let note_rows = self
             .status_note
             .as_deref()
-            .map_or(0, |n| word_wrapped_rows(&sanitize_line(n), usable_w));
+            .map_or(0, |n| word_wrapped_rows(&sanitize_terminal_text(n), usable_w));
         let desired = u16::try_from(help_rows + note_rows).unwrap_or(6).max(2);
         let max_allowed = height.saturating_sub(5).max(1);
         desired.min(max_allowed)
@@ -259,7 +265,7 @@ impl ClusterRankState {
         ));
         if !entry.creators.is_empty() {
             spans.push(Span::styled(
-                format!("{} ", sanitize_line(&entry.creators.join(", "))),
+                format!("{} ", sanitize_terminal_text(&entry.creators.join(", "))),
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
             ));
         }
@@ -268,7 +274,7 @@ impl ClusterRankState {
         } else {
             Style::default()
         };
-        spans.push(Span::styled(sanitize_line(&entry.title), title_style));
+        spans.push(Span::styled(sanitize_terminal_text(&entry.title), title_style));
         if let Some(year) = entry.release_year {
             spans.push(Span::styled(format!(" ({year})"), Style::default().fg(Color::DarkGray)));
         }
@@ -458,10 +464,6 @@ pub fn open_system_browser(url: &str) -> Result<()> {
     let parsed = validate_browser_open_url(url)?;
     open::that_detached(parsed.as_str()).context("Failed to launch system browser")?;
     Ok(())
-}
-
-fn sanitize_line(input: &str) -> String {
-    input.chars().filter(|c| !c.is_control()).collect()
 }
 
 fn word_wrapped_rows(text: &str, width: usize) -> usize {

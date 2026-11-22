@@ -70,6 +70,42 @@ pub(super) fn redirect_see_other(location: &str) -> Response {
     resp
 }
 
+const MAX_FLASH_MESSAGE_CHARS: usize = 512;
+/// Caps raw UTF-8 length so even 100% percent-encoded multibyte text (`3x` expansion)
+/// stays well below RFC 6265's 4096-byte `Set-Cookie` limit.
+const MAX_FLASH_MESSAGE_UTF8_BYTES: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlashKind {
+    Notice,
+    Err,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PendingFlash {
+    pub kind: FlashKind,
+    pub message: String,
+}
+
+#[must_use]
+pub(super) fn sanitize_flash_message(msg: &str) -> String {
+    let mut out = String::new();
+    let mut char_count = 0usize;
+    for ch in msg.trim().chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if char_count >= MAX_FLASH_MESSAGE_CHARS
+            || out.len() + ch.len_utf8() > MAX_FLASH_MESSAGE_UTF8_BYTES
+        {
+            break;
+        }
+        out.push(ch);
+        char_count += 1;
+    }
+    out
+}
+
 pub(super) fn redirect_with_flash(base: &str, param: &str, msg: &str) -> Response {
     let safe_base = safe_local_redirect(Some(base), "/");
     let (path_and_query, fragment) = match safe_base.split_once('#') {
@@ -90,16 +126,19 @@ pub(super) fn redirect_with_flash(base: &str, param: &str, msg: &str) -> Respons
         }
         None => (path_and_query, String::new()),
     };
-    let mut loc = if cleaned_query.is_empty() {
-        format!("{path}?{param}={}", urlencode(msg))
-    } else {
-        format!("{path}?{cleaned_query}&{param}={}", urlencode(msg))
-    };
+    let mut loc =
+        if cleaned_query.is_empty() { path.to_owned() } else { format!("{path}?{cleaned_query}") };
     if let Some(frag) = fragment {
         loc.push('#');
         loc.push_str(frag);
     }
-    redirect_see_other(&loc)
+    let mut resp = redirect_see_other(&loc);
+    let clean_msg = sanitize_flash_message(msg);
+    if !clean_msg.is_empty() {
+        let kind = if param == "err" { FlashKind::Err } else { FlashKind::Notice };
+        resp.extensions_mut().insert(PendingFlash { kind, message: clean_msg });
+    }
+    resp
 }
 
 #[must_use]
@@ -485,11 +524,9 @@ impl NavSection {
     }
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct FlashQuery {
-    #[serde(default)]
     pub notice: Option<String>,
-    #[serde(default)]
     pub err: Option<String>,
 }
 

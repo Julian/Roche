@@ -1488,19 +1488,6 @@
     });
   };
 
-  const stripFlashParamsFromUrl = () => {
-    if (!window.location.search || typeof window.history?.replaceState !== "function") return;
-    const params = new URLSearchParams(window.location.search);
-    if (!params.has("notice") && !params.has("err")) return;
-    params.delete("notice");
-    params.delete("err");
-    const qs = params.toString();
-    const nextUrl = `${window.location.pathname}${qs ? `?${qs}` : ""}${window.location.hash}`;
-    try {
-      window.history.replaceState(window.history.state, "", nextUrl);
-    } catch {}
-  };
-
   const hasDirtyFormOrOpenDetails = () => {
     const active = document.activeElement;
     if (active?.matches?.("input, textarea, select, [contenteditable]")) {
@@ -1567,13 +1554,7 @@
       }
     };
 
-    const cleanCurrentPathSearch = () => {
-      const cleanParams = new URLSearchParams(window.location.search);
-      cleanParams.delete("notice");
-      cleanParams.delete("err");
-      const qs = cleanParams.toString();
-      return `${window.location.pathname}${qs ? `?${qs}` : ""}`;
-    };
+    const cleanCurrentPathSearch = () => `${window.location.pathname}${window.location.search}`;
 
     const scheduleCheck = (delayMs) => {
       if (refreshPollTimer) clearTimeout(refreshPollTimer);
@@ -2931,7 +2912,6 @@
   };
 
   const initPageWidgets = () => {
-    stripFlashParamsFromUrl();
     scrollActiveNavIntoView();
     syncPlayButtonsFn?.();
     initReaderProgress();

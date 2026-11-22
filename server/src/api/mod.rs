@@ -9,11 +9,11 @@ mod tags;
 #[cfg(test)]
 mod tests;
 
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -137,6 +137,7 @@ impl ApiRoutes {
 
         let compression = CompressionLayer::new().compress_when(
             DefaultPredicate::new()
+                .and(NotForContentType::new("text/html"))
                 .and(NotForContentType::new("video/"))
                 .and(NotForContentType::new("audio/"))
                 .and(NotForContentType::new("application/pdf")),
@@ -155,6 +156,7 @@ impl ApiRoutes {
                 request_permits,
                 Self::enforce_concurrency_and_timeout,
             ))
+            .layer(middleware::from_fn(Self::attach_security_headers))
             .layer(TraceLayer::new_for_http())
             .layer(compression)
             .with_state(service)
@@ -321,6 +323,25 @@ impl ApiRoutes {
                     .into_response()
             }
         })
+    }
+
+    async fn attach_security_headers(req: Request, next: Next) -> Response {
+        let peer_addr = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0);
+        let forwarded_https =
+            crate::util::http_security::is_forwarded_https(peer_addr, req.headers());
+        let mut resp = next.run(req).await;
+        let headers = resp.headers_mut();
+        headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+        if !headers.contains_key(header::CACHE_CONTROL) {
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
+        if forwarded_https && !headers.contains_key(header::STRICT_TRANSPORT_SECURITY) {
+            headers.insert(
+                header::STRICT_TRANSPORT_SECURITY,
+                HeaderValue::from_static("max-age=31536000"),
+            );
+        }
+        resp
     }
 
     async fn require_auth(

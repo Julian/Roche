@@ -7,13 +7,16 @@ use std::{
 
 use hex::FromHex;
 use hmac::{Hmac, KeyInit, Mac};
+use rand::Rng as _;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use uuid::Uuid;
 
 use super::{AppError, RocheService};
 use crate::{
     auth::{pairing::PairingManager, tokens::TokenManager},
     db::DeviceToken,
+    util::clock::now_utc,
 };
 
 const MAX_DEVICE_NAME_LEN: usize = 128;
@@ -23,6 +26,8 @@ const PAIR_RATE_LIMIT_MAX_FAILURES: usize = 4;
 const PAIR_PRE_DB_MAX_ATTEMPTS: usize = 12;
 const MAX_TRACKED_PAIRING_IPS: usize = 4_096;
 const MAX_TAILSCALE_WEB_TOKENS_PER_USER: i64 = 3;
+pub const WEB_SESSION_TTL_DAYS: i64 = 30;
+pub const WEB_SESSION_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PairingClientKey {
@@ -171,6 +176,18 @@ impl AuthService<'_> {
         self.pair_device_with_key(device_name, pairing_code, key).await
     }
 
+    pub async fn pair_web_session_for_request(
+        &self,
+        label: &str,
+        pairing_code: &str,
+        peer_addr: Option<SocketAddr>,
+        tailscale_user_login: Option<&str>,
+        x_forwarded_for: Option<&str>,
+    ) -> Result<String, AppError> {
+        let key = self.resolve_pairing_client_key(peer_addr, tailscale_user_login, x_forwarded_for);
+        self.pair_web_session_with_key(label, pairing_code, key).await
+    }
+
     pub async fn issue_pairing_code(&self) -> Result<String, AppError> {
         let pairing = PairingManager::new(self.service.db.auth());
         let code = pairing.create_code(self.service.config.auth.pairing_code_ttl).await?;
@@ -178,13 +195,13 @@ impl AuthService<'_> {
         Ok(code)
     }
 
-    pub async fn pair_device_with_key(
+    async fn consume_pairing_code_for_label(
         &self,
-        device_name: &str,
+        label: &str,
         pairing_code: &str,
         client_key: PairingClientKey,
     ) -> Result<String, AppError> {
-        let trimmed_name = device_name.trim();
+        let trimmed_name = label.trim();
         if trimmed_name.is_empty() {
             return Err(AppError::bad_request("device_name cannot be empty"));
         }
@@ -222,15 +239,40 @@ impl AuthService<'_> {
         }
 
         self.service.pairing_limiter.reset();
+        Ok(trimmed_name.to_owned())
+    }
 
+    async fn create_web_session_token(&self, label: &str) -> Result<String, AppError> {
+        let raw_token = TokenManager::generate_token(self.service.config.auth.token_length);
+        let token_hash = TokenManager::hash_token(&raw_token);
+        let id = Uuid::new_v4().to_string();
+        let expires_at = now_utc() + chrono::Duration::days(WEB_SESSION_TTL_DAYS);
+        self.service.db.auth().create_web_session(&id, label, &token_hash, expires_at).await?;
+        Ok(raw_token)
+    }
+
+    pub async fn pair_device_with_key(
+        &self,
+        device_name: &str,
+        pairing_code: &str,
+        client_key: PairingClientKey,
+    ) -> Result<String, AppError> {
+        let trimmed_name =
+            self.consume_pairing_code_for_label(device_name, pairing_code, client_key).await?;
         let tokens = TokenManager::new(self.service.db.auth());
-        let token = tokens.create(trimmed_name, self.service.config.auth.token_length).await?;
+        let token = tokens.create(&trimmed_name, self.service.config.auth.token_length).await?;
         Ok(token)
     }
 
-    pub async fn authenticate(&self, bearer_token: &str) -> Result<(), AppError> {
-        let _ = self.authenticate_device(bearer_token).await?;
-        Ok(())
+    pub async fn pair_web_session_with_key(
+        &self,
+        label: &str,
+        pairing_code: &str,
+        client_key: PairingClientKey,
+    ) -> Result<String, AppError> {
+        let trimmed_name =
+            self.consume_pairing_code_for_label(label, pairing_code, client_key).await?;
+        self.create_web_session_token(&trimmed_name).await
     }
 
     pub async fn authenticate_device(&self, bearer_token: &str) -> Result<String, AppError> {
@@ -239,6 +281,19 @@ impl AuthService<'_> {
             .validate_token_id(bearer_token)
             .await?
             .ok_or_else(|| AppError::token_invalid("Invalid or revoked bearer token"))
+    }
+
+    pub async fn authenticate_web_session(
+        &self,
+        raw_session_token: &str,
+    ) -> Result<String, AppError> {
+        let token_hash = TokenManager::hash_token(raw_session_token);
+        self.service
+            .db
+            .auth()
+            .validate_web_session_id(&token_hash)
+            .await?
+            .ok_or_else(|| AppError::token_invalid("Invalid or expired web session"))
     }
 
     pub async fn verify_sync_peer_binding(
@@ -289,17 +344,29 @@ impl AuthService<'_> {
     #[must_use]
     pub fn csrf_token_for_session(&self, raw_session_token: &str) -> String {
         let _ = self;
-        hex::encode(Self::csrf_mac_bytes(raw_session_token))
+        let base = Self::csrf_mac_bytes(raw_session_token);
+        let mut mask = [0u8; 32];
+        rand::rng().fill_bytes(&mut mask);
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&mask);
+        for i in 0..32 {
+            out[32 + i] = base[i] ^ mask[i];
+        }
+        hex::encode(out)
     }
 
     #[must_use]
     pub fn verify_csrf_token(&self, raw_session_token: &str, candidate: &str) -> bool {
         let _ = self;
-        let Ok(cand_bytes) = <[u8; 32]>::from_hex(candidate.trim()) else {
+        let Ok(decoded) = <[u8; 64]>::from_hex(candidate.trim()) else {
             return false;
         };
+        let mut unmasked = [0u8; 32];
+        for i in 0..32 {
+            unmasked[i] = decoded[i] ^ decoded[32 + i];
+        }
         let exp_bytes = Self::csrf_mac_bytes(raw_session_token);
-        bool::from(exp_bytes.ct_eq(&cand_bytes))
+        bool::from(exp_bytes.ct_eq(&unmasked))
     }
 
     pub async fn mint_tailscale_web_session(&self, login: &str) -> Result<String, AppError> {
@@ -312,21 +379,18 @@ impl AuthService<'_> {
             .get(&clean_login)
             .cloned();
         if let Some(existing) = cached
-            && self.authenticate(&existing).await.is_ok()
+            && self.authenticate_web_session(&existing).await.is_ok()
         {
             return Ok(existing);
         }
 
         let raw_name = format!("Roche Web ({clean_login})");
         let safe_name: String = raw_name.chars().take(MAX_DEVICE_NAME_LEN).collect();
+        let minted = self.create_web_session_token(&safe_name).await?;
         let auth_repo = self.service.db.auth();
-        let tokens = TokenManager::new(auth_repo);
-        let minted = tokens.create(&safe_name, self.service.config.auth.token_length).await?;
-        let _ = self
-            .service
-            .db
-            .auth()
-            .prune_excess_named_tokens(&safe_name, MAX_TAILSCALE_WEB_TOKENS_PER_USER)
+        let _ = auth_repo.prune_expired_web_sessions().await;
+        let _ = auth_repo
+            .prune_excess_web_sessions(&safe_name, MAX_TAILSCALE_WEB_TOKENS_PER_USER)
             .await;
         self.service
             .tailscale_web_sessions
@@ -346,7 +410,7 @@ impl AuthService<'_> {
             guard.retain(|_, tok| tok != raw_session_token);
         }
         let token_hash = TokenManager::hash_token(raw_session_token);
-        Ok(self.service.db.auth().revoke_device_by_token_hash(&token_hash).await?)
+        Ok(self.service.db.auth().revoke_web_session_by_token_hash(&token_hash).await?)
     }
 }
 

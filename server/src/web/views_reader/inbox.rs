@@ -16,11 +16,11 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            ARCHIVE_BOX_SVG, FlashQuery, NavSection, PageShell, RESTORE_BOX_SVG, WebError,
-            WithWebCsrf as _, content_type_badge_class, content_type_label, esc,
-            format_audio_duration, parse_csv_list, redirect_see_other, redirect_with_flash,
-            render_feed_favicon, render_inline_csrf_form, render_page, render_triage_form,
-            safe_local_redirect, urlencode,
+            ARCHIVE_BOX_SVG, NavSection, PageShell, RESTORE_BOX_SVG, WebError, WithWebCsrf as _,
+            content_type_badge_class, content_type_label, esc, format_audio_duration,
+            parse_csv_list, redirect_see_other, redirect_with_flash, render_feed_favicon,
+            render_inline_csrf_form, render_page, render_triage_form, safe_local_redirect,
+            urlencode,
         },
         links::sanitize_non_local_href,
     },
@@ -118,7 +118,7 @@ pub(in crate::web) async fn inbox_get(
         title: feed_label.as_deref().unwrap_or("Inbox"),
         active: NavSection::Inbox,
         csrf_token: &session.csrf_token,
-        flash: &q.flash,
+        flash: &session.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
         search_query: None,
@@ -944,17 +944,8 @@ fn render_inbox_row_controls(
     out.push_str("\n</div>\n");
 }
 
-pub(in crate::web) async fn starred_get(
-    State(_service): State<Arc<RocheService>>,
-    Query(flash): Query<FlashQuery>,
-) -> Response {
-    if let Some(err) = flash.err.as_deref().filter(|s| !s.is_empty()) {
-        redirect_with_flash("/lists/starred", "err", err)
-    } else if let Some(notice) = flash.notice.as_deref().filter(|s| !s.is_empty()) {
-        redirect_with_flash("/lists/starred", "notice", notice)
-    } else {
-        redirect_see_other("/lists/starred")
-    }
+pub(in crate::web) async fn starred_get() -> Response {
+    redirect_see_other("/lists/starred")
 }
 
 pub(in crate::web) async fn post_item_save(

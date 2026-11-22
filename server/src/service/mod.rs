@@ -22,15 +22,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use self::{
-    auth::{AuthService, PairingRateLimiter},
-    enrich::{ArtistEnricher, EnrichService},
-    items::ItemService,
-    media::MediaService,
-    sync::SyncService,
-    tags::TagService,
-};
 pub use self::{
+    auth::WEB_SESSION_MAX_AGE_SECS,
     catalog::{
         CatalogService, ClusterSelectFilter, EntryListAppearance, EpScoreCache,
         RankedCollectionFilter, RankedCollectionView, RankedEntryRow,
@@ -40,6 +33,14 @@ pub use self::{
     items::ItemDetail,
     media::unlink_and_delete_media_rows,
     sync::{SyncChanges, SyncStatus},
+};
+use self::{
+    auth::{AuthService, PairingRateLimiter},
+    enrich::{ArtistEnricher, EnrichService},
+    items::ItemService,
+    media::MediaService,
+    sync::SyncService,
+    tags::TagService,
 };
 use crate::{
     config::Config,

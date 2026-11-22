@@ -2,6 +2,8 @@ pub mod clock;
 pub mod fs_perms;
 pub mod hash;
 pub mod http_media;
+pub mod http_security;
 pub use roche_core::media_urls;
 pub mod task_tracker;
+pub mod terminal;
 pub mod url_guard;

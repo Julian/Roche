@@ -209,36 +209,101 @@ impl<'a> AuthRepo<'a> {
         Ok(res.rows_affected() > 0)
     }
 
-    pub async fn revoke_device_by_token_hash(&self, token_hash: &str) -> Result<bool> {
-        let res = sqlx::query!("DELETE FROM device_tokens WHERE token = ?", token_hash)
+    pub async fn create_web_session(
+        &self,
+        id: &str,
+        label: &str,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let now = now_utc();
+        sqlx::query(
+            "INSERT INTO web_sessions (id, token_hash, label, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(token_hash)
+        .bind(label)
+        .bind(now)
+        .bind(expires_at)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn validate_web_session_id(&self, token_hash: &str) -> Result<Option<String>> {
+        let now = now_utc();
+        let row: Option<(String, bool)> = sqlx::query_as(
+            "SELECT id,
+                    (last_used_at IS NULL OR datetime(last_used_at) <= datetime('now', '-60 seconds'))
+             FROM web_sessions
+             WHERE token_hash = ? AND datetime(expires_at) > datetime(?)",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .fetch_optional(self.pool)
+        .await?;
+
+        let Some((id, should_update)) = row else {
+            return Ok(None);
+        };
+
+        if should_update {
+            sqlx::query("UPDATE web_sessions SET last_used_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(&id)
+                .execute(self.pool)
+                .await?;
+        }
+
+        Ok(Some(id))
+    }
+
+    pub async fn revoke_web_session_by_token_hash(&self, token_hash: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM web_sessions WHERE token_hash = ?")
+            .bind(token_hash)
             .execute(self.pool)
             .await?;
         Ok(res.rows_affected() > 0)
     }
 
-    /// Prunes older Tailscale web session tokens for `device_name` beyond `keep_most_recent`
-    /// so `device_tokens` stays bounded even across repeated server restarts.
-    pub async fn prune_excess_named_tokens(
+    pub async fn prune_expired_web_sessions(&self) -> Result<u64> {
+        let now = now_utc();
+        let res = sqlx::query("DELETE FROM web_sessions WHERE datetime(expires_at) <= datetime(?)")
+            .bind(now)
+            .execute(self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Prunes older web sessions for `label` beyond `keep_most_recent`
+    /// so `web_sessions` stays bounded even across repeated server restarts.
+    pub async fn prune_excess_web_sessions(
         &self,
-        device_name: &str,
+        label: &str,
         keep_most_recent: i64,
     ) -> Result<u64> {
         let keep = keep_most_recent.max(1);
-        let res = sqlx::query!(
-            "DELETE FROM device_tokens
-             WHERE device_name = ?
+        let res = sqlx::query(
+            "DELETE FROM web_sessions
+             WHERE label = ?
                AND id NOT IN (
-                   SELECT id FROM device_tokens
-                   WHERE device_name = ?
+                   SELECT id FROM web_sessions
+                   WHERE label = ?
                    ORDER BY COALESCE(last_used_at, created_at) DESC, created_at DESC
                    LIMIT ?
                )",
-            device_name,
-            device_name,
-            keep,
         )
+        .bind(label)
+        .bind(label)
+        .bind(keep)
         .execute(self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+
+    #[cfg(test)]
+    pub async fn count_web_sessions(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions").fetch_one(self.pool).await?)
     }
 }

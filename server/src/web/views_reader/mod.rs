@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 
 use serde::Deserialize;
 
-use super::html::{FlashQuery, de_opt_from_str, esc, urlencode};
+use super::html::{de_opt_from_str, esc, urlencode};
 use crate::{db::Item, domain::ContentType};
 
 pub(super) use feeds::{
@@ -26,8 +26,6 @@ pub(super) use reader::{
 pub(super) struct ReaderQuery {
     #[serde(default)]
     pub return_to: Option<String>,
-    #[serde(flatten)]
-    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -35,8 +33,6 @@ pub(super) struct FeedsQuery {
     pub status: Option<String>,
     pub kind: Option<String>,
     pub q: Option<String>,
-    #[serde(flatten)]
-    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -48,8 +44,6 @@ pub(super) struct InboxQuery {
     pub q: Option<String>,
     #[serde(default, deserialize_with = "de_opt_from_str")]
     pub page: Option<usize>,
-    #[serde(flatten)]
-    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Deserialize)]

@@ -15,9 +15,9 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _, de_opt_from_str,
-        de_query_bool, esc, parse_form_bool, redirect_see_other, redirect_with_flash,
-        render_inline_csrf_form, render_page, safe_local_redirect, urlencode,
+        NavSection, PageShell, WebError, WithWebCsrf as _, de_opt_from_str, de_query_bool, esc,
+        parse_form_bool, redirect_see_other, redirect_with_flash, render_inline_csrf_form,
+        render_page, safe_local_redirect, urlencode,
     },
     links::{
         load_artist_id_by_lower_name, render_creator_links, sanitize_non_local_href,
@@ -54,8 +54,6 @@ pub(super) struct RankSessionQuery {
     pub random: Option<usize>,
     pub covered: Option<String>,
     pub undo_comp: Option<String>,
-    #[serde(flatten)]
-    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -64,13 +62,7 @@ pub(super) struct ComparisonUndoForm {
     pub return_to: Option<String>,
 }
 
-pub(super) async fn rank_picker_get(Query(flash): Query<FlashQuery>) -> Response {
-    if let Some(err) = flash.err.as_deref().filter(|s| !s.is_empty()) {
-        return redirect_with_flash("/lists", "err", err);
-    }
-    if let Some(notice) = flash.notice.as_deref().filter(|s| !s.is_empty()) {
-        return redirect_with_flash("/lists", "notice", notice);
-    }
+pub(super) async fn rank_picker_get() -> Response {
     redirect_see_other("/lists")
 }
 
@@ -161,7 +153,7 @@ pub(super) async fn rank_session_get(
         title: &format!("Rank: {}", ranked_view.collection.title),
         active,
         csrf_token: &session.csrf_token,
-        flash: &q.flash,
+        flash: &session.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
         search_query: None,

@@ -9,19 +9,19 @@ mod views_rank;
 mod views_reader;
 mod views_search;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, Request},
-    http::{HeaderValue, StatusCode, header},
+    extract::{ConnectInfo, DefaultBodyLimit, Request},
+    http::{HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::service::RocheService;
+use crate::{service::RocheService, util::http_security::is_forwarded_https};
 
 const ROCHE_CSS: &str = include_str!("roche.css");
 const ROCHE_JS: &str = include_str!("roche.js");
@@ -146,8 +146,10 @@ async fn serve_js() -> Response {
 }
 
 const WEB_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; media-src 'self' https: http:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'";
+const WEB_PERMISSIONS_POLICY: &str = "camera=(), microphone=(), geolocation=(), payment=(), usb=()";
+const PERMISSIONS_POLICY_HEADER: HeaderName = HeaderName::from_static("permissions-policy");
 
-fn apply_web_security_headers(resp: &mut Response) {
+fn apply_web_security_headers(resp: &mut Response, forwarded_https: bool) {
     let headers = resp.headers_mut();
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN"));
@@ -160,8 +162,17 @@ fn apply_web_security_headers(resp: &mut Response) {
             HeaderValue::from_static(WEB_CONTENT_SECURITY_POLICY),
         );
     }
+    if !headers.contains_key(&PERMISSIONS_POLICY_HEADER) {
+        headers.insert(PERMISSIONS_POLICY_HEADER, HeaderValue::from_static(WEB_PERMISSIONS_POLICY));
+    }
     if !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    }
+    if forwarded_https && !headers.contains_key(header::STRICT_TRANSPORT_SECURITY) {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
     }
 }
 
@@ -175,7 +186,7 @@ pub fn render_status_html(
 ) -> Response {
     let theme = auth::extract_theme_cookie(headers);
     let mut resp = html::render_error_page(status, heading, detail, None, theme);
-    apply_web_security_headers(&mut resp);
+    apply_web_security_headers(&mut resp, false);
     resp
 }
 
@@ -191,6 +202,8 @@ pub fn render_not_found_html(headers: &axum::http::HeaderMap) -> Response {
 }
 
 async fn attach_web_security_headers(req: Request, next: Next) -> Response {
+    let peer_addr = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0);
+    let forwarded_https = is_forwarded_https(peer_addr, req.headers());
     let theme = auth::extract_theme_cookie(req.headers());
     let mut resp = next.run(req).await;
     if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -209,6 +222,9 @@ async fn attach_web_security_headers(req: Request, next: Next) -> Response {
             );
         }
     }
-    apply_web_security_headers(&mut resp);
+    if let Some(pending_flash) = resp.extensions_mut().remove::<html::PendingFlash>() {
+        auth::append_flash_set_cookie(&mut resp, &pending_flash, forwarded_https);
+    }
+    apply_web_security_headers(&mut resp, forwarded_https);
     resp
 }

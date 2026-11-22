@@ -71,8 +71,11 @@ pub(in crate::web) async fn reader_get(
     let is_finished = is_consumed
         || detail.item.read_at.is_some()
         || detail.item.read_progress >= READER_AUTO_READ_THRESHOLD;
-    let suppress_auto_finish =
-        query.flash.notice.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("Marked unfinished"));
+    let suppress_auto_finish = session
+        .flash
+        .notice
+        .as_deref()
+        .is_some_and(|n| n.eq_ignore_ascii_case("Marked unfinished"));
 
     let mut body = String::with_capacity(14_336);
     render_reader_article(
@@ -90,7 +93,7 @@ pub(in crate::web) async fn reader_get(
         title: &detail.item.title,
         active: active_nav,
         csrf_token: &session.csrf_token,
-        flash: &query.flash,
+        flash: &session.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
         search_query: None,

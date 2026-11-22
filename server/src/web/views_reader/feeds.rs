@@ -187,7 +187,7 @@ pub(in crate::web) async fn feeds_get(
         title: "Feeds",
         active: NavSection::Feeds,
         csrf_token: &session.csrf_token,
-        flash: &query.flash,
+        flash: &session.flash,
         is_refreshing: service.is_refreshing(),
         theme: session.theme,
         search_query: None,
