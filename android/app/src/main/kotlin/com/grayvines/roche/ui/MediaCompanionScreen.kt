@@ -5,6 +5,7 @@ package com.grayvines.roche.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -65,16 +66,21 @@ import com.grayvines.roche.data.catalog.CollectionRole
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.RankedCatalogEntry
 import com.grayvines.roche.data.catalog.generatorFor
+import com.grayvines.roche.model.AppTab
+import com.grayvines.roche.ui.components.CatalogCoverThumbnail
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheAlertDialog
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
+import com.grayvines.roche.ui.components.RocheStripTab
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.components.SkipDrawIcon
+import com.grayvines.roche.ui.components.TierBadgePill
 import com.grayvines.roche.ui.components.TopHeaderCountPill
+import com.grayvines.roche.ui.components.UnpinnedTabBackButton
 import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
@@ -87,6 +93,7 @@ fun MediaCompanionScreen(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
+    overviewScrollState: ScrollState = rememberScrollState(),
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = {},
     onOpenExternalUrl: (String) -> Unit = {},
 ) {
@@ -111,31 +118,31 @@ fun MediaCompanionScreen(
 
     BackHandler(enabled = activeList != null) { onAction(MainAction.SelectCatalogCollection(null)) }
     RocheRefreshableTabScaffold(
-        isRefreshing = state.isSyncing,
-        onRefresh = { onAction(MainAction.SyncNow) },
+        isRefreshing = state.isManualRefreshing,
+        onRefresh = { onAction(MainAction.ManualRefresh) },
         pullToRefreshTestTag = "lists_pull_to_refresh",
         modifier = Modifier.testTag("lists_companion_screen"),
-        header = { ListsTopHeaderBar(headerCount) { onAction(MainAction.OpenSearch) } },
+        header = {
+            ListsTopHeaderBar(
+                countBadge = headerCount,
+                showBackToHome = activeList == null && state.isUnpinnedDestination(AppTab.LISTS),
+                onBackToHome = { onAction(MainAction.SelectTab(AppTab.HOME)) },
+                onOpenSearch = { onAction(MainAction.OpenSearch) },
+            )
+        },
     ) {
-        if (activeList == null) {
-            ListsOverviewPane(
-                state = state,
-                lists = lists,
-                onOpenList = { onAction(MainAction.SelectCatalogCollection(it)) },
-                onRankList = { onAction(MainAction.StartRankingSession(it)) },
-                onOpenCreateList = { showCreateListDialog = true },
-            )
-        } else {
-            RankedListDetailPane(
-                state = state,
-                activeList = activeList,
-                rankedEntries = activeEntries,
-                listState = listState,
-                onAction = onAction,
-                onOpenCollectionDraw = onOpenCollectionDraw,
-                onOpenExternalUrl = onOpenExternalUrl,
-            )
-        }
+        MediaCompanionBody(
+            state = state,
+            lists = lists,
+            activeList = activeList,
+            activeEntries = activeEntries,
+            listState = listState,
+            overviewScrollState = overviewScrollState,
+            onAction = onAction,
+            onOpenCreateList = { showCreateListDialog = true },
+            onOpenCollectionDraw = onOpenCollectionDraw,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
     }
     if (showCreateListDialog) {
         CreateCustomListDialog(
@@ -149,12 +156,59 @@ fun MediaCompanionScreen(
 }
 
 @Composable
+@Suppress("LongParameterList")
+private fun MediaCompanionBody(
+    state: MainUiState,
+    lists: List<CatalogListSummary>,
+    activeList: CatalogListSummary?,
+    activeEntries: List<RankedCatalogEntry>,
+    listState: LazyListState,
+    overviewScrollState: ScrollState,
+    onAction: (MainAction) -> Unit,
+    onOpenCreateList: () -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    if (activeList == null) {
+        ListsOverviewPane(
+            state = state,
+            lists = lists,
+            overviewScrollState = overviewScrollState,
+            onOpenList = { onAction(MainAction.SelectCatalogCollection(it)) },
+            onRankList = { onAction(MainAction.StartRankingSession(it)) },
+            onOpenCreateList = onOpenCreateList,
+        )
+    } else {
+        RankedListDetailPane(
+            state = state,
+            activeList = activeList,
+            rankedEntries = activeEntries,
+            listState = listState,
+            onAction = onAction,
+            onOpenCollectionDraw = onOpenCollectionDraw,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+    }
+}
+
+@Composable
 private fun ListsTopHeaderBar(
     countBadge: String,
+    showBackToHome: Boolean,
+    onBackToHome: () -> Unit,
     onOpenSearch: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    RocheTopHeader(title = "Lists", badgeText = countBadge) {
+    RocheTopHeader(
+        title = "Lists",
+        badgeText = countBadge,
+        navigationAction =
+            if (showBackToHome) {
+                { UnpinnedTabBackButton(onBack = onBackToHome) }
+            } else {
+                null
+            },
+    ) {
         RocheIconActionButton(
             contentDescription = "Search",
             outlined = true,
@@ -171,6 +225,7 @@ private fun ListsTopHeaderBar(
 private fun ListsOverviewPane(
     state: MainUiState,
     lists: List<CatalogListSummary>,
+    overviewScrollState: ScrollState,
     onOpenList: (String) -> Unit,
     onRankList: (String) -> Unit,
     onOpenCreateList: () -> Unit,
@@ -206,7 +261,7 @@ private fun ListsOverviewPane(
         Column(
             modifier =
                 Modifier.fillMaxSize()
-                    .verticalScroll(rememberScrollState())
+                    .verticalScroll(overviewScrollState)
                     .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -574,7 +629,6 @@ private fun RankedListDetailPane(
         }
     val canEditManualList = isEditableManualUserList(activeList)
     val activeDraw = state.catalog.generatorFor(activeList.collectionId)?.currentDraw
-    val readableIds = remember(state.allEntries) { state.allEntries.mapTo(HashSet()) { it.id } }
 
     Column(modifier = Modifier.fillMaxSize()) {
         ListDetailSubHeader(
@@ -597,7 +651,7 @@ private fun RankedListDetailPane(
             activeDraw = activeDraw,
             canEditManualList = canEditManualList,
             rankedEntries = filteredEntries,
-            readableIds = readableIds,
+            readableIds = state.readableEntryIds,
             listState = listState,
             onAction = onAction,
             onOpenCollectionDraw = onOpenCollectionDraw,
@@ -697,14 +751,14 @@ private fun ListTierFilterStrip(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        SoftStripTab(
+        RocheStripTab(
             label = "All (${formatCompactInt(totalCount)})",
             selected = selectedTier == null,
             onClick = { onSelectTier(null) },
             modifier = Modifier.testTag("list_tier_all"),
         )
         tierCounts.forEach { (tier, count) ->
-            SoftStripTab(
+            RocheStripTab(
                 label = "$tier ($count)",
                 selected = selectedTier == tier,
                 onClick = { onSelectTier(tier) },

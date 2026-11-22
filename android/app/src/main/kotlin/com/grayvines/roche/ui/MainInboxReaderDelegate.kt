@@ -241,6 +241,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         val prevEntry = host.latestEntries().firstOrNull { it.id == entryId }
         val wasCached = prevEntry?.isCachedOffline == true
         val cached = host.repository.toggleOfflineCache(entryId)
+        host.refreshOfflineSizes()
         if (cached && host.currentTransientState().selectedReaderEntryId == entryId) {
             host.repository.hydrateItemContentIfNeeded(entryId)?.let { content ->
                 host.applyReaderContentIfActive(entryId, content)
@@ -248,14 +249,23 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         }
         val entry = host.latestEntries().firstOrNull { it.id == entryId } ?: prevEntry
         val isAudio = entry?.contentType == ContentType.AUDIO
+        if (wasCached && !cached) {
+            val evictedLabel = if (isAudio) "Removed episode download" else "Removed offline copy"
+            val titlePart = entry?.title?.take(SNACKBAR_TITLE_LIMIT)?.let { " · $it" }.orEmpty()
+            host.showUndoAction(
+                UndoActionEvent(
+                    message = "$evictedLabel$titlePart",
+                    kind = UndoActionKind.RestoreOfflineCache(entryId),
+                )
+            )
+            return
+        }
         val msg =
             when {
                 cached && isAudio -> "Downloaded episode for offline playback"
                 cached -> "Cached local copy"
-                !wasCached && isAudio -> "Failed to download episode for offline playback"
-                !wasCached -> "Failed to cache offline copy"
-                isAudio -> "Deleted local episode download"
-                else -> "Removed local offline copy"
+                isAudio -> "Failed to download episode for offline playback"
+                else -> "Failed to cache offline copy"
             }
         host.showStatusMessage(msg)
     }
@@ -263,6 +273,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
     private suspend fun performCacheOffline(entryId: String) {
         val prevEntry = host.latestEntries().firstOrNull { it.id == entryId }
         val cached = host.repository.cacheEntryOffline(entryId)
+        host.refreshOfflineSizes()
         if (cached && host.currentTransientState().selectedReaderEntryId == entryId) {
             host.repository.hydrateItemContentIfNeeded(entryId)?.let { content ->
                 host.applyReaderContentIfActive(entryId, content)
@@ -322,30 +333,70 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                 statusBanner = null,
                 messageSequence = current.messageSequence + 1,
                 undoEvent =
-                    UndoArchiveEvent(
-                        itemId = entry.id,
-                        previousStatus = previousStatus,
-                        previousReadAt = previousReadAt,
-                        batchSnapshots = listOfNotNull(snapshot),
+                    UndoActionEvent(
                         message = "$label · ${entry.title.take(SNACKBAR_TITLE_LIMIT)}",
+                        kind =
+                            UndoActionKind.RestoreEntryArchive(
+                                itemId = entry.id,
+                                previousStatus = previousStatus,
+                                previousReadAt = previousReadAt,
+                            ),
                     ),
             )
         }
     }
 
     private suspend fun performUndoArchive() {
-        val pending = host.currentTransientState().undoEvent ?: return
-        if (pending.batchSnapshots.size > 1) {
-            host.repository.restoreArchiveSnapshots(pending.batchSnapshots)
-            host.showStatusMessage("Restored ${pending.batchSnapshots.size} entries")
-        } else {
-            host.repository.restoreStatus(
-                itemId = pending.itemId,
-                status = pending.previousStatus,
-                readAt = pending.previousReadAt,
-            )
-            host.showStatusMessage("Restored entry")
+        var pending: UndoActionEvent? = null
+        host.updateTransient { current ->
+            pending = current.undoEvent
+            if (current.undoEvent != null) current.copy(undoEvent = null) else current
         }
+        val event = pending ?: return
+        runSuspendCatching { executeUndoKind(event.kind) }
+            .onFailure { err ->
+                host.showStatusMessage("Could not undo (${err.message ?: "error"})")
+            }
+    }
+
+    private suspend fun executeUndoKind(kind: UndoActionKind) {
+        when (kind) {
+            is UndoActionKind.RestoreEntryArchive -> {
+                host.repository.restoreStatus(
+                    itemId = kind.itemId,
+                    status = kind.previousStatus,
+                    readAt = kind.previousReadAt,
+                )
+                host.showStatusMessage("Restored entry")
+            }
+            is UndoActionKind.RestoreBatchArchive -> {
+                host.repository.restoreArchiveSnapshots(kind.batchSnapshots)
+                host.showStatusMessage("Restored ${kind.batchSnapshots.size} entries")
+            }
+            is UndoActionKind.RestoreCollectionEntry -> {
+                host.repository.catalog.addCollectionEntry(kind.collectionId, kind.entryId)
+                host.showStatusMessage("Restored to ${kind.label}")
+            }
+            is UndoActionKind.RestoreQueueItem -> {
+                restoreQueueItemAtIndex(kind.entryId, kind.previousIndex)
+                host.showStatusMessage("Restored to Queue")
+            }
+            is UndoActionKind.RestoreOfflineCache -> {
+                val restored = host.repository.cacheEntryOffline(kind.entryId)
+                host.refreshOfflineSizes()
+                val msg = if (restored) "Restored local offline copy" else "Could not restore copy"
+                host.showStatusMessage(msg)
+            }
+        }
+    }
+
+    private suspend fun restoreQueueItemAtIndex(entryId: String, previousIndex: Int) {
+        host.settingsRepository.update { current ->
+            val next = current.queueItemIds.filterNot { it == entryId }.toMutableList()
+            next.add(previousIndex.coerceIn(0, next.size), entryId)
+            current.copy(queueItemIds = next)
+        }
+        host.playbackOrchestrator.syncActivePlayerQueueState(host.playerController)
     }
 
     private suspend fun performArchiveVisibleEntries() {
@@ -376,21 +427,12 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         host.cleanupRemovedEntries(archivedIds)
         val archivedCount = snapshots.size
         val noun = entryCountNoun(archivedCount)
-        val first = snapshots.first()
-        host.updateTransient {
-            it.copy(
-                statusBanner = null,
-                messageSequence = it.messageSequence + 1,
-                undoEvent =
-                    UndoArchiveEvent(
-                        itemId = first.itemId,
-                        previousStatus = first.previousStatus,
-                        previousReadAt = first.previousReadAt,
-                        batchSnapshots = snapshots,
-                        message = "Archived $archivedCount $noun",
-                    ),
+        host.showUndoAction(
+            UndoActionEvent(
+                message = "Archived $archivedCount $noun",
+                kind = UndoActionKind.RestoreBatchArchive(snapshots),
             )
-        }
+        )
     }
 
     private suspend fun performSaveUrl(
@@ -546,12 +588,29 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
     }
 
     private suspend fun performRemoveFromQueue(entryId: String, showBanner: Boolean) {
+        var previousIndex = -1
         host.settingsRepository.update { current ->
+            previousIndex = current.queueItemIds.indexOf(entryId)
             current.copy(queueItemIds = current.queueItemIds.filterNot { it == entryId })
         }
         host.playbackOrchestrator.syncActivePlayerQueueState(host.playerController)
         host.updateTransient { it.copy(contextSheetEntryId = null) }
-        if (showBanner) {
+        if (showBanner && previousIndex >= 0) {
+            val titlePart =
+                host
+                    .latestEntries()
+                    .firstOrNull { it.id == entryId }
+                    ?.title
+                    ?.take(SNACKBAR_TITLE_LIMIT)
+                    ?.let { " · $it" }
+                    .orEmpty()
+            host.showUndoAction(
+                UndoActionEvent(
+                    message = "Removed from Queue$titlePart",
+                    kind = UndoActionKind.RestoreQueueItem(entryId, previousIndex),
+                )
+            )
+        } else if (showBanner) {
             host.showStatusMessage("Removed from Queue")
         }
     }

@@ -1,5 +1,6 @@
 package com.grayvines.roche.ui
 
+import com.grayvines.roche.data.WorkspaceSearchResult
 import com.grayvines.roche.model.AppTab
 
 internal fun reduceUiAction(
@@ -31,11 +32,12 @@ private fun reduceNavigationUiAction(
                         },
                     selectedReaderEntryId = null,
                     readerContent = null,
-                    catalogDetailEntryId = null,
+                    catalogDetailStack = emptyList(),
                     selectedFeedId = null,
                     selectedTag = null,
                     scopeOriginTab = null,
                 )
+        MainAction.ResetSettingsToHub -> state
         is MainAction.SelectFilter -> state.copy(activeFilter = action.filter)
         is MainAction.FilterByTag ->
             state
@@ -93,7 +95,7 @@ private fun reduceOverlayUiAction(
                 isSearchOpen = true,
                 contextSheetEntryId = null,
                 feedContextSheetId = null,
-                catalogDetailEntryId = null,
+                catalogDetailStack = emptyList(),
                 isAddSheetOpen = false,
             )
         MainAction.CloseSearch -> state.clearSearch()
@@ -131,7 +133,7 @@ private fun reduceOpenReader(
         readerContent = state.readerContent?.takeIf { it.itemId == action.entryId },
         hydratingEntryIds = state.hydratingEntryIds + action.entryId,
         contextSheetEntryId = null,
-        catalogDetailEntryId = null,
+        catalogDetailStack = emptyList(),
         isPlayerFullscreenOpen =
             if (action.forceArticleView) false else state.isPlayerFullscreenOpen,
         isPlayerSpeedSheetOpen =
@@ -177,11 +179,27 @@ private fun reduceCatalogUiAction(
             state.copy(selectedCatalogCollectionId = action.collectionId)
         is MainAction.SelectWantCollection ->
             state.copy(selectedWantCollectionId = action.collectionId)
-        is MainAction.OpenCatalogDetailSheet -> state.copy(catalogDetailEntryId = action.entryId)
-        MainAction.CloseCatalogDetailSheet -> state.copy(catalogDetailEntryId = null)
+        is MainAction.LaunchCollectionDraw,
+        is MainAction.EnrichAndLaunchMusicDraw -> state
+        else -> reduceCatalogSheetUiAction(state, action)
+    }
+
+private fun reduceCatalogSheetUiAction(
+    state: TransientUiState,
+    action: MainAction.CatalogUi,
+): TransientUiState =
+    when (action) {
+        is MainAction.OpenCatalogDetailSheet ->
+            state.copy(
+                catalogDetailStack =
+                    pushCatalogDetailEntry(state.catalogDetailStack, action.entryId)
+            )
+        MainAction.PopCatalogDetailSheet ->
+            state.copy(catalogDetailStack = state.catalogDetailStack.dropLast(1))
+        MainAction.CloseCatalogDetailSheet -> state.copy(catalogDetailStack = emptyList())
         is MainAction.OpenQuickLogSheet ->
             state.copy(
-                catalogDetailEntryId = null,
+                catalogDetailStack = emptyList(),
                 isQuickLogSheetOpen = true,
                 quickLogDefaultWant = action.defaultToWant,
                 quickLogTargetCollectionId = action.targetCollectionId,
@@ -205,7 +223,21 @@ private fun reduceCatalogUiAction(
             state.copy(drawNoteDialog = DrawNoteDialogState(action.collectionId, action.mode))
         MainAction.CloseDrawNoteDialog -> state.copy(drawNoteDialog = null)
         MainAction.CloseRankSession -> state.copy(rankSession = null)
+        else -> state
     }
+
+internal fun pushCatalogDetailEntry(stack: List<String>, entryId: String): List<String> {
+    if (entryId.isBlank()) return stack
+    if (stack.lastOrNull() == entryId) return stack
+    val existingIdx = stack.indexOf(entryId)
+    val next =
+        if (existingIdx >= 0) {
+            stack.subList(0, existingIdx + 1)
+        } else {
+            (stack + entryId).takeLast(MAX_CATALOG_DETAIL_STACK_DEPTH)
+        }
+    return next
+}
 
 private fun reduceOpenCompanionSection(
     state: TransientUiState,
@@ -242,7 +274,7 @@ private fun reduceOpenCompanionSection(
                 },
             selectedReaderEntryId = null,
             readerContent = null,
-            catalogDetailEntryId = null,
+            catalogDetailStack = emptyList(),
             selectedFeedId = null,
             selectedTag = null,
             scopeOriginTab = null,
@@ -254,6 +286,8 @@ private fun reduceUpdateSearchQuery(state: TransientUiState, query: String): Tra
     return state.copy(
         searchQuery = query,
         deepSearchQuery = if (clean.isEmpty()) "" else state.deepSearchQuery,
-        deepSearchResults = if (clean.isEmpty()) emptyList() else state.deepSearchResults,
+        workspaceSearch = if (clean.isEmpty()) WorkspaceSearchResult() else state.workspaceSearch,
     )
 }
+
+private const val MAX_CATALOG_DETAIL_STACK_DEPTH = 12

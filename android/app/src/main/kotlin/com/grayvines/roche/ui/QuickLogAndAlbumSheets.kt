@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.ui.components.RocheStripTab
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.components.SheetActionFooter
 import com.grayvines.roche.ui.theme.LocalRocheColors
@@ -369,7 +370,7 @@ private fun QuickLogSelectorsSection(
             horizontalArrangement = Arrangement.spacedBy(2.dp),
         ) {
             loggableKinds.forEach { kind ->
-                SoftStripTab(
+                RocheStripTab(
                     label = kind.displayLabel,
                     selected = selectedKind == kind,
                     onClick = { onSelectKind(kind) },
@@ -379,7 +380,7 @@ private fun QuickLogSelectorsSection(
         if (!addToWant && !addToListOnly) {
             Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                 ConsumptionStatus.entries.forEach { status ->
-                    SoftStripTab(
+                    RocheStripTab(
                         label = status.displayLabel,
                         selected = selectedStatus == status,
                         onClick = { onSelectStatus(status) },

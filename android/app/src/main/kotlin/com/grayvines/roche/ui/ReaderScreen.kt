@@ -77,7 +77,7 @@ import com.grayvines.roche.reader.ArticleBlock
 import com.grayvines.roche.reader.ArticleBlockCache
 import com.grayvines.roche.reader.mapBlockHeadingIndices
 import com.grayvines.roche.reader.stripInlineHtmlToPlainText
-import com.grayvines.roche.ui.components.FilingCabinetIcon
+import com.grayvines.roche.ui.components.CompactStarAndArchiveButtons
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.MoreDotsIcon
@@ -86,7 +86,6 @@ import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.SiteFaviconBadge
-import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
@@ -1104,43 +1103,6 @@ private fun ReaderSectionsOutlineList(
                     )
                 }
             }
-        }
-    }
-}
-
-@Composable
-internal fun CompactStarAndArchiveButtons(
-    entry: InboxEntry,
-    tagPrefix: String,
-    onToggleStar: () -> Unit,
-    onToggleArchive: () -> Unit,
-    outlined: Boolean = true,
-) {
-    val colors = LocalRocheColors.current
-    val starTint = if (entry.isFavorite) colors.accentEcru else colors.textSecondary
-    val starDesc = if (entry.isFavorite) "Remove Star" else "Star Entry"
-    val archiveDesc = if (entry.isArchived) "Unarchive to Inbox" else "Archive Entry"
-
-    Row(horizontalArrangement = Arrangement.spacedBy(if (outlined) 6.dp else 0.dp)) {
-        RocheIconActionButton(
-            contentDescription = starDesc,
-            outlined = outlined,
-            onClick = onToggleStar,
-            modifier = Modifier.testTag("${tagPrefix}_star_btn"),
-        ) {
-            StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 16.dp)
-        }
-        RocheIconActionButton(
-            contentDescription = archiveDesc,
-            outlined = outlined,
-            onClick = onToggleArchive,
-            modifier = Modifier.testTag("${tagPrefix}_archive_btn"),
-        ) {
-            FilingCabinetIcon(
-                tint = colors.textSecondary,
-                isArchived = entry.isArchived,
-                size = 16.dp,
-            )
         }
     }
 }

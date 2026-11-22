@@ -1,5 +1,6 @@
 package com.grayvines.roche.ui
 
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
@@ -158,7 +159,9 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                 }
             }
         if (nextSession != null) {
-            host.updateTransient { it.copy(rankSession = nextSession, catalogDetailEntryId = null) }
+            host.updateTransient {
+                it.copy(rankSession = nextSession, catalogDetailStack = emptyList())
+            }
         }
         return nextSession != null
     }
@@ -415,7 +418,12 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
 
     private suspend fun performRemoveWantEntry(collectionId: String, entryId: String) {
         val meta = host.repository.catalog.resolveCollectionRankMeta(collectionId)
-        val label = if (meta?.scopeCollectionId != null) "Want Queue" else meta?.title ?: "list"
+        val label =
+            when {
+                collectionId == STARRED_COLLECTION_ID -> "Stars"
+                meta?.scopeCollectionId != null -> "Want Queue"
+                else -> meta?.title ?: "list"
+            }
         runSuspendCatching {
             host.repository.catalog.removeCollectionEntry(collectionId, entryId)
         }
@@ -423,7 +431,12 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                 host.updateTransient { cur ->
                     cur.copy(optimisticFavorites = cur.optimisticFavorites - entryId)
                 }
-                host.showStatusMessage("Removed from $label")
+                host.showUndoAction(
+                    UndoActionEvent(
+                        message = "Removed from $label",
+                        kind = UndoActionKind.RestoreCollectionEntry(collectionId, entryId, label),
+                    )
+                )
             }
             .onFailure { err ->
                 host.showStatusMessage("Could not remove (${err.message ?: "error"})")

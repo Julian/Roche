@@ -17,6 +17,8 @@ internal interface MainDelegateHost {
 
     fun showStatusMessage(message: String)
 
+    fun showUndoAction(event: UndoActionEvent)
+
     suspend fun latestEntries(): List<InboxEntry>
 
     suspend fun cleanupRemovedEntries(removedIds: Set<String>)
@@ -29,10 +31,18 @@ internal interface InboxReaderHost : MainDelegateHost {
     fun cancelDeepSearch()
 
     fun applyReaderContentIfActive(entryId: String, content: ReaderItemContent)
+
+    fun refreshOfflineSizes()
 }
 
 internal interface SyncFeedHost : MainDelegateHost {
     fun tryAcquireSyncLock(): Boolean
+
+    fun isManualRefreshing(): Boolean
+
+    fun setManualRefreshing(refreshing: Boolean)
+
+    suspend fun awaitSyncFinished()
 
     fun refreshLocalNetworkTier()
 

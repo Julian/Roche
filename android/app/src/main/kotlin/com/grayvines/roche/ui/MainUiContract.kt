@@ -3,8 +3,10 @@ package com.grayvines.roche.ui
 import com.grayvines.roche.data.ArchiveStateSnapshot
 import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.RepositorySnapshot
-import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.SyncStatusState
+import com.grayvines.roche.data.WorkspaceSearchResult
 import com.grayvines.roche.data.catalog.CatalogSnapshot
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
@@ -26,6 +28,7 @@ import com.grayvines.roche.model.ThemeMode
 import com.grayvines.roche.playback.PlayerDrawerTab
 import com.grayvines.roche.playback.findNextQueuedAudioEntry
 import com.grayvines.roche.ranking.RankClusterCandidate
+import java.util.Locale
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -68,13 +71,43 @@ data class ActiveRankSessionUiState(
     val settlement: RankSettlementSummary? = null,
 )
 
-data class UndoArchiveEvent(
-    val itemId: String,
-    val previousStatus: ItemStatus,
+sealed interface UndoActionKind {
+    data class RestoreEntryArchive(
+        val itemId: String,
+        val previousStatus: ItemStatus,
+        val previousReadAt: String? = null,
+    ) : UndoActionKind
+
+    data class RestoreBatchArchive(val batchSnapshots: List<ArchiveStateSnapshot>) : UndoActionKind
+
+    data class RestoreCollectionEntry(
+        val collectionId: String,
+        val entryId: String,
+        val label: String,
+    ) : UndoActionKind
+
+    data class RestoreQueueItem(
+        val entryId: String,
+        val previousIndex: Int,
+    ) : UndoActionKind
+
+    data class RestoreOfflineCache(val entryId: String) : UndoActionKind
+}
+
+data class UndoActionEvent(
     val message: String,
-    val previousReadAt: String? = null,
-    val batchSnapshots: List<ArchiveStateSnapshot> = emptyList(),
-)
+    val kind: UndoActionKind,
+) {
+    val itemId: String?
+        get() =
+            when (kind) {
+                is UndoActionKind.RestoreEntryArchive -> kind.itemId
+                is UndoActionKind.RestoreBatchArchive -> kind.batchSnapshots.firstOrNull()?.itemId
+                is UndoActionKind.RestoreCollectionEntry -> kind.entryId
+                is UndoActionKind.RestoreQueueItem -> kind.entryId
+                is UndoActionKind.RestoreOfflineCache -> kind.entryId
+            }
+}
 
 data class MainUiState(
     val activeTab: AppTab = AppTab.HOME,
@@ -97,9 +130,19 @@ data class MainUiState(
     val prefilledShareIsFeed: Boolean = false,
     val isInitialLoading: Boolean = false,
     val isSyncing: Boolean = false,
+    val isManualRefreshing: Boolean = false,
+    val syncStatus: SyncStatusState = SyncStatusState(),
     val visibleEntries: List<InboxEntry> = emptyList(),
+    val unscopedInboxEntries: List<InboxEntry> =
+        if (selectedFeedId == null && selectedTag == null) visibleEntries else emptyList(),
+    val entriesByFeedId: Map<String, List<InboxEntry>> = emptyMap(),
+    val entriesByTag: Map<String, List<InboxEntry>> = emptyMap(),
+    val hasPrecomputedBuckets: Boolean = false,
     val searchResults: List<InboxEntry> = emptyList(),
+    val workspaceSearch: WorkspaceSearchResult = WorkspaceSearchResult(),
     val allEntries: List<InboxEntry> = emptyList(),
+    val entryById: Map<String, InboxEntry> = allEntries.associateBy { it.id },
+    val readableEntryIds: Set<String> = entryById.keys,
     val feeds: List<FeedItem> = emptyList(),
     val tags: List<TagItem> = emptyList(),
     val activePeers: List<PeerNodeDto> = emptyList(),
@@ -112,12 +155,17 @@ data class MainUiState(
     val archivedFeeds: List<FeedItem> = computeArchivedFeeds(feeds),
     val starredEntries: List<InboxEntry> = computeStarredEntries(allEntries),
     val offlineEntries: List<InboxEntry> = computeOfflineEntries(allEntries),
+    val offlineBytesByEntryId: Map<String, Long> = emptyMap(),
+    val totalOfflineCacheBytes: Long = 0L,
     val catalog: CatalogSnapshot = CatalogSnapshot(),
+    val catalogUrlsById: Map<String, String> = computeCatalogUrlsById(catalog),
+    val resolvingMusicEntryId: String? = null,
     val companionSubTab: CompanionSubTab = CompanionSubTab.LISTS,
     val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
     val catalogDetailEntryId: String? = null,
+    val catalogDetailStack: List<String> = listOfNotNull(catalogDetailEntryId),
     val isQuickLogSheetOpen: Boolean = false,
     val quickLogDefaultWant: Boolean = false,
     val quickLogTargetCollectionId: String? = null,
@@ -131,7 +179,8 @@ data class MainUiState(
     val isPlayerFullscreenOpen: Boolean = false,
     val isPlayerSpeedSheetOpen: Boolean = false,
     val activePlayerDrawerTab: PlayerDrawerTab? = null,
-    val undoEvent: UndoArchiveEvent? = null,
+    val settingsHubResetTick: Int = 0,
+    val undoEvent: UndoActionEvent? = null,
     val statusBanner: String? = null,
     val messageSequence: Long = 0L,
 ) {
@@ -143,7 +192,8 @@ data class MainUiState(
 
     val activeReaderEntry: InboxEntry?
         get() {
-            val base = allEntries.firstOrNull { it.id == selectedReaderEntryId } ?: return null
+            val id = selectedReaderEntryId ?: return null
+            val base = entryById[id] ?: return null
             val full =
                 readerContent?.takeIf { it.itemId == base.id }
                     ?: activePlayerNotesContent?.takeIf { it.itemId == base.id }
@@ -151,7 +201,7 @@ data class MainUiState(
         }
 
     val contextSheetEntry: InboxEntry?
-        get() = allEntries.firstOrNull { it.id == contextSheetEntryId }
+        get() = contextSheetEntryId?.let { entryById[it] }
 
     val contextSheetFeed: FeedItem?
         get() = feeds.firstOrNull { it.id == feedContextSheetId }
@@ -161,11 +211,63 @@ data class MainUiState(
 
     val isReaderHydrating: Boolean
         get() = selectedReaderEntryId != null && selectedReaderEntryId in hydratingEntryIds
+
+    val hasOpenModalSheet: Boolean
+        get() =
+            contextSheetEntryId != null ||
+                feedContextSheetId != null ||
+                isAddSheetOpen ||
+                drawNoteDialog != null ||
+                rankSession != null ||
+                catalogDetailEntryId != null ||
+                isQuickLogSheetOpen ||
+                isPlayerSpeedSheetOpen
+}
+
+fun MainUiState.isUnpinnedDestination(tab: AppTab): Boolean =
+    tab != AppTab.HOME && tab !in AppTab.normalizeBottomTabs(settings.bottomNavTabs)
+
+fun MainUiState.entriesForScope(feedId: String?, tag: String?): List<InboxEntry> =
+    when {
+        tag != null -> resolveScopedTagEntries(tag)
+        feedId != null -> resolveScopedFeedEntries(feedId)
+        else -> resolveUnscopedFallbackEntries()
+    }
+
+private fun MainUiState.resolveScopedTagEntries(tag: String): List<InboxEntry> {
+    val normalized = tag.lowercase(Locale.US)
+    if (hasPrecomputedBuckets) return entriesByTag[normalized].orEmpty()
+    return entriesByTag[normalized]
+        ?: if (selectedTag?.equals(tag, ignoreCase = true) == true) {
+            visibleEntries
+        } else {
+            buildInboxScopeBuckets(allEntries, activeFilter).entriesByTag[normalized].orEmpty()
+        }
+}
+
+private fun MainUiState.resolveScopedFeedEntries(feedId: String): List<InboxEntry> {
+    if (hasPrecomputedBuckets) return entriesByFeedId[feedId].orEmpty()
+    return entriesByFeedId[feedId]
+        ?: if (selectedFeedId == feedId) {
+            visibleEntries
+        } else {
+            buildInboxScopeBuckets(allEntries, activeFilter).entriesByFeedId[feedId].orEmpty()
+        }
+}
+
+private fun MainUiState.resolveUnscopedFallbackEntries(): List<InboxEntry> {
+    if (hasPrecomputedBuckets) return unscopedInboxEntries
+    if (unscopedInboxEntries.isNotEmpty()) return unscopedInboxEntries
+    return if (selectedFeedId == null && selectedTag == null && visibleEntries.isNotEmpty()) {
+        visibleEntries
+    } else {
+        buildInboxScopeBuckets(allEntries, activeFilter).unscopedEntries
+    }
 }
 
 fun MainUiState.resolveActivePlayerEntry(activeAudioEntryId: String?): InboxEntry? {
     val activeId = activeAudioEntryId ?: return null
-    val base = allEntries.firstOrNull { it.id == activeId } ?: return null
+    val base = entryById[activeId] ?: return null
     val full =
         activePlayerNotesContent?.takeIf { it.itemId == base.id }
             ?: readerContent?.takeIf { it.itemId == base.id }
@@ -226,6 +328,8 @@ sealed interface MainAction {
     sealed interface CatalogMutation : Mutation
 
     data class SelectTab(val tab: AppTab) : NavigationUi
+
+    data object ResetSettingsToHub : NavigationUi
 
     data class SelectFilter(val filter: InboxFilter) : NavigationUi
 
@@ -378,6 +482,8 @@ sealed interface MainAction {
 
     data object SyncNow : FeedSyncAction
 
+    data object ManualRefresh : FeedSyncAction
+
     data object PollFeedsOnDeviceNow : FeedSyncAction
 
     data class SyncWithServerConfig(
@@ -418,7 +524,13 @@ sealed interface MainAction {
 
     data class OpenCatalogDetailSheet(val entryId: String) : CatalogUi
 
+    data object PopCatalogDetailSheet : CatalogUi
+
     data object CloseCatalogDetailSheet : CatalogUi
+
+    data class LaunchCollectionDraw(val draw: CollectionDrawSnapshot) : CatalogUi
+
+    data class EnrichAndLaunchMusicDraw(val draw: CollectionDrawSnapshot) : CatalogUi
 
     data class OpenQuickLogSheet(
         val defaultToWant: Boolean = false,
@@ -521,7 +633,7 @@ internal data class TransientUiState(
     val isSearchOpen: Boolean = false,
     val searchQuery: String = "",
     val deepSearchQuery: String = "",
-    val deepSearchResults: List<InboxEntry> = emptyList(),
+    val workspaceSearch: WorkspaceSearchResult = WorkspaceSearchResult(),
     val optimisticFavorites: Map<String, Boolean> = emptyMap(),
     val selectedTag: String? = null,
     val selectedFeedId: String? = null,
@@ -541,7 +653,7 @@ internal data class TransientUiState(
     val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
-    val catalogDetailEntryId: String? = null,
+    val catalogDetailStack: List<String> = emptyList(),
     val isQuickLogSheetOpen: Boolean = false,
     val quickLogDefaultWant: Boolean = false,
     val quickLogTargetCollectionId: String? = null,
@@ -556,10 +668,13 @@ internal data class TransientUiState(
     val isPlayerSpeedSheetOpen: Boolean = false,
     val activePlayerDrawerTab: PlayerDrawerTab? = null,
     val localNetworkTier: NetworkTier = NetworkTier.WIFI,
-    val undoEvent: UndoArchiveEvent? = null,
+    val undoEvent: UndoActionEvent? = null,
     val statusBanner: String? = null,
     val messageSequence: Long = 0L,
-)
+) {
+    val catalogDetailEntryId: String?
+        get() = catalogDetailStack.lastOrNull()
+}
 
 @Serializable
 internal data class SavedNavigationUiState(
@@ -618,7 +733,7 @@ internal fun TransientUiState.clearSearch(): TransientUiState =
         isSearchOpen = false,
         searchQuery = "",
         deepSearchQuery = "",
-        deepSearchResults = emptyList(),
+        workspaceSearch = WorkspaceSearchResult(),
     )
 
 internal fun InboxEntry.mergeReaderContent(full: ReaderItemContent?): InboxEntry {
@@ -669,258 +784,142 @@ internal fun updateBottomNavSlot(
     }
 }
 
+@Suppress("LongMethod", "LongParameterList")
+internal fun assembleMainUiState(
+    snapshot: RepositorySnapshot,
+    inboxDerived: InboxFeedsDerivedState,
+    catalogProjections: CatalogProjections,
+    searchProjection: SearchProjection,
+    settings: Settings,
+    local: TransientUiState,
+    resolvingMusicEntryId: String?,
+    settingsHubResetTick: Int,
+): MainUiState {
+    val isSyncing = local.isSyncing || inboxDerived.isSyncActive
+    val visible =
+        inboxDerived.scopeBuckets.resolveVisible(
+            selectedFeedId = local.selectedFeedId,
+            selectedTag = local.selectedTag,
+        )
+    return MainUiState(
+        activeTab = local.activeTab,
+        activeFilter = local.activeFilter,
+        isSearchOpen = local.isSearchOpen,
+        searchQuery = local.searchQuery,
+        selectedTag = local.selectedTag,
+        selectedFeedId = local.selectedFeedId,
+        scopeOriginTab = local.scopeOriginTab,
+        selectedReaderEntryId = local.selectedReaderEntryId,
+        readerContent = local.readerContent,
+        activePlayerNotesContent = local.activePlayerNotesContent,
+        hydratingEntryIds = local.hydratingEntryIds,
+        inFlightOfflineEntryIds = inboxDerived.inFlightOfflineEntryIds,
+        contextSheetEntryId = local.contextSheetEntryId,
+        feedContextSheetId = local.feedContextSheetId,
+        isAddSheetOpen = local.isAddSheetOpen,
+        prefilledShareUrl = local.prefilledShareUrl,
+        prefilledShareTitle = local.prefilledShareTitle,
+        prefilledShareIsFeed = local.prefilledShareIsFeed,
+        isInitialLoading = false,
+        isSyncing = isSyncing,
+        isManualRefreshing = inboxDerived.isManualRefreshing,
+        syncStatus = inboxDerived.syncStatus,
+        visibleEntries = visible,
+        unscopedInboxEntries = inboxDerived.scopeBuckets.unscopedEntries,
+        entriesByFeedId = inboxDerived.scopeBuckets.entriesByFeedId,
+        entriesByTag = inboxDerived.scopeBuckets.entriesByTag,
+        hasPrecomputedBuckets = true,
+        searchResults = searchProjection.results,
+        workspaceSearch = searchProjection.workspaceResult,
+        allEntries = inboxDerived.entryProjections.entries,
+        entryById = inboxDerived.entryProjections.entryById,
+        readableEntryIds = inboxDerived.entryProjections.readableEntryIds,
+        feeds = snapshot.feeds,
+        tags = snapshot.tags,
+        activePeers = snapshot.activePeers,
+        localNetworkTier = local.localNetworkTier,
+        settings = settings.redactedForUi(),
+        hasBearerToken = settings.bearerToken.isNotBlank(),
+        queueEntries = inboxDerived.queueEntries,
+        listeningHistoryEntries = inboxDerived.entryProjections.listeningHistoryEntries,
+        activeFeeds = inboxDerived.feedProjections.activeFeeds,
+        archivedFeeds = inboxDerived.feedProjections.archivedFeeds,
+        starredEntries = inboxDerived.entryProjections.starredEntries,
+        offlineEntries = inboxDerived.entryProjections.offlineEntries,
+        offlineBytesByEntryId = inboxDerived.offlineSizes.bytesByEntryId,
+        totalOfflineCacheBytes = inboxDerived.offlineSizes.totalBytes,
+        catalog = catalogProjections.catalog,
+        catalogUrlsById = catalogProjections.catalogUrlsById,
+        resolvingMusicEntryId = resolvingMusicEntryId,
+        companionSubTab = local.companionSubTab,
+        queueSubTab = local.queueSubTab,
+        selectedCatalogCollectionId = local.selectedCatalogCollectionId,
+        selectedWantCollectionId = local.selectedWantCollectionId,
+        catalogDetailEntryId = local.catalogDetailEntryId,
+        catalogDetailStack = local.catalogDetailStack,
+        isQuickLogSheetOpen = local.isQuickLogSheetOpen,
+        quickLogDefaultWant = local.quickLogDefaultWant,
+        quickLogTargetCollectionId = local.quickLogTargetCollectionId,
+        quickLogTargetCollectionTitle = local.quickLogTargetCollectionTitle,
+        quickLogPrefillKind = local.quickLogPrefillKind,
+        quickLogPrefillTitle = local.quickLogPrefillTitle,
+        quickLogPrefillCreators = local.quickLogPrefillCreators,
+        quickLogPrefillReleaseYear = local.quickLogPrefillReleaseYear,
+        drawNoteDialog = local.drawNoteDialog,
+        rankSession = local.rankSession,
+        isPlayerFullscreenOpen = local.isPlayerFullscreenOpen,
+        isPlayerSpeedSheetOpen = local.isPlayerSpeedSheetOpen,
+        activePlayerDrawerTab = local.activePlayerDrawerTab,
+        settingsHubResetTick = settingsHubResetTick,
+        undoEvent = local.undoEvent,
+        statusBanner = local.statusBanner,
+        messageSequence = local.messageSequence,
+    )
+}
+
 internal fun buildMainUiState(
     snapshot: RepositorySnapshot,
     settings: Settings,
     local: TransientUiState,
     localNetworkTier: NetworkTier = local.localNetworkTier,
-): MainUiState =
-    MainUiStateMemoizer()
-        .build(
-            snapshot = snapshot,
-            settings = settings,
-            local = local,
-            localNetworkTier = localNetworkTier,
+    syncStatus: SyncStatusState = SyncStatusState(),
+): MainUiState {
+    val effectiveEntries = applyOptimisticFavorites(snapshot.entries, local.optimisticFavorites)
+    val entryProjections = buildEntryProjections(effectiveEntries)
+    val scopeBuckets = buildInboxScopeBuckets(effectiveEntries, local.activeFilter)
+    val feedProjections = buildFeedProjections(snapshot.feeds)
+    val normalizedQuery = local.searchQuery.trim().lowercase()
+    val searchResults =
+        resolveMergedSearchResults(
+            entries = effectiveEntries,
+            normalizedQuery = normalizedQuery,
+            deepSearchQuery = local.deepSearchQuery,
+            deepSearchResults = local.workspaceSearch.entries,
         )
-
-internal class MainUiStateMemoizer {
-    private var lastRawEntries: List<InboxEntry>? = null
-    private var lastOptimisticFavorites: Map<String, Boolean> = emptyMap()
-    private var lastEffectiveEntries: List<InboxEntry> = emptyList()
-
-    private var lastVisibleInput: List<InboxEntry>? = null
-    private var lastActiveFilter: InboxFilter? = null
-    private var lastSelectedTag: String? = null
-    private var lastSelectedFeedId: String? = null
-    private var lastVisibleEntries: List<InboxEntry> = emptyList()
-
-    private var lastSearchInput: List<InboxEntry>? = null
-    private var lastNormalizedQuery: String? = null
-    private var lastDeepSearchQuery: String? = null
-    private var lastDeepSearchResults: List<InboxEntry>? = null
-    private var lastSearchResults: List<InboxEntry> = emptyList()
-
-    private var lastQueueInput: List<InboxEntry>? = null
-    private var lastQueueItemIds: List<String>? = null
-    private var lastQueueEntries: List<InboxEntry> = emptyList()
-
-    private var lastDerivedInput: List<InboxEntry>? = null
-    private var lastListeningHistory: List<InboxEntry> = emptyList()
-    private var lastStarredEntries: List<InboxEntry> = emptyList()
-    private var lastOfflineEntries: List<InboxEntry> = emptyList()
-
-    private var lastFeedsInput: List<FeedItem>? = null
-    private var lastActiveFeeds: List<FeedItem> = emptyList()
-    private var lastArchivedFeeds: List<FeedItem> = emptyList()
-
-    internal fun build(
-        snapshot: RepositorySnapshot,
-        settings: Settings,
-        local: TransientUiState,
-        localNetworkTier: NetworkTier = local.localNetworkTier,
-        inFlightOfflineEntryIds: Set<String> = emptySet(),
-    ): MainUiState =
-        synchronized(this) {
-            val effectiveEntries =
-                resolveEffectiveEntries(snapshot.entries, local.optimisticFavorites)
-            val filtered =
-                resolveVisibleEntries(
-                    effectiveEntries = effectiveEntries,
-                    activeFilter = local.activeFilter,
-                    selectedTag = local.selectedTag,
-                    selectedFeedId = local.selectedFeedId,
-                )
-            val searchResults =
-                resolveSearch(
-                    effectiveEntries = effectiveEntries,
-                    normalizedQuery = local.searchQuery.trim().lowercase(),
-                    deepSearchQuery = local.deepSearchQuery,
-                    deepSearchResults = local.deepSearchResults,
-                )
-            resolveEntryProjections(effectiveEntries)
-            resolveFeedProjections(snapshot.feeds)
-            assembleMainUiState(
-                snapshot = snapshot,
-                settings = settings,
-                local = local,
-                localNetworkTier = localNetworkTier,
-                inFlightOfflineEntryIds = inFlightOfflineEntryIds,
-                effectiveEntries = effectiveEntries,
-                filtered = filtered,
-                searchResults = searchResults,
-            )
+    val activeWorkspace =
+        if (normalizedQuery.isNotBlank() && local.deepSearchQuery == normalizedQuery) {
+            local.workspaceSearch
+        } else {
+            WorkspaceSearchResult()
         }
-
-    @Suppress("LongParameterList")
-    private fun assembleMainUiState(
-        snapshot: RepositorySnapshot,
-        settings: Settings,
-        local: TransientUiState,
-        localNetworkTier: NetworkTier,
-        inFlightOfflineEntryIds: Set<String>,
-        effectiveEntries: List<InboxEntry>,
-        filtered: List<InboxEntry>,
-        searchResults: List<InboxEntry>,
-    ): MainUiState =
-        MainUiState(
-            activeTab = local.activeTab,
-            activeFilter = local.activeFilter,
-            isSearchOpen = local.isSearchOpen,
-            searchQuery = local.searchQuery,
-            selectedTag = local.selectedTag,
-            selectedFeedId = local.selectedFeedId,
-            scopeOriginTab = local.scopeOriginTab,
-            selectedReaderEntryId = local.selectedReaderEntryId,
-            readerContent = local.readerContent,
-            activePlayerNotesContent = local.activePlayerNotesContent,
-            hydratingEntryIds = local.hydratingEntryIds,
-            inFlightOfflineEntryIds = inFlightOfflineEntryIds,
-            contextSheetEntryId = local.contextSheetEntryId,
-            feedContextSheetId = local.feedContextSheetId,
-            isAddSheetOpen = local.isAddSheetOpen,
-            prefilledShareUrl = local.prefilledShareUrl,
-            prefilledShareTitle = local.prefilledShareTitle,
-            prefilledShareIsFeed = local.prefilledShareIsFeed,
-            isInitialLoading = false,
-            isSyncing = local.isSyncing,
-            visibleEntries = filtered,
-            searchResults = searchResults,
-            allEntries = effectiveEntries,
-            feeds = snapshot.feeds,
-            tags = snapshot.tags,
-            activePeers = snapshot.activePeers,
-            localNetworkTier = localNetworkTier,
-            settings = settings.redactedForUi(),
-            hasBearerToken = settings.bearerToken.isNotBlank(),
-            queueEntries = resolveQueue(effectiveEntries, settings.queueItemIds),
-            listeningHistoryEntries = lastListeningHistory,
-            activeFeeds = lastActiveFeeds,
-            archivedFeeds = lastArchivedFeeds,
-            starredEntries = lastStarredEntries,
-            offlineEntries = lastOfflineEntries,
-            catalog = snapshot.catalog,
-            companionSubTab = local.companionSubTab,
-            queueSubTab = local.queueSubTab,
-            selectedCatalogCollectionId = local.selectedCatalogCollectionId,
-            selectedWantCollectionId = local.selectedWantCollectionId,
-            catalogDetailEntryId = local.catalogDetailEntryId,
-            isQuickLogSheetOpen = local.isQuickLogSheetOpen,
-            quickLogDefaultWant = local.quickLogDefaultWant,
-            quickLogTargetCollectionId = local.quickLogTargetCollectionId,
-            quickLogTargetCollectionTitle = local.quickLogTargetCollectionTitle,
-            quickLogPrefillKind = local.quickLogPrefillKind,
-            quickLogPrefillTitle = local.quickLogPrefillTitle,
-            quickLogPrefillCreators = local.quickLogPrefillCreators,
-            quickLogPrefillReleaseYear = local.quickLogPrefillReleaseYear,
-            drawNoteDialog = local.drawNoteDialog,
-            rankSession = local.rankSession,
-            isPlayerFullscreenOpen = local.isPlayerFullscreenOpen,
-            isPlayerSpeedSheetOpen = local.isPlayerSpeedSheetOpen,
-            activePlayerDrawerTab = local.activePlayerDrawerTab,
-            undoEvent = local.undoEvent,
-            statusBanner = local.statusBanner,
-            messageSequence = local.messageSequence,
-        )
-
-    private fun resolveEffectiveEntries(
-        rawEntries: List<InboxEntry>,
-        optimisticFavorites: Map<String, Boolean>,
-    ): List<InboxEntry> {
-        if (rawEntries === lastRawEntries && optimisticFavorites == lastOptimisticFavorites) {
-            return lastEffectiveEntries
-        }
-        val computed = applyOptimisticFavorites(rawEntries, optimisticFavorites)
-        lastRawEntries = rawEntries
-        lastOptimisticFavorites = optimisticFavorites
-        lastEffectiveEntries = computed
-        return computed
-    }
-
-    private fun resolveVisibleEntries(
-        effectiveEntries: List<InboxEntry>,
-        activeFilter: InboxFilter,
-        selectedTag: String?,
-        selectedFeedId: String?,
-    ): List<InboxEntry> {
-        val sameScope =
-            activeFilter == lastActiveFilter &&
-                selectedTag == lastSelectedTag &&
-                selectedFeedId == lastSelectedFeedId
-        if (effectiveEntries === lastVisibleInput && sameScope) {
-            return lastVisibleEntries
-        }
-        val computed =
-            RocheRepository.filterEntries(
-                entries = effectiveEntries,
-                filter = activeFilter,
-                searchQuery = "",
-                selectedTag = selectedTag,
-                selectedFeedId = selectedFeedId,
-            )
-        lastVisibleInput = effectiveEntries
-        lastActiveFilter = activeFilter
-        lastSelectedTag = selectedTag
-        lastSelectedFeedId = selectedFeedId
-        lastVisibleEntries = computed
-        return computed
-    }
-
-    private fun resolveSearch(
-        effectiveEntries: List<InboxEntry>,
-        normalizedQuery: String,
-        deepSearchQuery: String,
-        deepSearchResults: List<InboxEntry>,
-    ): List<InboxEntry> {
-        val sameQuery =
-            normalizedQuery == lastNormalizedQuery &&
-                deepSearchQuery == lastDeepSearchQuery &&
-                deepSearchResults === lastDeepSearchResults
-        if (effectiveEntries === lastSearchInput && sameQuery) {
-            return lastSearchResults
-        }
-        val computed =
-            resolveMergedSearchResults(
-                entries = effectiveEntries,
-                normalizedQuery = normalizedQuery,
-                deepSearchQuery = deepSearchQuery,
-                deepSearchResults = deepSearchResults,
-            )
-        lastSearchInput = effectiveEntries
-        lastNormalizedQuery = normalizedQuery
-        lastDeepSearchQuery = deepSearchQuery
-        lastDeepSearchResults = deepSearchResults
-        lastSearchResults = computed
-        return computed
-    }
-
-    private fun resolveQueue(
-        effectiveEntries: List<InboxEntry>,
-        queueItemIds: List<String>,
-    ): List<InboxEntry> {
-        if (effectiveEntries === lastQueueInput && queueItemIds == lastQueueItemIds) {
-            return lastQueueEntries
-        }
-        val computed = computeQueueEntries(effectiveEntries, queueItemIds)
-        lastQueueInput = effectiveEntries
-        lastQueueItemIds = queueItemIds
-        lastQueueEntries = computed
-        return computed
-    }
-
-    private fun resolveEntryProjections(effectiveEntries: List<InboxEntry>) {
-        if (effectiveEntries === lastDerivedInput) return
-        lastDerivedInput = effectiveEntries
-        lastListeningHistory = computeListeningHistory(effectiveEntries)
-        lastStarredEntries = computeStarredEntries(effectiveEntries)
-        lastOfflineEntries = computeOfflineEntries(effectiveEntries)
-    }
-
-    private fun resolveFeedProjections(feeds: List<FeedItem>) {
-        if (feeds === lastFeedsInput) return
-        lastFeedsInput = feeds
-        lastActiveFeeds = computeActiveFeeds(feeds)
-        lastArchivedFeeds = computeArchivedFeeds(feeds)
-    }
+    return assembleMainUiState(
+        snapshot = snapshot,
+        inboxDerived =
+            InboxFeedsDerivedState(
+                entryProjections = entryProjections,
+                scopeBuckets = scopeBuckets,
+                queueEntries = computeQueueEntries(effectiveEntries, settings.queueItemIds),
+                feedProjections = feedProjections,
+                syncStatus = syncStatus,
+            ),
+        catalogProjections = buildCatalogProjections(snapshot.catalog),
+        searchProjection =
+            SearchProjection(results = searchResults, workspaceResult = activeWorkspace),
+        settings = settings,
+        local = local.copy(localNetworkTier = localNetworkTier),
+        resolvingMusicEntryId = null,
+        settingsHubResetTick = 0,
+    )
 }
 
 internal fun applyOptimisticFavorites(

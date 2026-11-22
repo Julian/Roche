@@ -1243,7 +1243,7 @@ class MainViewModelTest {
             assertEquals(1, beforeState.offlineEntries.size)
 
             // Non-list transient UI updates (e.g. context sheet / snackbar) keep derived lists
-            // reference-identical via MainUiStateMemoizer
+            // reference-identical via reactive per-slice Flows
             viewModel.dispatch(MainAction.OpenContextSheet("art-stage-2"))
             val afterSheetOpen = viewModel.uiState.first { it.contextSheetEntryId == "art-stage-2" }
             assertSame(beforeState.visibleEntries, afterSheetOpen.visibleEntries)

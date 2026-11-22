@@ -61,6 +61,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.grayvines.roche.BuildConfig
 import com.grayvines.roche.core.isLoopbackHost
+import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.remote.PeerNodeDto
 import com.grayvines.roche.data.settings.normalizeServerUrl
@@ -70,7 +71,10 @@ import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheSectionHeader
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.RocheColors
 import java.net.URI
+import java.time.Duration
+import java.time.Instant
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -593,7 +597,7 @@ internal fun ServerConnectionStatusCard(
     onHideKeyboard: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val (dotColor, statusText) = resolveServerStatusBadge(state, isConfigured)
+    val health = resolveSyncHealthPresentation(state, isConfigured, colors)
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         RocheSectionHeader(label = "Connection Status")
         RocheSurfaceCard {
@@ -601,13 +605,20 @@ internal fun ServerConnectionStatusCard(
                 modifier = Modifier.padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                ServerStatusHeaderRow(dotColor = dotColor, statusText = statusText)
+                ServerStatusHeaderRow(dotColor = health.dotColor, statusText = health.statusTitle)
                 Text(
                     text = serverUrl.ifBlank { "No server URL configured" },
                     color = colors.textMuted,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 11.5.sp,
                 )
+                val syncError = state.syncStatus.lastError?.takeIf { it.isNotBlank() }
+                if (isConfigured && syncError != null) {
+                    ServerSyncErrorDetailText(
+                        error = syncError,
+                        isAuthError = state.syncStatus.isAuthError,
+                    )
+                }
                 ServerConnectionActionRow(
                     onSyncNow = onSyncNow,
                     onAction = onAction,
@@ -631,28 +642,110 @@ internal fun ServerConnectionStatusCard(
 }
 
 @Composable
-private fun resolveServerStatusBadge(
+private fun ServerSyncErrorDetailText(error: String, isAuthError: Boolean) {
+    val colors = LocalRocheColors.current
+    Text(
+        text = error,
+        color = if (isAuthError) colors.accentIndianRed else colors.accentEcru,
+        fontSize = 12.sp,
+        lineHeight = 16.sp,
+        modifier = Modifier.testTag("server_sync_error_detail"),
+    )
+}
+
+internal data class SyncHealthPresentation(
+    val dotColor: Color,
+    val statusTitle: String,
+    val hubSubtitle: String,
+)
+
+internal fun resolveSyncHealthPresentation(
     state: MainUiState,
     isConfigured: Boolean,
-): Pair<Color, String> {
-    val colors = LocalRocheColors.current
+    colors: RocheColors,
+    now: Instant = Instant.now(),
+): SyncHealthPresentation {
+    val syncStatus = state.syncStatus
     val isOffline = state.localNetworkTier == NetworkTier.OFFLINE
-    val dotColor =
-        when {
-            state.settings.hasUndecryptableToken -> colors.accentIndianRed
-            !isConfigured -> colors.accentEcru
-            isOffline -> colors.accentIndianRed
-            else -> colors.accentVerdigris
-        }
-    val statusText =
-        when {
-            state.settings.hasUndecryptableToken -> "Saved Token Unavailable — Re-pair"
-            !isConfigured -> "Server Not Yet Paired"
-            isOffline -> "Offline · Server Paired"
-            else -> "Paired with Tailnet Server"
-        }
-    return dotColor to statusText
+    val lastSyncedLabel = syncStatus.lastSyncedAtIso?.let { formatRelativeSyncTime(it, now) }
+    val syncError = syncStatus.lastError?.takeIf { it.isNotBlank() }
+    return when {
+        state.settings.hasUndecryptableToken ->
+            SyncHealthPresentation(
+                dotColor = colors.accentIndianRed,
+                statusTitle = "Saved Token Unavailable — Re-pair",
+                hubSubtitle = "Token unavailable · Tap to re-pair",
+            )
+        !isConfigured ->
+            SyncHealthPresentation(
+                dotColor = colors.accentEcru,
+                statusTitle = "Server Not Yet Paired",
+                hubSubtitle = "Tap to pair device or set Server URL",
+            )
+        syncStatus.isAuthError ->
+            SyncHealthPresentation(
+                dotColor = colors.accentIndianRed,
+                statusTitle = "Auth expired — Re-pair",
+                hubSubtitle = "Token rejected · Tap to re-pair",
+            )
+        isOffline ->
+            SyncHealthPresentation(
+                dotColor = colors.accentIndianRed,
+                statusTitle = "Offline · Server Paired",
+                hubSubtitle = "Offline · Local changes queued to sync",
+            )
+        syncError != null ->
+            SyncHealthPresentation(
+                dotColor = colors.accentEcru,
+                statusTitle = "Sync issue",
+                hubSubtitle = "Sync issue · $syncError",
+            )
+        lastSyncedLabel != null ->
+            SyncHealthPresentation(
+                dotColor = colors.accentVerdigris,
+                statusTitle = "Synced $lastSyncedLabel",
+                hubSubtitle = buildSyncedHubSubtitle(lastSyncedLabel, state.activePeers.size),
+            )
+        else ->
+            SyncHealthPresentation(
+                dotColor = colors.accentBlue,
+                statusTitle = "Paired · Not yet synced",
+                hubSubtitle =
+                    if (state.activePeers.isEmpty()) {
+                        "Paired · Tap Sync to verify"
+                    } else {
+                        formatActivePeersSummary(state.activePeers.size)
+                    },
+            )
+    }
 }
+
+internal fun formatRelativeSyncTime(isoTimestamp: String, now: Instant = Instant.now()): String {
+    val parsed = parseIsoInstant(isoTimestamp) ?: return "recently"
+    val minutes = Duration.between(parsed, now).toMinutes().coerceAtLeast(0L)
+    return when {
+        minutes < 1L -> "just now"
+        minutes < MINUTES_PER_HOUR -> "${minutes}m ago"
+        minutes < MINUTES_PER_DAY -> "${minutes / MINUTES_PER_HOUR}h ago"
+        else -> "${minutes / MINUTES_PER_DAY}d ago"
+    }
+}
+
+private fun buildSyncedHubSubtitle(relativeLabel: String, peerCount: Int): String =
+    if (peerCount > 0) {
+        val peerNoun = if (peerCount == 1) "peer" else "peers"
+        "Synced $relativeLabel · $peerCount active $peerNoun"
+    } else {
+        "Synced $relativeLabel"
+    }
+
+private fun formatActivePeersSummary(peerCount: Int): String {
+    val peerNoun = if (peerCount == 1) "peer" else "peers"
+    return "$peerCount active $peerNoun · Cooperative sync"
+}
+
+private const val MINUTES_PER_HOUR = 60L
+private const val MINUTES_PER_DAY = 60L * 24L
 
 @Composable
 private fun ServerStatusHeaderRow(

@@ -3,11 +3,13 @@
 package com.grayvines.roche.ui
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -26,6 +28,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
@@ -57,13 +60,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.DiaryEntryItem
-import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.RankedCatalogEntry
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.model.extractCleanDomain
 import com.grayvines.roche.ui.components.BottomTabIcon
+import com.grayvines.roche.ui.components.CatalogCoverThumbnail
+import com.grayvines.roche.ui.components.EntrySourceMetadataRow
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
@@ -72,10 +79,9 @@ import com.grayvines.roche.ui.components.RocheSectionHeader
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SearchIcon
-import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.SkipDrawIcon
+import com.grayvines.roche.ui.components.TierBadgePill
 import com.grayvines.roche.ui.components.WikipediaIcon
-import com.grayvines.roche.ui.components.drawArticleImagePlaceholder
 import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
 import com.grayvines.roche.ui.components.rememberHighResImageBitmap
 import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
@@ -90,19 +96,15 @@ fun HomeTabContent(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     scrollState: ScrollState = rememberScrollState(),
-    @Suppress("UnusedParameter") activeAudioEntryId: String? = null,
+    activeAudioEntryId: String? = null,
     onOpenExternalUrl: (String) -> Unit = {},
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = { draw ->
-        val fallback =
-            if (draw.isMusicKind) draw.youtubeMusicUrl else draw.primaryExternalUrl.orEmpty()
-        if (fallback.isNotBlank()) {
-            onOpenExternalUrl(fallback)
-        }
+        onAction(MainAction.LaunchCollectionDraw(draw))
     },
 ) {
     RocheRefreshableTabScaffold(
-        isRefreshing = state.isSyncing,
-        onRefresh = { onAction(MainAction.SyncNow) },
+        isRefreshing = state.isManualRefreshing,
+        onRefresh = { onAction(MainAction.ManualRefresh) },
         pullToRefreshTestTag = "home_pull_to_refresh",
         modifier = Modifier.testTag("home_screen"),
         header = { HomeTopHeaderBar(onAction = onAction) },
@@ -113,6 +115,7 @@ fun HomeTabContent(
                 state = state,
                 scrollState = scrollState,
                 isWideLayout = isWideLayout,
+                activeAudioEntryId = activeAudioEntryId,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
                 onOpenCollectionDraw = onOpenCollectionDraw,
@@ -149,10 +152,12 @@ private fun HomeTopHeaderBar(onAction: (MainAction) -> Unit) {
 }
 
 @Composable
+@Suppress("LongParameterList")
 internal fun HomeScrollableGrid(
     state: MainUiState,
     scrollState: ScrollState,
     isWideLayout: Boolean,
+    activeAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
@@ -169,6 +174,7 @@ internal fun HomeScrollableGrid(
             HomeWideTwoColumnDashboard(
                 state = state,
                 activeDraws = activeDraws,
+                activeAudioEntryId = activeAudioEntryId,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
                 onOpenCollectionDraw = onOpenCollectionDraw,
@@ -177,6 +183,7 @@ internal fun HomeScrollableGrid(
             HomeSingleColumnDashboard(
                 state = state,
                 activeDraws = activeDraws,
+                activeAudioEntryId = activeAudioEntryId,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
                 onOpenCollectionDraw = onOpenCollectionDraw,
@@ -187,9 +194,11 @@ internal fun HomeScrollableGrid(
 }
 
 @Composable
+@Suppress("LongParameterList")
 private fun HomeWideTwoColumnDashboard(
     state: MainUiState,
     activeDraws: List<CollectionGeneratorState>,
+    activeAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
@@ -206,7 +215,15 @@ private fun HomeWideTwoColumnDashboard(
             HomeInboxWidget(
                 state = state,
                 maxItems = WIDE_INBOX_ITEMS,
+                activeAudioEntryId = activeAudioEntryId,
                 onAction = onAction,
+            )
+            HomeWantQueueWidget(
+                state = state,
+                maxItems = HOME_QUEUE_PREVIEW_ITEMS,
+                activeAudioEntryId = activeAudioEntryId,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
             )
         }
         Column(
@@ -216,6 +233,7 @@ private fun HomeWideTwoColumnDashboard(
             activeDraws.forEach { gen ->
                 HomeCollectionDrawWidget(
                     generator = gen,
+                    resolvingMusicEntryId = state.resolvingMusicEntryId,
                     onAction = onAction,
                     onOpenExternalUrl = onOpenExternalUrl,
                     onOpenCollectionDraw = onOpenCollectionDraw,
@@ -232,9 +250,11 @@ private fun HomeWideTwoColumnDashboard(
 }
 
 @Composable
+@Suppress("LongParameterList")
 private fun HomeSingleColumnDashboard(
     state: MainUiState,
     activeDraws: List<CollectionGeneratorState>,
+    activeAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
@@ -242,6 +262,7 @@ private fun HomeSingleColumnDashboard(
     activeDraws.forEach { gen ->
         HomeCollectionDrawWidget(
             generator = gen,
+            resolvingMusicEntryId = state.resolvingMusicEntryId,
             onAction = onAction,
             onOpenExternalUrl = onOpenExternalUrl,
             onOpenCollectionDraw = onOpenCollectionDraw,
@@ -250,7 +271,15 @@ private fun HomeSingleColumnDashboard(
     HomeInboxWidget(
         state = state,
         maxItems = COMPACT_INBOX_ITEMS,
+        activeAudioEntryId = activeAudioEntryId,
         onAction = onAction,
+    )
+    HomeWantQueueWidget(
+        state = state,
+        maxItems = HOME_QUEUE_PREVIEW_ITEMS,
+        activeAudioEntryId = activeAudioEntryId,
+        onAction = onAction,
+        onOpenExternalUrl = onOpenExternalUrl,
     )
     HomeRecentDiaryWidget(
         state = state,
@@ -267,6 +296,7 @@ internal fun HomeCollectionDrawWidget(
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
     modifier: Modifier = Modifier,
+    resolvingMusicEntryId: String? = null,
 ) {
     val draw = generator.currentDraw
     val openCollectionList = {
@@ -287,6 +317,9 @@ internal fun HomeCollectionDrawWidget(
                 CollectionDrawSleeveCardBody(
                     generator = generator,
                     draw = draw,
+                    isResolvingMusic =
+                        resolvingMusicEntryId != null &&
+                            resolvingMusicEntryId == draw.musicResolveKey(),
                     onAction = onAction,
                     onOpenExternalUrl = onOpenExternalUrl,
                     onOpenCollectionDraw = onOpenCollectionDraw,
@@ -307,18 +340,26 @@ internal fun HomeCollectionDrawWidget(
 private fun CollectionDrawSleeveCardBody(
     generator: CollectionGeneratorState,
     draw: CollectionDrawSnapshot,
+    isResolvingMusic: Boolean,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val openDrawDetail = {
+        if (draw.entryId.isNotBlank()) {
+            onAction(MainAction.OpenCatalogDetailSheet(draw.entryId))
+        } else {
+            onOpenCollectionDraw(draw)
+        }
+    }
     Column(
         modifier = Modifier.fillMaxWidth().padding(bottom = 11.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         CollectionDrawTitleRow(
             draw = draw,
-            onOpenDraw = { onOpenCollectionDraw(draw) },
+            onOpenDetail = openDrawDetail,
             onSkip = {
                 onAction(
                     MainAction.OpenDrawNoteDialog(
@@ -330,7 +371,9 @@ private fun CollectionDrawSleeveCardBody(
         )
         CollectionDrawMediaRow(
             draw = draw,
-            onOpenDraw = { onOpenCollectionDraw(draw) },
+            isResolvingMusic = isResolvingMusic,
+            onOpenCover = { onOpenCollectionDraw(draw) },
+            onOpenDetail = openDrawDetail,
             onOpenExternalUrl = onOpenExternalUrl,
         )
         HorizontalDivider(
@@ -356,7 +399,7 @@ private fun CollectionDrawSleeveCardBody(
 @Composable
 private fun CollectionDrawTitleRow(
     draw: CollectionDrawSnapshot,
-    onOpenDraw: () -> Unit,
+    onOpenDetail: () -> Unit,
     onSkip: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -402,7 +445,7 @@ private fun CollectionDrawTitleRow(
             overflow = TextOverflow.Ellipsis,
             modifier =
                 Modifier.weight(1f)
-                    .clickable(onClick = onOpenDraw)
+                    .clickable(onClick = onOpenDetail)
                     .padding(vertical = 4.dp)
                     .testTag("collection_draw_meta"),
         )
@@ -420,7 +463,9 @@ private fun CollectionDrawTitleRow(
 @Composable
 private fun CollectionDrawMediaRow(
     draw: CollectionDrawSnapshot,
-    onOpenDraw: () -> Unit,
+    isResolvingMusic: Boolean,
+    onOpenCover: () -> Unit,
+    onOpenDetail: () -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -431,7 +476,11 @@ private fun CollectionDrawMediaRow(
         horizontalArrangement = Arrangement.spacedBy(11.dp),
         verticalAlignment = Alignment.Top,
     ) {
-        CollectionDrawCompactCover(draw = draw, onClick = onOpenDraw)
+        CollectionDrawCompactCover(
+            draw = draw,
+            isResolvingMusic = isResolvingMusic,
+            onClick = onOpenCover,
+        )
         Column(
             modifier = Modifier.weight(1f).heightIn(min = 74.dp),
             verticalArrangement = Arrangement.SpaceBetween,
@@ -446,7 +495,9 @@ private fun CollectionDrawMediaRow(
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                     modifier =
-                        Modifier.fillMaxWidth().clickable(onClick = onOpenDraw).padding(top = 1.dp),
+                        Modifier.fillMaxWidth()
+                            .clickable(onClick = onOpenDetail)
+                            .padding(top = 1.dp),
                 )
             } else {
                 Spacer(modifier = Modifier.height(1.dp))
@@ -643,6 +694,7 @@ private fun CompactRankButton(
 @Composable
 private fun CollectionDrawCompactCover(
     draw: CollectionDrawSnapshot,
+    isResolvingMusic: Boolean,
     onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -674,10 +726,26 @@ private fun CollectionDrawCompactCover(
         } else {
             Canvas(modifier = Modifier.fillMaxSize()) { drawVinylSleeveArtwork(colors) }
         }
-        AlbumCoverPlayBadge(
-            accentColor = if (draw.isMusicKind) SPOTIFY_GREEN else colors.accentBlue,
-            modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp),
-        )
+        if (isResolvingMusic) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier =
+                    Modifier.fillMaxSize()
+                        .background(Color(0x99141413))
+                        .testTag("collection_draw_resolving_spinner"),
+            ) {
+                CircularProgressIndicator(
+                    color = colors.accentVerdigris,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+        } else if (draw.isMusicKind) {
+            AlbumCoverPlayBadge(
+                accentColor = colors.accentVerdigris,
+                modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp),
+            )
+        }
     }
 }
 
@@ -784,6 +852,7 @@ internal fun HomeInboxWidget(
     maxItems: Int,
     onAction: (MainAction) -> Unit,
     modifier: Modifier = Modifier,
+    activeAudioEntryId: String? = null,
 ) {
     val feedInboxEntries =
         remember(state.allEntries) { state.allEntries.filter { it.inFeedInbox && !it.isArchived } }
@@ -793,6 +862,12 @@ internal fun HomeInboxWidget(
         remember(unreadEntries, feedInboxEntries, maxItems) {
             unreadEntries.ifEmpty { feedInboxEntries }.take(maxItems)
         }
+    val headerBadge =
+        when {
+            unreadCount > 0 -> formatIntegerCount(unreadCount)
+            previewEntries.isNotEmpty() -> "Caught up · Recent"
+            else -> null
+        }
     val openInbox = { onAction(MainAction.SelectTab(AppTab.INBOX)) }
 
     Column(
@@ -801,7 +876,7 @@ internal fun HomeInboxWidget(
     ) {
         RocheSectionHeader(
             label = "Inbox",
-            badgeText = if (unreadCount > 0) formatIntegerCount(unreadCount) else null,
+            badgeText = headerBadge,
             actionLabel = "All →",
             actionTestTag = "home_open_inbox_btn",
             onActionClick = openInbox,
@@ -812,7 +887,9 @@ internal fun HomeInboxWidget(
             } else {
                 HomeInboxPreviewList(
                     previewEntries = previewEntries,
+                    activeAudioEntryId = activeAudioEntryId,
                     onOpenEntry = { onAction(MainAction.OpenReader(it)) },
+                    onLongPressEntry = { onAction(MainAction.OpenContextSheet(it)) },
                 )
             }
         }
@@ -822,14 +899,21 @@ internal fun HomeInboxWidget(
 @Composable
 private fun HomeInboxPreviewList(
     previewEntries: List<InboxEntry>,
+    activeAudioEntryId: String?,
     onOpenEntry: (String) -> Unit,
+    onLongPressEntry: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     previewEntries.forEachIndexed { index, entry ->
         if (index > 0) {
             HorizontalDivider(color = colors.border, thickness = 1.dp)
         }
-        HomeInboxPreviewRow(entry = entry, onClick = { onOpenEntry(entry.id) })
+        HomeInboxPreviewRow(
+            entry = entry,
+            isPlayingAudio = entry.id == activeAudioEntryId,
+            onClick = { onOpenEntry(entry.id) },
+            onLongClick = { onLongPressEntry(entry.id) },
+        )
     }
 }
 
@@ -858,24 +942,33 @@ private fun HomeInboxEmptyBody(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun HomeInboxPreviewRow(
     entry: InboxEntry,
+    isPlayingAudio: Boolean,
     onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    testTagPrefix: String = "home_inbox_item",
 ) {
     val colors = LocalRocheColors.current
     val headlineFamily = currentHeadlineFontFamily()
+    val hasThumbSource = entry.hasThumbnailSource()
+    val rowBg = if (isPlayingAudio) colors.accentBlue.copy(alpha = 0.12f) else Color.Transparent
+
     Row(
         modifier =
             Modifier.fillMaxWidth()
+                .background(rowBg)
+                .drawLeftAccentBar(if (isPlayingAudio) colors.accentBlue else null)
                 .heightIn(min = 48.dp)
-                .clickable(onClick = onClick)
+                .combinedClickable(onClick = onClick, onLongClick = onLongClick)
                 .padding(horizontal = 12.dp, vertical = 10.dp)
-                .testTag("home_inbox_item_${entry.id}"),
+                .testTag("${testTagPrefix}_${entry.id}"),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.Top,
     ) {
-        if (entry.showsThumbnailPreview) {
+        if (hasThumbSource) {
             HomeCompactEntryThumbnail(entry = entry)
         }
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -889,34 +982,13 @@ private fun HomeInboxPreviewRow(
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
-            ) {
-                SiteFaviconBadge(
-                    primaryFaviconUrl = entry.faviconUrl,
-                    fallbackFaviconUrl = entry.fallbackFaviconUrl,
-                    domain = entry.displayDomain,
-                    title = entry.feedTitle,
-                    size = 14.dp,
-                )
-                Text(
-                    text = entry.feedTitle,
-                    color = colors.textSecondary,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Normal,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false),
-                )
-                Text(
-                    text = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
-                    color = colors.textMuted,
-                    fontSize = 10.5.sp,
-                    fontWeight = FontWeight.Normal,
-                    maxLines = 1,
-                )
-            }
+            EntrySourceMetadataRow(
+                entry = entry,
+                trailingMetaText =
+                    "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
+                showOfflineIndicator = true,
+                showStarDot = entry.isFavorite,
+            )
         }
     }
 }
@@ -925,7 +997,6 @@ private fun HomeInboxPreviewRow(
 private fun HomeCompactEntryThumbnail(entry: InboxEntry) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(5.dp)
-    val landscapePath = remember { Path() }
     val bitmap =
         rememberEntryThumbnailBitmap(
             primaryKey = entry.thumbnailMediaId,
@@ -946,9 +1017,215 @@ private fun HomeCompactEntryThumbnail(entry: InboxEntry) {
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
             )
-        } else {
-            Canvas(modifier = Modifier.matchParentSize()) {
-                drawArticleImagePlaceholder(colors = colors, landscape = landscapePath)
+        }
+    }
+}
+
+private sealed interface HomeQueuePreviewItem {
+    val stableId: String
+
+    data class UpNextEntry(val entry: InboxEntry) : HomeQueuePreviewItem {
+        override val stableId: String = entry.id
+    }
+
+    data class WantCatalogItem(val item: RankedCatalogEntry) : HomeQueuePreviewItem {
+        override val stableId: String = item.entry.id
+    }
+}
+
+@Composable
+internal fun HomeWantQueueWidget(
+    state: MainUiState,
+    maxItems: Int,
+    activeAudioEntryId: String?,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val wantToReadItems = state.catalog.entriesByCollectionId[WANT_TO_READ_COLLECTION_ID].orEmpty()
+    val previewItems =
+        remember(state.queueEntries, wantToReadItems, maxItems) {
+            buildHomeQueuePreviewItems(state.queueEntries, wantToReadItems, maxItems)
+        }
+    val totalCount =
+        remember(state.queueEntries, wantToReadItems) {
+            val ids = HashSet<String>(state.queueEntries.size + wantToReadItems.size)
+            state.queueEntries.forEach { ids.add(it.id) }
+            wantToReadItems.forEach { ids.add(it.entry.id) }
+            ids.size
+        }
+    val offlineCount = state.offlineEntries.size
+    val offlineLabel = if (offlineCount > 0) "Offline ($offlineCount)" else "Offline"
+
+    Column(
+        modifier = modifier.fillMaxWidth().testTag("home_widget_queue_want"),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        RocheSectionHeader(
+            label = "Queue & Want",
+            badgeText = if (totalCount > 0) formatIntegerCount(totalCount) else null,
+            secondaryActionLabel = offlineLabel,
+            secondaryActionTestTag = "home_open_offline_btn",
+            onSecondaryActionClick = { onAction(MainAction.SelectTab(AppTab.OFFLINE)) },
+            actionLabel = "Queue →",
+            actionTestTag = "home_open_queue_btn",
+            onActionClick = { onAction(MainAction.SelectTab(AppTab.QUEUE)) },
+        )
+        RocheSurfaceCard {
+            if (previewItems.isEmpty()) {
+                HomeWantQueueEmptyBody(onAction = onAction)
+            } else {
+                HomeWantQueuePreviewList(
+                    items = previewItems,
+                    state = state,
+                    activeAudioEntryId = activeAudioEntryId,
+                    onAction = onAction,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                )
+            }
+        }
+    }
+}
+
+private fun buildHomeQueuePreviewItems(
+    queueEntries: List<InboxEntry>,
+    wantToReadItems: List<RankedCatalogEntry>,
+    maxItems: Int,
+): List<HomeQueuePreviewItem> {
+    val seen = HashSet<String>(maxItems)
+    val result = ArrayList<HomeQueuePreviewItem>(maxItems)
+    for (entry in queueEntries) {
+        if (result.size >= maxItems) break
+        if (seen.add(entry.id)) {
+            result.add(HomeQueuePreviewItem.UpNextEntry(entry))
+        }
+    }
+    for (want in wantToReadItems) {
+        if (result.size >= maxItems) break
+        if (seen.add(want.entry.id)) {
+            result.add(HomeQueuePreviewItem.WantCatalogItem(want))
+        }
+    }
+    return result
+}
+
+@Composable
+private fun HomeWantQueueEmptyBody(onAction: (MainAction) -> Unit) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "Save URLs or queue episodes to read and listen next.",
+            color = colors.textMuted,
+            fontSize = 12.5.sp,
+            modifier = Modifier.weight(1f).padding(end = 8.dp),
+        )
+        HeaderActionButton(
+            label = "+ Save URL",
+            onClick = { onAction(MainAction.OpenAddSheet()) },
+            modifier = Modifier.testTag("home_queue_save_url_btn"),
+        )
+    }
+}
+
+@Composable
+private fun HomeWantQueuePreviewList(
+    items: List<HomeQueuePreviewItem>,
+    state: MainUiState,
+    activeAudioEntryId: String?,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    items.forEachIndexed { index, item ->
+        if (index > 0) {
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+        }
+        when (item) {
+            is HomeQueuePreviewItem.UpNextEntry ->
+                HomeInboxPreviewRow(
+                    entry = item.entry,
+                    isPlayingAudio = item.entry.id == activeAudioEntryId,
+                    onClick = { onAction(MainAction.OpenReader(item.entry.id)) },
+                    onLongClick = { onAction(MainAction.OpenContextSheet(item.entry.id)) },
+                    testTagPrefix = "home_queue_item",
+                )
+            is HomeQueuePreviewItem.WantCatalogItem ->
+                HomeWantCatalogPreviewRow(
+                    item = item.item,
+                    onClick =
+                        resolveHomeWantItemClick(item.item, state, onAction, onOpenExternalUrl),
+                )
+        }
+    }
+}
+
+private fun resolveHomeWantItemClick(
+    want: RankedCatalogEntry,
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+): () -> Unit =
+    resolveCatalogEntryOpenAction(
+        entryId = want.entry.id,
+        externalUrl = want.entry.url,
+        readableIds = state.readableEntryIds,
+        onOpenReader = { onAction(MainAction.OpenReader(it)) },
+        onOpenExternalUrl = onOpenExternalUrl,
+        entryKind = want.entry.kind,
+        onOpenCatalogDetail = { onAction(MainAction.OpenCatalogDetailSheet(it)) },
+    ) ?: { onAction(MainAction.OpenCompanionSection(CompanionSubTab.WANT)) }
+
+@Composable
+private fun HomeWantCatalogPreviewRow(
+    item: RankedCatalogEntry,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    val meta =
+        remember(item.entry) {
+            buildList {
+                    item.entry.url
+                        ?.let(::extractCleanDomain)
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let(::add)
+                    add(item.entry.kind.displayLabel)
+                }
+                .joinToString(" · ")
+        }
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .heightIn(min = 48.dp)
+                .clickable(onClick = onClick)
+                .padding(horizontal = 12.dp, vertical = 9.dp)
+                .testTag("home_want_item_${item.entry.id}"),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                text = item.entry.title,
+                color = colors.textPrimary,
+                fontFamily = headlineFamily,
+                fontSize = 14.sp,
+                lineHeight = 19.sp,
+                fontWeight = FontWeight.Normal,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (meta.isNotBlank()) {
+                Text(
+                    text = meta,
+                    color = colors.textMuted,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }
@@ -964,15 +1241,6 @@ internal fun HomeRecentDiaryWidget(
 ) {
     val diaryEntries =
         remember(state.catalog.diaryEntries, maxItems) { state.catalog.diaryEntries.take(maxItems) }
-    val readableIds = remember(state.allEntries) { state.allEntries.mapTo(HashSet()) { it.id } }
-    val catalogUrlsById =
-        remember(state.catalog.entriesByCollectionId) {
-            buildMap {
-                state.catalog.entriesByCollectionId.values.flatten().forEach { item ->
-                    item.entry.url?.takeIf { it.isNotBlank() }?.let { put(item.entry.id, it) }
-                }
-            }
-        }
     val openDiary = { onAction(MainAction.OpenCompanionSection(CompanionSubTab.DIARY)) }
 
     Column(
@@ -981,6 +1249,9 @@ internal fun HomeRecentDiaryWidget(
     ) {
         RocheSectionHeader(
             label = "Recent Diary",
+            secondaryActionLabel = "+ Log",
+            secondaryActionTestTag = "home_diary_header_quick_log_btn",
+            onSecondaryActionClick = { onAction(MainAction.OpenQuickLogSheet(false)) },
             actionLabel = "Diary →",
             actionTestTag = "home_open_diary_btn",
             onActionClick = openDiary,
@@ -991,8 +1262,8 @@ internal fun HomeRecentDiaryWidget(
             } else {
                 HomeRecentDiaryList(
                     diaryEntries = diaryEntries,
-                    readableIds = readableIds,
-                    catalogUrlsById = catalogUrlsById,
+                    readableIds = state.readableEntryIds,
+                    catalogUrlsById = state.catalogUrlsById,
                     onOpenDiary = openDiary,
                     onAction = onAction,
                     onOpenExternalUrl = onOpenExternalUrl,
@@ -1080,7 +1351,12 @@ private fun HomeDiaryPreviewRow(
             maxLines = 1,
             modifier = Modifier.widthIn(min = 38.dp),
         )
-        HomeDiaryThumbnail(thumbnailUrl = diary.thumbnailUrl, kind = diary.kind)
+        CatalogCoverThumbnail(
+            thumbnailUrl = diary.thumbnailUrl,
+            kind = diary.kind,
+            size = 32.dp,
+            cornerRadius = 5.dp,
+        )
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
             Text(
                 text = diary.title,
@@ -1103,61 +1379,8 @@ private fun HomeDiaryPreviewRow(
             }
         }
         if (diary.tier != null) {
-            HomeTierPill(tier = diary.tier)
+            TierBadgePill(tier = diary.tier)
         }
-    }
-}
-
-@Composable
-private fun HomeDiaryThumbnail(thumbnailUrl: String?, kind: EntryKind) {
-    val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(5.dp)
-    val bitmap = rememberEntryThumbnailBitmap(primaryKey = null, fallbackKey = thumbnailUrl)
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier =
-            Modifier.size(32.dp)
-                .clip(shape)
-                .background(colors.surfaceElevated)
-                .border(1.dp, colors.border, shape),
-    ) {
-        if (bitmap != null) {
-            Image(
-                bitmap = bitmap,
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
-            )
-        } else {
-            Text(
-                text = if (kind == EntryKind.ALBUM || kind == EntryKind.SONG) "♪" else "▪",
-                color = colors.textMuted,
-                fontSize = 12.sp,
-                modifier = Modifier.clearAndSetSemantics {},
-            )
-        }
-    }
-}
-
-@Composable
-private fun HomeTierPill(tier: Char) {
-    val colors = LocalRocheColors.current
-    val headlineFamily = currentHeadlineFontFamily()
-    val tierColor = resolveTierColor(tier, colors)
-    val shape = RoundedCornerShape(4.dp)
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier =
-            Modifier.size(20.dp).clip(shape).border(1.dp, tierColor.copy(alpha = 0.72f), shape),
-    ) {
-        Text(
-            text = tier.toString(),
-            color = tierColor,
-            fontFamily = headlineFamily,
-            fontSize = 10.5.sp,
-            fontWeight = FontWeight.Medium,
-            maxLines = 1,
-        )
     }
 }
 
@@ -1179,8 +1402,8 @@ private fun formatIntegerCount(value: Int): String =
     NumberFormat.getIntegerInstance(Locale.US).format(value)
 
 private val WIDE_DASHBOARD_BREAKPOINT = 540.dp
-private val SPOTIFY_GREEN = Color(0xFF1ED760)
 private const val WIDE_INBOX_ITEMS = 7
 private const val COMPACT_INBOX_ITEMS = 4
+private const val HOME_QUEUE_PREVIEW_ITEMS = 3
 private const val WIDE_DIARY_ITEMS = 6
 private const val COMPACT_DIARY_ITEMS = 3

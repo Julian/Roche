@@ -71,7 +71,9 @@ import com.grayvines.roche.data.catalog.extractArtistDiscography
 import com.grayvines.roche.data.catalog.extractMetadataGenres
 import com.grayvines.roche.data.catalog.resolveWikipediaUrl
 import com.grayvines.roche.data.catalog.toMusicLaunchSnapshot
+import com.grayvines.roche.ui.components.CatalogCoverThumbnail
 import com.grayvines.roche.ui.components.RocheSurfaceCard
+import com.grayvines.roche.ui.components.TierBadgePill
 import com.grayvines.roche.ui.components.WikipediaIcon
 import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
 import com.grayvines.roche.ui.components.rememberHighResImageBitmap

@@ -21,7 +21,7 @@ import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.sync.PeerSyncScheduler
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.playback.PodcastPlaybackService
-import com.grayvines.roche.ui.CompanionSubTab
+import com.grayvines.roche.ui.CollectionDrawLaunchEffect
 import com.grayvines.roche.ui.LocalArticleBlockCache
 import com.grayvines.roche.ui.LocalOfflineCacheDir
 import com.grayvines.roche.ui.LocalPdfDocumentStore
@@ -29,16 +29,14 @@ import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainViewModel
 import com.grayvines.roche.ui.components.LocalThumbnailLoader
-import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
 import com.grayvines.roche.ui.theme.RocheTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 
 class MainActivity : ComponentActivity() {
-    private var musicDrawResolveJob: Job? = null
+    private var albumLaunchJob: Job? = null
 
     private val viewModel: MainViewModel by viewModels {
         val graph = (application as RocheApp).graph
@@ -81,6 +79,9 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val state by viewModel.uiState.collectAsStateWithLifecycle()
+            LaunchedEffect(viewModel) {
+                viewModel.drawLaunchEffects.collect(::handleDrawLaunchEffect)
+            }
             LaunchedEffect(state.isInitialLoading, state.settings.serverUrl) {
                 if (!state.isInitialLoading) {
                     PeerSyncScheduler.schedulePeriodicSync(
@@ -108,7 +109,6 @@ class MainActivity : ComponentActivity() {
                         onOpenExternalUrl = ::openUrlInBrowser,
                         onImportOpml = { importOpmlLauncher.launch(OPML_MIME_TYPES) },
                         onExportOpml = { exportOpmlLauncher.launch("roche-feeds.opml") },
-                        onOpenCollectionDraw = ::openCollectionDraw,
                         onPlayMusicTrack = { track ->
                             lifecycleScope.launch {
                                 launchMusicTrack(this@MainActivity, track, ::openUrlInBrowser)
@@ -121,10 +121,59 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        albumLaunchJob?.cancel()
+        albumLaunchJob = null
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         handleIncomingShareIntent(intent)
+    }
+
+    private fun handleDrawLaunchEffect(effect: CollectionDrawLaunchEffect) {
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+        when (effect) {
+            is CollectionDrawLaunchEffect.ProbeOrLaunchMusicAlbum ->
+                probeOrLaunchMusicAlbum(effect.draw)
+            is CollectionDrawLaunchEffect.LaunchEnrichedMusicAlbum ->
+                launchResolvedAlbumDraw(effect.draw)
+            is CollectionDrawLaunchEffect.OpenExternalUrl -> openUrlInBrowser(effect.url)
+        }
+    }
+
+    private fun probeOrLaunchMusicAlbum(draw: CollectionDrawSnapshot) {
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+        albumLaunchJob?.cancel()
+        albumLaunchJob = lifecycleScope.launch {
+            val plan = resolveInitialAlbumLaunchPlan(this@MainActivity, draw)
+            if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                when (plan) {
+                    is InitialAlbumLaunchPlan.LaunchDirect ->
+                        launchStreamingResolution(this@MainActivity, draw, plan.resolution)
+                    InitialAlbumLaunchPlan.FallbackSearchOrBrowser ->
+                        launchAlbumSearchOrFallback(this@MainActivity, draw, ::openUrlInBrowser)
+                    InitialAlbumLaunchPlan.NeedsEnrichment ->
+                        viewModel.dispatch(MainAction.EnrichAndLaunchMusicDraw(draw))
+                }
+            }
+        }
+    }
+
+    private fun launchResolvedAlbumDraw(draw: CollectionDrawSnapshot) {
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+        albumLaunchJob?.cancel()
+        albumLaunchJob = lifecycleScope.launch {
+            val resolution = resolveEnrichedAlbumLaunch(this@MainActivity, draw)
+            if (
+                lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) &&
+                    !launchStreamingResolution(this@MainActivity, draw, resolution)
+            ) {
+                launchAlbumSearchOrFallback(this@MainActivity, draw, ::openUrlInBrowser)
+            }
+        }
     }
 
     private fun handleIncomingShareIntent(intent: Intent?) {
@@ -176,67 +225,6 @@ class MainActivity : ComponentActivity() {
                     putExtra(Intent.EXTRA_TEXT, entry.url)
                 }
             startActivity(Intent.createChooser(sendIntent, entry.title))
-        }
-    }
-
-    private fun openCollectionDraw(draw: CollectionDrawSnapshot) {
-        if (draw.isMusicKind) {
-            openMusicCollectionDraw(draw)
-            return
-        }
-        val readableIds = viewModel.uiState.value.allEntries.mapTo(HashSet()) { it.id }
-        val fallback: (() -> Unit)? =
-            draw.collectionId
-                .takeIf { it.isNotBlank() }
-                ?.let { colId ->
-                    {
-                        viewModel.dispatch(
-                            MainAction.OpenCompanionSection(CompanionSubTab.LISTS, colId)
-                        )
-                    }
-                }
-        resolveCatalogEntryOpenAction(
-                entryId = draw.entryId,
-                externalUrl = draw.primaryExternalUrl,
-                readableIds = readableIds,
-                onOpenReader = { entryId -> viewModel.dispatch(MainAction.OpenReader(entryId)) },
-                onOpenExternalUrl = ::openUrlInBrowser,
-                onFallback = fallback,
-            )
-            ?.invoke()
-    }
-
-    private fun openMusicCollectionDraw(draw: CollectionDrawSnapshot) {
-        musicDrawResolveJob?.cancel()
-        musicDrawResolveJob = lifecycleScope.launch {
-            when (val plan = resolveInitialAlbumLaunchPlan(this@MainActivity, draw)) {
-                is InitialAlbumLaunchPlan.LaunchDirect -> {
-                    if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
-                        launchStreamingResolution(this@MainActivity, draw, plan.resolution)
-                    }
-                }
-                InitialAlbumLaunchPlan.FallbackSearchOrBrowser -> {
-                    if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
-                        launchAlbumSearchOrFallback(this@MainActivity, draw, ::openUrlInBrowser)
-                    }
-                }
-                InitialAlbumLaunchPlan.NeedsEnrichment -> {
-                    enrichAndLaunchAlbum(draw)
-                }
-            }
-        }
-    }
-
-    private suspend fun enrichAndLaunchAlbum(draw: CollectionDrawSnapshot) {
-        val repo = (application as RocheApp).graph.repository
-        val enriched =
-            withTimeoutOrNull(ALBUM_RESOLVE_TIMEOUT_MS) {
-                repo.resolveCollectionDrawStreaming(draw)
-            } ?: draw
-        val resolution = resolveEnrichedAlbumLaunch(this@MainActivity, enriched)
-        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
-        if (!launchStreamingResolution(this@MainActivity, enriched, resolution)) {
-            launchAlbumSearchOrFallback(this@MainActivity, enriched, ::openUrlInBrowser)
         }
     }
 
@@ -300,7 +288,6 @@ class MainActivity : ComponentActivity() {
             "com.grayvines.roche.EXTRA_SHARE_ERROR_MESSAGE"
         internal const val EXTRA_SHARE_PREFILL_IS_FEED =
             "com.grayvines.roche.EXTRA_SHARE_PREFILL_IS_FEED"
-        private const val ALBUM_RESOLVE_TIMEOUT_MS = 5_000L
         private val ALLOWED_EXTERNAL_SCHEMES = setOf("http", "https", "mailto")
         private val OPML_MIME_TYPES = arrayOf("text/xml", "application/xml", "text/x-opml", "*/*")
     }

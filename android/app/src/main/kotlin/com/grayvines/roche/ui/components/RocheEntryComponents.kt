@@ -42,12 +42,14 @@ internal fun EntrySourceMetadataRow(
     modifier: Modifier = Modifier,
     showUnreadDot: Boolean = false,
     unreadDotTestTag: String? = null,
+    showStarDot: Boolean = false,
     faviconSize: Dp = 14.dp,
     feedLabelFontSize: TextUnit = 11.sp,
     emphasizeFeedTitleWhenUnread: Boolean = false,
     trailingMetaText: String? = null,
     trailingMetaFontSize: TextUnit = 11.sp,
     trailingBadge: String? = null,
+    trailingBadgeColor: Color? = null,
     showOfflineIndicator: Boolean = false,
 ) {
     val colors = LocalRocheColors.current
@@ -62,6 +64,7 @@ internal fun EntrySourceMetadataRow(
             entry = entry,
             showUnreadDot = showUnreadDot,
             unreadDotTestTag = unreadDotTestTag,
+            showStarDot = showStarDot,
             faviconSize = faviconSize,
             feedLabelFontSize = feedLabelFontSize,
             emphasizeFeedTitleWhenUnread = emphasizeFeedTitleWhenUnread,
@@ -73,7 +76,7 @@ internal fun EntrySourceMetadataRow(
         if (trailingBadge != null) {
             Text(
                 text = trailingBadge,
-                color = colors.accentVerdigris,
+                color = trailingBadgeColor ?: colors.accentVerdigris,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.SemiBold,
@@ -83,10 +86,12 @@ internal fun EntrySourceMetadataRow(
 }
 
 @Composable
+@Suppress("LongParameterList")
 private fun EntrySourceLeadingCluster(
     entry: InboxEntry,
     showUnreadDot: Boolean,
     unreadDotTestTag: String?,
+    showStarDot: Boolean,
     faviconSize: Dp,
     feedLabelFontSize: TextUnit,
     emphasizeFeedTitleWhenUnread: Boolean,
@@ -102,9 +107,12 @@ private fun EntrySourceLeadingCluster(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        if (showUnreadDot && entry.isUnread) {
-            EntryUnreadDot(testTag = unreadDotTestTag)
-        }
+        EntryLeadingStatusDots(
+            entry = entry,
+            showUnreadDot = showUnreadDot,
+            unreadDotTestTag = unreadDotTestTag,
+            showStarDot = showStarDot,
+        )
         SiteFaviconBadge(
             primaryFaviconUrl = entry.faviconUrl,
             fallbackFaviconUrl = entry.fallbackFaviconUrl,
@@ -121,22 +129,96 @@ private fun EntrySourceLeadingCluster(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f, fill = false),
         )
-        if (trailingMetaText != null) {
-            Text(
-                text = trailingMetaText,
-                color = colors.textMuted,
-                fontFamily = FontFamily.Monospace,
-                fontSize = trailingMetaFontSize,
-                maxLines = 1,
-            )
+        EntryTrailingMetaAndOffline(
+            trailingMetaText = trailingMetaText,
+            trailingMetaFontSize = trailingMetaFontSize,
+            showOfflineBadge = showOfflineIndicator && entry.isCachedOffline,
+        )
+    }
+}
+
+@Composable
+private fun EntryLeadingStatusDots(
+    entry: InboxEntry,
+    showUnreadDot: Boolean,
+    unreadDotTestTag: String?,
+    showStarDot: Boolean,
+) {
+    val colors = LocalRocheColors.current
+    if (showUnreadDot && entry.isUnread) {
+        EntryUnreadDot(testTag = unreadDotTestTag)
+    }
+    if (showStarDot && entry.isFavorite) {
+        Box(
+            modifier =
+                Modifier.size(6.dp)
+                    .clip(CircleShape)
+                    .background(colors.accentEcru)
+                    .semantics { contentDescription = "Starred" }
+                    .testTag("compact_star_dot_${entry.id}")
+        )
+    }
+}
+
+@Composable
+private fun EntryTrailingMetaAndOffline(
+    trailingMetaText: String?,
+    trailingMetaFontSize: TextUnit,
+    showOfflineBadge: Boolean,
+) {
+    val colors = LocalRocheColors.current
+    if (trailingMetaText != null) {
+        Text(
+            text = trailingMetaText,
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = trailingMetaFontSize,
+            maxLines = 1,
+        )
+    }
+    if (showOfflineBadge) {
+        Text(
+            text = "↓",
+            color = colors.accentVerdigris,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+            modifier = Modifier.semantics { contentDescription = "Cached offline" },
+        )
+    }
+}
+
+@Composable
+internal fun CompactStarAndArchiveButtons(
+    entry: InboxEntry,
+    tagPrefix: String,
+    onToggleStar: () -> Unit,
+    onToggleArchive: () -> Unit,
+    outlined: Boolean = true,
+) {
+    val colors = LocalRocheColors.current
+    val starTint = if (entry.isFavorite) colors.accentEcru else colors.textSecondary
+    val starDesc = if (entry.isFavorite) "Remove Star" else "Star Entry"
+    val archiveDesc = if (entry.isArchived) "Unarchive to Inbox" else "Archive Entry"
+
+    Row(horizontalArrangement = Arrangement.spacedBy(if (outlined) 6.dp else 0.dp)) {
+        RocheIconActionButton(
+            contentDescription = starDesc,
+            outlined = outlined,
+            onClick = onToggleStar,
+            modifier = Modifier.testTag("${tagPrefix}_star_btn"),
+        ) {
+            StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 16.dp)
         }
-        if (showOfflineIndicator && entry.isCachedOffline) {
-            Text(
-                text = "↓",
-                color = colors.accentVerdigris,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-                modifier = Modifier.semantics { contentDescription = "Cached offline" },
+        RocheIconActionButton(
+            contentDescription = archiveDesc,
+            outlined = outlined,
+            onClick = onToggleArchive,
+            modifier = Modifier.testTag("${tagPrefix}_archive_btn"),
+        ) {
+            FilingCabinetIcon(
+                tint = colors.textSecondary,
+                isArchived = entry.isArchived,
+                size = 16.dp,
             )
         }
     }

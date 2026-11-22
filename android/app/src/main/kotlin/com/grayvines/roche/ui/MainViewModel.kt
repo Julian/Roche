@@ -10,7 +10,6 @@ import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
 import com.grayvines.roche.data.ReaderItemContent
-import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.settings.Settings
@@ -27,17 +26,17 @@ import com.grayvines.roche.playback.PodcastPlayerController
 import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.playback.createManagedPlayerController
 import com.grayvines.roche.playback.hasNextQueuedAudio
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.scan
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -72,14 +71,6 @@ class MainViewModel(
                 ?: TransientUiState(localNetworkTier = repository.currentNetworkTier())
         )
 
-    private var deepSearchJob: Job? = null
-    private val uiStateMemoizer = MainUiStateMemoizer()
-
-    private val settingsForUi =
-        settingsRepository.settings
-            .onStart { emit(settingsRepository.latestSettings ?: Settings()) }
-            .distinctUntilChanged()
-
     private val uiErrorListener: (String) -> Unit = { message -> showStatusMessage(message) }
 
     internal val playerController: PodcastPlayerController =
@@ -102,29 +93,53 @@ class MainViewModel(
             replay = 1,
         )
 
+    private val settingsFeature = SettingsFeatureModel(settingsRepository)
+    private val inboxFeedsFeature =
+        InboxFeedsFeatureModel(
+            scope = viewModelScope,
+            repository = repository,
+        )
+    private val readerFeature =
+        ReaderFeatureModel(
+            scope = viewModelScope,
+            repository = repository,
+            transientState = transientState,
+            activePlayerIdProvider = { playerController.state.value.currentEntryId },
+            onActivePlayerNotesUpdated = ::refreshActivePlayerChapters,
+        )
+    private val catalogRankFeature =
+        CatalogRankFeatureModel(
+            scope = viewModelScope,
+            repository = repository,
+        )
+    private val searchFeature =
+        SearchFeatureModel(
+            scope = viewModelScope,
+            repository = repository,
+            transientState = transientState,
+        )
+
+    val drawLaunchEffects: Flow<CollectionDrawLaunchEffect> = catalogRankFeature.drawLaunchEffects
+
+    private val auxUiMetaFlow =
+        combine(
+            catalogRankFeature.resolvingMusicEntryId,
+            settingsFeature.settingsHubResetTick,
+            ::AuxUiMeta,
+        )
+
     private val baseUiStateFlow =
         combine(
-            sharedSnapshotFlow,
-            settingsForUi,
-            transientState,
-            repository.isSyncActive,
-            repository.inFlightOfflineEntryIds,
-        ) {
-            snapshot: RepositorySnapshot,
-            settings: Settings,
-            local: TransientUiState,
-            repoSyncing: Boolean,
-            inFlightOfflineIds: Set<String> ->
-            val effectiveLocal =
-                if (repoSyncing && !local.isSyncing) local.copy(isSyncing = true) else local
-            uiStateMemoizer.build(
-                snapshot = snapshot,
-                settings = settings,
-                local = effectiveLocal,
-                localNetworkTier = effectiveLocal.localNetworkTier,
-                inFlightOfflineEntryIds = inFlightOfflineIds,
+                sharedSnapshotFlow,
+                settingsFeature.settingsForUi,
+                transientState,
+                inboxFeedsFeature.syncAndOfflineMetaFlow,
+                auxUiMetaFlow,
+                ::RootUiStateInput,
             )
-        }
+            .scan<RootUiStateInput, DerivedUiStateSlice?>(null, ::reduceDerivedUiStateSlice)
+            .filterNotNull()
+            .map { it.uiState }
 
     val uiState: StateFlow<MainUiState> =
         baseUiStateFlow.stateIn(
@@ -150,6 +165,7 @@ class MainViewModel(
             playerController.updateSmartRewindEnabled(cached.smartRewindEnabled)
             playerController.syncSkipSilenceFromSettings(cached.skipSilenceEnabled)
         }
+        inboxFeedsFeature.startObservingOfflineSizes(sharedSnapshotFlow)
         observePlayerControllerSync()
         observeActiveEpisodeNotes()
         observeActiveCollectionDraws()
@@ -161,7 +177,7 @@ class MainViewModel(
         viewModelScope.launch {
             combine(
                     sharedSnapshotFlow.map { it.entries }.distinctUntilChanged(),
-                    settingsForUi
+                    settingsFeature.settingsForUi
                         .map { settings ->
                             PlayerSettingsSlice(
                                 queueItemIds = settings.queueItemIds,
@@ -240,6 +256,7 @@ class MainViewModel(
                     scopeOriginTab = local.scopeOriginTab,
                     selectedReaderEntryId = local.selectedReaderEntryId,
                     hydratingEntryIds = local.hydratingEntryIds,
+                    syncStatus = repository.syncStatus.value,
                     companionSubTab = local.companionSubTab,
                     selectedCatalogCollectionId = local.selectedCatalogCollectionId,
                     selectedWantCollectionId = local.selectedWantCollectionId,
@@ -251,22 +268,24 @@ class MainViewModel(
                     hasBearerToken = cachedSettings?.bearerToken?.isNotBlank() == true,
                     isInitialLoading = true,
                 )
-        return uiStateMemoizer.build(
+        return buildMainUiState(
             snapshot = cachedSnapshot,
             settings = cachedSettings ?: Settings(),
             local = local,
             localNetworkTier = local.localNetworkTier,
+            syncStatus = repository.syncStatus.value,
         )
     }
 
-    internal suspend fun readSavedBearerToken(): String = settingsRepository.readBearerToken()
+    internal suspend fun readSavedBearerToken(): String = settingsFeature.readSavedBearerToken()
 
     internal suspend fun awaitBackgroundUiWorkForTest() {
-        deepSearchJob?.join()
+        searchFeature.awaitSearchForTest()
     }
 
     override fun onCleared() {
-        deepSearchJob?.cancel()
+        searchFeature.cancelSearch()
+        catalogRankFeature.cancelPendingResolve()
         playerController.clearUiErrorListener(uiErrorListener)
         if (ownsPlayerController) {
             playerController.releaseController()
@@ -278,46 +297,18 @@ class MainViewModel(
             playerController.state
                 .map { it.currentEntryId }
                 .distinctUntilChanged()
-                .collectLatest(::refreshActiveEpisodeNotes)
+                .collectLatest(readerFeature::refreshActiveEpisodeNotes)
         }
     }
 
-    private suspend fun refreshActiveEpisodeNotes(entryId: String?) {
-        if (entryId == null) {
-            transientState.update { current ->
-                val hasActivePlayerUi =
-                    current.activePlayerNotesContent != null ||
-                        current.isPlayerFullscreenOpen ||
-                        current.isPlayerSpeedSheetOpen ||
-                        current.activePlayerDrawerTab != null
-                if (hasActivePlayerUi) {
-                    current.copy(
-                        activePlayerNotesContent = null,
-                        isPlayerFullscreenOpen = false,
-                        isPlayerSpeedSheetOpen = false,
-                        activePlayerDrawerTab = null,
-                    )
-                } else {
-                    current
-                }
-            }
-            return
-        }
-        transientState.update { current ->
-            val kept = current.activePlayerNotesContent?.takeIf { it.itemId == entryId }
-            if (kept !== current.activePlayerNotesContent) {
-                current.copy(activePlayerNotesContent = kept)
-            } else {
-                current
-            }
-        }
-        val hydrated =
-            repository.hydrateItemContentIfNeeded(entryId) { localContent ->
-                applyReaderContentIfActive(entryId, localContent)
-            }
-        if (hydrated != null) {
-            applyReaderContentIfActive(entryId, hydrated)
-        }
+    private fun refreshActivePlayerChapters(entryId: String, content: ReaderItemContent) {
+        val base = peekLatestEntries().firstOrNull { it.id == entryId }
+        playerController.refreshChaptersFromNotes(
+            entryId = entryId,
+            pickLongerReaderText(content.contentHtml, base?.contentHtml),
+            pickLongerReaderText(content.contentText, base?.contentText),
+            base?.summary,
+        )
     }
 
     fun dispatch(action: MainAction) {
@@ -353,47 +344,37 @@ class MainViewModel(
     private fun handleUiSideEffects(action: MainAction.Ui) {
         when (action) {
             is MainAction.OpenReader -> launchReaderOpenSideEffects(action.entryId)
-            is MainAction.UpdateSearchQuery -> scheduleDeepSearch(action.query)
+            is MainAction.UpdateSearchQuery -> searchFeature.scheduleWorkspaceSearch(action.query)
+            MainAction.ResetSettingsToHub -> settingsFeature.requestResetToHub()
+            is MainAction.LaunchCollectionDraw ->
+                catalogRankFeature.launchCollectionDraw(
+                    draw = action.draw,
+                    readableEntryIds = uiState.value.readableEntryIds,
+                    onOpenReader = { entryId -> dispatch(MainAction.OpenReader(entryId)) },
+                    onOpenList = { colId ->
+                        dispatch(MainAction.OpenCompanionSection(CompanionSubTab.LISTS, colId))
+                    },
+                )
+            is MainAction.EnrichAndLaunchMusicDraw ->
+                catalogRankFeature.enrichAndLaunchMusicDraw(action.draw)
             MainAction.CloseSearch,
             is MainAction.SelectTab,
             is MainAction.FilterByTag,
             is MainAction.FilterByFeed,
-            is MainAction.OpenCompanionSection -> cancelDeepSearch()
+            is MainAction.OpenCompanionSection -> searchFeature.cancelSearch()
             else -> Unit
         }
     }
 
     private fun launchReaderOpenSideEffects(entryId: String) {
-        hydrateReaderEntryContent(entryId)
+        readerFeature.hydrateEntryIfNeeded(entryId)
         viewModelScope.launch { repository.setReadState(entryId, true) }
     }
 
-    private fun hydrateReaderEntryContent(entryId: String) {
-        viewModelScope.launch {
-            try {
-                val hydrated =
-                    repository.hydrateItemContentIfNeeded(entryId) { localContent ->
-                        applyReaderContentIfActive(entryId, localContent)
-                    }
-                if (hydrated != null) {
-                    applyReaderContentIfActive(entryId, hydrated)
-                }
-            } finally {
-                transientState.update { current ->
-                    if (entryId in current.hydratingEntryIds) {
-                        current.copy(hydratingEntryIds = current.hydratingEntryIds - entryId)
-                    } else {
-                        current
-                    }
-                }
-            }
-        }
-    }
-
     private fun restoreNavigationSideEffects(restored: SavedNavigationUiState) {
-        restored.selectedReaderEntryId?.let(::hydrateReaderEntryContent)
+        restored.selectedReaderEntryId?.let(readerFeature::hydrateEntryIfNeeded)
         if (restored.isSearchOpen && restored.searchQuery.isNotBlank()) {
-            scheduleDeepSearch(restored.searchQuery)
+            searchFeature.scheduleWorkspaceSearch(restored.searchQuery)
         }
         if (restored.selectedReaderEntryId != null || restored.selectedFeedId != null) {
             viewModelScope.launch { reconcileRestoredSelection(restored) }
@@ -425,8 +406,21 @@ class MainViewModel(
         )
 
     internal fun cancelDeepSearch() {
-        deepSearchJob?.cancel()
-        deepSearchJob = null
+        searchFeature.cancelSearch()
+    }
+
+    internal fun isManualRefreshing(): Boolean = inboxFeedsFeature.isManualRefreshing.value
+
+    internal fun setManualRefreshing(refreshing: Boolean) {
+        inboxFeedsFeature.setManualRefreshing(refreshing)
+    }
+
+    internal suspend fun awaitSyncFinished() {
+        transientState.first { !it.isSyncing }
+    }
+
+    internal fun refreshOfflineSizes() {
+        inboxFeedsFeature.refreshOfflineSizes()
     }
 
     private fun handleMutationAction(action: MainAction.Mutation) {
@@ -471,29 +465,6 @@ class MainViewModel(
     private fun resolveCurrentFavoriteState(entryId: String): Boolean? =
         transientState.value.optimisticFavorites[entryId]
             ?: peekLatestEntries().firstOrNull { it.id == entryId }?.isFavorite
-
-    private fun scheduleDeepSearch(rawQuery: String) {
-        deepSearchJob?.cancel()
-        val normalized = rawQuery.trim().lowercase()
-        if (normalized.isBlank()) {
-            deepSearchJob = null
-            return
-        }
-        deepSearchJob = viewModelScope.launch {
-            delay(DEEP_SEARCH_DEBOUNCE_MS)
-            val deepMatches = repository.searchDeepEntries(rawQuery)
-            transientState.update { current ->
-                if (current.searchQuery.trim().lowercase() == normalized) {
-                    current.copy(
-                        deepSearchQuery = normalized,
-                        deepSearchResults = deepMatches,
-                    )
-                } else {
-                    current
-                }
-            }
-        }
-    }
 
     internal suspend fun latestEntries(): List<InboxEntry> =
         repository.latestSnapshot?.entries ?: repository.snapshot.first().entries
@@ -559,6 +530,16 @@ class MainViewModel(
         }
     }
 
+    internal fun showUndoAction(event: UndoActionEvent) {
+        transientState.update {
+            it.copy(
+                undoEvent = event,
+                statusBanner = null,
+                messageSequence = it.messageSequence + 1,
+            )
+        }
+    }
+
     fun triggerStartupSyncIfConfigured() {
         dispatch(MainAction.StartupSyncIfConfigured)
     }
@@ -569,33 +550,7 @@ class MainViewModel(
     }
 
     internal fun applyReaderContentIfActive(entryId: String, content: ReaderItemContent) {
-        val activePlayerId = playerController.state.value.currentEntryId
-        transientState.update { current ->
-            val nextReaderContent =
-                if (current.selectedReaderEntryId == entryId) content else current.readerContent
-            val nextPlayerNotes =
-                if (activePlayerId == entryId) content else current.activePlayerNotesContent
-            if (
-                nextReaderContent !== current.readerContent ||
-                    nextPlayerNotes !== current.activePlayerNotesContent
-            ) {
-                current.copy(
-                    readerContent = nextReaderContent,
-                    activePlayerNotesContent = nextPlayerNotes,
-                )
-            } else {
-                current
-            }
-        }
-        if (activePlayerId == entryId) {
-            val base = peekLatestEntries().firstOrNull { it.id == entryId }
-            playerController.refreshChaptersFromNotes(
-                entryId = entryId,
-                pickLongerReaderText(content.contentHtml, base?.contentHtml),
-                pickLongerReaderText(content.contentText, base?.contentText),
-                base?.summary,
-            )
-        }
+        readerFeature.applyReaderContentIfActive(entryId, content)
     }
 
     internal fun tryAcquireSyncLock(): Boolean {
@@ -642,9 +597,182 @@ class MainViewModel(
 
     internal companion object {
         private const val STOP_TIMEOUT_MS = 5_000L
-        private const val DEEP_SEARCH_DEBOUNCE_MS = 200L
         internal const val SAVED_NAV_STATE_KEY = "roche_saved_navigation_state"
         internal const val SAVED_NAV_JSON_KEY = "roche_saved_navigation_json"
+    }
+}
+
+private data class AuxUiMeta(
+    val resolvingMusicEntryId: String?,
+    val settingsHubResetTick: Int,
+)
+
+private data class RootUiStateInput(
+    val snapshot: com.grayvines.roche.data.RepositorySnapshot,
+    val settings: Settings,
+    val local: TransientUiState,
+    val syncMeta: SyncAndOfflineMeta,
+    val auxMeta: AuxUiMeta,
+)
+
+private data class DerivedUiStateSlice(
+    val rawEntries: List<InboxEntry>,
+    val optimisticFavorites: Map<String, Boolean>,
+    val activeFilter: com.grayvines.roche.model.InboxFilter,
+    val queueItemIds: List<String>,
+    val rawFeeds: List<com.grayvines.roche.model.FeedItem>,
+    val rawCatalog: com.grayvines.roche.data.catalog.CatalogSnapshot,
+    val normalizedQuery: String,
+    val deepSearchQuery: String,
+    val workspaceSearch: com.grayvines.roche.data.WorkspaceSearchResult,
+    val entryProjections: EntryProjections,
+    val scopeBuckets: InboxScopeBuckets,
+    val queueEntries: List<InboxEntry>,
+    val feedProjections: FeedProjections,
+    val catalogProjections: CatalogProjections,
+    val searchProjection: SearchProjection,
+    val uiState: MainUiState,
+)
+
+private fun reduceDerivedUiStateSlice(
+    prev: DerivedUiStateSlice?,
+    input: RootUiStateInput,
+): DerivedUiStateSlice {
+    val entriesChanged = hasEntriesInputChanged(prev, input)
+    val entryProj = resolveEntryProjectionsSlice(prev, input, entriesChanged)
+    val buckets = resolveScopeBucketsSlice(prev, input, entryProj.entries, entriesChanged)
+    val queue = resolveQueueSlice(prev, input, entryProj.entries, entriesChanged)
+    val feedProj =
+        if (prev == null || input.snapshot.feeds !== prev.rawFeeds) {
+            buildFeedProjections(input.snapshot.feeds)
+        } else {
+            prev.feedProjections
+        }
+    val catalogProj =
+        if (prev == null || input.snapshot.catalog !== prev.rawCatalog) {
+            buildCatalogProjections(input.snapshot.catalog)
+        } else {
+            prev.catalogProjections
+        }
+    val normQuery = input.local.searchQuery.trim().lowercase()
+    val searchProj = resolveSearchSlice(prev, input, entryProj.entries, normQuery, entriesChanged)
+    val inboxDerived = buildInboxDerivedState(entryProj, buckets, queue, feedProj, input.syncMeta)
+    val uiState =
+        assembleMainUiState(
+            snapshot = input.snapshot,
+            inboxDerived = inboxDerived,
+            catalogProjections = catalogProj,
+            searchProjection = searchProj,
+            settings = input.settings,
+            local = input.local,
+            resolvingMusicEntryId = input.auxMeta.resolvingMusicEntryId,
+            settingsHubResetTick = input.auxMeta.settingsHubResetTick,
+        )
+    return DerivedUiStateSlice(
+        rawEntries = input.snapshot.entries,
+        optimisticFavorites = input.local.optimisticFavorites,
+        activeFilter = input.local.activeFilter,
+        queueItemIds = input.settings.queueItemIds,
+        rawFeeds = input.snapshot.feeds,
+        rawCatalog = input.snapshot.catalog,
+        normalizedQuery = normQuery,
+        deepSearchQuery = input.local.deepSearchQuery,
+        workspaceSearch = input.local.workspaceSearch,
+        entryProjections = entryProj,
+        scopeBuckets = buckets,
+        queueEntries = queue,
+        feedProjections = feedProj,
+        catalogProjections = catalogProj,
+        searchProjection = searchProj,
+        uiState = uiState,
+    )
+}
+
+private fun buildInboxDerivedState(
+    entryProj: EntryProjections,
+    buckets: InboxScopeBuckets,
+    queue: List<InboxEntry>,
+    feedProj: FeedProjections,
+    syncMeta: SyncAndOfflineMeta,
+): InboxFeedsDerivedState =
+    InboxFeedsDerivedState(
+        entryProjections = entryProj,
+        scopeBuckets = buckets,
+        queueEntries = queue,
+        feedProjections = feedProj,
+        offlineSizes = syncMeta.offlineSizes,
+        syncStatus = syncMeta.syncStatus,
+        isManualRefreshing = syncMeta.isManualRefreshing,
+        isSyncActive = syncMeta.isSyncActive,
+        inFlightOfflineEntryIds = syncMeta.inFlightOfflineEntryIds,
+    )
+
+private fun hasEntriesInputChanged(
+    prev: DerivedUiStateSlice?,
+    input: RootUiStateInput,
+): Boolean =
+    prev == null ||
+        input.snapshot.entries !== prev.rawEntries ||
+        input.local.optimisticFavorites != prev.optimisticFavorites
+
+private fun resolveEntryProjectionsSlice(
+    prev: DerivedUiStateSlice?,
+    input: RootUiStateInput,
+    entriesChanged: Boolean,
+): EntryProjections =
+    if (entriesChanged || prev == null) {
+        buildEntryProjections(
+            applyOptimisticFavorites(input.snapshot.entries, input.local.optimisticFavorites)
+        )
+    } else {
+        prev.entryProjections
+    }
+
+private fun resolveScopeBucketsSlice(
+    prev: DerivedUiStateSlice?,
+    input: RootUiStateInput,
+    effectiveEntries: List<InboxEntry>,
+    entriesChanged: Boolean,
+): InboxScopeBuckets =
+    if (entriesChanged || prev == null || input.local.activeFilter != prev.activeFilter) {
+        buildInboxScopeBuckets(effectiveEntries, input.local.activeFilter)
+    } else {
+        prev.scopeBuckets
+    }
+
+private fun resolveQueueSlice(
+    prev: DerivedUiStateSlice?,
+    input: RootUiStateInput,
+    effectiveEntries: List<InboxEntry>,
+    entriesChanged: Boolean,
+): List<InboxEntry> =
+    if (entriesChanged || prev == null || input.settings.queueItemIds != prev.queueItemIds) {
+        computeQueueEntries(effectiveEntries, input.settings.queueItemIds)
+    } else {
+        prev.queueEntries
+    }
+
+private fun resolveSearchSlice(
+    prev: DerivedUiStateSlice?,
+    input: RootUiStateInput,
+    effectiveEntries: List<InboxEntry>,
+    normQuery: String,
+    entriesChanged: Boolean,
+): SearchProjection {
+    val queryChanged =
+        prev == null ||
+            normQuery != prev.normalizedQuery ||
+            input.local.deepSearchQuery != prev.deepSearchQuery
+    val deepChanged = prev == null || input.local.workspaceSearch !== prev.workspaceSearch
+    return if (entriesChanged || queryChanged || deepChanged) {
+        buildSearchProjection(
+            entries = effectiveEntries,
+            normalizedQuery = normQuery,
+            deepSearchQuery = input.local.deepSearchQuery,
+            workspaceSearch = input.local.workspaceSearch,
+        )
+    } else {
+        prev.searchProjection
     }
 }
 
@@ -682,6 +810,7 @@ internal fun pruneMissingRestoredState(
     )
 }
 
+@Suppress("TooManyFunctions")
 private class MainViewModelHost(private val vm: MainViewModel) : InboxReaderHost, SyncFeedHost {
     override val repository: RocheRepository
         get() = vm.repository
@@ -705,6 +834,10 @@ private class MainViewModelHost(private val vm: MainViewModel) : InboxReaderHost
         vm.showStatusMessage(message)
     }
 
+    override fun showUndoAction(event: UndoActionEvent) {
+        vm.showUndoAction(event)
+    }
+
     override suspend fun latestEntries(): List<InboxEntry> = vm.latestEntries()
 
     override suspend fun cleanupRemovedEntries(removedIds: Set<String>) {
@@ -719,7 +852,21 @@ private class MainViewModelHost(private val vm: MainViewModel) : InboxReaderHost
         vm.applyReaderContentIfActive(entryId, content)
     }
 
+    override fun refreshOfflineSizes() {
+        vm.refreshOfflineSizes()
+    }
+
     override fun tryAcquireSyncLock(): Boolean = vm.tryAcquireSyncLock()
+
+    override fun isManualRefreshing(): Boolean = vm.isManualRefreshing()
+
+    override fun setManualRefreshing(refreshing: Boolean) {
+        vm.setManualRefreshing(refreshing)
+    }
+
+    override suspend fun awaitSyncFinished() {
+        vm.awaitSyncFinished()
+    }
 
     override fun refreshLocalNetworkTier() {
         vm.refreshLocalNetworkTier()

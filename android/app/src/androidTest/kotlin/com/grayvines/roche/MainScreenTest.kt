@@ -72,8 +72,8 @@ class MainScreenTest {
         composeRule.onNodeWithTag("inbox_search_btn").assertExists()
         composeRule.onNodeWithTag("inbox_spare_settings_btn").assertDoesNotExist()
         composeRule.onNodeWithText(sample.title).assertExists()
-        composeRule.onNodeWithTag("star_btn_${sample.id}").assertExists()
-        composeRule.onNodeWithTag("archive_btn_${sample.id}").assertExists()
+        composeRule.onNodeWithTag("star_btn_${sample.id}").assertDoesNotExist()
+        composeRule.onNodeWithTag("archive_btn_${sample.id}").assertDoesNotExist()
         composeRule.onNodeWithTag("search_fab").assertDoesNotExist()
         composeRule.onNodeWithTag("save_fab").assertDoesNotExist()
 

@@ -87,6 +87,7 @@ import com.grayvines.roche.ranking.resolveRankDropTarget
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheSurfaceCard
+import com.grayvines.roche.ui.components.TierBadgePill
 import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
@@ -117,42 +118,6 @@ private data class RankCardDragHandlers(
     val onEnd: () -> Unit,
     val onCancel: () -> Unit,
 )
-
-@Composable
-internal fun TierBadgePill(
-    tier: Char,
-    modifier: Modifier = Modifier,
-) {
-    val colors = LocalRocheColors.current
-    val badgeColor = resolveTierColor(tier, colors)
-    val shape = RoundedCornerShape(5.dp)
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier =
-            modifier
-                .clip(shape)
-                .background(badgeColor.copy(alpha = 0.16f))
-                .border(1.dp, badgeColor.copy(alpha = 0.55f), shape)
-                .padding(horizontal = 6.dp, vertical = 2.dp),
-    ) {
-        Text(
-            text = tier.toString(),
-            color = badgeColor,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Medium,
-        )
-    }
-}
-
-internal fun resolveTierColor(tier: Char, colors: RocheColors): Color =
-    when (tier.uppercaseChar()) {
-        'S' -> colors.tierSGold
-        'A' -> colors.accentVerdigris
-        'B' -> colors.accentBlue
-        'C' -> colors.accentEcru
-        else -> colors.accentIndianRed
-    }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

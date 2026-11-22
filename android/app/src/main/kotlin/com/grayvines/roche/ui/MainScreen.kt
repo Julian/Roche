@@ -26,11 +26,11 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -54,7 +54,6 @@ import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
-import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.MusicTrackLaunchRequest
@@ -74,6 +73,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 
 private val IdlePlayerStateFlow: StateFlow<PodcastPlayerState> =
@@ -94,25 +94,18 @@ fun MainScreen(
     onImportOpml: () -> Unit = {},
     onExportOpml: () -> Unit = {},
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = { draw ->
-        openCollectionDrawFallback(draw, onOpenExternalUrl)
+        onAction(MainAction.LaunchCollectionDraw(draw))
     },
     onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit = {},
     onRevealSavedBearerToken: suspend () -> String = { "" },
 ) {
     val colors = LocalRocheColors.current
     val scrollStates = rememberMainScrollStates()
+    val coroutineScope = rememberCoroutineScope()
     val activeAudioIdFlow = remember(playerStateFlow) { observeActiveAudioEntryId(playerStateFlow) }
     val activeAudioEntryId by activeAudioIdFlow.collectAsStateWithLifecycle(initialValue = null)
     val activePlayerEntry = state.resolveActivePlayerEntry(activeAudioEntryId)
     val activeReaderEntry = state.activeReaderEntry
-    val retainedSearchStateRef = remember { RetentionRef(state.takeIf { it.isSearchOpen }) }
-    val retainedScopedStates = remember { LinkedHashMap<RocheNavKey.ScopedInbox, MainUiState>() }
-    SideEffect {
-        if (state.isSearchOpen) {
-            retainedSearchStateRef.value = state
-        }
-        cacheActiveScopedState(state, retainedScopedStates)
-    }
     val currentState by rememberUpdatedState(state)
     val currentActiveAudioEntryId by rememberUpdatedState(activeAudioEntryId)
     val currentPlayerEntry by rememberUpdatedState(activePlayerEntry)
@@ -136,8 +129,8 @@ fun MainScreen(
             )
         }
     val navBackStack = rememberNavBackStack(*desiredBackStack.toTypedArray())
-    syncRocheNavBackStack(navBackStack, desiredBackStack)
-    val topKey = navBackStack.lastOrNull() as? RocheNavKey ?: desiredBackStack.last()
+    LaunchedEffect(desiredBackStack) { syncRocheNavBackStack(navBackStack, desiredBackStack) }
+    val topKey = desiredBackStack.last()
     val chromeFlags = computeChromeFlags(topKey)
     val activeTabForBar = resolveBarTab(topKey, state)
     var chromeBottomPx by remember { mutableIntStateOf(0) }
@@ -164,6 +157,17 @@ fun MainScreen(
             showAddFab = chromeFlags.showAddFab,
             activeTabForBar = activeTabForBar,
             onChromeBottomHeightChange = { chromeBottomPx = it },
+            onSelectTab = { tappedTab ->
+                handleBottomBarTabSelect(
+                    tappedTab = tappedTab,
+                    activeTab = activeTabForBar,
+                    topKey = topKey,
+                    state = currentState,
+                    scrollStates = scrollStates,
+                    onAction = currentOnAction,
+                    launchScroll = { block -> coroutineScope.launch { block() } },
+                )
+            },
             onAction = onAction,
         ) {
             NavDisplay(
@@ -192,13 +196,16 @@ fun MainScreen(
                         }
 
                         entry<RocheNavKey.ScopedInbox> { scopedKey ->
-                            MainScopedInboxDestination(
-                                scopedKey = scopedKey,
+                            InboxTabContent(
                                 state = currentState,
-                                activeAudioEntryId = currentActiveAudioEntryId,
-                                retainedFromParent = retainedScopedStates[scopedKey],
-                                scrollStates = scrollStates,
                                 onAction = currentOnAction,
+                                listState =
+                                    scrollStates.lazyListState(scopedInboxScrollKey(scopedKey)),
+                                activeAudioEntryId = currentActiveAudioEntryId,
+                                entries =
+                                    currentState.entriesForScope(scopedKey.feedId, scopedKey.tag),
+                                selectedFeedId = scopedKey.feedId,
+                                selectedTag = scopedKey.tag,
                             )
                         }
 
@@ -206,12 +213,6 @@ fun MainScreen(
                             MainSearchDestination(
                                 state = currentState,
                                 activeAudioEntryId = currentActiveAudioEntryId,
-                                retainedFromParent =
-                                    if (currentState.isSearchOpen) {
-                                        currentState
-                                    } else {
-                                        retainedSearchStateRef.value
-                                    },
                                 scrollStates = scrollStates,
                                 onAction = currentOnAction,
                             )
@@ -245,7 +246,7 @@ fun MainScreen(
 
         MainSnackbarOverlay(
             state = state,
-            hasFab = chromeFlags.hasFab,
+            chromeFlags = chromeFlags,
             onAction = onAction,
             modifier =
                 Modifier.align(Alignment.BottomCenter)
@@ -267,27 +268,53 @@ fun MainScreen(
     )
 }
 
-private class RetentionRef<T>(var value: T)
+@Suppress("LongParameterList")
+private fun handleBottomBarTabSelect(
+    tappedTab: AppTab,
+    activeTab: AppTab,
+    topKey: RocheNavKey,
+    state: MainUiState,
+    scrollStates: MainScrollStateHolder,
+    onAction: (MainAction) -> Unit,
+    launchScroll: (suspend () -> Unit) -> Unit,
+) {
+    if (tappedTab != activeTab || topKey is RocheNavKey.Search) {
+        onAction(MainAction.SelectTab(tappedTab))
+        return
+    }
+    when {
+        tappedTab == AppTab.SETTINGS -> onAction(MainAction.ResetSettingsToHub)
+        topKey is RocheNavKey.ScopedInbox ||
+            tappedTab == AppTab.LISTS && state.selectedCatalogCollectionId != null ->
+            onAction(MainAction.SelectTab(tappedTab))
+        else -> launchScroll { scrollStates.scrollToTop(tappedTab, state) }
+    }
+}
 
-private data class MainChromeFlags(
+internal data class MainChromeFlags(
     val showChrome: Boolean,
     val hasFab: Boolean,
     val showSearchFab: Boolean,
     val showAddFab: Boolean,
 )
 
-private fun computeChromeFlags(topKey: RocheNavKey): MainChromeFlags {
+private val HEADER_SEARCH_TABS =
+    setOf(
+        AppTab.HOME,
+        AppTab.INBOX,
+        AppTab.FEEDS,
+        AppTab.LISTS,
+        AppTab.DIARY,
+        AppTab.QUEUE,
+        AppTab.STARRED,
+        AppTab.OFFLINE,
+    )
+
+internal fun computeChromeFlags(topKey: RocheNavKey): MainChromeFlags {
     val showChrome = topKey !is RocheNavKey.Reader && topKey !is RocheNavKey.FullscreenPlayer
     val topTab = (topKey as? RocheNavKey.Tab)?.tab
     val isInboxTop = topKey is RocheNavKey.ScopedInbox || topTab == AppTab.INBOX
-    val hasHeaderSearch =
-        isInboxTop ||
-            topTab == AppTab.HOME ||
-            topTab == AppTab.FEEDS ||
-            topTab == AppTab.LISTS ||
-            topTab == AppTab.DIARY ||
-            topTab == AppTab.QUEUE ||
-            topTab == AppTab.STARRED
+    val hasHeaderSearch = isInboxTop || topTab in HEADER_SEARCH_TABS
     val hasFab = showChrome && topKey !is RocheNavKey.Search && topTab != AppTab.SETTINGS
     val showSearchFab = hasFab && !hasHeaderSearch
     val showAddFab = hasFab && !isInboxTop
@@ -297,25 +324,6 @@ private fun computeChromeFlags(topKey: RocheNavKey): MainChromeFlags {
         showSearchFab = showSearchFab,
         showAddFab = showAddFab,
     )
-}
-
-private fun cacheActiveScopedState(
-    state: MainUiState,
-    retainedScopedStates: MutableMap<RocheNavKey.ScopedInbox, MainUiState>,
-) {
-    if (state.selectedFeedId == null && state.selectedTag == null) return
-    val activeScopedKey =
-        RocheNavKey.ScopedInbox(
-            feedId = state.selectedFeedId,
-            tag = state.selectedTag,
-        )
-    if (
-        activeScopedKey !in retainedScopedStates &&
-            retainedScopedStates.size >= MAX_RETAINED_SCOPED_STATES
-    ) {
-        retainedScopedStates.keys.firstOrNull()?.let(retainedScopedStates::remove)
-    }
-    retainedScopedStates[activeScopedKey] = state
 }
 
 private fun resolveBarTab(topKey: RocheNavKey, state: MainUiState): AppTab =
@@ -330,6 +338,7 @@ internal fun rememberMainScrollStates(): MainScrollStateHolder =
     rememberSaveable(saver = MainScrollStateHolder.Saver) { MainScrollStateHolder() }
 
 @Composable
+@Suppress("LongParameterList")
 internal fun MainDestinationScaffold(
     state: MainUiState,
     activePlayerEntry: InboxEntry?,
@@ -340,6 +349,7 @@ internal fun MainDestinationScaffold(
     showAddFab: Boolean = hasFab,
     activeTabForBar: AppTab,
     onChromeBottomHeightChange: (Int) -> Unit,
+    onSelectTab: (AppTab) -> Unit,
     onAction: (MainAction) -> Unit,
     content: @Composable () -> Unit,
 ) {
@@ -372,6 +382,7 @@ internal fun MainDestinationScaffold(
                     activeTab = activeTabForBar,
                     activePlayerEntry = activePlayerEntry,
                     playerStateFlow = playerStateFlow,
+                    onSelectTab = onSelectTab,
                     onAction = onAction,
                     modifier = Modifier.onSizeChanged { onChromeBottomHeightChange(it.height) },
                 )
@@ -409,6 +420,7 @@ internal fun MainBottomBarChrome(
     activeTab: AppTab,
     activePlayerEntry: InboxEntry?,
     playerStateFlow: StateFlow<PodcastPlayerState>,
+    onSelectTab: (AppTab) -> Unit,
     onAction: (MainAction) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -428,7 +440,7 @@ internal fun MainBottomBarChrome(
             activeTab = activeTab,
             sideTabs = state.settings.bottomNavTabs,
             inboxUnreadCount = inboxUnreadCount,
-            onSelectTab = { onAction(MainAction.SelectTab(it)) },
+            onSelectTab = onSelectTab,
         )
     }
 }
@@ -474,35 +486,43 @@ internal fun FloatingOverlayButtonStack(
 @Composable
 internal fun MainSnackbarOverlay(
     state: MainUiState,
-    hasFab: Boolean,
+    chromeFlags: MainChromeFlags,
     onAction: (MainAction) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val undo = state.undoEvent
     val banner = state.statusBanner
+    val hasModalOpen = state.hasOpenModalSheet
     val accessibilityManager = LocalAccessibilityManager.current
-    LaunchedEffect(undo, banner, state.messageSequence, accessibilityManager) {
-        if (undo != null || banner != null) {
+    LaunchedEffect(undo, banner, state.messageSequence, hasModalOpen, accessibilityManager) {
+        if ((undo != null || banner != null) && !hasModalOpen) {
+            val baseTimeoutMs =
+                if (undo != null) UNDO_SNACKBAR_AUTO_DISMISS_MS else STATUS_SNACKBAR_AUTO_DISMISS_MS
             val timeoutMs =
                 accessibilityManager?.calculateRecommendedTimeoutMillis(
-                    originalTimeoutMillis = SNACKBAR_AUTO_DISMISS_MS,
+                    originalTimeoutMillis = baseTimeoutMs,
                     containsIcons = false,
                     containsText = true,
                     containsControls = undo != null,
-                ) ?: SNACKBAR_AUTO_DISMISS_MS
+                ) ?: baseTimeoutMs
             delay(timeoutMs)
             onAction(MainAction.DismissMessages)
         }
     }
 
     if (undo != null || banner != null) {
-        val endPadding = if (hasFab) 80.dp else 14.dp
+        val bottomPadding =
+            when {
+                chromeFlags.showSearchFab && chromeFlags.showAddFab -> 134.dp
+                chromeFlags.hasFab -> 76.dp
+                else -> 14.dp
+            }
         UndoOrStatusSnackbar(
             message = undo?.message ?: banner.orEmpty(),
             showUndo = undo != null,
             onUndo = { onAction(MainAction.UndoLastArchive) },
             onDismiss = { onAction(MainAction.DismissMessages) },
-            modifier = modifier.padding(start = 14.dp, end = endPadding, bottom = 14.dp),
+            modifier = modifier.padding(start = 14.dp, end = 14.dp, bottom = bottomPadding),
         )
     }
 }
@@ -646,52 +666,13 @@ internal fun MainOverlaySheets(
 }
 
 @Composable
-private fun MainScopedInboxDestination(
-    scopedKey: RocheNavKey.ScopedInbox,
-    state: MainUiState,
-    activeAudioEntryId: String?,
-    retainedFromParent: MainUiState?,
-    scrollStates: MainScrollStateHolder,
-    onAction: (MainAction) -> Unit,
-) {
-    val retainedStateRef =
-        remember(scopedKey) {
-            RetentionRef(resolveScopedInboxState(state, scopedKey, retainedFromParent))
-        }
-    val displayState =
-        resolveScopedInboxState(
-            state = state,
-            scopedKey = scopedKey,
-            retainedState = retainedFromParent ?: retainedStateRef.value,
-        )
-    SideEffect { retainedStateRef.value = displayState }
-    InboxTabContent(
-        state = displayState,
-        onAction = onAction,
-        listState = scrollStates.lazyListState(scopedInboxScrollKey(scopedKey)),
-        activeAudioEntryId = activeAudioEntryId,
-    )
-}
-
-@Composable
 private fun MainSearchDestination(
     state: MainUiState,
     activeAudioEntryId: String?,
-    retainedFromParent: MainUiState?,
     scrollStates: MainScrollStateHolder,
     onAction: (MainAction) -> Unit,
 ) {
-    val retainedSearchStateRef = remember {
-        RetentionRef(resolveSearchOverlayState(state, retainedFromParent))
-    }
-    val displayState =
-        when {
-            state.isSearchOpen -> state
-            retainedFromParent != null -> retainedFromParent
-            else -> retainedSearchStateRef.value
-        }
-    SideEffect { retainedSearchStateRef.value = displayState }
-    val normalizedQuery = displayState.searchQuery.trim().lowercase()
+    val normalizedQuery = state.searchQuery.trim().lowercase()
     val searchListState = scrollStates.lazyListState(SEARCH_SCROLL_STATE_KEY)
     var lastScrolledQuery by remember { mutableStateOf(normalizedQuery) }
     LaunchedEffect(normalizedQuery) {
@@ -701,7 +682,7 @@ private fun MainSearchDestination(
         }
     }
     SearchOverlay(
-        state = displayState,
+        state = state,
         onAction = onAction,
         listState = searchListState,
         isSearchActive = state.isSearchOpen,
@@ -718,26 +699,9 @@ private fun MainReaderDestination(
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
-    val liveEntry =
+    val targetEntry =
         activeReaderEntry?.takeIf { it.id == readerKey.entryId }
-            ?: state.allEntries.firstOrNull { it.id == readerKey.entryId }
-    val retainedEntryRef = remember(readerKey.entryId) { RetentionRef(liveEntry) }
-    val targetEntry = liveEntry ?: retainedEntryRef.value
-    val retainedBackLabelRef = remember(readerKey.entryId) { RetentionRef(readerBackLabel(state)) }
-    val backLabel =
-        if (activeReaderEntry?.id == readerKey.entryId) {
-            readerBackLabel(state)
-        } else {
-            retainedBackLabelRef.value
-        }
-    SideEffect {
-        if (liveEntry != null) {
-            retainedEntryRef.value = liveEntry
-        }
-        if (activeReaderEntry?.id == readerKey.entryId) {
-            retainedBackLabelRef.value = backLabel
-        }
-    }
+            ?: state.entryById[readerKey.entryId]
     if (targetEntry != null) {
         CompositionLocalProvider(LocalReaderFontScale provides state.settings.readerFontScale) {
             ReaderView(
@@ -748,7 +712,7 @@ private fun MainReaderDestination(
                 onAction = onAction,
                 onShareEntry = onShareEntry,
                 onOpenExternalUrl = onOpenExternalUrl,
-                backLabel = backLabel,
+                backLabel = readerBackLabel(state),
             )
         }
     }
@@ -765,16 +729,9 @@ private fun MainPlayerDestination(
     onOpenExternalUrl: (String) -> Unit,
 ) {
     val playerState by playerStateFlow.collectAsStateWithLifecycle()
-    val liveEntry =
+    val targetEntry =
         activePlayerEntry?.takeIf { it.id == playerKey.entryId }
-            ?: state.allEntries.firstOrNull { it.id == playerKey.entryId }
-    val retainedEntryRef = remember(playerKey.entryId) { RetentionRef(liveEntry) }
-    val targetEntry = liveEntry ?: retainedEntryRef.value
-    SideEffect {
-        if (liveEntry != null) {
-            retainedEntryRef.value = liveEntry
-        }
-    }
+            ?: state.entryById[playerKey.entryId]
     if (targetEntry != null) {
         val resolvedFeed =
             state.resolveActivePlayerFeed(playerState.currentEntryId)
@@ -794,103 +751,7 @@ private fun MainPlayerDestination(
 }
 
 @Composable
-private fun UnscopedInboxTabDestination(
-    state: MainUiState,
-    activeAudioEntryId: String?,
-    scrollStates: MainScrollStateHolder,
-    onAction: (MainAction) -> Unit,
-) {
-    val hasActiveScope = state.selectedFeedId != null || state.selectedTag != null
-    val unscopedEntries =
-        remember(hasActiveScope, state.allEntries, state.activeFilter, state.visibleEntries) {
-            if (hasActiveScope) {
-                RocheRepository.filterEntries(
-                    entries = state.allEntries,
-                    filter = state.activeFilter,
-                    searchQuery = "",
-                    selectedTag = null,
-                    selectedFeedId = null,
-                )
-            } else {
-                state.visibleEntries
-            }
-        }
-    val unscopedState = resolveUnscopedInboxState(state, unscopedEntries)
-    InboxTabContent(
-        state = unscopedState,
-        onAction = onAction,
-        listState = scrollStates.lazyListState("inbox:filter:${state.activeFilter.name}"),
-        activeAudioEntryId = activeAudioEntryId,
-    )
-}
-
-internal fun resolveUnscopedInboxState(
-    state: MainUiState,
-    unscopedEntries: List<InboxEntry> =
-        if (state.selectedFeedId != null || state.selectedTag != null) {
-            RocheRepository.filterEntries(
-                entries = state.allEntries,
-                filter = state.activeFilter,
-                searchQuery = "",
-                selectedTag = null,
-                selectedFeedId = null,
-            )
-        } else {
-            state.visibleEntries
-        },
-): MainUiState =
-    if (state.selectedFeedId != null || state.selectedTag != null) {
-        state.copy(
-            selectedFeedId = null,
-            selectedTag = null,
-            visibleEntries = unscopedEntries,
-        )
-    } else {
-        state
-    }
-
-internal fun resolveScopedInboxState(
-    state: MainUiState,
-    scopedKey: RocheNavKey.ScopedInbox,
-    retainedState: MainUiState? = null,
-): MainUiState =
-    when {
-        state.selectedFeedId == scopedKey.feedId && state.selectedTag == scopedKey.tag -> {
-            state
-        }
-        retainedState != null &&
-            retainedState.selectedFeedId == scopedKey.feedId &&
-            retainedState.selectedTag == scopedKey.tag -> {
-            retainedState
-        }
-        else -> {
-            val scopedVisible =
-                RocheRepository.filterEntries(
-                    entries = state.allEntries,
-                    filter = state.activeFilter,
-                    searchQuery = "",
-                    selectedTag = scopedKey.tag,
-                    selectedFeedId = scopedKey.feedId,
-                )
-            state.copy(
-                selectedFeedId = scopedKey.feedId,
-                selectedTag = scopedKey.tag,
-                visibleEntries = scopedVisible,
-            )
-        }
-    }
-
-internal fun resolveSearchOverlayState(
-    state: MainUiState,
-    retainedSearchState: MainUiState?,
-): MainUiState =
-    when {
-        state.isSearchOpen -> state
-        retainedSearchState != null -> retainedSearchState
-        else -> state
-    }
-
-@Composable
+@Suppress("LongParameterList")
 internal fun MainTabDestinationContent(
     tab: AppTab,
     state: MainUiState,
@@ -914,11 +775,14 @@ internal fun MainTabDestinationContent(
                 onOpenCollectionDraw = onOpenCollectionDraw,
             )
         AppTab.INBOX ->
-            UnscopedInboxTabDestination(
+            InboxTabContent(
                 state = state,
-                activeAudioEntryId = activeAudioEntryId,
-                scrollStates = scrollStates,
                 onAction = onAction,
+                listState = scrollStates.lazyListState("inbox:filter:${state.activeFilter.name}"),
+                activeAudioEntryId = activeAudioEntryId,
+                entries = state.unscopedInboxEntries,
+                selectedFeedId = null,
+                selectedTag = null,
             )
         AppTab.QUEUE ->
             QueueTabContent(
@@ -955,6 +819,7 @@ internal fun MainTabDestinationContent(
                 state = state,
                 onAction = onAction,
                 listState = scrollStates.lazyListState(companionScrollKey(state)),
+                overviewScrollState = scrollStates.scrollState("lists:overview"),
                 onOpenCollectionDraw = onOpenCollectionDraw,
                 onOpenExternalUrl = onOpenExternalUrl,
             )
@@ -1059,16 +924,6 @@ internal fun companionScrollKey(state: MainUiState): String =
         }
     }
 
-internal fun openCollectionDrawFallback(
-    draw: CollectionDrawSnapshot,
-    onOpenExternalUrl: (String) -> Unit,
-) {
-    val fallback = if (draw.isMusicKind) draw.youtubeMusicUrl else draw.primaryExternalUrl.orEmpty()
-    if (fallback.isNotBlank()) {
-        onOpenExternalUrl(fallback)
-    }
-}
-
 internal fun readerBackLabel(state: MainUiState): String =
     when {
         state.isSearchOpen -> "← Search"
@@ -1113,6 +968,36 @@ internal class MainScrollStateHolder(
     fun lazyListState(key: String): LazyListState = lazyStates.getOrPut(key) { LazyListState() }
 
     fun scrollState(key: String): ScrollState = scrollStates.getOrPut(key) { ScrollState(0) }
+
+    suspend fun scrollToTop(tab: AppTab, state: MainUiState) {
+        when (tab) {
+            AppTab.HOME -> scrollState("home").animateScrollTo(0)
+            AppTab.INBOX ->
+                lazyListState("inbox:filter:${state.activeFilter.name}").animateScrollToItem(0)
+            AppTab.QUEUE -> lazyListState(queueScrollKey(state.queueSubTab)).animateScrollToItem(0)
+            AppTab.STARRED -> lazyListState("starred").animateScrollToItem(0)
+            AppTab.FEEDS -> scrollState("feeds").animateScrollTo(0)
+            AppTab.OFFLINE -> lazyListState("offline").animateScrollToItem(0)
+            AppTab.LISTS -> scrollListsToTop(state)
+            AppTab.DIARY -> lazyListState("diary").animateScrollToItem(0)
+            AppTab.SETTINGS -> Unit
+        }
+    }
+
+    private suspend fun scrollListsToTop(state: MainUiState) {
+        if (state.selectedCatalogCollectionId == null) {
+            scrollState("lists:overview").animateScrollTo(0)
+        } else {
+            lazyListState(companionScrollKey(state)).animateScrollToItem(0)
+        }
+    }
+
+    private fun queueScrollKey(subTab: QueueSubTab): String =
+        when (subTab) {
+            QueueSubTab.UP_NEXT -> "queue:up_next"
+            QueueSubTab.WANT -> "queue:want"
+            QueueSubTab.HISTORY -> "queue:history"
+        }
 
     internal fun toSavedSnapshot(): SavedScrollStateSnapshot =
         SavedScrollStateSnapshot(
@@ -1159,6 +1044,6 @@ internal class MainScrollStateHolder(
 }
 
 private const val SAVE_FAB_DEFAULT_LABEL = "Save URL or Feed"
-private const val SNACKBAR_AUTO_DISMISS_MS = 4_000L
-private const val MAX_RETAINED_SCOPED_STATES = 8
+private const val STATUS_SNACKBAR_AUTO_DISMISS_MS = 4_000L
+private const val UNDO_SNACKBAR_AUTO_DISMISS_MS = 7_000L
 internal const val SEARCH_SCROLL_STATE_KEY = "search"

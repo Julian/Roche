@@ -586,21 +586,19 @@ class UiReviewFixesTest {
     }
 
     @Test
-    fun `SearchDisplayRetentionState freezes last active search state on close without snapshot writes`() {
-        val activeState = MainUiState(isSearchOpen = true, searchQuery = "distributed systems")
-        val closedState = MainUiState(isSearchOpen = false, searchQuery = "")
-        val holder =
-            SearchDisplayRetentionState(sawActiveSearch = true, retainedState = activeState)
+    fun `CloseSearch clears query and removes Search key from derived back stack`() {
+        val openState = MainUiState(isSearchOpen = true, searchQuery = "distributed systems")
+        assertTrue(RocheNavKey.Search in deriveRocheBackStack(openState))
 
-        val duringActive = computeRetainedSearchDisplay(holder, activeState, isSearchActive = true)
-        commitRetainedSearchDisplay(holder, activeState, isSearchActive = true)
-        assertEquals("distributed systems", duringActive.state.searchQuery)
-        assertTrue(duringActive.canEditQuery)
-
-        val duringExit = computeRetainedSearchDisplay(holder, closedState, isSearchActive = false)
-        commitRetainedSearchDisplay(holder, closedState, isSearchActive = false)
-        assertEquals("distributed systems", duringExit.state.searchQuery)
-        assertFalse(duringExit.canEditQuery)
+        val closedTransient =
+            reduceUiAction(
+                TransientUiState(isSearchOpen = true, searchQuery = "distributed systems"),
+                MainAction.CloseSearch,
+            )
+        assertFalse(closedTransient.isSearchOpen)
+        assertEquals("", closedTransient.searchQuery)
+        val closedUi = MainUiState(isSearchOpen = false, searchQuery = "")
+        assertFalse(RocheNavKey.Search in deriveRocheBackStack(closedUi))
     }
 
     @Test

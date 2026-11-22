@@ -9,6 +9,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -26,6 +27,8 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -37,9 +40,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
@@ -56,9 +56,11 @@ import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.catalog.CatalogListSummary
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.RankedCatalogEntry
+import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.extractCleanDomain
+import com.grayvines.roche.ui.components.CatalogCoverThumbnail
 import com.grayvines.roche.ui.components.EntrySourceMetadataRow
 import com.grayvines.roche.ui.components.EntryThumbnailPreview
 import com.grayvines.roche.ui.components.FilingCabinetIcon
@@ -66,10 +68,12 @@ import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
+import com.grayvines.roche.ui.components.RocheStripTab
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.components.StarIcon
+import com.grayvines.roche.ui.components.UnpinnedTabBackButton
 import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
@@ -147,11 +151,15 @@ fun StarredTabContent(
     val totalCount = orderedRows.size
 
     RocheRefreshableTabScaffold(
-        isRefreshing = state.isSyncing,
-        onRefresh = { onAction(MainAction.SyncNow) },
+        isRefreshing = state.isManualRefreshing,
+        onRefresh = { onAction(MainAction.ManualRefresh) },
         pullToRefreshTestTag = "starred_pull_to_refresh",
         header = {
-            StarredListHeaderBar(totalCount = totalCount, onAction = onAction)
+            StarredListHeaderBar(
+                totalCount = totalCount,
+                showBackToHome = state.isUnpinnedDestination(AppTab.STARRED),
+                onAction = onAction,
+            )
             StarredTypeFilterStrip(
                 allCount = totalCount,
                 selectedType = selectedTypeFilter,
@@ -194,10 +202,20 @@ private fun StarredEmptyPlaceholder(selectedTypeFilter: ContentType?) {
 @Composable
 private fun StarredListHeaderBar(
     totalCount: Int,
+    showBackToHome: Boolean,
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    RocheTopHeader(title = "Stars", badgeText = totalCount.toString()) {
+    RocheTopHeader(
+        title = "Stars",
+        badgeText = totalCount.toString(),
+        navigationAction =
+            if (showBackToHome) {
+                { UnpinnedTabBackButton(onBack = { onAction(MainAction.SelectTab(AppTab.HOME)) }) }
+            } else {
+                null
+            },
+    ) {
         if (totalCount >= 2) {
             HeaderActionButton(
                 label = "Rank",
@@ -233,31 +251,31 @@ private fun StarredTypeFilterStrip(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        SoftStripTab(
+        RocheStripTab(
             label = "All ($allCount)",
             selected = selectedType == null,
             onClick = { onSelectType(null) },
             modifier = Modifier.testTag("starred_filter_all"),
         )
-        SoftStripTab(
+        RocheStripTab(
             label = "Articles",
             selected = selectedType == ContentType.ARTICLE,
             onClick = { onSelectType(ContentType.ARTICLE) },
             modifier = Modifier.testTag("starred_filter_articles"),
         )
-        SoftStripTab(
+        RocheStripTab(
             label = "Papers",
             selected = selectedType == ContentType.PDF,
             onClick = { onSelectType(ContentType.PDF) },
             modifier = Modifier.testTag("starred_filter_papers"),
         )
-        SoftStripTab(
+        RocheStripTab(
             label = "Videos",
             selected = selectedType == ContentType.VIDEO,
             onClick = { onSelectType(ContentType.VIDEO) },
             modifier = Modifier.testTag("starred_filter_videos"),
         )
-        SoftStripTab(
+        RocheStripTab(
             label = "Podcasts",
             selected = selectedType == ContentType.AUDIO,
             onClick = { onSelectType(ContentType.AUDIO) },
@@ -278,64 +296,75 @@ private fun StarredEntriesList(
     listState: LazyListState,
 ) {
     val colors = LocalRocheColors.current
-    val readableIds = remember(state.allEntries) { state.allEntries.mapTo(HashSet()) { it.id } }
     val nextQueuedAudioId = state.resolveNextQueuedAudioEntry(activeAudioEntryId)?.id
-    LazyColumn(
-        state = listState,
-        modifier = Modifier.fillMaxSize().testTag("starred_list"),
-        contentPadding = PaddingValues(bottom = 88.dp),
-    ) {
-        items(items = rows, key = { it.stableKey }) { row ->
-            when (row) {
-                is StarredDisplayRow.ReaderRow -> {
-                    val entry = row.entry
-                    InboxEntryRowItem(
-                        entry = entry,
-                        ultraDense = state.settings.ultraDenseRows,
-                        swipeToArchiveEnabled = state.settings.swipeToArchive,
-                        isPlayingAudio = entry.id == activeAudioEntryId,
-                        isQueuedNextAudio = entry.id == nextQueuedAudioId,
-                        onOpen = { onAction(MainAction.OpenReader(entry.id)) },
-                        onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
-                        onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
-                        onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
-                        onDownloadOffline = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
-                    )
-                }
-                is StarredDisplayRow.CatalogRow -> {
-                    val catItem = row.item
-                    val onOpen =
-                        resolveCatalogEntryOpenAction(
-                            entryId = catItem.entry.id,
-                            externalUrl = catItem.entry.url,
-                            readableIds = readableIds,
-                            onOpenReader = { entryId -> onAction(MainAction.OpenReader(entryId)) },
-                            onOpenExternalUrl = onOpenExternalUrl,
-                            entryKind = catItem.entry.kind,
-                            onOpenCatalogDetail = { entryId ->
-                                onAction(MainAction.OpenCatalogDetailSheet(entryId))
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val isCompactWidth = maxWidth < COMPACT_ROW_BREAKPOINT
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize().testTag("starred_list"),
+            contentPadding = PaddingValues(bottom = 88.dp),
+        ) {
+            items(items = rows, key = { it.stableKey }) { row ->
+                when (row) {
+                    is StarredDisplayRow.ReaderRow -> {
+                        val entry = row.entry
+                        InboxEntryRowItem(
+                            entry = entry,
+                            ultraDense = state.settings.ultraDenseRows,
+                            swipeToArchiveEnabled = state.settings.swipeToArchive,
+                            isCompactWidth = isCompactWidth,
+                            isPlayingAudio = entry.id == activeAudioEntryId,
+                            isQueuedNextAudio = entry.id == nextQueuedAudioId,
+                            isDownloadingOffline = entry.id in state.inFlightOfflineEntryIds,
+                            onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                            onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
+                            onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
+                            onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                            onDownloadOffline = {
+                                onAction(MainAction.ToggleOfflineCache(entry.id))
                             },
                         )
-                    StarredCatalogEntryRow(
-                        item = catItem,
-                        onOpen = onOpen,
-                        onUnstar = {
-                            onAction(
-                                MainAction.RemoveWantEntry(STARRED_COLLECTION_ID, catItem.entry.id)
+                    }
+                    is StarredDisplayRow.CatalogRow -> {
+                        val catItem = row.item
+                        val onOpen =
+                            resolveCatalogEntryOpenAction(
+                                entryId = catItem.entry.id,
+                                externalUrl = catItem.entry.url,
+                                readableIds = state.readableEntryIds,
+                                onOpenReader = { entryId ->
+                                    onAction(MainAction.OpenReader(entryId))
+                                },
+                                onOpenExternalUrl = onOpenExternalUrl,
+                                entryKind = catItem.entry.kind,
+                                onOpenCatalogDetail = { entryId ->
+                                    onAction(MainAction.OpenCatalogDetailSheet(entryId))
+                                },
                             )
-                        },
-                        onRank = {
-                            onAction(
-                                MainAction.StartRankingSession(
-                                    STARRED_COLLECTION_ID,
-                                    catItem.entry.id,
+                        StarredCatalogEntryRow(
+                            item = catItem,
+                            onOpen = onOpen,
+                            onUnstar = {
+                                onAction(
+                                    MainAction.RemoveWantEntry(
+                                        STARRED_COLLECTION_ID,
+                                        catItem.entry.id,
+                                    )
                                 )
-                            )
-                        },
-                    )
+                            },
+                            onRank = {
+                                onAction(
+                                    MainAction.StartRankingSession(
+                                        STARRED_COLLECTION_ID,
+                                        catItem.entry.id,
+                                    )
+                                )
+                            },
+                        )
+                    }
                 }
+                HorizontalDivider(color = colors.border, thickness = 1.dp)
             }
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
         }
     }
 }
@@ -419,13 +448,15 @@ fun QueueTabContent(
         activeSubTab == QueueSubTab.UP_NEXT && nextQueuedAudio != null && activeAudioEntryId == null
 
     RocheRefreshableTabScaffold(
-        isRefreshing = state.isSyncing,
-        onRefresh = { onAction(MainAction.SyncNow) },
+        isRefreshing = state.isManualRefreshing,
+        onRefresh = { onAction(MainAction.ManualRefresh) },
         pullToRefreshTestTag = "queue_pull_to_refresh",
         header = {
             QueueHeaderBar(
                 countBadge = countBadge,
                 showPlayAudio = showPlayAudio,
+                showBackToHome = state.isUnpinnedDestination(AppTab.QUEUE),
+                onBackToHome = { onAction(MainAction.SelectTab(AppTab.HOME)) },
                 onPlayAudio = { onAction(MainAction.SkipToNextQueuedAudio) },
                 onOpenSearch = { onAction(MainAction.OpenSearch) },
             )
@@ -495,14 +526,26 @@ private fun QueueTabBody(
 }
 
 @Composable
+@Suppress("LongParameterList")
 private fun QueueHeaderBar(
     countBadge: Int,
     showPlayAudio: Boolean,
+    showBackToHome: Boolean,
+    onBackToHome: () -> Unit,
     onPlayAudio: () -> Unit,
     onOpenSearch: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    RocheTopHeader(title = "Queue", badgeText = countBadge.toString()) {
+    RocheTopHeader(
+        title = "Queue",
+        badgeText = countBadge.toString(),
+        navigationAction =
+            if (showBackToHome) {
+                { UnpinnedTabBackButton(onBack = onBackToHome) }
+            } else {
+                null
+            },
+    ) {
         if (showPlayAudio) {
             HeaderActionButton(
                 label = "▶ Play",
@@ -539,19 +582,19 @@ private fun QueueModeFilterRow(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        SoftStripTab(
+        RocheStripTab(
             label = "Up Next ($queueCount)",
             selected = activeSubTab == QueueSubTab.UP_NEXT,
             onClick = { onSelectSubTab(QueueSubTab.UP_NEXT) },
             modifier = Modifier.testTag("queue_mode_up_next"),
         )
-        SoftStripTab(
+        RocheStripTab(
             label = if (wantCount > 0) "Want ($wantCount)" else "Want",
             selected = activeSubTab == QueueSubTab.WANT,
             onClick = { onSelectSubTab(QueueSubTab.WANT) },
             modifier = Modifier.testTag("queue_mode_want"),
         )
-        SoftStripTab(
+        RocheStripTab(
             label = if (historyCount > 0) "History ($historyCount)" else "History",
             selected = activeSubTab == QueueSubTab.HISTORY,
             onClick = { onSelectSubTab(QueueSubTab.HISTORY) },
@@ -585,7 +628,6 @@ private fun WantQueuesPane(
         }
     val entries =
         activeQueue?.let { state.catalog.entriesByCollectionId[it.collectionId] }.orEmpty()
-    val readableIds = remember(state.allEntries) { state.allEntries.mapTo(HashSet()) { it.id } }
 
     Column(modifier = Modifier.fillMaxSize()) {
         if (queues.size > 1) {
@@ -601,7 +643,7 @@ private fun WantQueuesPane(
             WantQueueEntriesList(
                 activeQueue = activeQueue,
                 entries = entries,
-                readableIds = readableIds,
+                readableIds = state.readableEntryIds,
                 listState = listState,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
@@ -633,7 +675,7 @@ private fun WantQueuePickerRow(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         queues.forEach { queue ->
-            SoftStripTab(
+            RocheStripTab(
                 label = "${queue.title} (${queue.entryCount})",
                 selected = queue.collectionId == activeCollectionId,
                 onClick = { onSelect(queue.collectionId) },
@@ -885,25 +927,31 @@ private fun UpNextQueueListContent(
         }
         return
     }
-    LazyColumn(
-        state = listState,
-        modifier = Modifier.fillMaxSize().testTag("queue_list"),
-        contentPadding = PaddingValues(bottom = 96.dp),
-    ) {
-        itemsIndexed(items = queueEntries, key = { _, item -> item.id }) { index, entry ->
-            QueueEntryRowItem(
-                entry = entry,
-                canMoveUp = index > 0,
-                isPlayingAudio = entry.id == activeAudioEntryId,
-                isQueuedNextAudio = entry.id == nextQueuedAudioId,
-                onOpen = { onAction(MainAction.OpenReader(entry.id)) },
-                onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
-                onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
-                onMoveUp = { onAction(MainAction.MoveQueueItemUp(entry.id)) },
-                onRemoveFromQueue = { onAction(MainAction.RemoveFromQueue(entry.id)) },
-                onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
-            )
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val isCompactWidth = maxWidth < COMPACT_ROW_BREAKPOINT
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize().testTag("queue_list"),
+            contentPadding = PaddingValues(bottom = 96.dp),
+        ) {
+            itemsIndexed(items = queueEntries, key = { _, item -> item.id }) { index, entry ->
+                QueueEntryRowItem(
+                    entry = entry,
+                    queuePosition = index + 1,
+                    canMoveUp = index > 0,
+                    isCompactWidth = isCompactWidth,
+                    isPlayingAudio = entry.id == activeAudioEntryId,
+                    isQueuedNextAudio = entry.id == nextQueuedAudioId,
+                    onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                    onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
+                    onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
+                    onMoveToTop = { onAction(MainAction.MoveQueueItemToTop(entry.id)) },
+                    onMoveUp = { onAction(MainAction.MoveQueueItemUp(entry.id)) },
+                    onRemoveFromQueue = { onAction(MainAction.RemoveFromQueue(entry.id)) },
+                    onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                )
+                HorizontalDivider(color = colors.border, thickness = 1.dp)
+            }
         }
     }
 }
@@ -1051,51 +1099,95 @@ private fun ListeningHistoryMetaColumn(
 @Suppress("LongParameterList")
 private fun QueueEntryRowItem(
     entry: InboxEntry,
+    queuePosition: Int,
     canMoveUp: Boolean,
+    isCompactWidth: Boolean,
     isPlayingAudio: Boolean,
     isQueuedNextAudio: Boolean,
     onOpen: () -> Unit,
     onLongPress: () -> Unit,
     onToggleStar: () -> Unit,
+    onMoveToTop: () -> Unit,
     onMoveUp: () -> Unit,
     onRemoveFromQueue: () -> Unit,
     onToggleArchive: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val rowBackground =
-        when {
-            isPlayingAudio -> colors.accentBlue.copy(alpha = ROW_HIGHLIGHT_ALPHA)
-            isQueuedNextAudio -> colors.accentVerdigris.copy(alpha = QUEUE_NEXT_ALPHA)
-            else -> colors.background
-        }
-    val leftAccentColor =
-        when {
-            isPlayingAudio -> colors.accentBlue
-            isQueuedNextAudio -> colors.accentVerdigris
-            else -> null
-        }
-    val starTint = if (entry.isFavorite) colors.accentEcru else colors.textMuted
+    val (rowBackground, leftAccentColor) =
+        resolveQueueRowColors(colors, isPlayingAudio, isQueuedNextAudio)
 
     Row(
         modifier =
             Modifier.fillMaxWidth()
                 .background(rowBackground)
-                .drawBehind {
-                    if (leftAccentColor != null) {
-                        drawRect(
-                            color = leftAccentColor,
-                            topLeft = Offset.Zero,
-                            size = Size(width = 3.dp.toPx(), height = size.height),
-                        )
-                    }
-                }
+                .drawLeftAccentBar(leftAccentColor)
                 .combinedClickable(onClick = onOpen, onLongClick = onLongPress)
                 .semantics { role = Role.Button }
-                .padding(start = 10.dp, end = 12.dp, top = 11.dp, bottom = 11.dp)
+                .padding(
+                    start = if (isCompactWidth) 12.dp else 10.dp,
+                    end = if (isCompactWidth) 6.dp else 12.dp,
+                    top = 11.dp,
+                    bottom = 11.dp,
+                )
                 .testTag("queue_row_${entry.id}"),
-        verticalAlignment = Alignment.Top,
+        verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        QueueRowLeadingSlot(
+            entry = entry,
+            queuePosition = queuePosition,
+            isCompactWidth = isCompactWidth,
+            onToggleStar = onToggleStar,
+        )
+        QueueEntryTextColumn(
+            entry = entry,
+            showCompactStarDot = isCompactWidth && entry.isFavorite,
+            modifier = Modifier.weight(1f),
+        )
+        QueueRowTrailingSlot(
+            entry = entry,
+            canMoveUp = canMoveUp,
+            isCompactWidth = isCompactWidth,
+            onMoveToTop = onMoveToTop,
+            onMoveUp = onMoveUp,
+            onToggleStar = onToggleStar,
+            onToggleArchive = onToggleArchive,
+            onRemoveFromQueue = onRemoveFromQueue,
+        )
+    }
+}
+
+private fun resolveQueueRowColors(
+    colors: com.grayvines.roche.ui.theme.RocheColors,
+    isPlayingAudio: Boolean,
+    isQueuedNextAudio: Boolean,
+): Pair<androidx.compose.ui.graphics.Color, androidx.compose.ui.graphics.Color?> =
+    when {
+        isPlayingAudio -> colors.accentBlue.copy(alpha = ROW_HIGHLIGHT_ALPHA) to colors.accentBlue
+        isQueuedNextAudio ->
+            colors.accentVerdigris.copy(alpha = QUEUE_NEXT_ALPHA) to colors.accentVerdigris
+        else -> colors.background to null
+    }
+
+@Composable
+private fun QueueRowLeadingSlot(
+    entry: InboxEntry,
+    queuePosition: Int,
+    isCompactWidth: Boolean,
+    onToggleStar: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    if (isCompactWidth) {
+        Text(
+            text = "$queuePosition",
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+            textAlign = TextAlign.End,
+            modifier = Modifier.width(18.dp),
+        )
+    } else {
+        val starTint = if (entry.isFavorite) colors.accentEcru else colors.textMuted
         RocheIconActionButton(
             contentDescription =
                 if (entry.isFavorite) "Unstar ${entry.title}" else "Star ${entry.title}",
@@ -1105,13 +1197,39 @@ private fun QueueEntryRowItem(
         ) {
             StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 17.dp)
         }
-        if (entry.showsThumbnailPreview) {
-            EntryThumbnailPreview(entry = entry, modifier = Modifier.padding(top = 2.dp))
-        }
-        QueueEntryTextColumn(entry = entry, modifier = Modifier.weight(1f))
+    }
+    if (entry.hasThumbnailSource()) {
+        EntryThumbnailPreview(entry = entry, modifier = Modifier.padding(top = 2.dp))
+    }
+}
+
+@Composable
+@Suppress("LongParameterList")
+private fun QueueRowTrailingSlot(
+    entry: InboxEntry,
+    canMoveUp: Boolean,
+    isCompactWidth: Boolean,
+    onMoveToTop: () -> Unit,
+    onMoveUp: () -> Unit,
+    onToggleStar: () -> Unit,
+    onToggleArchive: () -> Unit,
+    onRemoveFromQueue: () -> Unit,
+) {
+    if (isCompactWidth) {
+        QueueCompactOverflowMenu(
+            entry = entry,
+            canMoveUp = canMoveUp,
+            onMoveToTop = onMoveToTop,
+            onMoveUp = onMoveUp,
+            onToggleStar = onToggleStar,
+            onToggleArchive = onToggleArchive,
+            onRemoveFromQueue = onRemoveFromQueue,
+        )
+    } else {
         QueueEntryTrailingActions(
             entry = entry,
             canMoveUp = canMoveUp,
+            onMoveToTop = onMoveToTop,
             onMoveUp = onMoveUp,
             onRemoveFromQueue = onRemoveFromQueue,
             onToggleArchive = onToggleArchive,
@@ -1122,6 +1240,7 @@ private fun QueueEntryRowItem(
 @Composable
 private fun QueueEntryTextColumn(
     entry: InboxEntry,
+    showCompactStarDot: Boolean,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
@@ -1142,14 +1261,119 @@ private fun QueueEntryTextColumn(
             trailingMetaText = "· ${entry.readEstimateLabel}",
             trailingMetaFontSize = 11.sp,
             showOfflineIndicator = true,
+            showStarDot = showCompactStarDot,
         )
     }
 }
 
 @Composable
+@Suppress("LongParameterList")
+private fun QueueCompactOverflowMenu(
+    entry: InboxEntry,
+    canMoveUp: Boolean,
+    onMoveToTop: () -> Unit,
+    onMoveUp: () -> Unit,
+    onToggleStar: () -> Unit,
+    onToggleArchive: () -> Unit,
+    onRemoveFromQueue: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    var expanded by rememberSaveable(entry.id) { mutableStateOf(false) }
+
+    Box {
+        RocheIconActionButton(
+            contentDescription = "Queue options for ${entry.title}",
+            onClick = { expanded = true },
+            outlined = false,
+            modifier = Modifier.testTag("queue_more_btn_${entry.id}"),
+        ) {
+            Text(
+                text = "⋯",
+                color = colors.textSecondary,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            containerColor = colors.surfaceElevated,
+        ) {
+            QueueCompactOverflowMenuItems(
+                entry = entry,
+                canMoveUp = canMoveUp,
+                onDismiss = { expanded = false },
+                onMoveToTop = onMoveToTop,
+                onMoveUp = onMoveUp,
+                onToggleStar = onToggleStar,
+                onToggleArchive = onToggleArchive,
+                onRemoveFromQueue = onRemoveFromQueue,
+            )
+        }
+    }
+}
+
+@Composable
+@Suppress("LongParameterList")
+private fun QueueCompactOverflowMenuItems(
+    entry: InboxEntry,
+    canMoveUp: Boolean,
+    onDismiss: () -> Unit,
+    onMoveToTop: () -> Unit,
+    onMoveUp: () -> Unit,
+    onToggleStar: () -> Unit,
+    onToggleArchive: () -> Unit,
+    onRemoveFromQueue: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    if (canMoveUp) {
+        QueueOverflowOption("Move to Top", colors.textPrimary, "queue_move_top_item_${entry.id}") {
+            onDismiss()
+            onMoveToTop()
+        }
+        QueueOverflowOption("Move Up", colors.textPrimary, "queue_up_item_${entry.id}") {
+            onDismiss()
+            onMoveUp()
+        }
+    }
+    QueueOverflowOption(if (entry.isFavorite) "Remove Star" else "Star", colors.textPrimary) {
+        onDismiss()
+        onToggleStar()
+    }
+    QueueOverflowOption(if (entry.isArchived) "Unarchive" else "Archive", colors.textPrimary) {
+        onDismiss()
+        onToggleArchive()
+    }
+    QueueOverflowOption(
+        "Remove from Up Next",
+        colors.accentIndianRed,
+        "queue_remove_item_${entry.id}",
+    ) {
+        onDismiss()
+        onRemoveFromQueue()
+    }
+}
+
+@Composable
+private fun QueueOverflowOption(
+    label: String,
+    textColor: androidx.compose.ui.graphics.Color,
+    testTag: String? = null,
+    onClick: () -> Unit,
+) {
+    DropdownMenuItem(
+        text = { Text(label, color = textColor) },
+        onClick = onClick,
+        modifier = if (testTag != null) Modifier.testTag(testTag) else Modifier,
+    )
+}
+
+@Composable
+@Suppress("LongParameterList")
 private fun QueueEntryTrailingActions(
     entry: InboxEntry,
     canMoveUp: Boolean,
+    onMoveToTop: () -> Unit,
     onMoveUp: () -> Unit,
     onRemoveFromQueue: () -> Unit,
     onToggleArchive: () -> Unit,
@@ -1160,19 +1384,7 @@ private fun QueueEntryTrailingActions(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         if (canMoveUp) {
-            RocheIconActionButton(
-                contentDescription = "Move up ${entry.title}",
-                onClick = onMoveUp,
-                outlined = false,
-                modifier = Modifier.testTag("queue_up_btn_${entry.id}"),
-            ) {
-                Text(
-                    text = "↑",
-                    color = colors.textSecondary,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 14.sp,
-                )
-            }
+            QueueReorderIconButtons(entry = entry, onMoveToTop = onMoveToTop, onMoveUp = onMoveUp)
         }
         RocheIconActionButton(
             contentDescription = "Remove ${entry.title} from Queue",
@@ -1180,12 +1392,7 @@ private fun QueueEntryTrailingActions(
             outlined = false,
             modifier = Modifier.testTag("queue_remove_btn_${entry.id}"),
         ) {
-            Text(
-                text = "✕",
-                color = colors.textMuted,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 13.sp,
-            )
+            Text("✕", color = colors.textMuted, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
         }
         RocheIconActionButton(
             contentDescription = "Archive ${entry.title}",
@@ -1193,12 +1400,33 @@ private fun QueueEntryTrailingActions(
             outlined = false,
             modifier = Modifier.testTag("queue_archive_btn_${entry.id}"),
         ) {
-            FilingCabinetIcon(
-                tint = colors.textMuted,
-                isArchived = entry.isArchived,
-                size = 17.dp,
-            )
+            FilingCabinetIcon(tint = colors.textMuted, isArchived = entry.isArchived, size = 17.dp)
         }
+    }
+}
+
+@Composable
+private fun QueueReorderIconButtons(
+    entry: InboxEntry,
+    onMoveToTop: () -> Unit,
+    onMoveUp: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    RocheIconActionButton(
+        contentDescription = "Move ${entry.title} to top of Queue",
+        onClick = onMoveToTop,
+        outlined = false,
+        modifier = Modifier.testTag("queue_top_btn_${entry.id}"),
+    ) {
+        Text("⇈", color = colors.textSecondary, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
+    }
+    RocheIconActionButton(
+        contentDescription = "Move up ${entry.title}",
+        onClick = onMoveUp,
+        outlined = false,
+        modifier = Modifier.testTag("queue_up_btn_${entry.id}"),
+    ) {
+        Text("↑", color = colors.textSecondary, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
     }
 }
 

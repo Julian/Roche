@@ -29,6 +29,7 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
             is MainAction.ToggleFeedArchive -> performToggleFeedArchive(action.feedId)
             is MainAction.DeleteFeed -> performDeleteFeed(action.feedId)
             MainAction.SyncNow -> performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
+            MainAction.ManualRefresh -> performManualRefresh()
             MainAction.PollFeedsOnDeviceNow -> performPollFeedsOnDevice()
             is MainAction.SyncWithServerConfig -> performSyncWithServerConfig(action)
             MainAction.StartupSyncIfConfigured -> performStartupSync()
@@ -149,19 +150,15 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
         host.cleanupRemovedEntries(archivedIds)
         val count = snapshots.size
         val noun = entryCountNoun(count)
-        val first = snapshots.first()
         host.updateTransient {
             it.copy(
                 feedContextSheetId = null,
                 statusBanner = null,
                 messageSequence = it.messageSequence + 1,
                 undoEvent =
-                    UndoArchiveEvent(
-                        itemId = first.itemId,
-                        previousStatus = first.previousStatus,
-                        previousReadAt = first.previousReadAt,
-                        batchSnapshots = snapshots,
+                    UndoActionEvent(
                         message = "Archived $count $noun in feed",
+                        kind = UndoActionKind.RestoreBatchArchive(snapshots),
                     ),
             )
         }
@@ -358,42 +355,71 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
         }
     }
 
+    private suspend fun performManualRefresh() {
+        if (host.isManualRefreshing()) return
+        if (!host.tryAcquireSyncLock()) {
+            host.setManualRefreshing(true)
+            try {
+                host.awaitSyncFinished()
+                host.repository.syncStatus.value.lastError
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { err -> host.showStatusMessage(err) }
+            } finally {
+                host.setManualRefreshing(false)
+            }
+            return
+        }
+        host.setManualRefreshing(true)
+        try {
+            executeLockedSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
+        } finally {
+            host.setManualRefreshing(false)
+            host.refreshLocalNetworkTier()
+            host.updateTransient { it.copy(isSyncing = false) }
+        }
+    }
+
     private suspend fun performSync(errorPolicy: SyncErrorPolicy) {
         host.refreshLocalNetworkTier()
         if (!host.tryAcquireSyncLock()) return
         try {
-            val hasServer = host.settingsRepository.settings.first().serverUrl.isNotBlank()
-            val syncResult = host.repository.syncWithServer()
-            host.refreshLocalNetworkTier()
-            syncResult
-                .onSuccess { count ->
-                    val message =
-                        when {
-                            hasServer -> "Synced $count entries from server"
-                            count == 0 -> "Feeds are up to date"
-                            else -> "Refreshed $count ${if (count == 1) "feed" else "feeds"}"
-                        }
-                    host.showStatusMessage(message)
-                }
-                .onFailure { error ->
-                    if (errorPolicy == SyncErrorPolicy.SHOW_BANNER) {
-                        val detail = formatErrorDetail(error, "unreachable")
-                        val banner =
-                            if (
-                                error is ProblemDetailsException &&
-                                    error.problemType == RocheProblemTypes.TOKEN_INVALID
-                            ) {
-                                detail
-                            } else {
-                                "Sync offline ($detail)"
-                            }
-                        host.showStatusMessage(banner)
-                    }
-                }
+            executeLockedSync(errorPolicy = errorPolicy)
         } finally {
             host.refreshLocalNetworkTier()
             host.updateTransient { it.copy(isSyncing = false) }
         }
+    }
+
+    private suspend fun executeLockedSync(errorPolicy: SyncErrorPolicy) {
+        host.refreshLocalNetworkTier()
+        val hasServer = host.settingsRepository.settings.first().serverUrl.isNotBlank()
+        val syncResult = host.repository.syncWithServer()
+        host.refreshLocalNetworkTier()
+        syncResult
+            .onSuccess { count ->
+                val message =
+                    when {
+                        hasServer -> "Synced $count entries from server"
+                        count == 0 -> "Feeds are up to date"
+                        else -> "Refreshed $count ${if (count == 1) "feed" else "feeds"}"
+                    }
+                host.showStatusMessage(message)
+            }
+            .onFailure { error ->
+                if (errorPolicy == SyncErrorPolicy.SHOW_BANNER) {
+                    val detail = formatErrorDetail(error, "unreachable")
+                    val banner =
+                        if (
+                            error is ProblemDetailsException &&
+                                error.problemType == RocheProblemTypes.TOKEN_INVALID
+                        ) {
+                            detail
+                        } else {
+                            "Sync offline ($detail)"
+                        }
+                    host.showStatusMessage(banner)
+                }
+            }
     }
 
     private fun formatErrorDetail(error: Throwable, fallback: String): String =

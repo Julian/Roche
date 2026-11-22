@@ -1,6 +1,5 @@
 package com.grayvines.roche.ui
 
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -16,7 +15,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -25,7 +23,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
-import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,30 +32,28 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.role
-import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.DiaryEntryItem
-import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.model.AppTab
+import com.grayvines.roche.ui.components.CatalogCoverThumbnail
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
+import com.grayvines.roche.ui.components.RocheStripTab
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SearchIcon
-import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
+import com.grayvines.roche.ui.components.TierBadgePill
+import com.grayvines.roche.ui.components.UnpinnedTabBackButton
 import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
@@ -81,13 +76,15 @@ fun DiaryScreen(
         }
 
     RocheRefreshableTabScaffold(
-        isRefreshing = state.isSyncing,
-        onRefresh = { onAction(MainAction.SyncNow) },
+        isRefreshing = state.isManualRefreshing,
+        onRefresh = { onAction(MainAction.ManualRefresh) },
         pullToRefreshTestTag = "diary_pull_to_refresh",
         modifier = Modifier.testTag("diary_screen"),
         header = {
             DiaryTopHeaderBar(
                 entryCount = filteredEntries.size,
+                showBackToHome = state.isUnpinnedDestination(AppTab.DIARY),
+                onBackToHome = { onAction(MainAction.SelectTab(AppTab.HOME)) },
                 onOpenSearch = { onAction(MainAction.OpenSearch) },
             )
             DiaryStatusFilterStrip(
@@ -116,12 +113,20 @@ fun DiaryScreen(
 @Composable
 private fun DiaryTopHeaderBar(
     entryCount: Int,
+    showBackToHome: Boolean,
+    onBackToHome: () -> Unit,
     onOpenSearch: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
     RocheTopHeader(
         title = "Diary",
         badgeText = entryCount.toString(),
+        navigationAction =
+            if (showBackToHome) {
+                { UnpinnedTabBackButton(onBack = onBackToHome) }
+            } else {
+                null
+            },
     ) {
         RocheIconActionButton(
             contentDescription = "Search",
@@ -148,25 +153,25 @@ private fun DiaryStatusFilterStrip(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        SoftStripTab(
+        RocheStripTab(
             label = "All",
             selected = selectedStatus == null,
             onClick = { onSelectStatus(null) },
             modifier = Modifier.testTag("diary_filter_all"),
         )
-        SoftStripTab(
+        RocheStripTab(
             label = "Consumed",
             selected = selectedStatus == ConsumptionStatus.CONSUMED,
             onClick = { onSelectStatus(ConsumptionStatus.CONSUMED) },
             modifier = Modifier.testTag("diary_filter_consumed"),
         )
-        SoftStripTab(
+        RocheStripTab(
             label = "Started",
             selected = selectedStatus == ConsumptionStatus.STARTED,
             onClick = { onSelectStatus(ConsumptionStatus.STARTED) },
             modifier = Modifier.testTag("diary_filter_started"),
         )
-        SoftStripTab(
+        RocheStripTab(
             label = "Abandoned",
             selected = selectedStatus == ConsumptionStatus.ABANDONED,
             onClick = { onSelectStatus(ConsumptionStatus.ABANDONED) },
@@ -213,15 +218,6 @@ private fun DiaryMonthsList(
     onOpenExternalUrl: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val readableIds = remember(state.allEntries) { state.allEntries.mapTo(HashSet()) { it.id } }
-    val catalogUrlsById =
-        remember(state.catalog.entriesByCollectionId) {
-            buildMap {
-                state.catalog.entriesByCollectionId.values.flatten().forEach { item ->
-                    item.entry.url?.takeIf { it.isNotBlank() }?.let { put(item.entry.id, it) }
-                }
-            }
-        }
     val grouped = remember(diaryEntries) { diaryEntries.groupBy { it.monthKey } }
 
     LazyColumn(
@@ -245,8 +241,8 @@ private fun DiaryMonthsList(
                             val onOpen =
                                 resolveCatalogEntryOpenAction(
                                     entryId = diary.entryId,
-                                    externalUrl = catalogUrlsById[diary.entryId],
-                                    readableIds = readableIds,
+                                    externalUrl = state.catalogUrlsById[diary.entryId],
+                                    readableIds = state.readableEntryIds,
                                     onOpenReader = { onAction(MainAction.OpenReader(it)) },
                                     onOpenExternalUrl = onOpenExternalUrl,
                                     entryKind = diary.kind,
@@ -376,98 +372,6 @@ private fun DiaryTrailingBadge(diary: DiaryEntryItem) {
             fontSize = 10.sp,
             fontWeight = FontWeight.Normal,
         )
-    }
-}
-
-@Composable
-internal fun SoftStripTab(
-    label: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(8.dp)
-    val bg = if (selected) colors.accentBlue.copy(alpha = 0.16f) else Color.Transparent
-    val textColor = if (selected) colors.accentBlue else colors.textSecondary
-    val weight = if (selected) FontWeight.Medium else FontWeight.Normal
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier =
-            modifier
-                .minimumInteractiveComponentSize()
-                .clip(shape)
-                .clickable(onClick = onClick)
-                .semantics {
-                    role = Role.Tab
-                    this.selected = selected
-                },
-    ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier =
-                Modifier.heightIn(min = 30.dp)
-                    .clip(shape)
-                    .background(bg)
-                    .padding(horizontal = 10.dp, vertical = 5.dp),
-        ) {
-            Text(
-                text = label,
-                color = textColor,
-                fontSize = 12.sp,
-                fontWeight = weight,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
-}
-
-@Composable
-internal fun CatalogCoverThumbnail(
-    thumbnailUrl: String?,
-    kind: EntryKind,
-    size: Dp,
-    modifier: Modifier = Modifier,
-) {
-    val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(6.dp)
-    val bitmap = rememberEntryThumbnailBitmap(primaryKey = null, fallbackKey = thumbnailUrl)
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier =
-            modifier
-                .size(size)
-                .clip(shape)
-                .background(colors.surfaceElevated)
-                .border(1.dp, colors.border, shape),
-    ) {
-        if (bitmap != null) {
-            Image(
-                bitmap = bitmap,
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
-            )
-        } else {
-            val glyph =
-                when (kind) {
-                    EntryKind.ALBUM,
-                    EntryKind.SONG,
-                    EntryKind.ARTIST -> "♪"
-                    EntryKind.MOVIE,
-                    EntryKind.TV,
-                    EntryKind.VIDEO -> "▶"
-                    else -> "▪"
-                }
-            Text(
-                text = glyph,
-                color = colors.textMuted,
-                fontSize = 12.sp,
-                modifier = Modifier.clearAndSetSemantics {},
-            )
-        }
     }
 }
 

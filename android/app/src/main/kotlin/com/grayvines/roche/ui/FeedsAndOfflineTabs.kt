@@ -36,7 +36,6 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
-import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,6 +59,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedListFilter
 import com.grayvines.roche.model.FeedSortOrder
@@ -73,11 +73,13 @@ import com.grayvines.roche.ui.components.PredictiveBackDrawerContainer
 import com.grayvines.roche.ui.components.RefreshIcon
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
+import com.grayvines.roche.ui.components.RocheStripTab
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.SortArrowsIcon
+import com.grayvines.roche.ui.components.UnpinnedTabBackButton
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
@@ -118,29 +120,28 @@ fun FeedsAndTagsTabContent(
     var showArchived by rememberSaveable { mutableStateOf(false) }
     val derived =
         rememberFeedsListDerived(
-            activeFeeds = state.activeFeeds,
-            archivedFeeds = state.archivedFeeds,
-            activeFilter = activeFilter,
-            sortOrder = sortOrder,
-            showArchived = showArchived,
+            state.activeFeeds,
+            state.archivedFeeds,
+            activeFilter,
+            sortOrder,
+            showArchived,
         )
     val hasActiveDrawer = showFilterDrawer || showArchived || state.selectedTag != null
 
     RocheRefreshableTabScaffold(
-        isRefreshing = state.isSyncing,
-        onRefresh = { onAction(MainAction.SyncNow) },
+        isRefreshing = state.isManualRefreshing,
+        onRefresh = { onAction(MainAction.ManualRefresh) },
         pullToRefreshTestTag = "feeds_pull_to_refresh",
         header = {
-            FeedsTopHeaderBar(state.activeFeeds.size) { onAction(MainAction.OpenSearch) }
-            FeedsFilterControlBar(
-                availableFilters = derived.availableFilters,
-                selectedFilter = derived.effectiveFilter,
-                failingCount = derived.failingCount,
+            FeedsTabHeaderBlock(
+                state = state,
+                derived = derived,
                 sortOrder = sortOrder,
-                hasActiveDrawerFilter = hasActiveDrawer,
+                hasActiveDrawer = hasActiveDrawer,
                 onSelectFilter = { activeFilter = it },
                 onSelectSortOrder = { sortOrder = it },
                 onToggleFilterDrawer = { showFilterDrawer = !showFilterDrawer },
+                onAction = onAction,
             )
         },
         drawer = {
@@ -172,14 +173,52 @@ fun FeedsAndTagsTabContent(
 }
 
 @Composable
+@Suppress("LongParameterList")
+private fun FeedsTabHeaderBlock(
+    state: MainUiState,
+    derived: FeedsListDerived,
+    sortOrder: FeedSortOrder,
+    hasActiveDrawer: Boolean,
+    onSelectFilter: (FeedListFilter) -> Unit,
+    onSelectSortOrder: (FeedSortOrder) -> Unit,
+    onToggleFilterDrawer: () -> Unit,
+    onAction: (MainAction) -> Unit,
+) {
+    FeedsTopHeaderBar(
+        activeFeedCount = state.activeFeeds.size,
+        showBackToHome = state.isUnpinnedDestination(AppTab.FEEDS),
+        onBackToHome = { onAction(MainAction.SelectTab(AppTab.HOME)) },
+        onOpenSearch = { onAction(MainAction.OpenSearch) },
+    )
+    FeedsFilterControlBar(
+        availableFilters = derived.availableFilters,
+        selectedFilter = derived.effectiveFilter,
+        failingCount = derived.failingCount,
+        sortOrder = sortOrder,
+        hasActiveDrawerFilter = hasActiveDrawer,
+        onSelectFilter = onSelectFilter,
+        onSelectSortOrder = onSelectSortOrder,
+        onToggleFilterDrawer = onToggleFilterDrawer,
+    )
+}
+
+@Composable
 internal fun FeedsTopHeaderBar(
     activeFeedCount: Int,
+    showBackToHome: Boolean = false,
+    onBackToHome: () -> Unit = {},
     onOpenSearch: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
     RocheTopHeader(
         title = "Feeds",
         badgeText = activeFeedCount.toString(),
+        navigationAction =
+            if (showBackToHome) {
+                { UnpinnedTabBackButton(onBack = onBackToHome) }
+            } else {
+                null
+            },
     ) {
         RocheIconActionButton(
             contentDescription = "Search",
@@ -220,7 +259,7 @@ private fun FeedsFilterControlBar(
                     } else {
                         filter.label
                     }
-                FeedFilterTab(
+                RocheStripTab(
                     label = label,
                     selected = selectedFilter == filter,
                     warning = filter == FeedListFilter.ERRORS,
@@ -250,58 +289,6 @@ private fun FeedsFilterControlBar(
         }
     }
     HorizontalDivider(color = colors.border, thickness = 1.dp)
-}
-
-@Composable
-private fun FeedFilterTab(
-    label: String,
-    selected: Boolean,
-    warning: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(8.dp)
-    val accent = if (warning) colors.accentIndianRed else colors.accentBlue
-    val bg = if (selected) accent.copy(alpha = 0.16f) else Color.Transparent
-    val textColor =
-        when {
-            selected -> accent
-            warning -> colors.accentIndianRed
-            else -> colors.textSecondary
-        }
-    val weight = if (selected) FontWeight.Medium else FontWeight.Normal
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier =
-            modifier
-                .minimumInteractiveComponentSize()
-                .clip(shape)
-                .clickable(onClick = onClick)
-                .semantics {
-                    this.role = Role.Tab
-                    this.selected = selected
-                },
-    ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier =
-                Modifier.heightIn(min = 30.dp)
-                    .clip(shape)
-                    .background(bg)
-                    .padding(horizontal = 10.dp, vertical = 5.dp),
-        ) {
-            Text(
-                text = label,
-                color = textColor,
-                fontSize = 12.sp,
-                fontWeight = weight,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
 }
 
 @Composable
@@ -446,6 +433,8 @@ private fun FeedsFilterDrawer(
         modifier =
             modifier
                 .fillMaxWidth()
+                .heightIn(max = MAX_FILTER_DRAWER_HEIGHT)
+                .verticalScroll(rememberScrollState())
                 .background(colors.surface)
                 .padding(horizontal = 16.dp, vertical = 10.dp)
                 .testTag("feeds_filter_drawer"),
@@ -914,14 +903,11 @@ fun OfflineTabContent(
     val offlineEntries = state.offlineEntries
 
     RocheRefreshableTabScaffold(
-        isRefreshing = state.isSyncing,
-        onRefresh = { onAction(MainAction.SyncNow) },
+        isRefreshing = state.isManualRefreshing,
+        onRefresh = { onAction(MainAction.ManualRefresh) },
         pullToRefreshTestTag = "offline_pull_to_refresh",
         header = {
-            RocheTopHeader(
-                title = "Offline Vault",
-                badgeText = offlineEntries.size.toString(),
-            )
+            OfflineTopHeaderBar(state = state, count = offlineEntries.size, onAction = onAction)
         },
     ) {
         if (offlineEntries.isEmpty()) {
@@ -951,6 +937,34 @@ fun OfflineTabContent(
                     HorizontalDivider(color = colors.border, thickness = 1.dp)
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun OfflineTopHeaderBar(
+    state: MainUiState,
+    count: Int,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    RocheTopHeader(
+        title = "Offline Vault",
+        badgeText = count.toString(),
+        navigationAction =
+            if (state.isUnpinnedDestination(AppTab.OFFLINE)) {
+                { UnpinnedTabBackButton(onBack = { onAction(MainAction.SelectTab(AppTab.HOME)) }) }
+            } else {
+                null
+            },
+    ) {
+        RocheIconActionButton(
+            contentDescription = "Search",
+            outlined = true,
+            onClick = { onAction(MainAction.OpenSearch) },
+            modifier = Modifier.testTag("offline_search_btn"),
+        ) {
+            SearchIcon(tint = colors.textSecondary, size = 17.dp)
         }
     }
 }

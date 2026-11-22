@@ -26,7 +26,12 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -45,7 +50,6 @@ import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
-import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
@@ -59,6 +63,7 @@ import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.ServerRackIcon
 import com.grayvines.roche.ui.components.SettingToggleRow
+import com.grayvines.roche.ui.components.UnpinnedTabBackButton
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import java.util.Locale
@@ -73,15 +78,14 @@ fun SettingsTabContent(
     onRevealSavedBearerToken: suspend () -> String = { "" },
 ) {
     val settingsBackStack = rememberNavBackStack(SettingsNavKey.Hub)
+    SettingsHubResetEffect(state.settingsHubResetTick) {
+        while (settingsBackStack.size > 1) settingsBackStack.removeLastOrNull()
+    }
     val popSubpage: () -> Unit = {
-        if (settingsBackStack.size > 1) {
-            settingsBackStack.removeLastOrNull()
-        }
+        if (settingsBackStack.size > 1) settingsBackStack.removeLastOrNull()
     }
     val openSubpage: (SettingsNavKey) -> Unit = { key ->
-        if (settingsBackStack.lastOrNull() != key) {
-            settingsBackStack.add(key)
-        }
+        if (settingsBackStack.lastOrNull() != key) settingsBackStack.add(key)
     }
 
     NavDisplay(
@@ -127,14 +131,38 @@ fun SettingsTabContent(
 }
 
 @Composable
+private fun SettingsHubResetEffect(resetTick: Int, onResetToHub: () -> Unit) {
+    var lastHandledResetTick by rememberSaveable { mutableIntStateOf(resetTick) }
+    LaunchedEffect(resetTick) {
+        if (resetTick > lastHandledResetTick) {
+            lastHandledResetTick = resetTick
+            onResetToHub()
+        }
+    }
+}
+
+@Composable
 internal fun SettingsHubPage(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     onOpenSubpage: (SettingsNavKey) -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val showBackToHome = state.isUnpinnedDestination(AppTab.SETTINGS)
     Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(title = "Settings")
+        RocheTopHeader(
+            title = "Settings",
+            navigationAction =
+                if (showBackToHome) {
+                    {
+                        UnpinnedTabBackButton(
+                            onBack = { onAction(MainAction.SelectTab(AppTab.HOME)) }
+                        )
+                    }
+                } else {
+                    null
+                },
+        )
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
         Column(
@@ -223,17 +251,11 @@ private fun SettingsServerHubRow(
 ) {
     val colors = LocalRocheColors.current
     val isConfigured = state.settings.serverUrl.isNotBlank() && state.hasBearerToken
-    val isOffline = state.localNetworkTier == NetworkTier.OFFLINE
     val hostLabel =
         extractCleanDomain(state.settings.serverUrl).ifBlank { "Configure Self-Hosted Server" }
-    val subtitle = resolveServerSummarySubtitle(state = state, isConfigured = isConfigured)
-    val dotColor =
-        when {
-            state.settings.hasUndecryptableToken -> colors.accentIndianRed
-            !isConfigured -> colors.accentEcru
-            isOffline -> colors.accentIndianRed
-            else -> colors.accentVerdigris
-        }
+    val health = resolveSyncHealthPresentation(state, isConfigured, colors)
+    val dotColor = health.dotColor
+    val subtitle = health.hubSubtitle
 
     Row(
         modifier =
@@ -802,23 +824,6 @@ private fun buildAppearanceSummary(state: MainUiState): String {
     val font = if (state.settings.headlineFont == HeadlineFont.SERIF) "Serif" else "Sans"
     val density = if (state.settings.ultraDenseRows) "Compact" else "Comfortable"
     return "$theme · $font · $density"
-}
-
-private fun resolveServerSummarySubtitle(
-    state: MainUiState,
-    isConfigured: Boolean,
-): String =
-    when {
-        state.settings.hasUndecryptableToken -> "Token unavailable · Tap to re-pair"
-        !isConfigured -> "Tap to pair device or set Server URL"
-        state.localNetworkTier == NetworkTier.OFFLINE -> "Offline · Local changes queued to sync"
-        state.activePeers.isEmpty() -> "Paired · Tap to configure"
-        else -> formatActivePeersSummary(state.activePeers.size)
-    }
-
-private fun formatActivePeersSummary(peerCount: Int): String {
-    val peerNoun = if (peerCount == 1) "peer" else "peers"
-    return "$peerCount active $peerNoun · Cooperative sync"
 }
 
 private fun resolveUnpinnedTabSubtitle(

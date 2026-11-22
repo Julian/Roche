@@ -495,12 +495,9 @@ class RankBoardAndGate5UiLogicTest {
                 }
             assertEquals(AppTab.FEEDS, scopedState.scopeOriginTab)
 
-            val unscopedDuringBack = resolveUnscopedInboxState(scopedState)
-            assertNull(unscopedDuringBack.selectedFeedId)
-            assertNull(unscopedDuringBack.selectedTag)
             assertEquals(
                 setOf("i-f1", "i-f2"),
-                unscopedDuringBack.visibleEntries.map(InboxEntry::id).toSet(),
+                scopedState.unscopedInboxEntries.map(InboxEntry::id).toSet(),
             )
 
             viewModel.dispatch(MainAction.OpenCompanionSection(CompanionSubTab.DIARY))
@@ -531,14 +528,11 @@ class RankBoardAndGate5UiLogicTest {
             )
 
             val scopedKey = RocheNavKey.ScopedInbox(feedId = "f-1", tag = null)
-            val retainedScoped = resolveScopedInboxState(companionState, scopedKey, scopedState)
-            assertEquals("Systems Weekly", retainedScoped.selectedFeedTitle)
-            assertEquals(listOf("i-f1"), retainedScoped.visibleEntries.map(InboxEntry::id))
-
-            val openSearch = companionState.copy(isSearchOpen = true, searchQuery = "Compiler")
+            val precomputedScoped = companionState.entriesForScope(scopedKey.feedId, scopedKey.tag)
+            assertEquals(listOf("i-f1"), precomputedScoped.map(InboxEntry::id))
             assertEquals(
-                "Compiler",
-                resolveSearchOverlayState(companionState, openSearch).searchQuery,
+                setOf("i-f1", "i-f2"),
+                companionState.entriesForScope(null, null).map(InboxEntry::id).toSet(),
             )
             collectJob.cancel()
         }

@@ -8,6 +8,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -30,7 +31,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -67,64 +67,15 @@ import com.grayvines.roche.data.extractSearchMatchSnippet
 import com.grayvines.roche.data.matchesSearchScopeFilter
 import com.grayvines.roche.data.searchCatalogEntriesWithTotal
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.ui.components.CatalogCoverThumbnail
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheStripTab
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.SearchIcon
+import com.grayvines.roche.ui.components.TierBadgePill
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
-
-internal data class RetainedSearchDisplay(
-    val state: MainUiState,
-    val canEditQuery: Boolean,
-)
-
-internal class SearchDisplayRetentionState(
-    var sawActiveSearch: Boolean,
-    var retainedState: MainUiState,
-)
-
-internal fun computeRetainedSearchDisplay(
-    holder: SearchDisplayRetentionState,
-    state: MainUiState,
-    isSearchActive: Boolean,
-): RetainedSearchDisplay {
-    val nextSawActive = holder.sawActiveSearch || isSearchActive
-    val effectiveState =
-        if (nextSawActive && !isSearchActive) {
-            holder.retainedState
-        } else {
-            state
-        }
-    return RetainedSearchDisplay(
-        state = effectiveState,
-        canEditQuery = !nextSawActive || isSearchActive,
-    )
-}
-
-internal fun commitRetainedSearchDisplay(
-    holder: SearchDisplayRetentionState,
-    state: MainUiState,
-    isSearchActive: Boolean,
-) {
-    if (isSearchActive) {
-        holder.sawActiveSearch = true
-        holder.retainedState = state
-    } else if (!holder.sawActiveSearch) {
-        holder.retainedState = state
-    }
-}
-
-@Composable
-private fun rememberSearchDisplayState(
-    state: MainUiState,
-    isSearchActive: Boolean,
-): RetainedSearchDisplay {
-    val holder = remember { SearchDisplayRetentionState(isSearchActive, state) }
-    val display = computeRetainedSearchDisplay(holder, state, isSearchActive)
-    SideEffect { commitRetainedSearchDisplay(holder, state, isSearchActive) }
-    return display
-}
 
 private data class SearchOverlayComputed(
     val visibleResults: List<InboxEntry>,
@@ -179,16 +130,15 @@ fun SearchOverlay(
 ) {
     val colors = LocalRocheColors.current
     val focusRequester = remember { FocusRequester() }
-    val (displayState, canEditQuery) = rememberSearchDisplayState(state, isSearchActive)
     var scopeFilter by rememberSaveable { mutableStateOf(SearchScopeFilter.ALL) }
     var catalogLimit by
-        rememberSaveable(displayState.searchQuery) {
+        rememberSaveable(state.searchQuery) {
             mutableIntStateOf(DEFAULT_CATALOG_SEARCH_LIMIT)
         }
-    val computed = rememberSearchOverlayComputed(displayState, scopeFilter, catalogLimit)
+    val computed = rememberSearchOverlayComputed(state, scopeFilter, catalogLimit)
 
     LaunchedEffect(isSearchActive) {
-        if (isSearchActive && displayState.searchQuery.isBlank()) {
+        if (isSearchActive && state.searchQuery.isBlank()) {
             runCatching { focusRequester.requestFocus() }
         }
     }
@@ -201,9 +151,9 @@ fun SearchOverlay(
                 .testTag("search_overlay")
     ) {
         SearchIntegratedTopBar(
-            query = displayState.searchQuery,
-            totalEntryCount = displayState.allEntries.size,
-            canEditQuery = canEditQuery,
+            query = state.searchQuery,
+            totalEntryCount = state.allEntries.size,
+            canEditQuery = isSearchActive,
             focusRequester = focusRequester,
             onAction = onAction,
         )
@@ -220,11 +170,10 @@ fun SearchOverlay(
             catalogTotalCount = computed.catalogTotalCount,
             onShowMoreCatalog = { catalogLimit += DEFAULT_CATALOG_SEARCH_LIMIT },
             onSelectAllScope = { scopeFilter = SearchScopeFilter.ALL },
-            state = displayState,
+            state = state,
             selectedScope = scopeFilter,
             playingEntryId = activeAudioEntryId,
-            nextQueuedAudioEntryId =
-                displayState.resolveNextQueuedAudioEntry(activeAudioEntryId)?.id,
+            nextQueuedAudioEntryId = state.resolveNextQueuedAudioEntry(activeAudioEntryId)?.id,
             onAction = onAction,
             listState = listState,
         )
@@ -395,7 +344,7 @@ internal fun SearchScopeFilterStrip(
                 scopeCounts[scope]
                     ?: if (scope == SearchScopeFilter.CATALOG) catalogMatchCount else 0
             val label = if (count > 0) "${scope.label} ($count)" else scope.label
-            SoftStripTab(
+            RocheStripTab(
                 label = label,
                 selected = selectedScope == scope,
                 onClick = { onSelectScope(scope) },
@@ -420,7 +369,6 @@ internal fun SearchResultsBody(
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
 ) {
-    val colors = LocalRocheColors.current
     val hasAnyResults = results.isNotEmpty() || catalogMatches.isNotEmpty()
     if (!hasAnyResults) {
         val hasOtherScopeMatches =
@@ -436,6 +384,38 @@ internal fun SearchResultsBody(
         )
         return
     }
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val isCompactWidth = maxWidth < COMPACT_ROW_BREAKPOINT
+        SearchResultsList(
+            results = results,
+            catalogMatches = catalogMatches,
+            state = state,
+            catalogTotalCount = catalogTotalCount,
+            onShowMoreCatalog = onShowMoreCatalog,
+            isCompactWidth = isCompactWidth,
+            playingEntryId = playingEntryId,
+            nextQueuedAudioEntryId = nextQueuedAudioEntryId,
+            onAction = onAction,
+            listState = listState,
+        )
+    }
+}
+
+@Composable
+@Suppress("LongParameterList")
+private fun SearchResultsList(
+    results: List<InboxEntry>,
+    catalogMatches: List<CatalogSearchMatch>,
+    state: MainUiState,
+    catalogTotalCount: Int,
+    onShowMoreCatalog: (() -> Unit)?,
+    isCompactWidth: Boolean,
+    playingEntryId: String?,
+    nextQueuedAudioEntryId: String?,
+    onAction: (MainAction) -> Unit,
+    listState: LazyListState,
+) {
+    val colors = LocalRocheColors.current
     LazyColumn(
         state = listState,
         modifier = Modifier.fillMaxSize().testTag("search_results_list"),
@@ -466,6 +446,7 @@ internal fun SearchResultsBody(
                 SearchInboxMatchRow(
                     entry = entry,
                     state = state,
+                    isCompactWidth = isCompactWidth,
                     playingEntryId = playingEntryId,
                     nextQueuedAudioEntryId = nextQueuedAudioEntryId,
                     onAction = onAction,
@@ -652,9 +633,11 @@ private fun SearchSectionLabelRow(
 }
 
 @Composable
+@Suppress("LongParameterList")
 private fun SearchInboxMatchRow(
     entry: InboxEntry,
     state: MainUiState,
+    isCompactWidth: Boolean,
     playingEntryId: String?,
     nextQueuedAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
@@ -663,6 +646,8 @@ private fun SearchInboxMatchRow(
         entry = entry,
         ultraDense = state.settings.ultraDenseRows,
         swipeToArchiveEnabled = state.settings.swipeToArchive,
+        isCompactWidth = isCompactWidth,
+        isDownloadingOffline = entry.id in state.inFlightOfflineEntryIds,
         isPlayingAudio = playingEntryId == entry.id,
         isQueuedNextAudio = nextQueuedAudioEntryId == entry.id && playingEntryId != entry.id,
         onOpen = { onAction(MainAction.OpenReader(entry.id)) },
