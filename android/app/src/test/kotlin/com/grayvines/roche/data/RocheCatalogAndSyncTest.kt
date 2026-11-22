@@ -495,7 +495,8 @@ class RocheCatalogAndSyncTest {
 
             // Simulate a second fresh peer receiving that catalog state + a server-completed
             // article
-            val peerDb = RocheDatabase.createInMemory()
+            val managedPeerDb = ManagedTestDatabase()
+            val peerDb = managedPeerDb.database
             try {
                 val peerCatalog = CatalogStore(peerDb.dao())
                 val serverHlc = "001780000001000-0000-server-1"
@@ -600,7 +601,7 @@ class RocheCatalogAndSyncTest {
                     }
                 )
             } finally {
-                peerDb.close()
+                managedPeerDb.close()
             }
         }
 

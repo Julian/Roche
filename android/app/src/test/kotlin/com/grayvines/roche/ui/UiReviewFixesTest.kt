@@ -544,40 +544,43 @@ class UiReviewFixesTest {
         val callerDispatcher = QueuedTestDispatcher()
         val ioDispatcher = QueuedTestDispatcher()
         val scope = CoroutineScope(SupervisorJob() + callerDispatcher)
-        val closed = AtomicBoolean(false)
-        val published = AtomicBoolean(false)
-        var caughtCancellation = false
-        val fakeResource = AutoCloseable { closed.set(true) }
+        try {
+            val closed = AtomicBoolean(false)
+            val published = AtomicBoolean(false)
+            var caughtCancellation = false
+            val fakeResource = AutoCloseable { closed.set(true) }
 
-        val job = scope.launch {
-            try {
-                openSessionCancellably(
-                    ioDispatcher = ioDispatcher,
-                    openOnIo = { fakeResource },
-                    publishOnCaller = { published.set(true) },
-                )
-            } catch (ce: CancellationException) {
-                caughtCancellation = true
-                throw ce
+            val job = scope.launch {
+                try {
+                    openSessionCancellably(
+                        ioDispatcher = ioDispatcher,
+                        openOnIo = { fakeResource },
+                        publishOnCaller = { published.set(true) },
+                    )
+                } catch (ce: CancellationException) {
+                    caughtCancellation = true
+                    throw ce
+                }
             }
+
+            // Start coroutine on caller -> dispatches openOnIo to ioDispatcher.
+            callerDispatcher.drain()
+            // Run openOnIo on ioDispatcher -> creates fakeResource and queues resume onto
+            // callerDispatcher.
+            ioDispatcher.drain()
+            assertFalse(closed.get())
+            assertFalse(published.get())
+
+            // Cancel right at the withContext resume boundary before callerDispatcher resumes.
+            job.cancel()
+            callerDispatcher.drain()
+
+            assertTrue(caughtCancellation)
+            assertTrue(closed.get())
+            assertFalse(published.get())
+        } finally {
+            scope.cancel()
         }
-
-        // Start coroutine on caller -> dispatches openOnIo to ioDispatcher.
-        callerDispatcher.drain()
-        // Run openOnIo on ioDispatcher -> creates fakeResource and queues resume onto
-        // callerDispatcher.
-        ioDispatcher.drain()
-        assertFalse(closed.get())
-        assertFalse(published.get())
-
-        // Cancel right at the withContext resume boundary before callerDispatcher resumes.
-        job.cancel()
-        callerDispatcher.drain()
-
-        assertTrue(caughtCancellation)
-        assertTrue(closed.get())
-        assertFalse(published.get())
-        scope.cancel()
     }
 
     @Test

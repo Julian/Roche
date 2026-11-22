@@ -167,24 +167,31 @@ class SettingsRepositoryTest {
         val prefsFile = File(tempDir, "cold_start_peer_id.preferences_pb")
 
         val scope1 = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val store1 =
-            PreferenceDataStoreFactory.create(
-                scope = scope1,
-                produceFile = { prefsFile },
-            )
-        val firstBootPeerId = SettingsRepository(store1).settings.first().peerId
+        val firstBootPeerId =
+            try {
+                val store1 =
+                    PreferenceDataStoreFactory.create(
+                        scope = scope1,
+                        produceFile = { prefsFile },
+                    )
+                SettingsRepository(store1).settings.first().peerId
+            } finally {
+                scope1.coroutineContext[Job]?.cancelAndJoin()
+            }
         assertTrue(firstBootPeerId.startsWith("android-"))
-        scope1.coroutineContext[Job]?.cancelAndJoin()
 
         val scope2 = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val store2 =
-            PreferenceDataStoreFactory.create(
-                scope = scope2,
-                produceFile = { prefsFile },
-            )
-        val secondBootPeerId = SettingsRepository(store2).settings.first().peerId
-        assertEquals(firstBootPeerId, secondBootPeerId)
-        scope2.coroutineContext[Job]?.cancelAndJoin()
+        try {
+            val store2 =
+                PreferenceDataStoreFactory.create(
+                    scope = scope2,
+                    produceFile = { prefsFile },
+                )
+            val secondBootPeerId = SettingsRepository(store2).settings.first().peerId
+            assertEquals(firstBootPeerId, secondBootPeerId)
+        } finally {
+            scope2.coroutineContext[Job]?.cancelAndJoin()
+        }
     }
 
     @Test

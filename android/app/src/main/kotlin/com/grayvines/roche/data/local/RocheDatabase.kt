@@ -11,6 +11,7 @@ import androidx.room3.migration.Migration
 import androidx.sqlite.SQLiteConnection
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import androidx.sqlite.execSQL
+import kotlin.coroutines.CoroutineContext
 
 @Database(
     entities =
@@ -225,10 +226,21 @@ abstract class RocheDatabase : RoomDatabase() {
                 MIGRATION_11_12,
             )
 
-        internal fun createInMemory(): RocheDatabase =
+        internal fun createInMemory(
+            queryCoroutineContext: CoroutineContext? = null,
+            allowMainThreadQueries: Boolean = false,
+        ): RocheDatabase =
             Room.inMemoryDatabaseBuilder<RocheDatabase>()
                 .setDriver(BundledSQLiteDriver())
                 .addCallback(schemaCallback())
+                .apply {
+                    if (queryCoroutineContext != null) {
+                        setQueryCoroutineContext(queryCoroutineContext)
+                    }
+                    if (allowMainThreadQueries) {
+                        allowMainThreadQueries()
+                    }
+                }
                 .build()
 
         fun create(context: Context): RocheDatabase {

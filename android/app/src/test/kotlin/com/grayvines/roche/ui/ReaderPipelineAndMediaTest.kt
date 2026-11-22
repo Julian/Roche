@@ -36,8 +36,9 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -331,7 +332,7 @@ internal class ReaderPipelineAndMediaTest {
             assertEquals("decoded-img", loader.loadInlineImage(url))
             assertEquals(2, calls)
         } finally {
-            dataStoreScope.cancel()
+            dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
             tempDir.deleteRecursively()
         }
     }

@@ -94,12 +94,18 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
 
     private suspend fun performSetSkipSilence(enabled: Boolean) {
         host.settingsRepository.update { it.copy(skipSilenceEnabled = enabled) }
-        host.playerController.setSkipSilence(enabled)
+        host.playbackOrchestrator.syncPlayerFromLatestSettings(
+            playerController = host.playerController,
+            fallbackSkipSilence = enabled,
+        )
     }
 
     private suspend fun performSetSmartRewind(enabled: Boolean) {
         host.settingsRepository.update { it.copy(smartRewindEnabled = enabled) }
-        host.playerController.updateSmartRewindEnabled(enabled)
+        host.playbackOrchestrator.syncPlayerFromLatestSettings(
+            playerController = host.playerController,
+            fallbackSmartRewind = enabled,
+        )
     }
 
     private suspend fun executeQueueFeedAudioMutation(action: MainAction.QueueFeedAudioMutation) {

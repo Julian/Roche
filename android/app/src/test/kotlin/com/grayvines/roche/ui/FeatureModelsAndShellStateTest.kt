@@ -46,21 +46,36 @@ import org.junit.jupiter.api.io.TempDir
 class FeatureModelsAndShellStateTest {
     @TempDir lateinit var tempDir: File
 
-    private lateinit var env: TestRocheEnv
-    private lateinit var viewModel: MainViewModel
+    private var envOrNull: TestRocheEnv? = null
+    private var viewModelOrNull: MainViewModel? = null
+
+    private val env: TestRocheEnv
+        get() =
+            envOrNull
+                ?: TestRocheEnv(tempDir, "feature_models_test.preferences_pb").also {
+                    envOrNull = it
+                }
+
+    private val viewModel: MainViewModel
+        get() =
+            viewModelOrNull
+                ?: MainViewModel(repository = env.repository, settingsRepository = env.settings)
+                    .also { viewModelOrNull = it }
 
     @BeforeEach
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        env = TestRocheEnv(tempDir, "feature_models_test.preferences_pb")
-        viewModel = MainViewModel(repository = env.repository, settingsRepository = env.settings)
     }
 
     @AfterEach
     fun tearDown() {
-        viewModel.playerController.releaseController()
-        runBlocking { viewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin() }
-        env.close()
+        viewModelOrNull?.let { vm ->
+            vm.playerController.releaseController()
+            runBlocking { vm.viewModelScope.coroutineContext[Job]?.cancelAndJoin() }
+        }
+        viewModelOrNull = null
+        envOrNull?.close()
+        envOrNull = null
         Dispatchers.resetMain()
     }
 

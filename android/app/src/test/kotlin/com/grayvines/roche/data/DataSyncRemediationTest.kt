@@ -73,17 +73,19 @@ import org.junit.jupiter.api.Test
 
 class DataSyncRemediationTest {
     private lateinit var tempDir: File
-    private lateinit var database: RocheDatabase
+    private var managedDbOrNull: ManagedTestDatabase? = null
+    private val database: RocheDatabase
+        get() = (managedDbOrNull ?: ManagedTestDatabase().also { managedDbOrNull = it }).database
 
     @BeforeEach
     fun setUp() {
         tempDir = Files.createTempDirectory("roche-remediation-test").toFile()
-        database = RocheDatabase.createInMemory()
     }
 
     @AfterEach
     fun tearDown() {
-        database.close()
+        managedDbOrNull?.close()
+        managedDbOrNull = null
         tempDir.deleteRecursively()
     }
 

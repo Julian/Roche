@@ -159,7 +159,8 @@ class AlbumStreamingResolverTest {
     @Test
     fun `prewarmCollectionDraw persists YouTube Music and Wikipedia IDs and marks entry dirty for sync`() =
         runTest {
-            val db = RocheDatabase.createInMemory()
+            val managedDb = ManagedTestDatabase()
+            val db = managedDb.database
             val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
             try {
                 val settingsStore =
@@ -207,8 +208,8 @@ class AlbumStreamingResolverTest {
                 val active = checkNotNull(updated.catalog.generatorFor(listId)?.currentDraw)
                 assertResolvedSyncAndIdempotency(db, repo, active)
             } finally {
-                db.close()
                 dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
+                managedDb.close()
             }
         }
 

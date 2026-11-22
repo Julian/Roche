@@ -77,7 +77,7 @@ class MainViewModel(
                 settingsRepository = settingsRepository,
                 orchestrator = playbackOrchestrator,
                 playerBackend = playerBackend,
-                observerScope = viewModelScope,
+                observerScope = null,
             )
 
     val playerState: StateFlow<PodcastPlayerState> = playerController.state
@@ -157,13 +157,16 @@ class MainViewModel(
             )
         }
         playerController.setUiErrorListener(uiErrorListener)
-        settingsRepository.latestSettings?.let { cached ->
-            playerController.updateSmartRewindEnabled(cached.smartRewindEnabled)
-            playerController.syncSkipSilenceFromSettings(cached.skipSilenceEnabled)
+        if (settingsRepository.latestSettings != null) {
+            playbackOrchestrator.syncPlayerFromLatestSettings(playerController)
         }
         inboxFeedsFeature.startObservingOfflineSizes(sharedSnapshotFlow)
         if (!playerController.hasBackgroundObserver) {
-            playbackOrchestrator.startBackgroundObservers(viewModelScope, playerController)
+            playbackOrchestrator.startBackgroundObservers(
+                scope = viewModelScope,
+                playerController = playerController,
+                snapshotFlow = sharedSnapshotFlow,
+            )
         }
         observeActiveEpisodeNotes()
         observeActiveCollectionDraws()

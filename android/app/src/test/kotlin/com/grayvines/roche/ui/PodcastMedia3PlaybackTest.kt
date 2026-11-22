@@ -4,8 +4,6 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.room3.Room
-import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.grayvines.roche.data.collectInBackground
@@ -19,6 +17,9 @@ import com.grayvines.roche.data.remote.HttpRequest
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.tailnetNetworkTierProvider
+import com.grayvines.roche.model.ContentType
+import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.playback.AudioBackendListener
 import com.grayvines.roche.playback.AudioLoadRequest
 import com.grayvines.roche.playback.AudioPlaybackMetadata
@@ -59,6 +60,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -79,32 +81,46 @@ import org.junit.jupiter.api.io.TempDir
 class PodcastMedia3PlaybackTest {
     @TempDir lateinit var tempDir: File
 
-    private lateinit var dataStoreScope: CoroutineScope
-    private lateinit var database: RocheDatabase
-    private lateinit var settings: SettingsRepository
+    private var managedDbOrNull: com.grayvines.roche.data.ManagedTestDatabase? = null
+    private var dataStoreScopeOrNull: CoroutineScope? = null
+    private var settingsOrNull: SettingsRepository? = null
+
+    private val database: RocheDatabase
+        get() =
+            (managedDbOrNull
+                    ?: com.grayvines.roche.data
+                        .ManagedTestDatabase(allowMainThreadQueries = true)
+                        .also { managedDbOrNull = it })
+                .database
+
+    private val settings: SettingsRepository
+        get() =
+            settingsOrNull
+                ?: run {
+                    val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+                    dataStoreScopeOrNull = scope
+                    val dataStore =
+                        PreferenceDataStoreFactory.create(
+                            scope = scope,
+                            produceFile = { File(tempDir, "settings.preferences_pb") },
+                        )
+                    SettingsRepository(dataStore).also { settingsOrNull = it }
+                }
 
     @BeforeEach
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        database =
-            Room.inMemoryDatabaseBuilder<RocheDatabase>()
-                .setDriver(BundledSQLiteDriver())
-                .addCallback(RocheDatabase.schemaCallback())
-                .allowMainThreadQueries()
-                .build()
-        dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val dataStore =
-            PreferenceDataStoreFactory.create(
-                scope = dataStoreScope,
-                produceFile = { File(tempDir, "settings.preferences_pb") },
-            )
-        settings = SettingsRepository(dataStore)
     }
 
     @AfterEach
     fun tearDown() {
-        runBlocking { dataStoreScope.coroutineContext[Job]?.cancelAndJoin() }
-        database.close()
+        dataStoreScopeOrNull?.let { scope ->
+            runBlocking { scope.coroutineContext[Job]?.cancelAndJoin() }
+        }
+        dataStoreScopeOrNull = null
+        settingsOrNull = null
+        managedDbOrNull?.close()
+        managedDbOrNull = null
         Dispatchers.resetMain()
     }
 
@@ -381,6 +397,8 @@ class PodcastMedia3PlaybackTest {
             assertNull(backend.latestMetadata)
         } finally {
             parentScope.coroutineContext[Job]?.cancel()
+            mainDispatcher.drainQueue()
+            runBlocking { parentScope.coroutineContext[Job]?.cancelAndJoin() }
         }
     }
 
@@ -411,6 +429,8 @@ class PodcastMedia3PlaybackTest {
             assertFalse(secondFuture.isCancelled)
         } finally {
             parentScope.coroutineContext[Job]?.cancel()
+            mainDispatcher.drainQueue()
+            runBlocking { parentScope.coroutineContext[Job]?.cancelAndJoin() }
         }
     }
 
@@ -584,6 +604,8 @@ class PodcastMedia3PlaybackTest {
             assertEquals(123_000L, backend.currentPositionMs())
         } finally {
             parentScope.coroutineContext[Job]?.cancel()
+            mainDispatcher.drainQueue()
+            runBlocking { parentScope.coroutineContext[Job]?.cancelAndJoin() }
         }
     }
 
@@ -621,6 +643,62 @@ class PodcastMedia3PlaybackTest {
             } finally {
                 controller.releaseController()
                 bgScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
+
+    @Test
+    fun `player controller orders backend sync and suppresses synchronous seek and speed echoes`() =
+        runTest {
+            val backend = InspectableAudioBackend().apply { echoSeekAndSpeedSynchronously = true }
+            val controllerScope =
+                CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher(testScheduler))
+            var progressSaveCount = 0
+            var sessionSpeedCallbacks = 0
+            val controller =
+                PodcastPlayerController(
+                    scope = controllerScope,
+                    backend = backend,
+                    onProgressSaved = { _, _, _ -> progressSaveCount++ },
+                    onSpeedChangedFromSession = { _, _ -> sessionSpeedCallbacks++ },
+                )
+            var observedReleaseBeforeClear = false
+            val collectJob =
+                backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                    controller.state.collect { state ->
+                        if (backend.releaseCount > 0) {
+                            assertFalse(backend.isPlaying())
+                            observedReleaseBeforeClear = true
+                        } else {
+                            assertEquals(state.skipSilenceEnabled, backend.skipSilenceEnabled)
+                            assertEquals(state.hasNextQueuedAudio, backend.hasNextQueuedAudio)
+                        }
+                    }
+                }
+            try {
+                controller.playEntry(
+                    entry = sampleAudioEntry("ep-order"),
+                    sourceUriOrPath = "https://pod.example.com/ep-order.mp3",
+                    speed = 1.0f,
+                    skipSilenceEnabled = false,
+                )
+                controller.cancelAutoTickerForTest()
+                controller.setPlaybackSpeed(1.75f)
+                controller.seekToMs(120_000L)
+                controller.setSkipSilence(true)
+                controller.setSkipSilence(false)
+                controller.updateHasNextQueuedAudio(true)
+                controller.updateHasNextQueuedAudio(false)
+                controller.stopAndClear()
+                assertEquals(1.75f, backend.lastSpeed, 1e-3f)
+                assertEquals(0, sessionSpeedCallbacks)
+                assertEquals(1, progressSaveCount)
+                assertFalse(backend.skipSilenceEnabled)
+                assertFalse(backend.hasNextQueuedAudio)
+                assertTrue(observedReleaseBeforeClear)
+            } finally {
+                collectJob.cancelAndJoin()
+                controller.releaseController()
+                controllerScope.coroutineContext[Job]?.cancelAndJoin()
             }
         }
 
@@ -743,12 +821,40 @@ class PodcastMedia3PlaybackTest {
             )
     }
 
+    private fun sampleAudioEntry(id: String): InboxEntry =
+        InboxEntry(
+            id = id,
+            feedId = "f-pod",
+            feedTitle = "Deep Tech",
+            title = "Episode $id",
+            url = "https://pod.example.com/$id",
+            author = "Host",
+            summary = "Summary",
+            contentText = null,
+            contentHtml = null,
+            contentType = ContentType.AUDIO,
+            status = ItemStatus.UNREAD,
+            isFavorite = false,
+            isCachedOffline = false,
+            publishedAt = "2026-06-01T12:00:00Z",
+            createdAt = "2026-06-01T12:00:00Z",
+            readProgress = 0.0,
+            thumbnailMediaId = null,
+            duration = "10:00",
+            tags = emptyList(),
+            audioUrl = "https://pod.example.com/$id.mp3",
+        )
+
     private class InspectableAudioBackend : AudioPlayerBackend {
-        var skipSilenceEnabled: Boolean = false
-        var simulatedPositionMs: Long = 0L
-        private var durationMs: Long = 600_000L
-        private var playing: Boolean = false
-        private var listener: AudioBackendListener? = null
+        @Volatile var echoSeekAndSpeedSynchronously: Boolean = false
+        @Volatile var skipSilenceEnabled: Boolean = false
+        @Volatile var lastSpeed: Float = 1.0f
+        @Volatile var hasNextQueuedAudio: Boolean = false
+        @Volatile var releaseCount: Int = 0
+        @Volatile var simulatedPositionMs: Long = 0L
+        @Volatile private var durationMs: Long = 600_000L
+        @Volatile private var playing: Boolean = false
+        @Volatile private var listener: AudioBackendListener? = null
 
         fun emitExternalPlayState(isNowPlaying: Boolean) {
             playing = isNowPlaying
@@ -766,6 +872,8 @@ class PodcastMedia3PlaybackTest {
 
         override fun loadAndPlay(request: AudioLoadRequest) {
             this.skipSilenceEnabled = request.skipSilenceEnabled
+            this.lastSpeed = request.speed
+            this.hasNextQueuedAudio = request.hasNextQueuedAudio
             this.durationMs = request.fallbackDurationMs
             this.simulatedPositionMs = request.initialPositionMs
             this.playing = request.playWhenReady
@@ -782,12 +890,24 @@ class PodcastMedia3PlaybackTest {
 
         override fun seekTo(positionMs: Long) {
             simulatedPositionMs = positionMs
+            if (echoSeekAndSpeedSynchronously) {
+                listener?.onPositionSeeked(positionMs)
+            }
         }
 
-        override fun setSpeed(speed: Float) = Unit
+        override fun setSpeed(speed: Float) {
+            lastSpeed = speed
+            if (echoSeekAndSpeedSynchronously) {
+                listener?.onSpeedChanged(speed)
+            }
+        }
 
         override fun setSkipSilence(enabled: Boolean) {
             skipSilenceEnabled = enabled
+        }
+
+        override fun updateHasNextQueuedAudio(hasNext: Boolean) {
+            hasNextQueuedAudio = hasNext
         }
 
         override fun currentPositionMs(): Long = simulatedPositionMs
@@ -798,6 +918,7 @@ class PodcastMedia3PlaybackTest {
 
         override fun release() {
             playing = false
+            releaseCount++
         }
     }
 

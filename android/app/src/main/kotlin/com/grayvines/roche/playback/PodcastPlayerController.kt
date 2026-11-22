@@ -182,6 +182,7 @@ class PodcastPlayerController(
     @Volatile private var lastPersistedEntryId: String? = null
     @Volatile private var lastPersistedProgress: Double = -1.0
     @Volatile internal var hasBackgroundObserver: Boolean = false
+    internal val settingsSyncLock: Any = Any()
     private val uiErrorListeners = CopyOnWriteArraySet<(String) -> Unit>()
 
     private val backendListener =
@@ -426,8 +427,8 @@ class PodcastPlayerController(
 
     fun updateHasNextQueuedAudio(hasNext: Boolean) {
         if (_state.value.hasNextQueuedAudio != hasNext) {
-            _state.update { it.copy(hasNextQueuedAudio = hasNext) }
             backend.updateHasNextQueuedAudio(hasNext)
+            _state.update { it.copy(hasNextQueuedAudio = hasNext) }
         }
     }
 
@@ -560,6 +561,8 @@ class PodcastPlayerController(
         val current = _state.value
         if (!current.hasActiveEpisode) return
         val clamped = positionMs.coerceIn(0L, current.durationMs.coerceAtLeast(1L))
+        // Update state before backend.seekTo so synchronous Media3 discontinuity callbacks
+        // are recognized as self-echoes by handleBackendPositionSeeked.
         _state.update { it.copy(positionMs = clamped) }
         backend.seekTo(clamped)
         persistCurrentProgress(ProgressSaveReason.SEEK_OR_SKIP)
@@ -578,14 +581,16 @@ class PodcastPlayerController(
 
     fun setPlaybackSpeed(speed: Float) {
         val clamped = clampPlaybackSpeed(speed)
+        // Update state before backend.setSpeed so synchronous Media3 parameter callbacks
+        // are recognized as self-echoes by handleBackendSpeedChanged.
         _state.update { it.copy(playbackSpeed = clamped) }
         backend.setSpeed(clamped)
     }
 
     fun setSkipSilence(enabled: Boolean) {
         skipSilenceSyncedOnce = true
-        _state.update { it.copy(skipSilenceEnabled = enabled) }
         backend.setSkipSilence(enabled)
+        _state.update { it.copy(skipSilenceEnabled = enabled) }
     }
 
     internal fun syncSkipSilenceFromSettings(enabled: Boolean) {
@@ -623,8 +628,8 @@ class PodcastPlayerController(
         backendFailed = false
         lastPersistedEntryId = null
         lastPersistedProgress = -1.0
-        _state.value = PodcastPlayerState()
         backend.release()
+        _state.value = PodcastPlayerState()
     }
 
     fun releaseController() {

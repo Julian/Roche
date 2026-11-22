@@ -73,8 +73,25 @@ fun mockRepository(
 fun TestScope.collectInBackground(flow: Flow<*>): Job =
     backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { flow.collect() }
 
+class ManagedTestDatabase(allowMainThreadQueries: Boolean = false) : AutoCloseable {
+    private val roomScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    val database: RocheDatabase =
+        RocheDatabase.createInMemory(
+            queryCoroutineContext = roomScope.coroutineContext,
+            allowMainThreadQueries = allowMainThreadQueries,
+        )
+
+    override fun close() {
+        runBlocking { roomScope.coroutineContext[Job]?.cancelAndJoin() }
+        database.close()
+    }
+}
+
 class TestRocheEnv(tempDir: File, prefsFileName: String = "test_settings.preferences_pb") {
-    val database: RocheDatabase = RocheDatabase.createInMemory()
+    private val managedDb = ManagedTestDatabase()
+    val database: RocheDatabase
+        get() = managedDb.database
+
     val dataStoreScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val settings: SettingsRepository =
         SettingsRepository(
@@ -100,6 +117,6 @@ class TestRocheEnv(tempDir: File, prefsFileName: String = "test_settings.prefere
 
     fun close() {
         runBlocking { dataStoreScope.coroutineContext[Job]?.cancelAndJoin() }
-        database.close()
+        managedDb.close()
     }
 }

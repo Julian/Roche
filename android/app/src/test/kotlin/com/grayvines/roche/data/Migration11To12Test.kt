@@ -64,9 +64,8 @@ class Migration11To12Test {
     @Test
     fun `PeerSyncIn ignores partial-page edges referencing missing entries without FK failure`() =
         runTest {
-            val db = RocheDatabase.createInMemory()
-            try {
-                val dao = db.dao()
+            ManagedTestDatabase().use { managed ->
+                val dao = managed.database.dao()
                 dao.upsertEntry(
                     EntryEntity(
                         id = "e-present",
@@ -82,8 +81,6 @@ class Migration11To12Test {
                 assertTrue(dao.getAllCollectionEntries().isEmpty())
                 assertTrue(dao.getAllConsumptionLogs().isEmpty())
                 assertTrue(dao.getAllComparisons().isEmpty())
-            } finally {
-                db.close()
             }
         }
 

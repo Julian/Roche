@@ -88,7 +88,16 @@ import org.junit.jupiter.api.io.TempDir
 class MainViewModelTest {
     @TempDir lateinit var tempDir: File
 
-    private lateinit var testEnv: com.grayvines.roche.data.TestRocheEnv
+    private var testEnvOrNull: com.grayvines.roche.data.TestRocheEnv? = null
+    private var viewModelOrNull: MainViewModel? = null
+
+    private val testEnv: com.grayvines.roche.data.TestRocheEnv
+        get() =
+            testEnvOrNull
+                ?: com.grayvines.roche.data
+                    .TestRocheEnv(tempDir, "vm_test_settings.preferences_pb")
+                    .also { testEnvOrNull = it }
+
     private val database: RocheDatabase
         get() = testEnv.database
 
@@ -99,26 +108,32 @@ class MainViewModelTest {
         get() = testEnv.repository
 
     private lateinit var playerBackend: FakeAudioPlayerBackend
-    private lateinit var viewModel: MainViewModel
+
+    private val viewModel: MainViewModel
+        get() =
+            viewModelOrNull
+                ?: MainViewModel(
+                        repository = repository,
+                        settingsRepository = settings,
+                        playerBackend = playerBackend,
+                    )
+                    .also { viewModelOrNull = it }
 
     @BeforeEach
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        testEnv = com.grayvines.roche.data.TestRocheEnv(tempDir, "vm_test_settings.preferences_pb")
         playerBackend = FakeAudioPlayerBackend()
-        viewModel =
-            MainViewModel(
-                repository = repository,
-                settingsRepository = settings,
-                playerBackend = playerBackend,
-            )
     }
 
     @AfterEach
     fun tearDown() {
-        viewModel.playerController.releaseController()
-        runBlocking { viewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin() }
-        testEnv.close()
+        viewModelOrNull?.let { vm ->
+            vm.playerController.releaseController()
+            runBlocking { vm.viewModelScope.coroutineContext[Job]?.cancelAndJoin() }
+        }
+        viewModelOrNull = null
+        testEnvOrNull?.close()
+        testEnvOrNull = null
         Dispatchers.resetMain()
     }
 
@@ -767,7 +782,8 @@ class MainViewModelTest {
             // Play ep-1: applies podcast customPlaybackSpeed (2.65x), parses chapters, sets
             // next queued audio to ep-2 (skipping art-mid)
             viewModel.dispatch(MainAction.PlayAudioEntry("ep-1", openFullscreen = true))
-            val playingEp1Player = viewModel.playerState.first { it.currentEntryId == "ep-1" }
+            val playingEp1Player =
+                viewModel.playerState.first { it.currentEntryId == "ep-1" && !it.isBuffering }
             val playingEp1 = viewModel.uiState.first { it.isPlayerFullscreenOpen }
             assertEquals(2.65f, playingEp1Player.playbackSpeed, 1e-3f)
             assertEquals(3, playingEp1Player.chapters.size)
@@ -781,7 +797,7 @@ class MainViewModelTest {
                 abs(it.allEntries.first { e -> e.id == "ep-1" }.readProgress - 0.25) < 1e-2
             }
             viewModel.dispatch(MainAction.SkipToNextQueuedAudio)
-            viewModel.playerState.first { it.currentEntryId == "ep-2" }
+            viewModel.playerState.first { it.currentEntryId == "ep-2" && !it.isBuffering }
             val playingEp2 =
                 viewModel.uiState.first {
                     it.queueEntries.map { e -> e.id } == listOf("art-mid", "ep-2", "ep-1") &&
@@ -798,7 +814,7 @@ class MainViewModelTest {
 
             // Actual episode completion DOES mark ep-2 100% read & archived and autoplays ep-1
             viewModel.playerController.completeActiveEpisodeNow()
-            viewModel.playerState.first { it.currentEntryId == "ep-1" }
+            viewModel.playerState.first { it.currentEntryId == "ep-1" && !it.isBuffering }
             val afterEp2Completed =
                 viewModel.uiState.first {
                     it.allEntries.first { e -> e.id == "ep-2" }.isArchived
@@ -877,7 +893,9 @@ class MainViewModelTest {
         viewModel.uiState.first { it.queueEntries.size == 2 }
         viewModel.dispatch(MainAction.PlayAudioEntry("ep-a"))
 
-        viewModel.playerState.first { it.currentEntryId == "ep-a" && it.hasNextQueuedAudio }
+        viewModel.playerState.first {
+            it.currentEntryId == "ep-a" && !it.isBuffering && it.hasNextQueuedAudio
+        }
         assertEquals("Episode A", playerBackend.lastMetadata?.episodeTitle)
         assertTrue(playerBackend.lastHasNextQueuedAudio)
 
@@ -897,7 +915,7 @@ class MainViewModelTest {
         // subscribers (app in background).
         collectJob.cancel()
         viewModel.playerController.requestSkipToNext()
-        viewModel.playerController.state.first { it.currentEntryId == "ep-b" }
+        viewModel.playerController.state.first { it.currentEntryId == "ep-b" && !it.isBuffering }
         assertEquals("Episode B", playerBackend.lastMetadata?.episodeTitle)
         assertTrue(playerBackend.lastHasNextQueuedAudio)
         assertFalse(repository.snapshot.first().entries.first { it.id == "ep-a" }.isArchived)
@@ -958,7 +976,7 @@ class MainViewModelTest {
             // Recovering when connection returns reloads and plays cleanly
             playerBackend.failNextLoad = false
             viewModel.dispatch(MainAction.TogglePlayPause)
-            val resumedState = viewModel.playerState.first { it.isPlaying }
+            val resumedState = viewModel.playerState.first { it.isPlaying && !it.isBuffering }
             assertTrue(resumedState.isPlaying)
 
             // Toggle Smart Rewind off and back on
@@ -1075,92 +1093,97 @@ class MainViewModelTest {
                     settingsRepository = settings,
                     playerBackend = localBackend,
                 )
-            assertEquals(1, tierQueryCount)
-
             val collectJob = collectInBackground(localVm.uiState)
-            val initial = localVm.uiState.first { !it.isInitialLoading }
-            assertEquals(NetworkTier.CELLULAR, initial.localNetworkTier)
-            assertEquals(1, tierQueryCount)
+            try {
+                assertEquals(1, tierQueryCount)
 
-            val podcastFeed = testFeed("f-tier-pod", "Systems Cast").copy(feedType = "podcast")
-            val episode =
-                testItem("ep-tier-1", "Episode 1", "f-tier-pod")
-                    .copy(
-                        contentType = "audio",
-                        audioUrl = "https://example.com/tier-1.mp3",
-                        duration = "10:00",
-                    )
-            database.dao().upsertFeeds(listOf(podcastFeed))
-            database.dao().upsertItems(listOf(episode))
-            localVm.uiState.first { it.allEntries.size == 1 }
+                val initial = localVm.uiState.first { !it.isInitialLoading }
+                assertEquals(NetworkTier.CELLULAR, initial.localNetworkTier)
+                assertEquals(1, tierQueryCount)
 
-            localVm.dispatch(MainAction.SelectTab(AppTab.FEEDS))
-            localVm.uiState.first { it.activeTab == AppTab.FEEDS }
-            localVm.dispatch(MainAction.UpdateSearchQuery("Episode"))
-            localVm.awaitBackgroundUiWorkForTest()
-            localVm.uiState.first { it.searchQuery == "Episode" }
-            localVm.dispatch(MainAction.PlayAudioEntry("ep-tier-1"))
-            localVm.playerState.first { it.currentEntryId == "ep-tier-1" }
-            localVm.uiState.first { it.activePlayerNotesContent != null }
-            localVm.playerController.cancelAutoTickerForTest()
-            localVm.dispatch(MainAction.SeekPlayerToMs(10_100L))
-            localVm.playerState.first { it.positionMs == 10_100L }
-            assertEquals(1, tierQueryCount)
+                val podcastFeed = testFeed("f-tier-pod", "Systems Cast").copy(feedType = "podcast")
+                val episode =
+                    testItem("ep-tier-1", "Episode 1", "f-tier-pod")
+                        .copy(
+                            contentType = "audio",
+                            audioUrl = "https://example.com/tier-1.mp3",
+                            duration = "10:00",
+                        )
+                database.dao().upsertFeeds(listOf(podcastFeed))
+                database.dao().upsertItems(listOf(episode))
+                localVm.uiState.first { it.allEntries.size == 1 }
 
-            var playerEmissions = 0
-            val playerCollectJob =
-                backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
-                    localVm.playerController.state.collect { playerEmissions++ }
-                }
-            assertEquals(1, playerEmissions)
+                localVm.dispatch(MainAction.SelectTab(AppTab.FEEDS))
+                localVm.uiState.first { it.activeTab == AppTab.FEEDS }
+                localVm.dispatch(MainAction.UpdateSearchQuery("Episode"))
+                localVm.awaitBackgroundUiWorkForTest()
+                localVm.uiState.first { it.searchQuery == "Episode" }
+                localVm.dispatch(MainAction.PlayAudioEntry("ep-tier-1"))
+                localVm.playerState.first { it.currentEntryId == "ep-tier-1" && !it.isBuffering }
+                localVm.uiState.first { it.activePlayerNotesContent != null }
+                localVm.playerController.cancelAutoTickerForTest()
+                localVm.dispatch(MainAction.SeekPlayerToMs(10_100L))
+                localVm.playerState.first { it.positionMs == 10_100L }
+                assertEquals(1, tierQueryCount)
 
-            // Stalled and sub-second ticks within the same whole second do not emit state updates
-            assertTrue(localVm.playerController.advanceSingleTick(tickCount = 1))
-            assertEquals(1, playerEmissions)
-            localBackend.setSimulatedPositionMs(10_850L)
-            assertTrue(localVm.playerController.advanceSingleTick(tickCount = 2))
-            assertEquals(1, playerEmissions)
+                var playerEmissions = 0
+                val playerCollectJob =
+                    backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                        localVm.playerController.state.collect { playerEmissions++ }
+                    }
+                assertEquals(1, playerEmissions)
 
-            // Crossing a whole-second boundary emits once and still avoids ConnectivityManager IPC
-            localBackend.setSimulatedPositionMs(11_200L)
-            assertTrue(localVm.playerController.advanceSingleTick(tickCount = 3))
-            assertEquals(2, playerEmissions)
-            assertEquals(
-                11_200L,
-                localVm.playerState.first { it.positionMs == 11_200L }.positionMs,
-            )
-            assertEquals(1, tierQueryCount)
+                // Stalled and sub-second ticks within the same whole second do not emit state
+                // updates
+                assertTrue(localVm.playerController.advanceSingleTick(tickCount = 1))
+                assertEquals(1, playerEmissions)
+                localBackend.setSimulatedPositionMs(10_850L)
+                assertTrue(localVm.playerController.advanceSingleTick(tickCount = 2))
+                assertEquals(1, playerEmissions)
 
-            // Active sleep timer ticks still emit countdown updates even when position is stalled
-            localVm.playerController.setSleepTimerMinutes(1)
-            assertEquals(3, playerEmissions)
-            assertTrue(localVm.playerController.advanceSingleTick(tickCount = 4))
-            assertEquals(4, playerEmissions)
-            assertEquals(59, localVm.playerController.state.value.sleepTimerRemainingSec)
-            playerCollectJob.cancel()
+                // Crossing a whole-second boundary emits once and still avoids ConnectivityManager
+                // IPC
+                localBackend.setSimulatedPositionMs(11_200L)
+                assertTrue(localVm.playerController.advanceSingleTick(tickCount = 3))
+                assertEquals(2, playerEmissions)
+                assertEquals(
+                    11_200L,
+                    localVm.playerState.first { it.positionMs == 11_200L }.positionMs,
+                )
+                assertEquals(1, tierQueryCount)
 
-            // SyncNow and PollFeedsOnDeviceNow refresh localNetworkTier in TransientUiState
-            currentTier = NetworkTier.WIFI
-            assertEquals(NetworkTier.CELLULAR, localVm.uiState.value.localNetworkTier)
-            localVm.dispatch(MainAction.SyncNow)
-            val afterSync =
-                localVm.uiState.first {
-                    !it.isSyncing && it.localNetworkTier == NetworkTier.WIFI
-                }
-            assertEquals(NetworkTier.WIFI, afterSync.localNetworkTier)
-            assertTrue(tierQueryCount > 1)
+                // Active sleep timer ticks still emit countdown updates even when position is
+                // stalled
+                localVm.playerController.setSleepTimerMinutes(1)
+                assertEquals(3, playerEmissions)
+                assertTrue(localVm.playerController.advanceSingleTick(tickCount = 4))
+                assertEquals(4, playerEmissions)
+                assertEquals(59, localVm.playerController.state.value.sleepTimerRemainingSec)
+                playerCollectJob.cancel()
 
-            currentTier = NetworkTier.OFFLINE
-            localVm.dispatch(MainAction.PollFeedsOnDeviceNow)
-            val afterPoll =
-                localVm.uiState.first {
-                    !it.isSyncing && it.localNetworkTier == NetworkTier.OFFLINE
-                }
-            assertEquals(NetworkTier.OFFLINE, afterPoll.localNetworkTier)
+                // SyncNow and PollFeedsOnDeviceNow refresh localNetworkTier in TransientUiState
+                currentTier = NetworkTier.WIFI
+                assertEquals(NetworkTier.CELLULAR, localVm.uiState.value.localNetworkTier)
+                localVm.dispatch(MainAction.SyncNow)
+                val afterSync =
+                    localVm.uiState.first {
+                        !it.isSyncing && it.localNetworkTier == NetworkTier.WIFI
+                    }
+                assertEquals(NetworkTier.WIFI, afterSync.localNetworkTier)
+                assertTrue(tierQueryCount > 1)
 
-            localVm.playerController.stopAndClear()
-            collectJob.cancel()
-            localVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+                currentTier = NetworkTier.OFFLINE
+                localVm.dispatch(MainAction.PollFeedsOnDeviceNow)
+                val afterPoll =
+                    localVm.uiState.first {
+                        !it.isSyncing && it.localNetworkTier == NetworkTier.OFFLINE
+                    }
+                assertEquals(NetworkTier.OFFLINE, afterPoll.localNetworkTier)
+            } finally {
+                localVm.playerController.releaseController()
+                collectJob.cancel()
+                localVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+            }
         }
 
     @Test
@@ -1353,7 +1376,7 @@ class MainViewModelTest {
             try {
                 localVm.uiState.first { it.allEntries.size == 2 }
                 localVm.dispatch(MainAction.PlayAudioEntry("ep-sync-1", openFullscreen = false))
-                localVm.playerState.first { it.currentEntryId == "ep-sync-1" }
+                localVm.playerState.first { it.currentEntryId == "ep-sync-1" && !it.isBuffering }
                 localVm.playerController.cancelAutoTickerForTest()
                 assertFalse(localVm.playerState.value.hasNextQueuedAudio)
 
@@ -1369,7 +1392,7 @@ class MainViewModelTest {
                 localVm.playerState.first { !it.skipSilenceEnabled }
                 assertFalse(localBackend.lastSkipSilence)
             } finally {
-                localVm.playerController.stopAndClear()
+                localVm.playerController.releaseController()
                 collectJob.cancel()
                 localVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
             }
@@ -1430,7 +1453,10 @@ class MainViewModelTest {
                 firstVm.uiState.first { it.queueEntries.size == 2 }
                 firstVm.dispatch(MainAction.PlayAudioEntry("ep-shared-1"))
                 firstVm.playerState.first {
-                    it.currentEntryId == "ep-shared-1" && it.isPlaying && it.hasNextQueuedAudio
+                    it.currentEntryId == "ep-shared-1" &&
+                        it.isPlaying &&
+                        !it.isBuffering &&
+                        it.hasNextQueuedAudio
                 }
                 assertEquals(
                     "ep-shared-2",
@@ -2019,7 +2045,7 @@ class MainViewModelTest {
 
                 // Skip immediately to ep-fast while ep-slow is still blocked on network.
                 localVm.dispatch(MainAction.PlayAudioEntry("ep-fast"))
-                localVm.playerState.first { it.currentEntryId == "ep-fast" }
+                localVm.playerState.first { it.currentEntryId == "ep-fast" && !it.isBuffering }
                 val hydratedFast =
                     localVm.uiState.first {
                         it.activePlayerNotesContent?.itemId == "ep-fast" &&
@@ -2033,22 +2059,22 @@ class MainViewModelTest {
                 assertFalse(slowGate.isCompleted)
             } finally {
                 slowGate.complete(Unit)
-                localVm.playerController.cancelAutoTickerForTest()
+                localVm.playerController.releaseController()
                 collectJob.cancel()
                 localVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
             }
         }
 
     private class FakeAudioPlayerBackend : AudioPlayerBackend {
-        var failNextLoad: Boolean = false
-        var lastSkipSilence: Boolean = false
-        var lastHasNextQueuedAudio: Boolean = false
-        var lastMetadata: AudioPlaybackMetadata? = null
-        private var positionMs: Long = 0L
-        private var durationMs: Long = 1_800_000L
-        private var playing: Boolean = false
-        private var speed: Float = 1.0f
-        private var listener: AudioBackendListener? = null
+        @Volatile var failNextLoad: Boolean = false
+        @Volatile var lastSkipSilence: Boolean = false
+        @Volatile var lastHasNextQueuedAudio: Boolean = false
+        @Volatile var lastMetadata: AudioPlaybackMetadata? = null
+        @Volatile private var positionMs: Long = 0L
+        @Volatile private var durationMs: Long = 1_800_000L
+        @Volatile private var playing: Boolean = false
+        @Volatile private var speed: Float = 1.0f
+        @Volatile private var listener: AudioBackendListener? = null
 
         fun setSimulatedPositionMs(nextPositionMs: Long) {
             positionMs = nextPositionMs.coerceAtLeast(0L)

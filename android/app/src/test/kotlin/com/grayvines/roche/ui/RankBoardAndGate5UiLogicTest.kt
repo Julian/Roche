@@ -61,7 +61,16 @@ import org.junit.jupiter.api.io.TempDir
 class RankBoardAndGate5UiLogicTest {
     @TempDir lateinit var tempDir: File
 
-    private lateinit var testEnv: TestRocheEnv
+    private var testEnvOrNull: TestRocheEnv? = null
+    private var viewModelOrNull: MainViewModel? = null
+
+    private val testEnv: TestRocheEnv
+        get() =
+            testEnvOrNull
+                ?: TestRocheEnv(tempDir, "gate5_settings.preferences_pb").also {
+                    testEnvOrNull = it
+                }
+
     private val database: RocheDatabase
         get() = testEnv.database
 
@@ -71,20 +80,27 @@ class RankBoardAndGate5UiLogicTest {
     private val repository: RocheRepository
         get() = testEnv.repository
 
-    private lateinit var viewModel: MainViewModel
+    private val viewModel: MainViewModel
+        get() =
+            viewModelOrNull
+                ?: MainViewModel(repository = repository, settingsRepository = settings).also {
+                    viewModelOrNull = it
+                }
 
     @BeforeEach
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        testEnv = TestRocheEnv(tempDir, "gate5_settings.preferences_pb")
-        viewModel = MainViewModel(repository = repository, settingsRepository = settings)
     }
 
     @AfterEach
     fun tearDown() {
-        viewModel.playerController.releaseController()
-        runBlocking { viewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin() }
-        testEnv.close()
+        viewModelOrNull?.let { vm ->
+            vm.playerController.releaseController()
+            runBlocking { vm.viewModelScope.coroutineContext[Job]?.cancelAndJoin() }
+        }
+        viewModelOrNull = null
+        testEnvOrNull?.close()
+        testEnvOrNull = null
         Dispatchers.resetMain()
     }
 

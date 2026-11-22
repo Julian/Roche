@@ -1,11 +1,13 @@
 package com.grayvines.roche.playback
 
+import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
 import com.grayvines.roche.model.InboxEntry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
@@ -18,6 +20,40 @@ class PodcastPlaybackOrchestrator(
     private val repository: RocheRepository,
     private val settingsRepository: SettingsRepository,
 ) {
+    internal fun syncPlayerFromLatestSettings(
+        playerController: PodcastPlayerController,
+        fallbackEntries: List<InboxEntry>? = null,
+        fallbackQueueIds: List<String>? = null,
+        fallbackSmartRewind: Boolean? = null,
+        fallbackSkipSilence: Boolean? = null,
+    ) {
+        synchronized(playerController.settingsSyncLock) {
+            val latestSettings = settingsRepository.latestSettings
+            val latestEntries = repository.latestSnapshot?.entries ?: fallbackEntries
+            val currentId = playerController.state.value.currentEntryId
+            if (latestEntries != null) {
+                val effectiveQueueIds = latestSettings?.queueItemIds ?: fallbackQueueIds
+                if (effectiveQueueIds != null) {
+                    val hasNext =
+                        hasNextQueuedAudio(
+                            latestEntries,
+                            effectiveQueueIds,
+                            excludeEntryId = currentId,
+                        )
+                    playerController.updateHasNextQueuedAudio(hasNext)
+                }
+            }
+            val effectiveSmartRewind = latestSettings?.smartRewindEnabled ?: fallbackSmartRewind
+            if (effectiveSmartRewind != null) {
+                playerController.updateSmartRewindEnabled(effectiveSmartRewind)
+            }
+            val effectiveSkipSilence = latestSettings?.skipSilenceEnabled ?: fallbackSkipSilence
+            if (effectiveSkipSilence != null) {
+                playerController.syncSkipSilenceFromSettings(effectiveSkipSilence)
+            }
+        }
+    }
+
     suspend fun playAudioEntry(
         playerController: PodcastPlayerController,
         entryId: String,
@@ -47,41 +83,43 @@ class PodcastPlaybackOrchestrator(
             updatedQueue = nextQueue
             current.copy(queueItemIds = nextQueue)
         }
+        val currentSettings = settingsRepository.latestSettings ?: latestSettings
         val hasNextAudio = hasNextQueuedAudio(allEntries, updatedQueue, excludeEntryId = entryId)
         playerController.playEntry(
             entry = entry,
             sourceUriOrPath = source,
             speed = effectiveSpeed,
-            skipSilenceEnabled = latestSettings.skipSilenceEnabled,
+            skipSilenceEnabled = currentSettings.skipSilenceEnabled,
             hasNextQueuedAudio = hasNextAudio,
-            smartRewindEnabled = latestSettings.smartRewindEnabled,
+            smartRewindEnabled = currentSettings.smartRewindEnabled,
         )
         repository.recordEpisodePlaybackStarted(entryId)
         return true
     }
 
     suspend fun syncActivePlayerQueueState(playerController: PodcastPlayerController) {
-        val currentId = playerController.state.value.currentEntryId ?: return
-        val latestSettings = settingsRepository.settings.first()
-        val latestEntries = repository.snapshot.first().entries
-        val hasNext =
-            hasNextQueuedAudio(
-                latestEntries,
-                latestSettings.queueItemIds,
-                excludeEntryId = currentId,
-            )
-        playerController.updateHasNextQueuedAudio(hasNext)
-        playerController.updateSmartRewindEnabled(latestSettings.smartRewindEnabled)
+        if (playerController.state.value.currentEntryId == null) return
+        val fallbackSettings =
+            settingsRepository.latestSettings ?: settingsRepository.settings.first()
+        val fallbackEntries =
+            repository.latestSnapshot?.entries ?: repository.snapshot.first().entries
+        syncPlayerFromLatestSettings(
+            playerController = playerController,
+            fallbackEntries = fallbackEntries,
+            fallbackQueueIds = fallbackSettings.queueItemIds,
+            fallbackSmartRewind = fallbackSettings.smartRewindEnabled,
+        )
     }
 
     fun startBackgroundObservers(
         scope: CoroutineScope,
         playerController: PodcastPlayerController,
+        snapshotFlow: Flow<RepositorySnapshot> = repository.snapshot,
     ): Job {
         playerController.hasBackgroundObserver = true
         return scope.launch {
             combine(
-                    repository.snapshot.map { it.entries }.distinctUntilChanged(),
+                    snapshotFlow.map { it.entries }.distinctUntilChanged(),
                     settingsRepository.settings
                         .map { settings ->
                             Triple(
@@ -96,22 +134,14 @@ class PodcastPlaybackOrchestrator(
                     Triple(entries, settingsSlice, currentEntryId)
                 }
                 .collect { (entries, settingsSlice, currentEntryId) ->
+                    syncPlayerFromLatestSettings(
+                        playerController = playerController,
+                        fallbackEntries = entries,
+                        fallbackQueueIds = settingsSlice.first,
+                        fallbackSmartRewind = settingsSlice.second,
+                        fallbackSkipSilence = settingsSlice.third,
+                    )
                     val latestEntries = repository.latestSnapshot?.entries ?: entries
-                    val latestSettings = settingsRepository.latestSettings
-                    val effectiveQueueIds = latestSettings?.queueItemIds ?: settingsSlice.first
-                    val hasNext =
-                        hasNextQueuedAudio(
-                            latestEntries,
-                            effectiveQueueIds,
-                            excludeEntryId = currentEntryId,
-                        )
-                    playerController.updateHasNextQueuedAudio(hasNext)
-                    playerController.updateSmartRewindEnabled(
-                        latestSettings?.smartRewindEnabled ?: settingsSlice.second
-                    )
-                    playerController.syncSkipSilenceFromSettings(
-                        latestSettings?.skipSilenceEnabled ?: settingsSlice.third
-                    )
                     currentEntryId
                         ?.let { id -> latestEntries.firstOrNull { it.id == id } }
                         ?.let(playerController::refreshChaptersFromEntry)

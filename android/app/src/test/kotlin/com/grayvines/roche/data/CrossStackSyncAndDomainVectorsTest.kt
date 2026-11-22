@@ -27,7 +27,6 @@ import com.grayvines.roche.data.local.EntryContentEntity
 import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryStateEntity
 import com.grayvines.roche.data.local.RocheDao
-import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.data.remote.SyncTombstoneDto
@@ -400,11 +399,8 @@ class CrossStackSyncAndDomainVectorsTest {
         val scenarios = loadExpandedGoldenVectors().peerSyncMergeScenarios
         assertTrue(scenarios.size >= MIN_PEER_SYNC_SCENARIOS)
         for (scenario in scenarios) {
-            val db = RocheDatabase.createInMemory()
-            try {
-                runPeerSyncScenario(db.dao(), scenario)
-            } finally {
-                db.close()
+            ManagedTestDatabase().use { managed ->
+                runPeerSyncScenario(managed.database.dao(), scenario)
             }
         }
     }
