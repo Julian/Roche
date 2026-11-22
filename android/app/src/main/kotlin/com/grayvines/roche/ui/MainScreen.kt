@@ -744,6 +744,7 @@ private fun MainReaderDestination(
                 entry = targetEntry,
                 settings = state.settings,
                 isHydrating = state.isReaderHydrating,
+                isDownloadingOffline = targetEntry.id in state.inFlightOfflineEntryIds,
                 onAction = onAction,
                 onShareEntry = onShareEntry,
                 onOpenExternalUrl = onOpenExternalUrl,

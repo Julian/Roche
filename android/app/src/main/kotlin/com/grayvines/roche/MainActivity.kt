@@ -22,7 +22,9 @@ import com.grayvines.roche.data.sync.PeerSyncScheduler
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.playback.PodcastPlaybackService
 import com.grayvines.roche.ui.CompanionSubTab
+import com.grayvines.roche.ui.LocalArticleBlockCache
 import com.grayvines.roche.ui.LocalOfflineCacheDir
+import com.grayvines.roche.ui.LocalPdfDocumentStore
 import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainViewModel
@@ -74,6 +76,8 @@ class MainActivity : ComponentActivity() {
         val appGraph = (application as RocheApp).graph
         val thumbnailLoader = appGraph.thumbnailLoader
         val offlineCacheDir = appGraph.offlineCacheDir
+        val pdfDocumentStore = appGraph.pdfDocumentStore
+        val articleBlockCache = appGraph.articleBlockCache
 
         setContent {
             val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -88,6 +92,8 @@ class MainActivity : ComponentActivity() {
             CompositionLocalProvider(
                 LocalThumbnailLoader provides thumbnailLoader,
                 LocalOfflineCacheDir provides offlineCacheDir,
+                LocalPdfDocumentStore provides pdfDocumentStore,
+                LocalArticleBlockCache provides articleBlockCache,
             ) {
                 RocheTheme(
                     themeMode = state.settings.themeMode,

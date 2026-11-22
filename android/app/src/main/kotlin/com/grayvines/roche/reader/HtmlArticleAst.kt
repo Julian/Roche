@@ -3,12 +3,17 @@
 package com.grayvines.roche.reader
 
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.Node
 import org.jsoup.nodes.TextNode
 
 internal sealed interface ArticleBlock {
-    data class Heading(val level: Int, val html: String) : ArticleBlock
+    data class Heading(
+        val level: Int,
+        val html: String,
+        val plainText: String = "",
+    ) : ArticleBlock
 
     data class CodeBlock(val code: String) : ArticleBlock
 
@@ -27,16 +32,24 @@ internal sealed interface ArticleBlock {
     data class TableBlock(
         val headers: List<String>,
         val rows: List<List<String>>,
+        val columnMaxChars: List<Int> = emptyList(),
     ) : ArticleBlock
 
     data class ImageBlock(
         val url: String,
         val alt: String? = null,
         val captionHtml: String? = null,
+        val captionPlainText: String? = null,
         val width: Int? = null,
         val height: Int? = null,
     ) : ArticleBlock
 }
+
+internal data class ParsedArticleDocument(
+    val blocks: List<ArticleBlock>,
+    val outlineHeadings: List<String>,
+    val orderedHeadingBlockIndices: List<Int>,
+)
 
 internal fun extractInboxSnippet(rawSummary: String): String =
     if ('<' !in rawSummary && '&' !in rawSummary) {
@@ -44,6 +57,21 @@ internal fun extractInboxSnippet(rawSummary: String): String =
     } else {
         Jsoup.parseBodyFragment(rawSummary).text().trim()
     }
+
+internal fun parseHtmlArticleDocument(
+    rawHtml: String,
+    baseUrl: String? = null,
+): ParsedArticleDocument {
+    val blocks = parseHtmlArticleBlocks(rawHtml = rawHtml, baseUrl = baseUrl)
+    val outlineHeadings = extractPlainTextHeadings(blocks)
+    val orderedHeadingIndices =
+        mapBlockHeadingIndices(blocks).entries.sortedBy { it.value }.map { it.key }
+    return ParsedArticleDocument(
+        blocks = blocks,
+        outlineHeadings = outlineHeadings,
+        orderedHeadingBlockIndices = orderedHeadingIndices,
+    )
+}
 
 internal fun parseHtmlArticleBlocks(
     rawHtml: String,
@@ -125,10 +153,14 @@ private fun appendPreBlock(element: Element, out: MutableList<ArticleBlock>) {
 }
 
 private fun parseHeadingElement(element: Element, tag: String): ArticleBlock.Heading? {
-    val cleanHtml = normalizeDomElementInlineHtml(element)
-    if (!hasVisibleHtmlText(cleanHtml)) return null
+    val normalized = normalizeDomInlineContent(element)
+    if (normalized.plainText.isEmpty()) return null
     val level = tag.substring(1).toIntOrNull()?.coerceIn(MIN_HEADING, MAX_HEADING) ?: 2
-    return ArticleBlock.Heading(level = level, html = cleanHtml)
+    return ArticleBlock.Heading(
+        level = level,
+        html = normalized.html,
+        plainText = normalized.plainText,
+    )
 }
 
 internal fun appendQuoteBlocks(
@@ -416,54 +448,95 @@ private fun appendTableBlocks(element: Element, out: MutableList<ArticleBlock>) 
     out.add(tableBlock)
 }
 
+private data class ExpandedTableRow(
+    val cellsHtml: List<String>,
+    val cellCharLengths: List<Int>,
+)
+
 internal fun parseTableElement(table: Element): ArticleBlock.TableBlock? {
     val rows =
-        table.select("tr").filter { tr ->
-            tr.parents().firstOrNull { it.normalName() == TAG_TABLE } == table
-        }
+        table
+            .select("tr")
+            .filter { tr -> tr.parents().firstOrNull { it.normalName() == TAG_TABLE } == table }
+            .take(MAX_TABLE_ROWS)
     if (rows.isEmpty()) return null
 
-    val headerRows = mutableListOf<List<String>>()
-    val dataRows = mutableListOf<List<String>>()
+    val headerRows = mutableListOf<ExpandedTableRow>()
+    val dataRows = mutableListOf<ExpandedTableRow>()
 
     rows.forEachIndexed { rowIndex, tr ->
         val cellElements =
             tr.children().filter { it.normalName() == "th" || it.normalName() == "td" }
         val isHeader = isHeaderTableRow(tr, cellElements, rowIndex, headerRows.isEmpty())
-        val cells = expandRowCells(cellElements, isHeaderRow = isHeader)
-        if (cells.any(::hasVisibleHtmlText)) {
+        val expanded = expandRowCellsWithLengths(cellElements, isHeaderRow = isHeader)
+        if (expanded.cellsHtml.any(::hasVisibleHtmlText)) {
             if (isHeader) {
-                headerRows.add(cells)
+                headerRows.add(expanded)
             } else {
-                dataRows.add(cells)
+                dataRows.add(expanded)
             }
         }
     }
 
-    val mergedHeaders = mergeTableHeaderRows(headerRows)
-    return if (mergedHeaders.isEmpty() && dataRows.isEmpty()) {
+    val mergedHeaders = mergeTableHeaderRows(headerRows.map { it.cellsHtml })
+    val bodyCells = dataRows.map { it.cellsHtml }
+    return if (mergedHeaders.isEmpty() && bodyCells.isEmpty()) {
         null
     } else {
-        ArticleBlock.TableBlock(headers = mergedHeaders, rows = dataRows)
+        ArticleBlock.TableBlock(
+            headers = mergedHeaders,
+            rows = bodyCells,
+            columnMaxChars = computeTableColumnMaxChars(headerRows, dataRows),
+        )
     }
 }
 
-internal fun expandRowCells(cellElements: List<Element>, isHeaderRow: Boolean): List<String> {
-    val expanded = mutableListOf<String>()
+private fun expandRowCellsWithLengths(
+    cellElements: List<Element>,
+    isHeaderRow: Boolean,
+): ExpandedTableRow {
+    val expandedHtml = mutableListOf<String>()
+    val expandedLengths = mutableListOf<Int>()
     for (cell in cellElements) {
-        val rawHtml = normalizeDomElementInlineHtml(cell)
+        if (expandedHtml.size >= MAX_TABLE_COLS) break
+        val normalized = normalizeDomInlineContent(cell)
         val styledHtml =
-            if (!isHeaderRow && cell.normalName() == "th" && hasVisibleHtmlText(rawHtml)) {
-                ensureStrongHtml(rawHtml)
+            if (!isHeaderRow && cell.normalName() == "th" && normalized.plainText.isNotEmpty()) {
+                ensureStrongHtml(normalized.html)
             } else {
-                rawHtml
+                normalized.html
             }
+        val cellMaxLen = normalized.maxLineLength
         val colspan = cell.attr("colspan").trim().toIntOrNull()?.coerceIn(1, MAX_TABLE_COLSPAN) ?: 1
-        expanded.add(styledHtml)
-        repeat(colspan - 1) { expanded.add("") }
+        expandedHtml.add(styledHtml)
+        expandedLengths.add(cellMaxLen)
+        repeat((colspan - 1).coerceAtMost(MAX_TABLE_COLS - expandedHtml.size)) {
+            expandedHtml.add("")
+            expandedLengths.add(0)
+        }
     }
-    return expanded
+    return ExpandedTableRow(cellsHtml = expandedHtml, cellCharLengths = expandedLengths)
 }
+
+private fun computeTableColumnMaxChars(
+    headerRows: List<ExpandedTableRow>,
+    dataRows: List<ExpandedTableRow>,
+): List<Int> {
+    val maxCols =
+        maxOf(
+            headerRows.maxOfOrNull { it.cellCharLengths.size } ?: 0,
+            dataRows.maxOfOrNull { it.cellCharLengths.size } ?: 0,
+        )
+    if (maxCols == 0) return emptyList()
+    return (0 until maxCols).map { colIndex ->
+        val headerMax = headerRows.maxOfOrNull { it.cellCharLengths.getOrElse(colIndex) { 0 } } ?: 0
+        val dataMax = dataRows.maxOfOrNull { it.cellCharLengths.getOrElse(colIndex) { 0 } } ?: 0
+        maxOf(headerMax, dataMax)
+    }
+}
+
+internal fun expandRowCells(cellElements: List<Element>, isHeaderRow: Boolean): List<String> =
+    expandRowCellsWithLengths(cellElements, isHeaderRow).cellsHtml
 
 internal fun mergeTableHeaderRows(headerRows: List<List<String>>): List<String> {
     if (headerRows.isEmpty()) return emptyList()
@@ -504,14 +577,20 @@ internal fun parseFigureElement(
     if (images.isNotEmpty() && !hasCompositeBlocks) {
         val fallbackCaption =
             if (explicitCaption == null) {
-                normalizeDomElementInlineHtml(withoutCaption).takeIf(::hasVisibleHtmlText)
+                normalizeDomInlineContent(withoutCaption).takeIf { it.plainText.isNotEmpty() }
             } else {
                 null
             }
-        val effectiveCaption = explicitCaption ?: fallbackCaption
+        val effectiveCaptionHtml = explicitCaption?.html ?: fallbackCaption?.html
+        val effectiveCaptionText = explicitCaption?.plainText ?: fallbackCaption?.plainText
         images.forEachIndexed { index, img ->
-            val attachedCaption = if (index == images.lastIndex) effectiveCaption else null
-            out.add(img.copy(captionHtml = attachedCaption))
+            val attach = index == images.lastIndex
+            out.add(
+                img.copy(
+                    captionHtml = if (attach) effectiveCaptionHtml else null,
+                    captionPlainText = if (attach) effectiveCaptionText else null,
+                )
+            )
         }
     } else {
         appendCompositeFigureBlocks(withoutCaption, explicitCaption, baseUrl, out)
@@ -522,10 +601,10 @@ internal fun parseFigureElement(
 internal fun splitFigcaptionContent(
     figcaption: Element?,
     baseUrl: String?,
-): Pair<String?, List<ArticleBlock>> {
+): Pair<NormalizedInlineContent?, List<ArticleBlock>> {
     if (figcaption == null) return null to emptyList()
     if (figcaption.selectFirst(COMPOSITE_FIGURE_QUERY) == null) {
-        val caption = normalizeDomElementInlineHtml(figcaption).takeIf(::hasVisibleHtmlText)
+        val caption = normalizeDomInlineContent(figcaption).takeIf { it.plainText.isNotEmpty() }
         return caption to emptyList()
     }
     val captionBox = Element(TAG_DIV)
@@ -542,7 +621,7 @@ internal fun splitFigcaptionContent(
             captionBox.appendChild(node.clone())
         }
     }
-    val caption = normalizeDomElementInlineHtml(captionBox).takeIf(::hasVisibleHtmlText)
+    val caption = normalizeDomInlineContent(captionBox).takeIf { it.plainText.isNotEmpty() }
     val trailingBlocks = mutableListOf<ArticleBlock>()
     walkDomContainer(remainderBox, baseUrl, trailingBlocks)
     return caption to trailingBlocks
@@ -559,7 +638,7 @@ internal fun shouldBreakFigcaption(node: Node, hasCaptionAlready: Boolean): Bool
 
 internal fun appendCompositeFigureBlocks(
     withoutCaption: Element,
-    explicitCaption: String?,
+    explicitCaption: NormalizedInlineContent?,
     baseUrl: String?,
     out: MutableList<ArticleBlock>,
 ) {
@@ -571,32 +650,39 @@ internal fun appendCompositeFigureBlocks(
         }
         out.addAll(figureBlocks)
     } else if (explicitCaption != null) {
-        out.add(italicCaptionParagraph(explicitCaption))
+        out.add(italicCaptionParagraph(explicitCaption.html))
     }
 }
 
 private fun italicCaptionParagraph(captionHtml: String): ArticleBlock.Paragraph =
     ArticleBlock.Paragraph("<em>$captionHtml</em>")
 
-internal fun attachFigureCaption(blocks: MutableList<ArticleBlock>, captionHtml: String) {
+internal fun attachFigureCaption(
+    blocks: MutableList<ArticleBlock>,
+    caption: NormalizedInlineContent,
+) {
     val lastIdx = blocks.lastIndex
     when (val last = blocks[lastIdx]) {
         is ArticleBlock.ImageBlock -> {
             if (last.captionHtml == null) {
-                blocks[lastIdx] = last.copy(captionHtml = captionHtml)
+                blocks[lastIdx] =
+                    last.copy(
+                        captionHtml = caption.html,
+                        captionPlainText = caption.plainText,
+                    )
             } else {
-                blocks.add(italicCaptionParagraph(captionHtml))
+                blocks.add(italicCaptionParagraph(caption.html))
             }
         }
         is ArticleBlock.Blockquote -> {
             if (last.attributionHtml == null) {
-                blocks[lastIdx] = last.copy(attributionHtml = captionHtml)
+                blocks[lastIdx] = last.copy(attributionHtml = caption.html)
             } else {
-                blocks.add(italicCaptionParagraph(captionHtml))
+                blocks.add(italicCaptionParagraph(caption.html))
             }
         }
         else -> {
-            blocks.add(italicCaptionParagraph(captionHtml))
+            blocks.add(italicCaptionParagraph(caption.html))
         }
     }
 }
@@ -608,9 +694,9 @@ internal fun flushInlineNodes(
     splitDoubleBrIntoParagraphs: Boolean = false,
 ) {
     if (nodes.isEmpty()) return
-    val scratchDoc = Jsoup.parseBodyFragment("")
+    val scratchDoc = Document("")
     scratchDoc.outputSettings().prettyPrint(false)
-    val buffer = scratchDoc.body()
+    val buffer = scratchDoc.appendElement("body")
 
     for (node in nodes) {
         if (node is Element && node.normalName() == TAG_IMG) {
@@ -681,35 +767,10 @@ internal fun parseImgElement(img: Element, baseUrl: String?): ArticleBlock.Image
         )
     }
 
-internal fun computeTableColumnWidths(block: ArticleBlock.TableBlock): List<Int> {
-    val columnCount =
-        maxOf(
-            block.headers.size,
-            block.rows.maxOfOrNull { it.size } ?: 0,
-        )
-    if (columnCount == 0) return emptyList()
-    return (0 until columnCount).map { colIndex ->
-        val headerLen = plainCellLength(block.headers.getOrNull(colIndex))
-        val maxRowLen = block.rows.maxOfOrNull { plainCellLength(it.getOrNull(colIndex)) } ?: 0
-        val maxChars = maxOf(headerLen, maxRowLen)
-        (maxChars * TABLE_CHAR_WIDTH_DP + TABLE_CELL_PADDING_DP).coerceIn(
-            MIN_TABLE_COL_WIDTH_DP,
-            MAX_TABLE_COL_WIDTH_DP,
-        )
-    }
-}
-
-internal fun plainCellLength(cellHtml: String?): Int {
-    if (cellHtml.isNullOrBlank()) return 0
-    val doc = Jsoup.parseBodyFragment(cellHtml)
-    doc.select("br").forEach { it.replaceWith(TextNode("\n")) }
-    return doc.body().wholeText().lines().maxOfOrNull { it.trim().length } ?: 0
-}
-
 internal fun extractPlainTextHeadings(blocks: List<ArticleBlock>): List<String> =
     blocks
         .filterIsInstance<ArticleBlock.Heading>()
-        .map { heading -> Jsoup.parseBodyFragment(heading.html).text().trim() }
+        .map(::resolveHeadingPlainText)
         .filter { it.isNotEmpty() }
         .distinct()
 
@@ -719,7 +780,7 @@ internal fun mapBlockHeadingIndices(blocks: List<ArticleBlock>): Map<Int, Int> {
     var nextHeadingIndex = 0
     blocks.forEachIndexed { blockIndex, block ->
         if (block is ArticleBlock.Heading) {
-            val plainText = Jsoup.parseBodyFragment(block.html).text().trim()
+            val plainText = resolveHeadingPlainText(block)
             if (plainText.isNotEmpty() && seenTexts.add(plainText)) {
                 indices[blockIndex] = nextHeadingIndex
                 nextHeadingIndex++
@@ -729,13 +790,14 @@ internal fun mapBlockHeadingIndices(blocks: List<ArticleBlock>): Map<Int, Int> {
     return indices
 }
 
+private fun resolveHeadingPlainText(heading: ArticleBlock.Heading): String =
+    heading.plainText.ifBlank { stripInlineHtmlToPlainText(heading.html) }
+
 private const val MIN_HEADING = 1
 private const val MAX_HEADING = 6
 private const val MAX_TABLE_COLSPAN = 8
-private const val TABLE_CHAR_WIDTH_DP = 7
-private const val TABLE_CELL_PADDING_DP = 24
-private const val MIN_TABLE_COL_WIDTH_DP = 72
-private const val MAX_TABLE_COL_WIDTH_DP = 240
+private const val MAX_TABLE_ROWS = 200
+private const val MAX_TABLE_COLS = 24
 private const val TAG_CITE = "cite"
 private const val TAG_BLOCKQUOTE = "blockquote"
 private const val TAG_FIGURE = "figure"

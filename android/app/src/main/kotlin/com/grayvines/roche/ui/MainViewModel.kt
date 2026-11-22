@@ -108,11 +108,13 @@ class MainViewModel(
             settingsForUi,
             transientState,
             repository.isSyncActive,
+            repository.inFlightOfflineEntryIds,
         ) {
             snapshot: RepositorySnapshot,
             settings: Settings,
             local: TransientUiState,
-            repoSyncing: Boolean ->
+            repoSyncing: Boolean,
+            inFlightOfflineIds: Set<String> ->
             val effectiveLocal =
                 if (repoSyncing && !local.isSyncing) local.copy(isSyncing = true) else local
             uiStateMemoizer.build(
@@ -120,6 +122,7 @@ class MainViewModel(
                 settings = settings,
                 local = effectiveLocal,
                 localNetworkTier = effectiveLocal.localNetworkTier,
+                inFlightOfflineEntryIds = inFlightOfflineIds,
             )
         }
 

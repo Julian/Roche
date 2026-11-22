@@ -15,6 +15,7 @@ import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.sync.AndroidNetworkTierProvider
 import com.grayvines.roche.data.sync.NetworkTierProvider
 import com.grayvines.roche.data.sync.PeerSyncScheduler
+import com.grayvines.roche.media.PdfDocumentStore
 import com.grayvines.roche.media.ThumbnailDiskCache
 import com.grayvines.roche.media.ThumbnailLoader
 import com.grayvines.roche.playback.AndroidPodcastMediaSessionBridge
@@ -23,6 +24,7 @@ import com.grayvines.roche.playback.PodcastMediaSessionBridge
 import com.grayvines.roche.playback.PodcastPlaybackOrchestrator
 import com.grayvines.roche.playback.PodcastPlayerController
 import com.grayvines.roche.playback.createManagedPlayerController
+import com.grayvines.roche.reader.ArticleBlockCache
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -66,6 +68,10 @@ class AppGraph(context: Context) : AutoCloseable {
     }
 
     val offlineCacheDir: File by lazy { File(appContext.filesDir, "offline_media") }
+
+    val pdfDocumentStore: PdfDocumentStore by lazy { PdfDocumentStore(cacheRoot = offlineCacheDir) }
+
+    val articleBlockCache: ArticleBlockCache by lazy { ArticleBlockCache() }
 
     val thumbnailDiskCache: ThumbnailDiskCache by lazy {
         ThumbnailDiskCache(cacheDir = offlineCacheDir)

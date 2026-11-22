@@ -33,6 +33,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
             is MainAction.ToggleStar -> performToggleStar(action.entryId)
             is MainAction.ToggleReadState -> performToggleReadState(action.entryId)
             is MainAction.ToggleOfflineCache -> performToggleOffline(action.entryId)
+            is MainAction.CacheEntryOffline -> performCacheOffline(action.entryId)
             is MainAction.ToggleTagOnEntry ->
                 host.repository.toggleTagOnItem(itemId = action.entryId, tagName = action.tagName)
             is MainAction.UpdateReadProgress ->
@@ -255,6 +256,29 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                 !wasCached -> "Failed to cache offline copy"
                 isAudio -> "Deleted local episode download"
                 else -> "Removed local offline copy"
+            }
+        host.showStatusMessage(msg)
+    }
+
+    private suspend fun performCacheOffline(entryId: String) {
+        val prevEntry = host.latestEntries().firstOrNull { it.id == entryId }
+        val cached = host.repository.cacheEntryOffline(entryId)
+        if (cached && host.currentTransientState().selectedReaderEntryId == entryId) {
+            host.repository.hydrateItemContentIfNeeded(entryId)?.let { content ->
+                host.applyReaderContentIfActive(entryId, content)
+            }
+        }
+        val entry = host.latestEntries().firstOrNull { it.id == entryId } ?: prevEntry
+        val isAudio = entry?.contentType == ContentType.AUDIO
+        val isPdf = entry != null && isPdfLikeEntry(entry)
+        val msg =
+            when {
+                cached && isAudio -> "Downloaded episode for offline playback"
+                cached && isPdf -> "Downloaded PDF for offline reading"
+                cached -> "Cached local copy"
+                isAudio -> "Failed to download episode for offline playback"
+                isPdf -> "Failed to download PDF"
+                else -> "Failed to cache offline copy"
             }
         host.showStatusMessage(msg)
     }

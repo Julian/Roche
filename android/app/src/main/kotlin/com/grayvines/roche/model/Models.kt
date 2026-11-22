@@ -397,7 +397,8 @@ private fun hasDisallowedImageScheme(url: String): Boolean =
 internal fun extractFirstImageUrlFromHtml(html: String?, baseUrl: String? = null): String? {
     if (html.isNullOrBlank() || !html.contains("<img", ignoreCase = true)) return null
     for (match in IMG_SRC_REGEX.findAll(html)) {
-        resolveArticleImageUrl(match.groupValues[1], baseUrl)?.let {
+        val rawSrc = match.groupValues[1].ifEmpty { match.groupValues[2] }
+        resolveArticleImageUrl(rawSrc, baseUrl)?.let {
             return it
         }
     }
@@ -407,7 +408,10 @@ internal fun extractFirstImageUrlFromHtml(html: String?, baseUrl: String? = null
 internal fun extractAllImageUrlsFromHtml(html: String?, baseUrl: String? = null): List<String> {
     if (html.isNullOrBlank() || !html.contains("<img", ignoreCase = true)) return emptyList()
     return IMG_SRC_REGEX.findAll(html)
-        .mapNotNull { match -> resolveArticleImageUrl(match.groupValues[1], baseUrl) }
+        .mapNotNull { match ->
+            val rawSrc = match.groupValues[1].ifEmpty { match.groupValues[2] }
+            resolveArticleImageUrl(rawSrc, baseUrl)
+        }
         .distinct()
         .toList()
 }
@@ -434,5 +438,8 @@ private const val COMPLETED_PROGRESS_THRESHOLD = 0.98
 private const val PERCENT_SCALE = 100
 private const val MAX_PARTIAL_PCT = 99
 private val IMG_SRC_REGEX =
-    Regex("""<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+    Regex(
+        """<img\b[^<>]{0,4096}?\bsrc\s*=\s*(?:"([^"<>]{1,4096})"|'([^'<>]{1,4096})')""",
+        RegexOption.IGNORE_CASE,
+    )
 private val SHORT_DATE_FORMATTER = DateTimeFormatter.ofPattern("MMM d", Locale.US)

@@ -88,6 +88,7 @@ data class MainUiState(
     val readerContent: ReaderItemContent? = null,
     val activePlayerNotesContent: ReaderItemContent? = null,
     val hydratingEntryIds: Set<String> = emptySet(),
+    val inFlightOfflineEntryIds: Set<String> = emptySet(),
     val contextSheetEntryId: String? = null,
     val feedContextSheetId: String? = null,
     val isAddSheetOpen: Boolean = false,
@@ -347,6 +348,8 @@ sealed interface MainAction {
     data class ToggleReadState(val entryId: String) : EntryMutation
 
     data class ToggleOfflineCache(val entryId: String) : EntryMutation
+
+    data class CacheEntryOffline(val entryId: String) : EntryMutation
 
     data class ToggleTagOnEntry(val entryId: String, val tagName: String) : EntryMutation
 
@@ -715,6 +718,7 @@ internal class MainUiStateMemoizer {
         settings: Settings,
         local: TransientUiState,
         localNetworkTier: NetworkTier = local.localNetworkTier,
+        inFlightOfflineEntryIds: Set<String> = emptySet(),
     ): MainUiState =
         synchronized(this) {
             val effectiveEntries =
@@ -740,6 +744,7 @@ internal class MainUiStateMemoizer {
                 settings = settings,
                 local = local,
                 localNetworkTier = localNetworkTier,
+                inFlightOfflineEntryIds = inFlightOfflineEntryIds,
                 effectiveEntries = effectiveEntries,
                 filtered = filtered,
                 searchResults = searchResults,
@@ -752,6 +757,7 @@ internal class MainUiStateMemoizer {
         settings: Settings,
         local: TransientUiState,
         localNetworkTier: NetworkTier,
+        inFlightOfflineEntryIds: Set<String>,
         effectiveEntries: List<InboxEntry>,
         filtered: List<InboxEntry>,
         searchResults: List<InboxEntry>,
@@ -768,6 +774,7 @@ internal class MainUiStateMemoizer {
             readerContent = local.readerContent,
             activePlayerNotesContent = local.activePlayerNotesContent,
             hydratingEntryIds = local.hydratingEntryIds,
+            inFlightOfflineEntryIds = inFlightOfflineEntryIds,
             contextSheetEntryId = local.contextSheetEntryId,
             feedContextSheetId = local.feedContextSheetId,
             isAddSheetOpen = local.isAddSheetOpen,

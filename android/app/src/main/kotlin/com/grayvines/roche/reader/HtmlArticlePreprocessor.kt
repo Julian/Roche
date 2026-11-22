@@ -30,15 +30,25 @@ internal fun parsePreprocessedHtmlBody(rawHtml: String, baseUrl: String? = null)
     return body
 }
 
+internal data class NormalizedInlineContent(
+    val html: String,
+    val plainText: String,
+    val maxLineLength: Int = 0,
+)
+
 internal fun prepareInlineHtmlForCompose(htmlFragment: String, baseUrl: String? = null): String {
     if (!containsCustomInlineTags(htmlFragment)) return htmlFragment
     val doc = Jsoup.parseBodyFragment(htmlFragment, baseUrl.orEmpty())
     doc.outputSettings().prettyPrint(false)
     val body = doc.body()
     sanitizeAnchorLinks(body, baseUrl)
-    body.select("code, kbd, samp").forEach { it.tagName(TAG_TT) }
-    body.select("var").forEach { it.tagName(TAG_EM) }
+    normalizeComposeInlineTags(body)
     return body.html()
+}
+
+internal fun normalizeComposeInlineTags(root: Element) {
+    root.select("code, kbd, samp").forEach { it.tagName(TAG_TT) }
+    root.select("var").forEach { it.tagName(TAG_EM) }
 }
 
 private fun containsCustomInlineTags(html: String): Boolean =
@@ -81,8 +91,106 @@ internal fun isAllowedAnchorUrl(url: String): Boolean {
 internal fun hasVisibleDomText(element: Element): Boolean =
     element.text().replace('\u00A0', ' ').isNotBlank()
 
-internal fun hasVisibleHtmlText(htmlFragment: String): Boolean =
-    htmlFragment.isNotBlank() && hasVisibleDomText(Jsoup.parseBodyFragment(htmlFragment).body())
+internal fun hasVisibleHtmlText(htmlFragment: String): Boolean {
+    if (htmlFragment.isBlank()) return false
+    if ('<' !in htmlFragment && '&' !in htmlFragment) {
+        return htmlFragment.replace('\u00A0', ' ').isNotBlank()
+    }
+    return scanVisibleInlineHtmlText(htmlFragment)
+}
+
+internal fun stripInlineHtmlToPlainText(htmlFragment: String): String {
+    if (htmlFragment.isBlank()) return ""
+    if ('<' !in htmlFragment && '&' !in htmlFragment) {
+        return htmlFragment.replace('\u00A0', ' ').trim()
+    }
+    return Jsoup.parseBodyFragment(htmlFragment).text().replace('\u00A0', ' ').trim()
+}
+
+internal fun computeDomCellMaxLineLength(cell: Element): Int {
+    val lines = StringBuilder()
+    appendDomTextWithLineBreaks(cell, lines)
+    return lines.toString().lines().maxOfOrNull { it.replace('\u00A0', ' ').trim().length } ?: 0
+}
+
+private fun appendDomTextWithLineBreaks(node: Node, out: StringBuilder) {
+    when (node) {
+        is TextNode -> {
+            out.append(node.text())
+        }
+        is Element -> {
+            if (node.normalName() == TAG_BR) {
+                out.append('\n')
+            } else {
+                node.childNodes().forEach { child -> appendDomTextWithLineBreaks(child, out) }
+            }
+        }
+    }
+}
+
+private fun scanVisibleInlineHtmlText(html: String): Boolean {
+    var index = 0
+    val len = html.length
+    while (index < len) {
+        val next = stepPastInvisibleToken(html, index)
+        if (next < 0) return true
+        index = next
+    }
+    return false
+}
+
+private fun stepPastInvisibleToken(html: String, index: Int): Int =
+    when (val ch = html[index]) {
+        '<' -> advancePastHtmlTag(html, index)
+        '&' -> advancePastInvisibleEntity(html, index)
+        else -> if (ch.isWhitespace() || ch == '\u00A0') index + 1 else -1
+    }
+
+private fun advancePastHtmlTag(html: String, startIndex: Int): Int {
+    val nextChar = html.getOrNull(startIndex + 1)
+    val looksLikeTag =
+        nextChar != null &&
+            (nextChar.isLetter() || nextChar == '/' || nextChar == '!' || nextChar == '?')
+    if (!looksLikeTag) return -1
+    var cursor = startIndex + 1
+    var quoteChar: Char? = null
+    while (cursor < html.length) {
+        val ch = html[cursor]
+        if (quoteChar != null) {
+            if (ch == quoteChar) quoteChar = null
+        } else if (ch == '"' || ch == '\'') {
+            quoteChar = ch
+        } else if (ch == '>') {
+            return cursor + 1
+        }
+        cursor++
+    }
+    return html.length
+}
+
+private fun advancePastInvisibleEntity(html: String, startIndex: Int): Int {
+    val semi = html.indexOf(';', startIndex = startIndex + 1)
+    if (semi < 0 || semi - startIndex > MAX_HTML_ENTITY_LEN) return -1
+    val entity = html.substring(startIndex + 1, semi).lowercase(Locale.US)
+    return if (isWhitespaceHtmlEntity(entity)) semi + 1 else -1
+}
+
+private fun isWhitespaceHtmlEntity(entity: String): Boolean =
+    entity in WHITESPACE_NAMED_ENTITIES ||
+        parseNumericEntityCodePoint(entity)?.let(::isWhitespaceCodePoint) == true
+
+private fun parseNumericEntityCodePoint(entity: String): Int? =
+    when {
+        !entity.startsWith("#") -> null
+        entity.startsWith("#x") -> entity.substring(2).toIntOrNull(HEX_RADIX)
+        else -> entity.substring(1).toIntOrNull()
+    }
+
+private fun isWhitespaceCodePoint(codePoint: Int): Boolean =
+    Character.isWhitespace(codePoint) ||
+        codePoint == NBSP_CODE_POINT ||
+        codePoint == ZERO_WIDTH_SPACE_CODE_POINT ||
+        codePoint == BOM_CODE_POINT
 
 internal fun extractPreCodeText(preElement: Element): String {
     val clone = preElement.clone()
@@ -341,7 +449,12 @@ internal fun transformDetailsElements(root: Element) {
 internal fun normalizeDomElementInlineHtml(
     element: Element,
     isInsideList: Boolean = false,
-): String {
+): String = normalizeDomInlineContent(element, isInsideList).html
+
+internal fun normalizeDomInlineContent(
+    element: Element,
+    isInsideList: Boolean = false,
+): NormalizedInlineContent {
     val clone = element.clone()
     clone.select(STRIPPED_INLINE_MEDIA_QUERY).remove()
     flattenNestedQuotesInDom(clone)
@@ -349,9 +462,20 @@ internal fun normalizeDomElementInlineHtml(
     flattenListsInDom(clone, rootIsListItem = isInsideList)
     unwrapParagraphsInDom(clone)
     unwrapContainerTagsInDom(clone)
+    normalizeComposeInlineTags(clone)
     normalizeTextNodesInDom(clone)
     trimEdgeBrNodes(clone)
-    return collapseExcessBrTags(clone.html().replace("<br>", BR_XHTML)).trim()
+    val plainText = clone.text().replace('\u00A0', ' ').trim()
+    if (plainText.isEmpty()) {
+        return NormalizedInlineContent(html = "", plainText = "", maxLineLength = 0)
+    }
+    val html = collapseExcessBrTags(clone.html().replace("<br>", BR_XHTML)).trim()
+    val maxLineLength = computeDomCellMaxLineLength(clone)
+    return NormalizedInlineContent(
+        html = html,
+        plainText = plainText,
+        maxLineLength = maxLineLength,
+    )
 }
 
 internal fun flattenNestedQuotesInDom(root: Element) {
@@ -675,6 +799,13 @@ private const val HTTPS_SCHEME_PREFIX_LEN = 8
 private const val HTTP_SCHEME_PREFIX_LEN = 7
 private const val MAILTO_SCHEME_PREFIX_LEN = 7
 private const val PLAIN_BULLET_PREFIX = "- "
+private const val MAX_HTML_ENTITY_LEN = 12
+private const val HEX_RADIX = 16
+private const val NBSP_CODE_POINT = 0x00A0
+private const val ZERO_WIDTH_SPACE_CODE_POINT = 0x200B
+private const val BOM_CODE_POINT = 0xFEFF
+private val WHITESPACE_NAMED_ENTITIES =
+    setOf("nbsp", "ensp", "emsp", "thinsp", "tab", "newline", "zwnj", "zwj")
 
 private const val TAG_IMG = "img"
 private const val TAG_PRE = "pre"

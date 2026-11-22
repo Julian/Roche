@@ -1,9 +1,12 @@
-@file:Suppress("MatchingDeclarationName")
+@file:Suppress("MatchingDeclarationName", "MagicNumber")
 
 package com.grayvines.roche.ui
 
+import android.content.ClipData
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -11,6 +14,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -22,14 +26,33 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
@@ -47,12 +70,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.reader.ArticleBlock
-import com.grayvines.roche.reader.computeTableColumnWidths
 import com.grayvines.roche.reader.prepareInlineHtmlForCompose
 import com.grayvines.roche.reader.resolveSafeAnchorHref
+import com.grayvines.roche.reader.stripInlineHtmlToPlainText
 import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 internal fun htmlToComposeAnnotatedString(
     html: String,
@@ -60,8 +85,9 @@ internal fun htmlToComposeAnnotatedString(
     codeBackground: Color,
     baseUrl: String? = null,
     linkInteractionListener: LinkInteractionListener? = null,
+    isPreNormalized: Boolean = false,
 ): AnnotatedString {
-    val prepared = prepareInlineHtmlForCompose(html, baseUrl)
+    val prepared = if (isPreNormalized) html else prepareInlineHtmlForCompose(html, baseUrl)
     val base =
         AnnotatedString.fromHtml(
             htmlString = prepared,
@@ -86,6 +112,7 @@ internal fun rememberRichHtmlText(
     codeBackground: Color,
     baseUrl: String? = null,
     onOpenUrl: ((String) -> Unit)? = null,
+    isPreNormalized: Boolean = true,
 ): AnnotatedString {
     val uriHandler = LocalUriHandler.current
     val currentOnOpenUrl by rememberUpdatedState(onOpenUrl)
@@ -101,13 +128,14 @@ internal fun rememberRichHtmlText(
                 )
             }
         }
-    return remember(html, linkStyles, codeBackground, baseUrl, linkListener) {
+    return remember(html, linkStyles, codeBackground, baseUrl, linkListener, isPreNormalized) {
         htmlToComposeAnnotatedString(
             html = html,
             linkStyles = linkStyles,
             codeBackground = codeBackground,
             baseUrl = baseUrl,
             linkInteractionListener = linkListener,
+            isPreNormalized = isPreNormalized,
         )
     }
 }
@@ -154,8 +182,41 @@ private fun applyRichInlineSpanStyles(
     }
 }
 
-private const val INLINE_CODE_FONT_EM = 0.92f
-private const val SUB_SUPER_FONT_EM = 0.75f
+internal fun computeTableColumnWidthsDp(block: ArticleBlock.TableBlock): List<Int> {
+    val maxCharsByColumn =
+        if (block.columnMaxChars.isNotEmpty()) {
+            block.columnMaxChars
+        } else {
+            fallbackColumnMaxChars(block)
+        }
+    return maxCharsByColumn.map { maxChars ->
+        (maxChars * TABLE_CHAR_WIDTH_DP + TABLE_CELL_PADDING_DP).coerceIn(
+            MIN_TABLE_COL_WIDTH_DP,
+            MAX_TABLE_COL_WIDTH_DP,
+        )
+    }
+}
+
+private fun fallbackColumnMaxChars(block: ArticleBlock.TableBlock): List<Int> {
+    val columnCount =
+        maxOf(
+            block.headers.size,
+            block.rows.maxOfOrNull { it.size } ?: 0,
+        )
+    if (columnCount == 0) return emptyList()
+    return (0 until columnCount).map { colIndex ->
+        val headerLen = plainCellLineLength(block.headers.getOrNull(colIndex))
+        val maxRowLen = block.rows.maxOfOrNull { plainCellLineLength(it.getOrNull(colIndex)) } ?: 0
+        maxOf(headerLen, maxRowLen)
+    }
+}
+
+private fun plainCellLineLength(cellHtml: String?): Int {
+    if (cellHtml.isNullOrBlank()) return 0
+    return cellHtml.split("<br/>", "<br>", ignoreCase = true).maxOfOrNull { segment ->
+        stripInlineHtmlToPlainText(segment).length
+    } ?: 0
+}
 
 @Composable
 internal fun rememberReaderLinkStyles(): TextLinkStyles {
@@ -176,6 +237,7 @@ internal fun StructuredHtmlArticleContent(
     blocks: List<ArticleBlock>,
     baseUrl: String? = null,
     onOpenUrl: ((String) -> Unit)? = null,
+    onZoomImage: ((ImageBitmap, ArticleBlock.ImageBlock) -> Unit)? = null,
 ) {
     val linkStyles = rememberReaderLinkStyles()
 
@@ -186,6 +248,7 @@ internal fun StructuredHtmlArticleContent(
                 linkStyles = linkStyles,
                 baseUrl = baseUrl,
                 onOpenUrl = onOpenUrl,
+                onZoomImage = onZoomImage,
             )
         }
     }
@@ -198,6 +261,7 @@ internal fun RenderArticleBlock(
     baseUrl: String?,
     onOpenUrl: ((String) -> Unit)?,
     modifier: Modifier = Modifier,
+    onZoomImage: ((ImageBitmap, ArticleBlock.ImageBlock) -> Unit)? = null,
 ) {
     when (block) {
         is ArticleBlock.Heading ->
@@ -249,6 +313,7 @@ internal fun RenderArticleBlock(
                 linkStyles = linkStyles,
                 baseUrl = baseUrl,
                 onOpenUrl = onOpenUrl,
+                onZoomImage = onZoomImage,
             )
     }
 }
@@ -299,23 +364,118 @@ internal fun RenderHeadingBlock(
 @Composable
 internal fun RenderCodeBlock(code: String) {
     val colors = LocalRocheColors.current
+    val clipboard = LocalClipboard.current
+    val coroutineScope = rememberCoroutineScope()
+    val scrollState = rememberScrollState()
+    var copiedTick by remember(code) { mutableIntStateOf(0) }
+    var isCopied by remember(code) { mutableStateOf(false) }
+
+    LaunchedEffect(copiedTick) {
+        if (copiedTick > 0) {
+            isCopied = true
+            delay(COPIED_BADGE_DURATION_MS)
+            isCopied = false
+        }
+    }
+
+    val shape = RoundedCornerShape(8.dp)
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clip(shape)
+                .background(colors.surface)
+                .border(1.dp, colors.border, shape)
+    ) {
+        CodeBlockHeaderBar(
+            isCopied = isCopied,
+            onCopy = {
+                coroutineScope.launch {
+                    runCatching {
+                        clipboard.setClipEntry(
+                            ClipEntry(ClipData.newPlainText("Code snippet", code))
+                        )
+                    }
+                        .onSuccess { copiedTick++ }
+                }
+            },
+        )
+        HorizontalDivider(color = colors.border, thickness = 0.5.dp)
+        CodeBlockScrollBody(code = code, scrollState = scrollState)
+    }
+}
+
+@Composable
+private fun CodeBlockScrollBody(
+    code: String,
+    scrollState: ScrollState,
+) {
+    val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     Box(
         modifier =
             Modifier.fillMaxWidth()
-                .clip(RoundedCornerShape(8.dp))
-                .background(colors.surface)
-                .border(1.dp, colors.border, RoundedCornerShape(8.dp))
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 14.dp, vertical = 12.dp)
+                .horizontalScrollEdgeFades(scrollState = scrollState, fadeColor = colors.surface)
+    ) {
+        Box(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .horizontalScroll(scrollState)
+                    .padding(horizontal = 14.dp, vertical = 12.dp)
+        ) {
+            Text(
+                text = code,
+                color = colors.textPrimary,
+                fontFamily = FontFamily.Monospace,
+                fontSize = (12.5f * scale).sp,
+                lineHeight = (18.5f * scale).sp,
+            )
+        }
+    }
+}
+
+@Composable
+private fun CodeBlockHeaderBar(
+    isCopied: Boolean,
+    onCopy: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .background(colors.surfaceElevated)
+                .padding(start = 12.dp, end = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            text = code,
-            color = colors.textPrimary,
+            text = "CODE",
+            color = colors.textMuted,
             fontFamily = FontFamily.Monospace,
-            fontSize = (12.5f * scale).sp,
-            lineHeight = (18.5f * scale).sp,
+            fontSize = 10.sp,
+            letterSpacing = 0.8.sp,
         )
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable(onClick = onCopy)
+                    .semantics {
+                        role = Role.Button
+                        contentDescription =
+                            if (isCopied) "Code copied to clipboard" else "Copy code block"
+                    }
+                    .padding(horizontal = 8.dp)
+                    .testTag("reader_code_copy_btn"),
+        ) {
+            Text(
+                text = if (isCopied) "✓ Copied" else "Copy",
+                color = if (isCopied) colors.accentVerdigris else colors.accentBlue,
+                fontFamily = FontFamily.SansSerif,
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
     }
 }
 
@@ -464,8 +624,10 @@ internal fun RenderTableBlock(
 ) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
-    val colWidths = remember(block) { computeTableColumnWidths(block) }
+    val colWidths = remember(block) { computeTableColumnWidthsDp(block) }
     if (colWidths.isEmpty()) return
+    val scrollState = rememberScrollState()
+    var headerHeightPx by remember(block) { mutableIntStateOf(0) }
 
     Box(
         modifier =
@@ -473,9 +635,14 @@ internal fun RenderTableBlock(
                 .clip(RoundedCornerShape(8.dp))
                 .background(colors.surface)
                 .border(1.dp, colors.border, RoundedCornerShape(8.dp))
-                .horizontalScroll(rememberScrollState())
+                .horizontalScrollEdgeFades(
+                    scrollState = scrollState,
+                    fadeColor = colors.surface,
+                    topBandHeightPx = if (block.headers.isNotEmpty()) headerHeightPx else 0,
+                    topBandFadeColor = colors.surfaceElevated,
+                )
     ) {
-        Column {
+        Column(modifier = Modifier.horizontalScroll(scrollState)) {
             if (block.headers.isNotEmpty()) {
                 RenderTableRow(
                     cells = block.headers,
@@ -485,6 +652,7 @@ internal fun RenderTableBlock(
                     linkStyles = linkStyles,
                     baseUrl = baseUrl,
                     onOpenUrl = onOpenUrl,
+                    modifier = Modifier.onSizeChanged { headerHeightPx = it.height },
                 )
                 if (block.rows.isNotEmpty()) {
                     HorizontalDivider(color = colors.border, thickness = 1.dp)
@@ -508,6 +676,77 @@ internal fun RenderTableBlock(
     }
 }
 
+private fun Modifier.horizontalScrollEdgeFades(
+    scrollState: ScrollState,
+    fadeColor: Color,
+    fadeWidthDp: Float = 24f,
+    topBandHeightPx: Int = 0,
+    topBandFadeColor: Color = fadeColor,
+): Modifier = drawWithContent {
+    drawContent()
+    val widthPx = fadeWidthDp.dp.toPx().coerceAtMost(size.width / 2f)
+    if (widthPx > 0f && (scrollState.canScrollBackward || scrollState.canScrollForward)) {
+        val clampedTopBand = topBandHeightPx.toFloat().coerceIn(0f, size.height)
+        if (clampedTopBand > 0f) {
+            drawHorizontalEdgeFadeBand(
+                canScrollBackward = scrollState.canScrollBackward,
+                canScrollForward = scrollState.canScrollForward,
+                fadeColor = topBandFadeColor,
+                widthPx = widthPx,
+                topY = 0f,
+                bandHeight = clampedTopBand,
+            )
+        }
+        val bodyHeight = (size.height - clampedTopBand).coerceAtLeast(0f)
+        if (bodyHeight > 0f) {
+            drawHorizontalEdgeFadeBand(
+                canScrollBackward = scrollState.canScrollBackward,
+                canScrollForward = scrollState.canScrollForward,
+                fadeColor = fadeColor,
+                widthPx = widthPx,
+                topY = clampedTopBand,
+                bandHeight = bodyHeight,
+            )
+        }
+    }
+}
+
+@Suppress("LongParameterList")
+private fun DrawScope.drawHorizontalEdgeFadeBand(
+    canScrollBackward: Boolean,
+    canScrollForward: Boolean,
+    fadeColor: Color,
+    widthPx: Float,
+    topY: Float,
+    bandHeight: Float,
+) {
+    val transparentFade = fadeColor.copy(alpha = 0f)
+    if (canScrollBackward) {
+        drawRect(
+            brush =
+                Brush.horizontalGradient(
+                    colors = listOf(fadeColor, transparentFade),
+                    startX = 0f,
+                    endX = widthPx,
+                ),
+            topLeft = Offset(0f, topY),
+            size = Size(widthPx, bandHeight),
+        )
+    }
+    if (canScrollForward) {
+        drawRect(
+            brush =
+                Brush.horizontalGradient(
+                    colors = listOf(transparentFade, fadeColor),
+                    startX = size.width - widthPx,
+                    endX = size.width,
+                ),
+            topLeft = Offset(size.width - widthPx, topY),
+            size = Size(widthPx, bandHeight),
+        )
+    }
+}
+
 @Composable
 private fun RenderTableRow(
     cells: List<String>,
@@ -517,12 +756,14 @@ private fun RenderTableRow(
     linkStyles: TextLinkStyles,
     baseUrl: String?,
     onOpenUrl: ((String) -> Unit)?,
+    modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
     val style = resolveTableRowStyle(isHeader, colors, currentHeadlineFontFamily())
     Row(
         modifier =
-            Modifier.background(style.background)
+            modifier
+                .background(style.background)
                 .padding(horizontal = 10.dp, vertical = style.verticalPad),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -550,9 +791,9 @@ private fun RenderTableRow(
 }
 
 private data class TableRowStyle(
-    val background: androidx.compose.ui.graphics.Color,
+    val background: Color,
     val verticalPad: androidx.compose.ui.unit.Dp,
-    val textColor: androidx.compose.ui.graphics.Color,
+    val textColor: Color,
     val fontFamily: FontFamily,
     val fontWeight: FontWeight,
 )
@@ -579,3 +820,11 @@ private fun resolveTableRowStyle(
             fontWeight = FontWeight.Normal,
         )
     }
+
+private const val INLINE_CODE_FONT_EM = 0.92f
+private const val SUB_SUPER_FONT_EM = 0.75f
+private const val TABLE_CHAR_WIDTH_DP = 7
+private const val TABLE_CELL_PADDING_DP = 24
+private const val MIN_TABLE_COL_WIDTH_DP = 72
+private const val MAX_TABLE_COL_WIDTH_DP = 240
+private const val COPIED_BADGE_DURATION_MS = 2_000L

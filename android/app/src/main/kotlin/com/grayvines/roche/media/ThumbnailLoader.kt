@@ -123,6 +123,13 @@ internal constructor(
         return faviconCache[cleanId]
     }
 
+    fun clearFailedKey(key: String) {
+        val cleanId = key.trim()
+        if (cleanId.isNotEmpty()) {
+            failedKeys.remove(cleanId)
+        }
+    }
+
     suspend fun loadThumbnail(mediaId: String): T? {
         val cleanId = mediaId.trim()
         if (cleanId.isBlank() || isHttpOrHttpsUrl(cleanId) && !isHttpsUrl(cleanId)) return null

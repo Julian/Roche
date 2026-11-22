@@ -1,16 +1,24 @@
+@file:Suppress("MatchingDeclarationName")
+
 package com.grayvines.roche.media
 
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
-import android.util.LruCache
+import androidx.collection.LruCache
 import androidx.core.graphics.createBitmap
 import com.grayvines.roche.core.PDF_MAGIC_BYTES
 import com.grayvines.roche.core.hasPdfMagicHeader
 import com.grayvines.roche.core.resolveSafeChildFile
 import com.grayvines.roche.core.sanitizeCacheFileName
 import java.io.File
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
@@ -21,95 +29,234 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 
 internal const val ITEMS_SUBDIR = "items"
 internal const val SHARED_PDF_FILENAME = "shared_document.pdf"
+internal const val MAX_PDF_PAGES = 500
+internal const val PDF_PAGE_RENDER_TIMEOUT_MS = 10_000L
 
 internal val pdfTeardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-internal data class RenderedPdfPage(
-    val bitmap: Bitmap,
+internal data class CachedPdfCandidate(
+    val file: File,
+    val canonicalPath: String,
+)
+
+internal data class RenderedPage<T : Any>(
+    val image: T,
     val aspectRatio: Float,
 )
 
-internal data class CachedRenderedPdfPage(
+internal typealias RenderedPdfPage = RenderedPage<Bitmap>
+
+internal data class CachedRenderedPage<T : Any>(
     val widthPx: Int,
-    val page: RenderedPdfPage,
+    val page: RenderedPage<T>,
 )
 
-internal class PdfRendererSession(
-    private val descriptor: ParcelFileDescriptor,
-    private val renderer: PdfRenderer,
+internal interface PdfPageBackend<T : Any> : AutoCloseable {
+    val totalPageCount: Int
+
+    fun renderPage(pageIndex: Int, widthPx: Int, maxHeightPx: Int): RenderedPage<T>?
+}
+
+class PdfDocumentStore(val cacheRoot: File?) {
+    internal fun findCachedPdf(entryId: String): CachedPdfCandidate? =
+        findCachedPdfFileForEntry(cacheRoot, entryId)?.let { file ->
+            val canonical = runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
+            CachedPdfCandidate(file = file, canonicalPath = canonical)
+        }
+
+    internal fun openSession(candidate: CachedPdfCandidate): PdfRendererSession? =
+        openPdfRendererSession(candidate.file, candidate.canonicalPath)
+}
+
+internal open class PdfDocumentSession<T : Any>(
+    private val backend: PdfPageBackend<T>,
     val canonicalPath: String = "",
+    private val maxPages: Int = MAX_PDF_PAGES,
+    private val renderTimeoutMs: Long = PDF_PAGE_RENDER_TIMEOUT_MS,
+    private val closeAwaitTimeoutMs: Long = CLOSE_AWAIT_TIMEOUT_MS,
 ) : AutoCloseable {
-    private val renderMutex = Mutex()
     private val closeRequested = AtomicBoolean(false)
+    private val backendClosed = AtomicBoolean(false)
     @Volatile private var closed = false
-    private val pageCache = LruCache<Int, CachedRenderedPdfPage>(MAX_CACHED_PDF_PAGES)
-
-    val pageCount: Int = renderer.pageCount
-
-    suspend fun renderPageBitmap(pageIndex: Int, targetWidthPx: Int): RenderedPdfPage? =
-        withContext(Dispatchers.IO) {
-            if (closed || closeRequested.get()) {
-                null
-            } else {
-                val clampedWidthPx =
-                    targetWidthPx.coerceIn(MIN_RENDER_WIDTH_PX, MAX_RENDER_WIDTH_PX)
-                renderMutex.withLock { getOrRenderPageLocked(pageIndex, clampedWidthPx) }
-            }
-        }
-
-    private fun getOrRenderPageLocked(pageIndex: Int, clampedWidthPx: Int): RenderedPdfPage? {
-        if (closed || closeRequested.get() || pageIndex !in 0 until pageCount) return null
-        val cached = pageCache.get(pageIndex)
-        if (cached != null && cached.widthPx == clampedWidthPx) return cached.page
-        return renderSinglePageLocked(pageIndex, clampedWidthPx)?.also { rendered ->
-            pageCache.put(pageIndex, CachedRenderedPdfPage(clampedWidthPx, rendered))
-        }
+    private val pageCache = LruCache<Int, CachedRenderedPage<T>>(MAX_CACHED_PDF_PAGES)
+    private val zoomPageCache = LruCache<Int, CachedRenderedPage<T>>(MAX_CACHED_ZOOM_PDF_PAGES)
+    private val renderExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "roche-pdf-render").apply { isDaemon = true }
     }
 
-    private fun renderSinglePageLocked(pageIndex: Int, widthPx: Int): RenderedPdfPage? =
-        runCatching {
-            renderer.openPage(pageIndex).use { page ->
-                val rawW = page.width.coerceAtLeast(1)
-                val rawH = page.height.coerceAtLeast(1)
-                val heightPx =
-                    (widthPx.toDouble() * rawH.toDouble() / rawW.toDouble())
-                        .roundToInt()
-                        .coerceIn(1, MAX_RENDER_HEIGHT_PX)
-                val bitmap = createBitmap(widthPx, heightPx)
-                bitmap.eraseColor(Color.WHITE)
-                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                RenderedPdfPage(
-                    bitmap = bitmap,
-                    aspectRatio =
-                        (rawW.toFloat() / rawH.toFloat()).coerceIn(MIN_ASPECT, MAX_ASPECT),
-                )
-            }
-        }
-        .getOrNull()
+    val totalPageCount: Int = backend.totalPageCount.coerceAtLeast(0)
+    val pageCount: Int = totalPageCount.coerceAtMost(maxPages.coerceAtLeast(1))
+    val isTruncated: Boolean
+        get() = totalPageCount > pageCount
 
-    suspend fun closeAsync() {
-        closeRequested.set(true)
-        withContext(Dispatchers.IO) {
-            renderMutex.withLock {
-                if (!closed) {
-                    closed = true
-                    pageCache.evictAll()
-                    runCatching { renderer.close() }
-                    runCatching { descriptor.close() }
+    fun getCachedPage(pageIndex: Int): RenderedPage<T>? {
+        if (closed || closeRequested.get() || pageIndex !in 0 until pageCount) return null
+        return synchronized(zoomPageCache) { zoomPageCache[pageIndex]?.page }
+            ?: synchronized(pageCache) { pageCache[pageIndex]?.page }
+    }
+
+    suspend fun renderPageBitmap(
+        pageIndex: Int,
+        targetWidthPx: Int,
+        allowHighResZoom: Boolean = false,
+    ): RenderedPage<T>? {
+        if (closed || closeRequested.get() || pageIndex !in 0 until pageCount) return null
+        val maxWidth = if (allowHighResZoom) MAX_ZOOM_RENDER_WIDTH_PX else MAX_RENDER_WIDTH_PX
+        val maxHeight = if (allowHighResZoom) MAX_ZOOM_RENDER_HEIGHT_PX else MAX_RENDER_HEIGHT_PX
+        val clampedWidthPx = targetWidthPx.coerceIn(MIN_RENDER_WIDTH_PX, maxWidth)
+        val cache = if (allowHighResZoom) zoomPageCache else pageCache
+        synchronized(cache) { cache[pageIndex]?.takeIf { it.widthPx == clampedWidthPx }?.page }
+            ?.let {
+                return it
+            }
+        val rendered = renderPageWithWatchdog(pageIndex, clampedWidthPx, maxHeight)
+        if (rendered != null) {
+            synchronized(cache) {
+                if (!closed && !closeRequested.get()) {
+                    cache.put(pageIndex, CachedRenderedPage(clampedWidthPx, rendered))
                 }
             }
         }
+        return rendered
+    }
+
+    private suspend fun renderPageWithWatchdog(
+        pageIndex: Int,
+        widthPx: Int,
+        maxHeightPx: Int,
+    ): RenderedPage<T>? {
+        val future = submitRenderTask(pageIndex, widthPx, maxHeightPx) ?: return null
+        return awaitRenderFuture(future)
+    }
+
+    private fun submitRenderTask(
+        pageIndex: Int,
+        widthPx: Int,
+        maxHeightPx: Int,
+    ): Future<RenderedPage<T>?>? = runCatching {
+        renderExecutor.submit<RenderedPage<T>?> {
+            if (closed || closeRequested.get()) {
+                closeBackendOnWorkerThread()
+                null
+            } else {
+                try {
+                    runCatching { backend.renderPage(pageIndex, widthPx, maxHeightPx) }.getOrNull()
+                } finally {
+                    if (closeRequested.get()) {
+                        closeBackendOnWorkerThread()
+                    }
+                }
+            }
+        }
+    }
+        .getOrNull()
+
+    private suspend fun awaitRenderFuture(future: Future<RenderedPage<T>?>): RenderedPage<T>? =
+        try {
+            runInterruptible(Dispatchers.IO) { future.get(renderTimeoutMs, TimeUnit.MILLISECONDS) }
+        } catch (ce: CancellationException) {
+            future.cancel(true)
+            throw ce
+        } catch (_: TimeoutException) {
+            future.cancel(true)
+            null
+        } catch (_: ExecutionException) {
+            null
+        } catch (_: InterruptedException) {
+            future.cancel(true)
+            Thread.currentThread().interrupt()
+            null
+        }
+
+    suspend fun closeAsync() {
+        closeRequested.set(true)
+        evictCaches()
+        val closeFuture = runCatching {
+            renderExecutor.submit { closeBackendOnWorkerThread() }
+        }
+            .getOrNull()
+        renderExecutor.shutdown()
+        if (closeFuture != null) {
+            runCatching {
+                runInterruptible(Dispatchers.IO) {
+                    closeFuture.get(closeAwaitTimeoutMs, TimeUnit.MILLISECONDS)
+                }
+            }
+        }
+        closed = true
+        evictCaches()
+    }
+
+    private fun closeBackendOnWorkerThread() {
+        if (backendClosed.compareAndSet(false, true)) {
+            closed = true
+            evictCaches()
+            runCatching { backend.close() }
+        }
+    }
+
+    private fun evictCaches() {
+        synchronized(pageCache) { pageCache.evictAll() }
+        synchronized(zoomPageCache) { zoomPageCache.evictAll() }
     }
 
     override fun close() {
         if (!closeRequested.compareAndSet(false, true)) return
         pdfTeardownScope.launch { closeAsync() }
+    }
+}
+
+internal class PdfRendererSession(
+    descriptor: ParcelFileDescriptor,
+    renderer: PdfRenderer,
+    canonicalPath: String = "",
+    maxPages: Int = MAX_PDF_PAGES,
+    renderTimeoutMs: Long = PDF_PAGE_RENDER_TIMEOUT_MS,
+) :
+    PdfDocumentSession<Bitmap>(
+        backend = AndroidPdfPageBackend(descriptor = descriptor, renderer = renderer),
+        canonicalPath = canonicalPath,
+        maxPages = maxPages,
+        renderTimeoutMs = renderTimeoutMs,
+    )
+
+private class AndroidPdfPageBackend(
+    private val descriptor: ParcelFileDescriptor,
+    private val renderer: PdfRenderer,
+) : PdfPageBackend<Bitmap> {
+    override val totalPageCount: Int = renderer.pageCount
+
+    override fun renderPage(
+        pageIndex: Int,
+        widthPx: Int,
+        maxHeightPx: Int,
+    ): RenderedPage<Bitmap>? = runCatching {
+        renderer.openPage(pageIndex).use { page ->
+            val rawW = page.width.coerceAtLeast(1)
+            val rawH = page.height.coerceAtLeast(1)
+            val heightPx =
+                (widthPx.toDouble() * rawH.toDouble() / rawW.toDouble())
+                    .roundToInt()
+                    .coerceIn(1, maxHeightPx)
+            val bitmap = createBitmap(widthPx, heightPx)
+            bitmap.eraseColor(Color.WHITE)
+            page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+            RenderedPage(
+                image = bitmap,
+                aspectRatio = (rawW.toFloat() / rawH.toFloat()).coerceIn(MIN_ASPECT, MAX_ASPECT),
+            )
+        }
+    }
+        .getOrNull()
+
+    override fun close() {
+        runCatching { renderer.close() }
+        runCatching { descriptor.close() }
     }
 }
 
@@ -187,9 +334,13 @@ private fun isValidPdfFile(file: File): Boolean {
         .getOrDefault(false)
 }
 
+internal const val MIN_RENDER_WIDTH_PX = 720
+internal const val MAX_RENDER_WIDTH_PX = 1_600
+internal const val MAX_RENDER_HEIGHT_PX = 2_800
+internal const val MAX_ZOOM_RENDER_WIDTH_PX = 2_400
+internal const val MAX_ZOOM_RENDER_HEIGHT_PX = 4_200
 private const val MIN_ASPECT = 0.35f
 private const val MAX_ASPECT = 2.5f
-private const val MIN_RENDER_WIDTH_PX = 720
-private const val MAX_RENDER_WIDTH_PX = 1_600
-private const val MAX_RENDER_HEIGHT_PX = 2_800
 private const val MAX_CACHED_PDF_PAGES = 6
+private const val MAX_CACHED_ZOOM_PDF_PAGES = 3
+private const val CLOSE_AWAIT_TIMEOUT_MS = 2_000L
