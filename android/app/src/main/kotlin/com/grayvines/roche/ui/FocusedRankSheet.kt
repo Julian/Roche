@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -68,6 +69,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -82,6 +84,7 @@ import androidx.compose.ui.zIndex
 import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.RankSettlementSummary
 import com.grayvines.roche.data.catalog.RankedCatalogEntry
+import com.grayvines.roche.ranking.EpRankingEngine
 import com.grayvines.roche.ranking.RankBoardState
 import com.grayvines.roche.ranking.RankClusterCandidate
 import com.grayvines.roche.ranking.RankDropTarget
@@ -416,19 +419,41 @@ private fun rankBoardStateSaver(
 ): Saver<RankBoardState, ArrayList<ArrayList<String>>> =
     Saver(
         save = { state ->
-            ArrayList(state.buckets.map { bucket -> ArrayList(bucket.map { it.entryId }) })
+            val encoded = ArrayList<ArrayList<String>>(state.buckets.size + 2)
+            encoded.add(ArrayList(state.excluded.map { it.entryId }))
+            encoded.add(ArrayList(state.manuallyExcludedIds))
+            for (bucket in state.buckets) {
+                encoded.add(ArrayList(bucket.map { it.entryId }))
+            }
+            encoded
         },
-        restore = { savedBuckets ->
+        restore = { saved ->
             val byId = candidates.associateBy { it.entryId }
-            val restored =
-                savedBuckets
-                    .map { bucketIds -> bucketIds.mapNotNull { byId[it] } }
-                    .filter { it.isNotEmpty() }
-            val restoredIds = restored.flatten().map { it.entryId }.toSet()
-            if (restoredIds == byId.keys && restored.isNotEmpty()) {
-                RankBoardState(restored)
-            } else {
+            if (saved.size < 3) {
                 RankBoardState.fromCandidates(candidates)
+            } else {
+                val excluded = saved[0].mapNotNull { byId[it] }
+                val manualIds = saved[1].filterTo(HashSet()) { it in byId }
+                val restoredBuckets =
+                    saved
+                        .drop(2)
+                        .map { bucketIds -> bucketIds.mapNotNull { byId[it] } }
+                        .filter { it.isNotEmpty() }
+                val activeIds = restoredBuckets.flatten().map { it.entryId }.toSet()
+                val excludedIds = excluded.map { it.entryId }.toSet()
+                val allAccounted =
+                    activeIds + excludedIds == byId.keys &&
+                        (activeIds intersect excludedIds).isEmpty() &&
+                        activeIds.size >= EpRankingEngine.MIN_K
+                if (allAccounted) {
+                    RankBoardState(
+                        buckets = restoredBuckets,
+                        excluded = excluded,
+                        manuallyExcludedIds = manualIds intersect excludedIds,
+                    )
+                } else {
+                    RankBoardState.fromCandidates(candidates)
+                }
             }
         },
     )
@@ -446,7 +471,8 @@ private fun ActiveClusterRankBody(
     val boardSaver = remember(session.cluster) { rankBoardStateSaver(session.cluster) }
     var board by
         rememberSaveable(session.roundIndex, clusterKey, stateSaver = boardSaver) {
-            mutableStateOf(RankBoardState.fromCandidates(session.cluster))
+            val init = RankBoardState.fromCandidates(session.cluster)
+            mutableStateOf(init.resizeTo(session.targetClusterSize, session.focusEntryId))
         }
     var activeDrag by
         remember(session.roundIndex, clusterKey) { mutableStateOf<ActiveRankDragState?>(null) }
@@ -460,18 +486,9 @@ private fun ActiveClusterRankBody(
         val isWide = maxWidth >= RANK_WIDE_BREAKPOINT
         val hPad = if (isWide) 20.dp else 16.dp
         Column(modifier = Modifier.fillMaxWidth()) {
-            ClusterRankHeader(
-                session = session,
-                provisionalRank = provisionalRank,
-                horizontalPad = hPad,
-                onDonePlacing = {
-                    if (session.focusEntryId != null && session.roundIndex > 0) {
-                        onAction(MainAction.FinishRankEarly)
-                    } else {
-                        onAction(MainAction.CloseRankSession)
-                    }
-                },
-            )
+            ClusterRankHeader(session, provisionalRank, hPad) {
+                dispatchDonePlacingAction(session, onAction)
+            }
             HorizontalDivider(color = colors.border, thickness = 1.dp)
             ClusterRankBoardScrollArea(
                 session = session,
@@ -483,7 +500,18 @@ private fun ActiveClusterRankBody(
                     activeDrag = next
                     onDragActiveChange(next != null)
                 },
-                onBoardChange = { board = it },
+                onBoardChange = {
+                    applyBoardChangeWithSizeSync(session, board, it, { b -> board = b }, onAction)
+                },
+                onSelectClusterSize = { targetK ->
+                    applyClusterSizeSelection(
+                        session,
+                        board,
+                        targetK,
+                        { board = board.resizeTo(it, session.focusEntryId) },
+                        onAction,
+                    )
+                },
             )
             HorizontalDivider(color = colors.border, thickness = 1.dp)
             ClusterRankFooter(
@@ -507,7 +535,9 @@ private fun ClusterRankBoardScrollArea(
     activeDrag: ActiveRankDragState?,
     onActiveDragChange: (ActiveRankDragState?) -> Unit,
     onBoardChange: (RankBoardState) -> Unit,
+    onSelectClusterSize: (Int) -> Unit,
 ) {
+    val maxSelectableK = session.maxSelectableClusterSize()
     Column(
         modifier =
             Modifier.fillMaxWidth()
@@ -516,6 +546,15 @@ private fun ClusterRankBoardScrollArea(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         ClusterRankProgressAndHint(session = session)
+        if (maxSelectableK > EpRankingEngine.MIN_K) {
+            ClusterSizeSelectorRow(
+                activeSize =
+                    session.targetClusterSize.coerceIn(EpRankingEngine.MIN_K, maxSelectableK),
+                maxSelectableK = maxSelectableK,
+                board = board,
+                onSelectSize = onSelectClusterSize,
+            )
+        }
         DraggableRankBoard(
             board = board,
             focusEntryId = session.focusEntryId,
@@ -524,6 +563,312 @@ private fun ClusterRankBoardScrollArea(
             onActiveDragChange = onActiveDragChange,
             onBoardChange = onBoardChange,
         )
+        if (board.excluded.isNotEmpty()) {
+            ExcludedCandidatesTray(
+                excluded = board.excluded,
+                manualExcludedIds = board.manuallyExcludedIds,
+                onRestore = { id -> onBoardChange(board.restore(id)) },
+                onRestoreAll = { onBoardChange(board.restoreAll()) },
+            )
+        }
+    }
+}
+
+private fun applyBoardChangeWithSizeSync(
+    session: ActiveRankSessionUiState,
+    previous: RankBoardState,
+    next: RankBoardState,
+    onSetBoard: (RankBoardState) -> Unit,
+    onAction: (MainAction) -> Unit,
+) {
+    val grewAboveTarget = next.size > previous.size && next.size > session.targetClusterSize
+    onSetBoard(next)
+    if (grewAboveTarget) {
+        onAction(
+            MainAction.SetRankClusterSize(
+                clusterSize = next.size.coerceAtMost(session.maxSelectableClusterSize()),
+                reloadCluster = false,
+            )
+        )
+    }
+}
+
+private fun dispatchDonePlacingAction(
+    session: ActiveRankSessionUiState,
+    onAction: (MainAction) -> Unit,
+) {
+    if (session.focusEntryId != null && session.roundIndex > 0) {
+        onAction(MainAction.FinishRankEarly)
+    } else {
+        onAction(MainAction.CloseRankSession)
+    }
+}
+
+private fun applyClusterSizeSelection(
+    session: ActiveRankSessionUiState,
+    board: RankBoardState,
+    targetK: Int,
+    onResizeInPlace: (Int) -> Unit,
+    onAction: (MainAction) -> Unit,
+) {
+    val maxSelectableK = session.maxSelectableClusterSize()
+    val needsReload =
+        targetK > board.totalCandidateCount &&
+            targetK > session.loadedMaxK &&
+            targetK <= maxSelectableK
+    if (needsReload) {
+        onAction(
+            MainAction.SetRankClusterSize(
+                clusterSize = targetK,
+                reloadCluster = true,
+                manualExcludedIds = board.manuallyExcludedIds,
+            )
+        )
+    } else {
+        onResizeInPlace(targetK)
+        onAction(MainAction.SetRankClusterSize(targetK, reloadCluster = false))
+    }
+}
+
+@Composable
+private fun ClusterSizeSelectorRow(
+    activeSize: Int,
+    maxSelectableK: Int,
+    board: RankBoardState,
+    onSelectSize: (Int) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val comparingCount = board.size
+    val totalLoadedCount = board.totalCandidateCount
+    val manualExcludedCount = board.manuallyExcludedIds.size
+    val countNote =
+        when {
+            comparingCount >= totalLoadedCount -> "$comparingCount items"
+            manualExcludedCount > 0 ->
+                "$comparingCount of $totalLoadedCount ($manualExcludedCount excluded)"
+            else -> "$comparingCount of $totalLoadedCount shown"
+        }
+    FlowRow(
+        modifier = Modifier.fillMaxWidth().testTag("rank_size_selector"),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        itemVerticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(0.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "COMPARE",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+                letterSpacing = 0.7.sp,
+                modifier = Modifier.padding(end = 4.dp),
+            )
+            for (k in EpRankingEngine.MIN_K..maxSelectableK) {
+                ClusterSizeOptionPill(
+                    sizeOption = k,
+                    isActive = k == activeSize,
+                    onClick = { onSelectSize(k) },
+                )
+            }
+        }
+        Text(
+            text = countNote,
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.5.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun ClusterSizeOptionPill(
+    sizeOption: Int,
+    isActive: Boolean,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(999.dp)
+    val bg = if (isActive) colors.accentBlue.copy(alpha = 0.16f) else colors.background
+    val borderColor = if (isActive) colors.accentBlue else colors.border
+    val fg = if (isActive) colors.accentBlue else colors.textSecondary
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.minimumInteractiveComponentSize()
+                .clip(shape)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    selected = isActive
+                    contentDescription = "Compare $sizeOption items"
+                }
+                .testTag("rank_size_$sizeOption"),
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.size(width = 34.dp, height = 28.dp)
+                    .clip(shape)
+                    .background(bg)
+                    .border(1.dp, borderColor, shape),
+        ) {
+            Text(
+                text = sizeOption.toString(),
+                color = fg,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+                fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
+        }
+    }
+}
+
+@Composable
+private fun ExcludedCandidatesTray(
+    excluded: List<RankClusterCandidate>,
+    manualExcludedIds: Set<String>,
+    onRestore: (String) -> Unit,
+    onRestoreAll: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(11.dp)
+    val manualCount = excluded.count { it.entryId in manualExcludedIds }
+    val headingText =
+        when {
+            manualCount == 0 -> "SET ASIDE AT THIS SIZE (${excluded.size})"
+            manualCount == excluded.size -> "EXCLUDED FROM COMPARISON (${excluded.size})"
+            else -> "LEFT OUT OF COMPARISON (${excluded.size})"
+        }
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clip(shape)
+                .background(colors.background)
+                .dashedRoundBorder(colors.border, 11.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+                .testTag("rank_excluded_tray"),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        ExcludedTrayHeader(
+            headingText = headingText,
+            showRestoreAll = excluded.size > 1,
+            onRestoreAll = onRestoreAll,
+        )
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalArrangement = Arrangement.spacedBy(0.dp),
+        ) {
+            for (candidate in excluded) {
+                ExcludedCandidateChip(
+                    candidate = candidate,
+                    isManualExcluded = candidate.entryId in manualExcludedIds,
+                    onClick = { onRestore(candidate.entryId) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExcludedTrayHeader(
+    headingText: String,
+    showRestoreAll: Boolean,
+    onRestoreAll: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = headingText,
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
+            letterSpacing = 0.7.sp,
+        )
+        if (showRestoreAll) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier =
+                    Modifier.minimumInteractiveComponentSize()
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable(onClick = onRestoreAll)
+                        .semantics { role = Role.Button }
+                        .testTag("rank_restore_all_btn"),
+            ) {
+                Text(
+                    text = "Restore all",
+                    color = colors.accentBlue,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExcludedCandidateChip(
+    candidate: RankClusterCandidate,
+    isManualExcluded: Boolean,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val chipShape = RoundedCornerShape(999.dp)
+    val borderMod =
+        if (isManualExcluded) {
+            Modifier.dashedRoundBorder(colors.accentEcru.copy(alpha = 0.65f), 999.dp)
+        } else {
+            Modifier.border(1.dp, colors.border, chipShape)
+        }
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.minimumInteractiveComponentSize()
+                .clip(chipShape)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    contentDescription = "Restore ${candidate.title}"
+                }
+                .testTag("rank_restore_${candidate.entryId}"),
+    ) {
+        Row(
+            modifier =
+                Modifier.clip(chipShape)
+                    .background(colors.surface)
+                    .then(borderMod)
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "+",
+                color = colors.accentBlue,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
+            Text(
+                text = candidate.title,
+                color = colors.textPrimary,
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
+        }
     }
 }
 
@@ -683,7 +1028,7 @@ private fun ClusterRankProgressAndHint(session: ActiveRankSessionUiState) {
         }
     }
     Text(
-        text = "Drag cards to reorder — drop onto another card to tie.",
+        text = "Drag cards to reorder — drop onto another card to tie, or tap × to exclude.",
         color = colors.textMuted,
         fontSize = 12.5.sp,
     )
@@ -843,6 +1188,7 @@ private fun RankBucketsColumn(
                 startFlatIndex = startFlatIndex,
                 bucket = bucket,
                 totalBuckets = board.buckets.size,
+                canExcludeAny = board.size > EpRankingEngine.MIN_K,
                 focusEntryId = focusEntryId,
                 isWide = isWide,
                 draggedEntryId = activeDrag?.candidate?.entryId,
@@ -853,6 +1199,7 @@ private fun RankBucketsColumn(
                 onMoveUp = { id -> onBoardChange(board.moveUp(id)) },
                 onMoveDown = { id -> onBoardChange(board.moveDown(id)) },
                 onToggleTie = { id -> onBoardChange(board.toggleTieWithAbove(id)) },
+                onExclude = { id -> onBoardChange(board.exclude(id, focusEntryId)) },
             )
         }
     }
@@ -865,6 +1212,7 @@ private fun RankBucketRow(
     startFlatIndex: Int,
     bucket: List<RankClusterCandidate>,
     totalBuckets: Int,
+    canExcludeAny: Boolean,
     focusEntryId: String?,
     isWide: Boolean,
     draggedEntryId: String?,
@@ -875,6 +1223,7 @@ private fun RankBucketRow(
     onMoveUp: (String) -> Unit,
     onMoveDown: (String) -> Unit,
     onToggleTie: (String) -> Unit,
+    onExclude: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val isTiedBucket = bucket.size > 1
@@ -898,6 +1247,7 @@ private fun RankBucketRow(
                 startFlatIndex,
                 bucket,
                 totalBuckets,
+                canExcludeAny,
                 focusEntryId,
                 isWide,
                 draggedEntryId,
@@ -906,6 +1256,7 @@ private fun RankBucketRow(
                 onMoveUp,
                 onMoveDown,
                 onToggleTie,
+                onExclude,
                 Modifier.weight(1f),
             )
         }
@@ -952,6 +1303,7 @@ private fun RankBucketCardsArea(
     startFlatIndex: Int,
     bucket: List<RankClusterCandidate>,
     totalBuckets: Int,
+    canExcludeAny: Boolean,
     focusEntryId: String?,
     isWide: Boolean,
     draggedEntryId: String?,
@@ -960,6 +1312,7 @@ private fun RankBucketCardsArea(
     onMoveUp: (String) -> Unit,
     onMoveDown: (String) -> Unit,
     onToggleTie: (String) -> Unit,
+    onExclude: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     if (isWide && bucket.size > 1) {
@@ -968,6 +1321,7 @@ private fun RankBucketCardsArea(
             startFlatIndex,
             bucket,
             totalBuckets,
+            canExcludeAny,
             focusEntryId,
             draggedEntryId,
             onCardPositioned,
@@ -975,6 +1329,7 @@ private fun RankBucketCardsArea(
             onMoveUp,
             onMoveDown,
             onToggleTie,
+            onExclude,
             modifier,
         )
     } else {
@@ -983,6 +1338,7 @@ private fun RankBucketCardsArea(
             startFlatIndex,
             bucket,
             totalBuckets,
+            canExcludeAny,
             focusEntryId,
             draggedEntryId,
             onCardPositioned,
@@ -990,6 +1346,7 @@ private fun RankBucketCardsArea(
             onMoveUp,
             onMoveDown,
             onToggleTie,
+            onExclude,
             modifier,
         )
     }
@@ -1001,6 +1358,7 @@ private fun SideBySideBucketCards(
     startFlatIndex: Int,
     bucket: List<RankClusterCandidate>,
     totalBuckets: Int,
+    canExcludeAny: Boolean,
     focusEntryId: String?,
     draggedEntryId: String?,
     onCardPositioned: (String, CardRootBounds) -> Unit,
@@ -1008,6 +1366,7 @@ private fun SideBySideBucketCards(
     onMoveUp: (String) -> Unit,
     onMoveDown: (String) -> Unit,
     onToggleTie: (String) -> Unit,
+    onExclude: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val chunked = remember(bucket) { bucket.withIndex().toList().chunked(2) }
@@ -1018,6 +1377,7 @@ private fun SideBySideBucketCards(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 rowPair.forEach { (iIdx, candidate) ->
+                    val isFocus = candidate.entryId == focusEntryId
                     RankCandidateCard(
                         candidate,
                         bucketIndex,
@@ -1025,7 +1385,8 @@ private fun SideBySideBucketCards(
                         startFlatIndex + iIdx,
                         bucket.size,
                         totalBuckets,
-                        candidate.entryId == focusEntryId,
+                        isFocus,
+                        canExcludeAny && !isFocus,
                         true,
                         candidate.entryId == draggedEntryId,
                         onCardPositioned,
@@ -1033,6 +1394,7 @@ private fun SideBySideBucketCards(
                         { onMoveUp(candidate.entryId) },
                         { onMoveDown(candidate.entryId) },
                         { onToggleTie(candidate.entryId) },
+                        { onExclude(candidate.entryId) },
                         Modifier.weight(1f),
                     )
                 }
@@ -1048,6 +1410,7 @@ private fun StackedBucketCards(
     startFlatIndex: Int,
     bucket: List<RankClusterCandidate>,
     totalBuckets: Int,
+    canExcludeAny: Boolean,
     focusEntryId: String?,
     draggedEntryId: String?,
     onCardPositioned: (String, CardRootBounds) -> Unit,
@@ -1055,10 +1418,12 @@ private fun StackedBucketCards(
     onMoveUp: (String) -> Unit,
     onMoveDown: (String) -> Unit,
     onToggleTie: (String) -> Unit,
+    onExclude: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         bucket.forEachIndexed { iIdx, candidate ->
+            val isFocus = candidate.entryId == focusEntryId
             RankCandidateCard(
                 candidate,
                 bucketIndex,
@@ -1066,7 +1431,8 @@ private fun StackedBucketCards(
                 startFlatIndex + iIdx,
                 bucket.size,
                 totalBuckets,
-                candidate.entryId == focusEntryId,
+                isFocus,
+                canExcludeAny && !isFocus,
                 false,
                 candidate.entryId == draggedEntryId,
                 onCardPositioned,
@@ -1074,6 +1440,7 @@ private fun StackedBucketCards(
                 { onMoveUp(candidate.entryId) },
                 { onMoveDown(candidate.entryId) },
                 { onToggleTie(candidate.entryId) },
+                { onExclude(candidate.entryId) },
                 Modifier.fillMaxWidth(),
             )
         }
@@ -1121,6 +1488,7 @@ private fun RankCandidateCard(
     bucketSize: Int,
     totalBuckets: Int,
     isFocused: Boolean,
+    canExclude: Boolean,
     isCompactTied: Boolean,
     isDraggingSource: Boolean,
     onCardPositioned: (String, CardRootBounds) -> Unit,
@@ -1128,6 +1496,7 @@ private fun RankCandidateCard(
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
     onToggleTie: () -> Unit,
+    onExclude: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
@@ -1141,36 +1510,110 @@ private fun RankCandidateCard(
             canMoveDown = bucketSize > 1 || bucketIndex + 1 < totalBuckets,
             canTie = canTie,
             isTiedWithAbove = isTiedWithAbove,
+            canExclude = canExclude,
             onMoveUp = onMoveUp,
             onMoveDown = onMoveDown,
             onToggleTie = onToggleTie,
+            onExclude = onExclude,
         )
-    Row(
+    BoxWithConstraints(
         modifier =
             modifier
                 .rankCardChrome(isFocused, isDraggingSource, isCompactTied, colors)
                 .reportCardBounds(candidate.entryId, onCardPositioned)
                 .longPressCardDrag(candidate, { currentBucketIndex }, { currentHandlers })
                 .semantics { customActions = cardA11yActions }
-                .testTag("rank_candidate_$flatIndex"),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(if (isCompactTied) 7.dp else 9.dp),
+                .testTag("rank_candidate_$flatIndex")
     ) {
-        RankDragGripHandle(
-            entryId = candidate.entryId,
-            onDragStart = { currentHandlers.onStart(candidate, currentBucketIndex) },
-            onDrag = { currentHandlers.onDrag(it) },
-            onDragEnd = { currentHandlers.onEnd() },
-            onDragCancel = { currentHandlers.onCancel() },
+        val stackControls = (canTie || canExclude) && (isCompactTied || maxWidth < 340.dp)
+        RankCandidateCardBody(
+            candidate = candidate,
+            isFocused = isFocused,
+            isCompactTied = isCompactTied,
+            stackControls = stackControls,
+            dragHandle = {
+                RankDragGripHandle(
+                    entryId = candidate.entryId,
+                    onDragStart = { currentHandlers.onStart(candidate, currentBucketIndex) },
+                    onDrag = { currentHandlers.onDrag(it) },
+                    onDragEnd = { currentHandlers.onEnd() },
+                    onDragCancel = { currentHandlers.onCancel() },
+                )
+            },
+            trailingControls = {
+                RankCardTrailingControls(
+                    title = candidate.title,
+                    flatIndex = flatIndex,
+                    canTie = canTie,
+                    isTiedWithAbove = isTiedWithAbove,
+                    canExclude = canExclude,
+                    onToggleTie = onToggleTie,
+                    onExclude = onExclude,
+                )
+            },
         )
-        RankCoverThumb(candidate.thumbnailUrl, candidate.title, if (isCompactTied) 38.dp else 44.dp)
-        RankCandidateTextBlock(candidate, isFocused, isCompactTied, Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun RankCandidateCardBody(
+    candidate: RankClusterCandidate,
+    isFocused: Boolean,
+    isCompactTied: Boolean,
+    stackControls: Boolean,
+    dragHandle: @Composable () -> Unit,
+    trailingControls: @Composable () -> Unit,
+) {
+    val gap = if (isCompactTied) 7.dp else 9.dp
+    val thumbSize = if (isCompactTied) 38.dp else 44.dp
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(gap),
+        ) {
+            dragHandle()
+            RankCoverThumb(candidate.thumbnailUrl, candidate.title, thumbSize)
+            RankCandidateTextBlock(candidate, isFocused, isCompactTied, Modifier.weight(1f))
+            if (!stackControls) {
+                trailingControls()
+            }
+        }
+        if (stackControls) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                trailingControls()
+            }
+        }
+    }
+}
+
+@Composable
+private fun RankCardTrailingControls(
+    title: String,
+    flatIndex: Int,
+    canTie: Boolean,
+    isTiedWithAbove: Boolean,
+    canExclude: Boolean,
+    onToggleTie: () -> Unit,
+    onExclude: () -> Unit,
+) {
+    if (!canTie && !canExclude) return
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         if (canTie) {
-            RankQuickTieButton(
-                isTiedWithAbove,
-                candidate.title,
-                onToggleTie,
-                "rank_tie_toggle_$flatIndex",
+            RankQuickTieButton(isTiedWithAbove, title, onToggleTie, "rank_tie_toggle_$flatIndex")
+        }
+        if (canExclude) {
+            RankQuickExcludeButton(
+                title = title,
+                onClick = onExclude,
+                testTag = "rank_exclude_$flatIndex",
             )
         }
     }
@@ -1205,9 +1648,11 @@ private fun rankCardA11yActions(
     canMoveDown: Boolean,
     canTie: Boolean,
     isTiedWithAbove: Boolean,
+    canExclude: Boolean,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
     onToggleTie: () -> Unit,
+    onExclude: () -> Unit,
 ): List<CustomAccessibilityAction> = buildList {
     if (canMoveUp) {
         add(
@@ -1230,6 +1675,14 @@ private fun rankCardA11yActions(
         add(
             CustomAccessibilityAction(label) {
                 onToggleTie()
+                true
+            }
+        )
+    }
+    if (canExclude) {
+        add(
+            CustomAccessibilityAction("Exclude from comparison") {
+                onExclude()
                 true
             }
         )
@@ -1328,7 +1781,7 @@ private fun RankCandidateTextBlock(
     val colors = LocalRocheColors.current
     val titleSize = if (isCompactTied) 13.5.sp else 14.5.sp
     val titleLineHeight = if (isCompactTied) 17.sp else 19.sp
-    val titleMaxLines = if (isCompactTied) 2 else 1
+    val titleMaxLines = 2
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Row(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -1412,6 +1865,41 @@ private fun RankQuickTieButton(
                 color = tint,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 15.sp,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
+        }
+    }
+}
+
+@Composable
+private fun RankQuickExcludeButton(
+    title: String,
+    onClick: () -> Unit,
+    testTag: String,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(8.dp)
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.minimumInteractiveComponentSize()
+                .clip(shape)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    contentDescription = "Exclude $title from comparison"
+                }
+                .testTag(testTag),
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.size(32.dp).clip(shape),
+        ) {
+            Text(
+                text = "×",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 16.sp,
                 modifier = Modifier.clearAndSetSemantics {},
             )
         }
@@ -1562,7 +2050,14 @@ private fun ClusterRankFooter(
             HeaderActionButton(
                 label = "Skip",
                 horizontalPadding = 10.dp,
-                onClick = { onAction(MainAction.SkipRankCluster) },
+                onClick = {
+                    onAction(
+                        MainAction.SkipRankCluster(
+                            activeEntryIds = board.rows().map { it.candidate.entryId },
+                            manualExcludedIds = board.manuallyExcludedIds,
+                        )
+                    )
+                },
                 modifier = Modifier.testTag("rank_skip_btn"),
             )
         }
@@ -1570,7 +2065,14 @@ private fun ClusterRankFooter(
             label = "Submit",
             style = RocheButtonStyle.PRIMARY,
             horizontalPadding = 14.dp,
-            onClick = { onAction(MainAction.SubmitRankCluster(board.toOrderingGroups())) },
+            onClick = {
+                onAction(
+                    MainAction.SubmitRankCluster(
+                        ordering = board.toOrderingGroups(),
+                        excludedEntryIds = board.manuallyExcludedIds,
+                    )
+                )
+            },
             modifier = Modifier.testTag("rank_submit_btn"),
         )
     }

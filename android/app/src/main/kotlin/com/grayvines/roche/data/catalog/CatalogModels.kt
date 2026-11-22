@@ -354,6 +354,7 @@ data class CollectionRankMeta(
     val slug: String,
     val title: String,
     val scopeCollectionId: String?,
+    val memberCount: Int = 0,
 )
 
 @Serializable

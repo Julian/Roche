@@ -20,8 +20,8 @@ use crate::{
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::{
-        MAX_K_DEFAULT, N_QUANTILES, RANDOM_SEED_EVERY, Score, infer_scores, rescale_to_quantiles,
-        select_cluster, sort_by_score_with_ties, tier_label,
+        MAX_K_DEFAULT, MIN_K, N_QUANTILES, RANDOM_SEED_EVERY, Score, infer_scores,
+        rescale_to_quantiles, select_cluster_prioritized, sort_by_score_with_ties, tier_label,
     },
 };
 
@@ -47,12 +47,22 @@ pub struct ClusterSelectFilter {
     pub max_k: usize,
     pub iteration: usize,
     pub focus_ids: Vec<String>,
+    pub excluded_ids: Vec<String>,
     pub recent_limit: Option<usize>,
     pub by_creator: Option<String>,
     pub from_parent_id: Option<String>,
 }
 
+/// Selected comparison cluster along with its selection-priority order
+/// (`[seed, most_confusable, ...]`) so UIs can safely shrink the board width.
+#[derive(Debug, Clone, Default)]
+pub struct PrioritizedCluster {
+    pub entries: Vec<CatalogEntry>,
+    pub priority_ids: Vec<String>,
+}
+
 const MAX_COVERED_CLUSTER_RETRIES: usize = 4;
+const MAX_FOCUSED_COVERED_RETRIES: usize = 12;
 const SPAWN_BLOCKING_EP_THRESHOLD: usize = 150;
 const MAX_CACHED_EP_SCOPES: usize = 64;
 const MAX_CONCURRENT_EP_RUNS: usize = 4;
@@ -634,14 +644,14 @@ impl<'a> CatalogService<'a> {
         Ok(FilteredRankedCollection { view, full_total, full_tier_counts })
     }
 
-    /// Selects the next uncovered cluster directly from an already-computed
-    /// [`RankedCollectionView`] without re-querying collection members or re-running EP inference.
-    pub async fn select_uncovered_cluster_from_ranked_view<F>(
+    /// Selects the next uncovered cluster together with its selection-priority order
+    /// (`[seed, most_confusable, ...]`) from an already-computed [`RankedCollectionView`].
+    pub async fn select_uncovered_cluster_prioritized_from_ranked_view<F>(
         &self,
         ranked: &RankedCollectionView,
         filter: &ClusterSelectFilter,
         is_covered: F,
-    ) -> Result<Vec<CatalogEntry>, AppError>
+    ) -> Result<PrioritizedCluster, AppError>
     where
         F: Fn(&[CatalogEntry]) -> bool,
     {
@@ -650,11 +660,13 @@ impl<'a> CatalogService<'a> {
         let scores: HashMap<String, Score> =
             ranked.rows.iter().map(|r| (r.entry.id.clone(), r.score)).collect();
         let seed_pool = self.resolve_cluster_seed_pool(filter).await?;
-        Ok(pick_uncovered_cluster(
+        let excluded_ids = self.resolve_cluster_excluded_ids(filter).await?;
+        Ok(pick_uncovered_cluster_prioritized(
             members,
             &scores,
             filter,
             seed_pool.as_deref(),
+            &excluded_ids,
             MAX_COVERED_CLUSTER_RETRIES,
             is_covered,
         ))
@@ -760,14 +772,17 @@ impl<'a> CatalogService<'a> {
             .map(|m| (m.id.clone(), scope_scores.get(&m.id).copied().unwrap_or_default()))
             .collect();
         let seed_pool = self.resolve_cluster_seed_pool(filter).await?;
-        let cluster_entries = pick_uncovered_cluster(
+        let excluded_ids = self.resolve_cluster_excluded_ids(filter).await?;
+        let cluster_entries = pick_uncovered_cluster_prioritized(
             members,
             &scores,
             filter,
             seed_pool.as_deref(),
+            &excluded_ids,
             max_covered_retries,
             is_covered,
-        );
+        )
+        .entries;
 
         Ok((inputs.collection, cluster_entries, scores))
     }
@@ -790,6 +805,17 @@ impl<'a> CatalogService<'a> {
             members.retain(|e| child_ids.contains(&e.id));
         }
         Ok(members)
+    }
+
+    async fn resolve_cluster_excluded_ids(
+        &self,
+        filter: &ClusterSelectFilter,
+    ) -> Result<HashSet<String>, AppError> {
+        if filter.excluded_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let resolved = self.repo.resolve_canonical_ids(&filter.excluded_ids).await?;
+        Ok(resolved.into_iter().collect())
     }
 
     async fn resolve_cluster_seed_pool(
@@ -1073,18 +1099,19 @@ fn count_row_tiers(rows: &[RankedEntryRow]) -> [usize; 5] {
     counts
 }
 
-fn pick_uncovered_cluster<F>(
+fn pick_uncovered_cluster_prioritized<F>(
     members: Vec<CatalogEntry>,
     scores: &HashMap<String, Score>,
     filter: &ClusterSelectFilter,
     seed_pool: Option<&[String]>,
+    excluded_ids: &HashSet<String>,
     max_covered_retries: usize,
     is_covered: F,
-) -> Vec<CatalogEntry>
+) -> PrioritizedCluster
 where
     F: Fn(&[CatalogEntry]) -> bool,
 {
-    let member_ids: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
+    let all_member_ids: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
     let by_id: HashMap<String, CatalogEntry> =
         members.into_iter().map(|e| (e.id.clone(), e)).collect();
 
@@ -1093,33 +1120,149 @@ where
         && filter.iteration > 0
         && filter.iteration.is_multiple_of(RANDOM_SEED_EVERY);
 
-    let mut cluster_entries: Vec<CatalogEntry> = {
-        let mut rng = rand::rng();
-        let cluster_ids =
-            select_cluster(scores, &member_ids, max_k, force_random, seed_pool, &mut rng);
-        cluster_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect()
+    let focus_set: HashSet<&str> = if filter.focus_ids.is_empty() {
+        HashSet::new()
+    } else {
+        seed_pool.map_or_else(HashSet::new, |pool| pool.iter().map(String::as_str).collect())
     };
 
-    if cluster_entries.len() >= 2 && is_covered(&cluster_entries) {
-        if filter.focus_ids.is_empty() && max_covered_retries > 0 {
-            let mut rng = rand::rng();
-            for _ in 0..max_covered_retries {
-                let cand_ids =
-                    select_cluster(scores, &member_ids, max_k, true, seed_pool, &mut rng);
-                let cand: Vec<CatalogEntry> =
-                    cand_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect();
-                if cand.len() >= 2 && !is_covered(&cand) {
-                    cluster_entries = cand;
-                    break;
-                }
+    if !excluded_ids.is_empty() {
+        let filtered_ids: Vec<String> = all_member_ids
+            .iter()
+            .filter(|id| focus_set.contains(id.as_str()) || !excluded_ids.contains(id.as_str()))
+            .cloned()
+            .collect();
+        if filtered_ids.len() >= MIN_K {
+            let picked = pick_uncovered_from_pool(
+                &filtered_ids,
+                &by_id,
+                scores,
+                max_k,
+                force_random,
+                seed_pool,
+                &focus_set,
+                max_covered_retries,
+                &is_covered,
+            );
+            if picked.entries.len() >= MIN_K {
+                return picked;
             }
-        }
-        if is_covered(&cluster_entries) {
-            cluster_entries.clear();
         }
     }
 
-    cluster_entries
+    pick_uncovered_from_pool(
+        &all_member_ids,
+        &by_id,
+        scores,
+        max_k,
+        force_random,
+        seed_pool,
+        &focus_set,
+        max_covered_retries,
+        &is_covered,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pick_uncovered_from_pool<F>(
+    pool_member_ids: &[String],
+    by_id: &HashMap<String, CatalogEntry>,
+    scores: &HashMap<String, Score>,
+    max_k: usize,
+    force_random: bool,
+    seed_pool: Option<&[String]>,
+    focus_set: &HashSet<&str>,
+    max_covered_retries: usize,
+    is_covered: &F,
+) -> PrioritizedCluster
+where
+    F: Fn(&[CatalogEntry]) -> bool,
+{
+    let materialize = |ordered_ids: &[String], priority_ids: Vec<String>| -> PrioritizedCluster {
+        let entries = ordered_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect();
+        PrioritizedCluster { entries, priority_ids }
+    };
+
+    let mut rng = rand::rng();
+    let initial = select_cluster_prioritized(
+        scores,
+        pool_member_ids,
+        max_k,
+        force_random,
+        seed_pool,
+        &mut rng,
+    );
+    let mut chosen = materialize(&initial.ordered_ids, initial.priority_ids);
+
+    if chosen.entries.len() < MIN_K || !is_covered(&chosen.entries) {
+        return chosen;
+    }
+
+    if !focus_set.is_empty() {
+        // In focused mode (especially at k = 2 or 3), a single tie or small score update can
+        // leave the exact same opponent as the top confusable neighbor. Accumulate already-seen
+        // colliding opponents across retries so we find an uncovered opponent instead of settling
+        // prematurely.
+        let mut retry_excluded: HashSet<String> = HashSet::new();
+        for _ in 0..MAX_FOCUSED_COVERED_RETRIES {
+            let mut added_any = false;
+            for entry in &chosen.entries {
+                if !focus_set.contains(entry.id.as_str()) && retry_excluded.insert(entry.id.clone())
+                {
+                    added_any = true;
+                }
+            }
+            if !added_any {
+                break;
+            }
+            let remaining_ids: Vec<String> = pool_member_ids
+                .iter()
+                .filter(|id| {
+                    focus_set.contains(id.as_str()) || !retry_excluded.contains(id.as_str())
+                })
+                .cloned()
+                .collect();
+            if remaining_ids.len() < MIN_K {
+                break;
+            }
+            let cand_sel = select_cluster_prioritized(
+                scores,
+                &remaining_ids,
+                max_k,
+                false,
+                seed_pool,
+                &mut rng,
+            );
+            let cand = materialize(&cand_sel.ordered_ids, cand_sel.priority_ids);
+            if cand.entries.len() < MIN_K {
+                break;
+            }
+            chosen = cand;
+            if !is_covered(&chosen.entries) {
+                return chosen;
+            }
+        }
+        return PrioritizedCluster::default();
+    }
+
+    if max_covered_retries > 0 {
+        for _ in 0..max_covered_retries {
+            let cand_sel = select_cluster_prioritized(
+                scores,
+                pool_member_ids,
+                max_k,
+                true,
+                seed_pool,
+                &mut rng,
+            );
+            let cand = materialize(&cand_sel.ordered_ids, cand_sel.priority_ids);
+            if cand.entries.len() >= MIN_K && !is_covered(&cand.entries) {
+                return cand;
+            }
+        }
+    }
+
+    PrioritizedCluster::default()
 }
 
 fn count_relevant_comparisons(member_ids: &[String], orderings: &[Vec<Vec<String>>]) -> usize {
@@ -1375,5 +1518,73 @@ mod tests {
         svc.append_comparison(None, &[vec![b.id.clone()], vec![a.id.clone()]], None).await.unwrap();
         let after = svc.get_ranked_collection("movies", false).await.unwrap();
         assert_eq!(after.rows[0].entry.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn test_focused_cluster_at_k2_retries_covered_opponents_and_respects_excluded_ids() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let svc = CatalogService::new(&db);
+
+        let mut ids = Vec::new();
+        for idx in 0..6 {
+            let entry = svc
+                .upsert_entry(&UpsertEntryInput {
+                    kind: Some(EntryKind::Movie),
+                    title: format!("Film {idx}"),
+                    ..UpsertEntryInput::default()
+                })
+                .await
+                .unwrap();
+            svc.log_consumption(&entry.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+            ids.push(entry.id);
+        }
+
+        let focus = ids[0].clone();
+        let opp1 = ids[1].clone();
+        let opp2 = ids[2].clone();
+        // Tie `focus` with `opp1` so `opp1` stays highly confusable with `focus`.
+        svc.append_comparison(None, &[vec![focus.clone(), opp1.clone()]], None).await.unwrap();
+
+        let ranked = svc.get_ranked_collection("movies", false).await.unwrap();
+        let covered_pair: HashSet<String> = [focus.clone(), opp1.clone()].into_iter().collect();
+        let filter = ClusterSelectFilter {
+            max_k: 2,
+            iteration: 1,
+            focus_ids: vec![focus.clone()],
+            excluded_ids: vec![opp2.clone()],
+            ..ClusterSelectFilter::default()
+        };
+        let picked = svc
+            .select_uncovered_cluster_prioritized_from_ranked_view(&ranked, &filter, |cand| {
+                cand.iter().all(|c| covered_pair.contains(&c.id))
+            })
+            .await
+            .unwrap();
+        assert_eq!(picked.entries.len(), 2);
+        assert_eq!(picked.priority_ids[0], focus);
+        assert!(picked.entries.iter().any(|e| e.id == focus));
+        assert!(picked.entries.iter().all(|e| e.id != opp1));
+        assert!(picked.entries.iter().all(|e| e.id != opp2));
+
+        // When excluded_ids omits every remaining opponent, falls back cleanly instead of stalling.
+        let all_others: Vec<String> = ids[1..].to_vec();
+        let fallback_filter = ClusterSelectFilter {
+            max_k: 2,
+            iteration: 2,
+            focus_ids: vec![focus.clone()],
+            excluded_ids: all_others,
+            ..ClusterSelectFilter::default()
+        };
+        let fallback = svc
+            .select_uncovered_cluster_prioritized_from_ranked_view(
+                &ranked,
+                &fallback_filter,
+                |cand| cand.iter().all(|c| covered_pair.contains(&c.id)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fallback.entries.len(), 2);
+        assert!(fallback.entries.iter().any(|e| e.id == focus));
+        assert!(fallback.entries.iter().all(|e| e.id != opp1));
     }
 }

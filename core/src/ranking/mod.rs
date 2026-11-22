@@ -255,6 +255,17 @@ pub fn confusability(a: Score, b: Score) -> f64 {
     0.5 * cody_erfc(z / SQRT2)
 }
 
+/// Selected comparison cluster in both display order and selection-priority order.
+///
+/// `ordered_ids` is sorted by descending posterior mean, while `priority_ids` preserves
+/// `[seed, most_confusable, ...]` so UIs can safely shrink cluster width without dropping
+/// the seed/focus item or biasing against lower-ranked items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedCluster {
+    pub ordered_ids: Vec<String>,
+    pub priority_ids: Vec<String>,
+}
+
 /// Selects a cluster of up to `max_k` items to compare next, returning `< 2` items when settled.
 pub fn select_cluster<R: Rng + ?Sized, S: BuildHasher>(
     scores: &HashMap<String, Score, S>,
@@ -264,9 +275,23 @@ pub fn select_cluster<R: Rng + ?Sized, S: BuildHasher>(
     seed_pool: Option<&[String]>,
     rng: &mut R,
 ) -> Vec<String> {
+    select_cluster_prioritized(scores, item_ids, max_k, force_random_seed, seed_pool, rng)
+        .ordered_ids
+}
+
+/// Selects a cluster of up to `max_k` items along with its selection-priority order
+/// (`[seed, highest confusability neighbor, ...]`).
+pub fn select_cluster_prioritized<R: Rng + ?Sized, S: BuildHasher>(
+    scores: &HashMap<String, Score, S>,
+    item_ids: &[String],
+    max_k: usize,
+    force_random_seed: bool,
+    seed_pool: Option<&[String]>,
+    rng: &mut R,
+) -> SelectedCluster {
     let cap = max_k.max(MIN_K);
     if item_ids.is_empty() {
-        return Vec::new();
+        return SelectedCluster { ordered_ids: Vec::new(), priority_ids: Vec::new() };
     }
 
     let candidates: Vec<&String> = seed_pool.map_or_else(
@@ -277,7 +302,7 @@ pub fn select_cluster<R: Rng + ?Sized, S: BuildHasher>(
         },
     );
     if candidates.is_empty() {
-        return Vec::new();
+        return SelectedCluster { ordered_ids: Vec::new(), priority_ids: Vec::new() };
     }
 
     let seed_id: &String = if force_random_seed {
@@ -289,7 +314,7 @@ pub fn select_cluster<R: Rng + ?Sized, S: BuildHasher>(
             })
             .collect();
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
-        ranked.truncate(cap);
+        ranked.truncate(cap.max(MAX_K_DEFAULT));
         let pick = rng.random_range(0..ranked.len());
         ranked[pick].2
     } else {
@@ -303,7 +328,7 @@ pub fn select_cluster<R: Rng + ?Sized, S: BuildHasher>(
         }
         match best {
             Some((_, _, id)) => id,
-            None => return Vec::new(),
+            None => return SelectedCluster { ordered_ids: Vec::new(), priority_ids: Vec::new() },
         }
     };
 
@@ -318,20 +343,21 @@ pub fn select_cluster<R: Rng + ?Sized, S: BuildHasher>(
         .collect();
     neighbors.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
 
-    let mut cluster = vec![seed_id.clone()];
+    let mut priority_ids = vec![seed_id.clone()];
     for (conf, _, cand_id) in neighbors {
-        if cluster.len() >= cap || conf < MIN_CONFUSABILITY {
+        if priority_ids.len() >= cap || conf < MIN_CONFUSABILITY {
             break;
         }
-        cluster.push(cand_id.clone());
+        priority_ids.push(cand_id.clone());
     }
 
-    cluster.sort_by(|a, b| {
+    let mut ordered_ids = priority_ids.clone();
+    ordered_ids.sort_by(|a, b| {
         let sa = scores.get(a).copied().unwrap_or_default().mean;
         let sb = scores.get(b).copied().unwrap_or_default().mean;
         sb.total_cmp(&sa).then_with(|| a.cmp(b))
     });
-    cluster
+    SelectedCluster { ordered_ids, priority_ids }
 }
 
 /// Maps posterior means into `n_quantiles` monotonic buckets (`0..n_quantiles - 1`).
@@ -987,5 +1013,55 @@ mod tests {
         let outside_eps = Score { mean: 1.0 + 1e-12, variance: 0.0 };
         assert!((confusability(base, within_eps) - 0.5).abs() <= f64::EPSILON);
         assert!((confusability(base, outside_eps) - 0.0).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn test_select_cluster_prioritized_preserves_seed_and_confusability_order() {
+        use rand::SeedableRng as _;
+
+        let items: Vec<String> =
+            ["focus", "hi", "near1", "near2", "far"].into_iter().map(ToOwned::to_owned).collect();
+        let scores = HashMap::from([
+            ("focus".to_owned(), Score { mean: -0.4, variance: 0.8 }),
+            ("hi".to_owned(), Score { mean: 0.45, variance: 0.3 }),
+            ("near1".to_owned(), Score { mean: -0.35, variance: 0.4 }),
+            ("near2".to_owned(), Score { mean: 0.1, variance: 0.4 }),
+            ("far".to_owned(), Score { mean: 0.3, variance: 0.2 }),
+        ]);
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let focus = vec!["focus".to_owned()];
+        let sel = select_cluster_prioritized(&scores, &items, 5, false, Some(&focus), &mut rng);
+
+        // Display order sorts descending by posterior mean, placing `focus` near the bottom...
+        assert_eq!(sel.ordered_ids.first().map(String::as_str), Some("hi"));
+        assert_eq!(sel.ordered_ids.last().map(String::as_str), Some("focus"));
+        // ...while selection-priority order always keeps `focus` at index 0 and orders neighbors
+        // by descending confusability so shrinking to k=2 or k=3 drops least-informative items.
+        assert_eq!(sel.priority_ids[0], "focus");
+        assert_eq!(sel.priority_ids[1], "near1");
+        assert_eq!(sel.priority_ids[2], "near2");
+    }
+
+    #[test]
+    fn test_select_cluster_force_random_seed_explores_beyond_k2() {
+        use rand::SeedableRng as _;
+
+        let items: Vec<String> = (0..6).map(|i| format!("i{i}")).collect();
+        let scores: HashMap<String, Score> = (0..6)
+            .map(|i| (format!("i{i}"), Score { mean: 0.0, variance: 1.0 - f64::from(i) * 0.05 }))
+            .collect();
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut seen_seeds = HashSet::new();
+        for _ in 0..80 {
+            let sel = select_cluster_prioritized(&scores, &items, 2, true, None, &mut rng);
+            assert_eq!(sel.ordered_ids.len(), 2);
+            seen_seeds.insert(sel.priority_ids[0].clone());
+        }
+        assert!(
+            seen_seeds.len() >= 3,
+            "expected random seed pool >= MAX_K_DEFAULT even at max_k=2, saw {seen_seeds:?}"
+        );
     }
 }

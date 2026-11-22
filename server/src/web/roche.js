@@ -899,12 +899,42 @@
     if (!form) return;
     const list = form.querySelector(".js-rank-list");
     const hiddenInput = form.querySelector("input[name='ordering_json']");
+    const kInput = form.querySelector("input[name='k']");
+    const roundExcludedInput = form.querySelector("input[name='round_excluded']");
     const tieAllBtn = form.querySelector(".js-rank-tie-all");
+    const excludedTray = form.querySelector(".js-rank-excluded-tray");
+    const excludedLabel = form.querySelector(".js-rank-excluded-label");
+    const excludedChips = form.querySelector(".js-rank-excluded-chips");
+    const restoreAllBtn = form.querySelector(".js-rank-restore-all");
+    const MIN_K = 2;
+    const MAX_K_DEFAULT = 5;
+    const MAX_COVERED_CLUSTERS = 12;
+    const MAX_EXCLUDED_TOKENS = 24;
+
+    const sizeGroup = document.querySelector(".js-rank-size-group");
+    const sizeHint = document.querySelector(".js-rank-size-hint");
+    const kbdMaxEl = document.querySelector(".js-rank-kbd-max");
     const skipForm = document.querySelector(".js-rank-skip-form");
+    const skipKInput = skipForm?.querySelector("input[name='k']");
+    const skipCoveredInput = skipForm?.querySelector("input[name='covered']");
+    const skipExcludedInput = skipForm?.querySelector("input[name='excluded']");
     if (!list || !hiddenInput) return;
 
     const initialCards = Array.from(list.querySelectorAll(".js-rank-card"));
     if (initialCards.length === 0) return;
+
+    const allLoadedCount = initialCards.length;
+    const loadedMaxK = Math.max(
+      MIN_K,
+      Math.min(
+        MAX_K_DEFAULT,
+        Number.parseInt(list.getAttribute("data-loaded-max-k") || String(allLoadedCount), 10) ||
+          allLoadedCount
+      )
+    );
+    initialCards.forEach((card, idx) => {
+      if (!card.dataset.initIdx) card.dataset.initIdx = String(idx);
+    });
 
     let buckets = [];
     for (const [idx, card] of initialCards.entries()) {
@@ -914,11 +944,106 @@
         buckets.push([card]);
       }
     }
+    let excludedEntries = [];
+    const maxPillK = sizeGroup
+      ? Array.from(sizeGroup.querySelectorAll(".js-rank-size-opt")).reduce(
+          (acc, el) =>
+            Math.max(acc, Number.parseInt(el.getAttribute("data-rank-k") || "0", 10)),
+          MIN_K
+        )
+      : Math.max(MIN_K, allLoadedCount);
+    let currentK = Math.max(
+      MIN_K,
+      Math.min(
+        maxPillK,
+        Number.parseInt(kInput?.value || String(allLoadedCount), 10) || allLoadedCount
+      )
+    );
     let selectedCard = initialCards[0];
     let draggedCard = null;
     let dropTarget = null;
 
     const flatCards = () => buckets.flat();
+    const cardIsFocus = (card) => card?.getAttribute("data-focus") === "1";
+    const cardPriority = (card) =>
+      Number.parseInt(card?.getAttribute("data-priority") || "99", 10);
+    const cardInitIdx = (card) =>
+      Number.parseInt(card?.dataset?.initIdx || "0", 10);
+    const canExcludeCard = (card, totalActive = flatCards().length) =>
+      Boolean(card && !cardIsFocus(card) && totalActive > MIN_K);
+    const shortToken = (id) => (id || "").slice(0, 8);
+
+    const buildActiveSkipCovered = (activeIds) => {
+      const prevRaw = (skipForm?.dataset?.prevCovered || "").trim();
+      const parts = prevRaw ? prevRaw.split("|").filter(Boolean) : [];
+      const activeTokens = Array.from(
+        new Set(activeIds.map(shortToken).filter(Boolean))
+      ).sort();
+      const sig = activeTokens.join(".");
+      if (sig && !parts.includes(sig)) {
+        parts.push(sig);
+      }
+      if (parts.length > MAX_COVERED_CLUSTERS) {
+        parts.splice(0, parts.length - MAX_COVERED_CLUSTERS);
+      }
+      return parts.join("|");
+    };
+
+    const buildMergedExcluded = (prevRaw, manualIds, activeIds = []) => {
+      const activeTokenSet = new Set(activeIds.map(shortToken).filter(Boolean));
+      const listTokens = (prevRaw || "")
+        .trim()
+        .split(".")
+        .filter((t) => t && !activeTokenSet.has(t));
+      for (const id of manualIds) {
+        const tok = shortToken(id);
+        if (tok && !activeTokenSet.has(tok) && !listTokens.includes(tok)) {
+          listTokens.push(tok);
+        }
+      }
+      if (listTokens.length > MAX_EXCLUDED_TOKENS) {
+        listTokens.splice(0, listTokens.length - MAX_EXCLUDED_TOKENS);
+      }
+      return listTokens.join(".");
+    };
+
+    const buildReloadHrefWithExclusions = (fallbackHref) => {
+      const manualIds = excludedEntries
+        .filter((e) => e.manual)
+        .map((e) => e.card.getAttribute("data-entry-id") || "")
+        .filter(Boolean);
+      if (manualIds.length === 0) return fallbackHref;
+      try {
+        const url = new URL(fallbackHref, window.location.origin);
+        const merged = buildMergedExcluded(url.searchParams.get("excluded") || "", manualIds);
+        if (merged) url.searchParams.set("excluded", merged);
+        return url.pathname + url.search + url.hash;
+      } catch {
+        return fallbackHref;
+      }
+    };
+
+    const persistRankKCookie = (k) => {
+      try {
+        const securePart = window.location.protocol === "https:" ? "; Secure" : "";
+        document.cookie = `roche_rank_k=${k}; Path=/; Max-Age=31536000; SameSite=Lax${securePart}`;
+      } catch {}
+    };
+
+    const syncSizeControls = (targetK) => {
+      currentK = Math.max(MIN_K, Math.min(maxPillK, targetK));
+      if (kInput) kInput.value = String(currentK);
+      if (skipKInput) skipKInput.value = String(currentK);
+      if (sizeGroup) {
+        for (const opt of sizeGroup.querySelectorAll(".js-rank-size-opt")) {
+          const optK = Number.parseInt(opt.getAttribute("data-rank-k") || "0", 10);
+          const isCur = optK === currentK;
+          opt.classList.toggle("is-active", isCur);
+          if (isCur) opt.setAttribute("aria-current", "true");
+          else opt.removeAttribute("aria-current");
+        }
+      }
+    };
 
     const findCoords = (targetCard) => {
       for (let b = 0; b < buckets.length; b++) {
@@ -968,6 +1093,10 @@
       const frag = document.createDocumentFragment();
 
       buckets = buckets.filter((b) => b.length > 0);
+      const totalActive = buckets.reduce((sum, b) => sum + b.length, 0);
+      if (!selectedCard || !buckets.some((b) => b.includes(selectedCard))) {
+        selectedCard = buckets[0]?.[0] || null;
+      }
 
       for (const [bIdx, bucket] of buckets.entries()) {
         const displayRank = flatIdx + 1;
@@ -1030,6 +1159,10 @@
               tieBtn.title = "Tie with rank above (=)";
             }
           }
+          const excludeBtn = card.querySelector(".js-card-exclude");
+          if (excludeBtn) {
+            excludeBtn.disabled = !canExcludeCard(card, totalActive);
+          }
           cardsWrap.appendChild(card);
           ids.push(card.getAttribute("data-entry-id"));
           flatIdx += 1;
@@ -1041,6 +1174,82 @@
       }
 
       list.replaceChildren(frag);
+
+      const manualExcludedIds = excludedEntries
+        .filter((e) => e.manual)
+        .map((e) => e.card.getAttribute("data-entry-id") || "")
+        .filter(Boolean);
+      const manualCount = manualExcludedIds.length;
+      const trimmedCount = excludedEntries.length - manualCount;
+
+      if (excludedTray && excludedChips) {
+        const exCount = excludedEntries.length;
+        excludedTray.hidden = exCount === 0;
+        if (excludedLabel) {
+          if (manualCount === 0) {
+            excludedLabel.textContent = `Set aside at this size (${exCount})`;
+          } else if (trimmedCount === 0) {
+            excludedLabel.textContent = `Excluded from this comparison (${exCount})`;
+          } else {
+            excludedLabel.textContent = `Left out of this comparison (${exCount})`;
+          }
+        }
+        if (restoreAllBtn) {
+          restoreAllBtn.hidden = exCount <= 1;
+        }
+        const chipFrag = document.createDocumentFragment();
+        for (const entry of excludedEntries) {
+          const title = cardTitle(entry.card);
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = `rank-excluded-chip js-rank-restore-chip${
+            entry.manual ? " is-manual-excluded" : ""
+          }`;
+          chip.setAttribute("data-restore-id", entry.card.getAttribute("data-entry-id") || "");
+          chip.setAttribute("aria-label", `Restore ${title}`);
+          chip.title = entry.manual
+            ? "Manually excluded (click to restore)"
+            : "Set aside by cluster size (click to restore)";
+          const plus = document.createElement("span");
+          plus.className = "rank-excluded-chip-plus";
+          plus.setAttribute("aria-hidden", "true");
+          plus.textContent = "+";
+          chip.append(plus, document.createTextNode(title));
+          chipFrag.appendChild(chip);
+        }
+        excludedChips.replaceChildren(chipFrag);
+      }
+
+      if (sizeHint) {
+        if (excludedEntries.length === 0) {
+          sizeHint.textContent = `Comparing ${totalActive} items`;
+        } else if (manualCount === 0) {
+          sizeHint.textContent = `Comparing ${totalActive} of ${allLoadedCount} (${trimmedCount} set aside)`;
+        } else if (trimmedCount === 0) {
+          sizeHint.textContent = `Comparing ${totalActive} of ${allLoadedCount} (${manualCount} excluded)`;
+        } else {
+          sizeHint.textContent = `Comparing ${totalActive} of ${allLoadedCount} (${manualCount} excluded, ${trimmedCount} set aside)`;
+        }
+      }
+
+      if (kbdMaxEl) {
+        kbdMaxEl.textContent = String(totalActive);
+      }
+
+      const activeIds = groups.flat();
+      if (roundExcludedInput) {
+        roundExcludedInput.value = manualExcludedIds.join(",");
+      }
+      if (skipCoveredInput) {
+        skipCoveredInput.value = buildActiveSkipCovered(activeIds);
+      }
+      if (skipExcludedInput) {
+        skipExcludedInput.value = buildMergedExcluded(
+          skipForm?.dataset?.prevExcluded || "",
+          manualExcludedIds,
+          activeIds
+        );
+      }
 
       if (tieAllBtn) {
         const allTied = buckets.length === 1 && flatIdx > 1;
@@ -1159,6 +1368,128 @@
       const untying = buckets.length === 1;
       buckets = untying ? all.map((c) => [c]) : [all];
       syncBoard(untying ? "Untied all items" : "Tied all items");
+    };
+
+    const insertCardNaturally = (card) => {
+      const targetIdx = cardInitIdx(card);
+      let insertAt = buckets.length;
+      for (let b = 0; b < buckets.length; b++) {
+        const firstIdx = cardInitIdx(buckets[b][0]);
+        if (targetIdx < firstIdx) {
+          insertAt = b;
+          break;
+        }
+      }
+      buckets.splice(insertAt, 0, [card]);
+    };
+
+    const excludeCard = (card, manual = true) => {
+      const all = flatCards();
+      if (!canExcludeCard(card, all.length)) return false;
+      const oldIdx = all.indexOf(card);
+      const coords = findCoords(card);
+      if (!coords) return false;
+      buckets[coords.b].splice(coords.i, 1);
+      if (buckets[coords.b].length === 0) {
+        buckets.splice(coords.b, 1);
+      }
+      if (!excludedEntries.some((e) => e.card === card)) {
+        excludedEntries.push({ card, manual });
+      }
+      if (selectedCard === card) {
+        const rem = flatCards();
+        selectedCard = rem[Math.min(oldIdx, rem.length - 1)] || rem[0] || null;
+      }
+      syncBoard(
+        `Excluded ${cardTitle(card)} from this comparison. ${flatCards().length} items remaining.`
+      );
+      return true;
+    };
+
+    const syncExpandedSizeAfterRestore = () => {
+      const activeCount = flatCards().length;
+      if (activeCount > currentK) {
+        const nextK = Math.min(maxPillK, activeCount);
+        persistRankKCookie(nextK);
+        syncSizeControls(nextK);
+      }
+    };
+
+    const restoreCardById = (entryId) => {
+      const idx = excludedEntries.findIndex(
+        (e) => e.card.getAttribute("data-entry-id") === entryId
+      );
+      if (idx === -1) return;
+      const [restored] = excludedEntries.splice(idx, 1);
+      insertCardNaturally(restored.card);
+      selectedCard = restored.card;
+      syncExpandedSizeAfterRestore();
+      syncBoard(`Restored ${cardTitle(restored.card)} to comparison.`);
+      selectedCard?.focus({ preventScroll: true });
+    };
+
+    const restoreAllCards = () => {
+      if (excludedEntries.length === 0) return;
+      const toRestore = excludedEntries.splice(0, excludedEntries.length);
+      toRestore.sort((a, b) => cardInitIdx(a.card) - cardInitIdx(b.card));
+      for (const item of toRestore) {
+        insertCardNaturally(item.card);
+      }
+      syncExpandedSizeAfterRestore();
+      syncBoard(`Restored all ${toRestore.length} excluded items.`);
+      selectedCard?.focus({ preventScroll: true });
+    };
+
+    const applyClusterSize = (targetK, fallbackHref) => {
+      const clamped = Math.max(MIN_K, Math.min(maxPillK, targetK));
+      persistRankKCookie(clamped);
+      syncSizeControls(clamped);
+
+      if (clamped > allLoadedCount && clamped > loadedMaxK && fallbackHref) {
+        const destHref = buildReloadHrefWithExclusions(fallbackHref);
+        if (navigateViaPjaxFn) navigateViaPjaxFn(destHref);
+        else window.location.href = destHref;
+        return;
+      }
+
+      const active = flatCards();
+      if (clamped < active.length) {
+        const removable = active
+          .filter((c) => !cardIsFocus(c))
+          .sort((a, b) => cardPriority(b) - cardPriority(a) || cardInitIdx(b) - cardInitIdx(a));
+        const toDrop = removable.slice(0, active.length - clamped);
+        for (const card of toDrop) {
+          const coords = findCoords(card);
+          if (!coords) continue;
+          buckets[coords.b].splice(coords.i, 1);
+          if (buckets[coords.b].length === 0) {
+            buckets.splice(coords.b, 1);
+          }
+          if (!excludedEntries.some((e) => e.card === card)) {
+            excludedEntries.push({ card, manual: false });
+          }
+        }
+        const rem = flatCards();
+        if (!rem.includes(selectedCard)) {
+          selectedCard = rem[0] || null;
+        }
+        syncBoard(
+          `Comparing ${rem.length} items. ${excludedEntries.length} set aside from this comparison.`
+        );
+      } else if (clamped > active.length) {
+        const trimmed = excludedEntries
+          .filter((e) => !e.manual)
+          .sort((a, b) => cardPriority(a.card) - cardPriority(b.card));
+        const toRestore = trimmed.slice(0, clamped - active.length);
+        for (const entry of toRestore) {
+          const idx = excludedEntries.indexOf(entry);
+          if (idx !== -1) excludedEntries.splice(idx, 1);
+          insertCardNaturally(entry.card);
+        }
+        syncBoard(`Comparing ${flatCards().length} items.`);
+      } else {
+        syncBoard(`Cluster size set to ${clamped}.`);
+      }
     };
 
     const applyDrop = (card, targetBucketIdx, mode) => {
@@ -1370,9 +1701,33 @@
       } else if (ev.target.closest(".js-card-tie")) {
         ev.preventDefault();
         toggleTieWithAbove(card);
+      } else if (ev.target.closest(".js-card-exclude")) {
+        ev.preventDefault();
+        excludeCard(card, true);
       } else {
         syncSelection();
       }
+    });
+
+    excludedChips?.addEventListener("click", (ev) => {
+      const btn = ev.target?.closest?.(".js-rank-restore-chip");
+      if (!btn) return;
+      ev.preventDefault();
+      restoreCardById(btn.getAttribute("data-restore-id") || "");
+    });
+
+    restoreAllBtn?.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      restoreAllCards();
+    });
+
+    sizeGroup?.addEventListener("click", (ev) => {
+      const opt = ev.target?.closest?.(".js-rank-size-opt");
+      if (!opt) return;
+      if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+      ev.preventDefault();
+      const targetK = Number.parseInt(opt.getAttribute("data-rank-k") || "5", 10);
+      applyClusterSize(targetK, opt.href);
     });
 
     tieAllBtn?.addEventListener("click", (ev) => {
@@ -1382,6 +1737,7 @@
 
     const onKeyDown = (ev) => {
       if (!document.body.contains(form)) return;
+      if (document.querySelector("dialog[open]")) return;
       if (ev.target?.closest?.("input, textarea, select, [contenteditable]")) return;
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
 
@@ -1429,6 +1785,32 @@
       } else if (ev.key === "t") {
         ev.preventDefault();
         tieAll();
+      } else if (ev.key === "x" || ev.key === "Backspace" || ev.key === "Delete") {
+        ev.preventDefault();
+        if (canExcludeCard(selectedCard)) {
+          excludeCard(selectedCard, true);
+          selectedCard?.focus({ preventScroll: true });
+        } else {
+          announce(
+            cardIsFocus(selectedCard)
+              ? "Cannot exclude the item being placed."
+              : `At least ${MIN_K} items are required for a comparison.`
+          );
+        }
+      } else if (ev.key === "-" && sizeGroup) {
+        const targetK = Math.max(MIN_K, currentK - 1);
+        const opt = sizeGroup.querySelector(`.js-rank-size-opt[data-rank-k="${targetK}"]`);
+        if (opt && targetK !== currentK) {
+          ev.preventDefault();
+          applyClusterSize(targetK, opt.href);
+        }
+      } else if (ev.key === "+" && sizeGroup) {
+        const targetK = Math.min(maxPillK, currentK + 1);
+        const opt = sizeGroup.querySelector(`.js-rank-size-opt[data-rank-k="${targetK}"]`);
+        if (opt && targetK !== currentK) {
+          ev.preventDefault();
+          applyClusterSize(targetK, opt.href);
+        }
       } else if (ev.key === "s" && skipForm) {
         ev.preventDefault();
         if (typeof skipForm.requestSubmit === "function") {

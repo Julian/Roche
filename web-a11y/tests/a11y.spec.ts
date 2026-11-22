@@ -166,6 +166,20 @@ function seedFixtures(serverBin: string, dataDir: string): void {
         creators: ['Andrei Tarkovsky'],
         release_year: 1979,
       },
+      {
+        ref_key: 'e7',
+        kind: 'book',
+        title: 'Thinking with Type',
+        creators: ['Ellen Lupton'],
+        release_year: 2004,
+      },
+      {
+        ref_key: 'e8',
+        kind: 'book',
+        title: 'Envisioning Information',
+        creators: ['Edward Tufte'],
+        release_year: 1990,
+      },
     ],
     collections: [
       {
@@ -179,6 +193,8 @@ function seedFixtures(serverBin: string, dataDir: string): void {
           { entry_ref: 'e2' },
           { entry_ref: 'e3' },
           { entry_ref: 'e4' },
+          { entry_ref: 'e7' },
+          { entry_ref: 'e8' },
         ],
       },
       {
@@ -201,6 +217,18 @@ function seedFixtures(serverBin: string, dataDir: string): void {
         status: 'consumed',
         notes: 'Practical ARIA patterns and semantic HTML.',
         ts: '2026-10-02T19:30:00Z',
+      },
+      {
+        entry_ref: 'e7',
+        status: 'consumed',
+        notes: 'Clear visual guide to letterforms, grids, and hierarchy.',
+        ts: '2026-10-05T14:00:00Z',
+      },
+      {
+        entry_ref: 'e8',
+        status: 'consumed',
+        notes: 'Dense analytical design principles for information displays.',
+        ts: '2026-10-09T16:15:00Z',
       },
       {
         entry_ref: 'e5',
@@ -482,6 +510,38 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     await expect(secondCardTieBtn).toHaveAttribute('aria-pressed', 'true');
     await expect(secondCardTieBtn).toHaveText('Untie');
     await assertAccessible(page, '/rank/design-classics (after move & tie)');
+
+    // Dynamically reduce cluster size from 4 -> 3, verify Skip covered only tracks the 3 active items,
+    // then manually exclude 1 more card down to floor 2, then restore all and verify size pill syncs back to 4
+    const size3Pill = page.locator('.js-rank-size-opt[data-rank-k="3"]');
+    await expect(size3Pill).toBeVisible();
+    await size3Pill.click();
+    await expect(page.locator('.js-rank-card')).toHaveCount(3);
+    await expect(page.locator('.js-rank-excluded-tray')).toBeVisible();
+    await expect(page.locator('.js-rank-excluded-label')).toContainText('Set aside at this size (1)');
+    await expect(page.locator('.js-rank-restore-chip')).toHaveCount(1);
+    const skipCoveredAt3 = await page
+      .locator('#rank-skip-form input[name="covered"]')
+      .inputValue();
+    expect(skipCoveredAt3.split('.').length).toBe(3);
+    await assertAccessible(page, '/rank/design-classics (resized to 3)');
+
+    await page.locator('.js-rank-card').last().locator('.js-card-exclude').click();
+    await expect(page.locator('.js-rank-card')).toHaveCount(2);
+    await expect(page.locator('.js-rank-card').first().locator('.js-card-exclude')).toBeDisabled();
+    await expect(page.locator('.js-rank-excluded-label')).toContainText('Left out of this comparison (2)');
+    await expect(page.locator('.js-rank-restore-chip')).toHaveCount(2);
+    await assertAccessible(page, '/rank/design-classics (excluded down to 2)');
+
+    await page.locator('.js-rank-restore-all').click();
+    await expect(page.locator('.js-rank-card')).toHaveCount(4);
+    await expect(page.locator('.js-rank-excluded-tray')).toBeHidden();
+    await expect(page.locator('.js-rank-size-opt[data-rank-k="4"]')).toHaveAttribute(
+      'aria-current',
+      'true'
+    );
+    await page.keyboard.press('+');
+    await expect(page.locator('.js-rank-card')).toHaveCount(4);
 
     // 4. Global search (/search), masthead + Log modal, unified Diary status labels
     await gotoAndAssertOk(page, baseUrl, '/search?q=Design', '/search');

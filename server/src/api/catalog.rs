@@ -367,6 +367,7 @@ pub(super) async fn catalog_rank_cluster(
         recent_limit: q.recent,
         by_creator: q.by,
         from_parent_id: q.from,
+        ..ClusterSelectFilter::default()
     };
     let (collection, cluster, scores) =
         service.catalog().select_next_cluster(&slug_or_id, q.want, &filter).await?;

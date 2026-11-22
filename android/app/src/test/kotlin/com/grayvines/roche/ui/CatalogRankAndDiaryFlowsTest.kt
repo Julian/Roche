@@ -105,7 +105,7 @@ class CatalogRankAndDiaryFlowsTest {
             assertEquals(focusId, session0.focusEntryId)
             val initialClusterIds = session0.cluster.map { it.entryId }.toSet()
 
-            viewModel.dispatch(MainAction.SkipRankCluster)
+            viewModel.dispatch(MainAction.SkipRankCluster())
             val afterSkip =
                 viewModel.uiState.first {
                     val s = it.rankSession
@@ -117,7 +117,7 @@ class CatalogRankAndDiaryFlowsTest {
             assertTrue(skippedSession.cluster.any { it.entryId == focusId })
             val skipped1Ids = skippedSession.cluster.map { it.entryId }.toSet()
 
-            viewModel.dispatch(MainAction.SkipRankCluster)
+            viewModel.dispatch(MainAction.SkipRankCluster())
             val afterSkip2 =
                 viewModel.uiState.first {
                     val s = it.rankSession
@@ -180,6 +180,158 @@ class CatalogRankAndDiaryFlowsTest {
             viewModel.dispatch(MainAction.SubmitRankCluster(followUpOrdering))
             val afterRefineSubmit = viewModel.uiState.first { it.rankSession?.roundIndex == 2 }
             assertNull(afterRefineSubmit.rankSession?.settlement)
+            uiJob.cancel()
+        }
+
+    @Test
+    fun `k2 focused session persists cluster size and avoids premature settlement after tie`() =
+        runTest {
+            val albumIds = seedAlbums(8)
+            val focusId = albumIds.first()
+            val uiJob = collectInBackground(viewModel.uiState)
+            viewModel.uiState.first {
+                it.catalog.entriesByCollectionId.values.any { list -> list.size >= 8 }
+            }
+
+            viewModel.dispatch(MainAction.StartRankingSession("albums", focusId))
+            viewModel.uiState.first { it.rankSession?.cluster?.size == 5 }
+
+            viewModel.dispatch(MainAction.SetRankClusterSize(2, reloadCluster = true))
+            val resized =
+                viewModel.uiState.first {
+                    val s = it.rankSession
+                    s != null &&
+                        s.targetClusterSize == 2 &&
+                        s.cluster.size == 2 &&
+                        it.settings.rankClusterSize == 2
+                }
+            val firstOpponent =
+                requireNotNull(resized.rankSession).cluster.first { it.entryId != focusId }.entryId
+
+            viewModel.dispatch(
+                MainAction.SubmitRankCluster(ordering = listOf(listOf(focusId, firstOpponent)))
+            )
+            val round1 = viewModel.uiState.first { it.rankSession?.roundIndex == 1 }
+            val round1Session = requireNotNull(round1.rankSession)
+            assertNull(round1Session.settlement)
+            assertEquals(2, round1Session.cluster.size)
+            assertTrue(round1Session.cluster.any { it.entryId == focusId })
+            assertTrue(round1Session.cluster.none { it.entryId == firstOpponent })
+
+            viewModel.dispatch(MainAction.SetRankClusterSize(3, reloadCluster = false))
+            viewModel.uiState.first { it.settings.rankClusterSize == 3 }
+            viewModel.dispatch(MainAction.CloseRankSession)
+            viewModel.uiState.first { it.rankSession == null }
+
+            viewModel.dispatch(MainAction.StartRankingSession("albums", null))
+            val reopened = viewModel.uiState.first { it.rankSession?.cluster?.isNotEmpty() == true }
+            val reopenedSession = requireNotNull(reopened.rankSession)
+            assertEquals(3, reopenedSession.targetClusterSize)
+            assertEquals(3, reopenedSession.cluster.size)
+            uiJob.cancel()
+        }
+
+    @Test
+    fun `partial subset exclusion cools down excluded items and undo restores them`() = runTest {
+        val albumIds = seedAlbums(8)
+        val focusId = albumIds.first()
+        val uiJob = collectInBackground(viewModel.uiState)
+        viewModel.uiState.first {
+            it.catalog.entriesByCollectionId.values.any { list -> list.size >= 8 }
+        }
+
+        viewModel.dispatch(MainAction.StartRankingSession("albums", focusId))
+        val started = viewModel.uiState.first { it.rankSession?.cluster?.size == 5 }
+        val nonFocus = requireNotNull(started.rankSession).cluster.filter { it.entryId != focusId }
+        val keptIds = listOf(focusId, nonFocus[0].entryId, nonFocus[1].entryId)
+        val excludedIds = setOf(nonFocus[2].entryId, nonFocus[3].entryId)
+
+        viewModel.dispatch(
+            MainAction.SubmitRankCluster(
+                ordering = keptIds.map(::listOf),
+                excludedEntryIds = excludedIds,
+            )
+        )
+        val round1 = viewModel.uiState.first { it.rankSession?.roundIndex == 1 }
+        val round1Session = requireNotNull(round1.rankSession)
+        assertEquals(keptIds.toSet(), round1Session.judgedClusters.last())
+        assertTrue(excludedIds.all { it in round1Session.excludedOpponents })
+        assertTrue(round1Session.cluster.none { it.entryId in excludedIds })
+
+        viewModel.dispatch(MainAction.UndoLastRankRound)
+        val afterUndo = viewModel.uiState.first { it.rankSession?.roundIndex == 0 }
+        assertTrue(requireNotNull(afterUndo.rankSession).excludedOpponents.isEmpty())
+        uiJob.cancel()
+    }
+
+    @Test
+    fun `non-focused exclusion cooldown falls back instead of settling on covered pair`() =
+        runTest {
+            seedAlbums(5)
+            val uiJob = collectInBackground(viewModel.uiState)
+            viewModel.uiState.first {
+                it.catalog.entriesByCollectionId.values.any { list -> list.size >= 5 }
+            }
+
+            viewModel.dispatch(MainAction.StartRankingSession("albums", null))
+            val started = viewModel.uiState.first { it.rankSession?.cluster?.size == 5 }
+            val allFive = requireNotNull(started.rankSession).cluster.map { it.entryId }
+            val keptPair = allFive.take(2)
+            val excludedThree = allFive.drop(2).toSet()
+
+            viewModel.dispatch(
+                MainAction.SubmitRankCluster(
+                    ordering = keptPair.map(::listOf),
+                    excludedEntryIds = excludedThree,
+                )
+            )
+            val round1 = viewModel.uiState.first { it.rankSession?.roundIndex == 1 }
+            val round1Session = requireNotNull(round1.rankSession)
+            assertNull(round1Session.settlement)
+            assertTrue(round1Session.cluster.size >= 2)
+            assertTrue(round1Session.cluster.any { it.entryId in excludedThree })
+            uiJob.cancel()
+        }
+
+    @Test
+    fun `skip after in-place shrink draws a different pair and undo restores target size`() =
+        runTest {
+            seedAlbums(5)
+            val uiJob = collectInBackground(viewModel.uiState)
+            viewModel.uiState.first {
+                it.catalog.entriesByCollectionId.values.any { list -> list.size >= 5 }
+            }
+
+            viewModel.dispatch(MainAction.StartRankingSession("albums", null))
+            val started = viewModel.uiState.first { it.rankSession?.cluster?.size == 5 }
+            val activeTwo = requireNotNull(started.rankSession).cluster.take(2).map { it.entryId }
+
+            viewModel.dispatch(MainAction.SetRankClusterSize(2, reloadCluster = false))
+            viewModel.uiState.first { it.rankSession?.targetClusterSize == 2 }
+
+            viewModel.dispatch(MainAction.SkipRankCluster(activeEntryIds = activeTwo))
+            val skipped =
+                viewModel.uiState.first {
+                    val s = it.rankSession
+                    s != null &&
+                        s.cluster.size == 2 &&
+                        s.cluster.map { c -> c.entryId }.toSet() != activeTwo.toSet()
+                }
+            val skippedCluster = requireNotNull(skipped.rankSession).cluster
+            assertEquals(2, skippedCluster.size)
+
+            viewModel.dispatch(
+                MainAction.SubmitRankCluster(ordering = skippedCluster.map { listOf(it.entryId) })
+            )
+            viewModel.uiState.first { it.rankSession?.roundIndex == 1 }
+            viewModel.dispatch(MainAction.SetRankClusterSize(4, reloadCluster = false))
+            viewModel.uiState.first { it.rankSession?.targetClusterSize == 4 }
+
+            viewModel.dispatch(MainAction.UndoLastRankRound)
+            val afterUndo = viewModel.uiState.first { it.rankSession?.roundIndex == 0 }
+            val undone = requireNotNull(afterUndo.rankSession)
+            assertEquals(2, undone.targetClusterSize)
+            assertEquals(2, undone.loadedMaxK)
             uiJob.cancel()
         }
 

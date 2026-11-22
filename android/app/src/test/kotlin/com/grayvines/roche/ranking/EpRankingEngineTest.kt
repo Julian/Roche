@@ -118,6 +118,61 @@ class EpRankingEngineTest {
         assertEquals(0.5, EpRankingEngine.confusability(base, withinEps), 0.0)
         assertEquals(0.0, EpRankingEngine.confusability(base, outsideEps), 0.0)
     }
+
+    @Test
+    fun `selectClusterPrioritized preserves focus seed and descending confusability order`() {
+        val items = listOf("focus", "hi", "near1", "near2", "far")
+        val scores =
+            mapOf(
+                "focus" to EpRankingEngine.Score(mean = -0.4, variance = 0.8),
+                "hi" to EpRankingEngine.Score(mean = 0.45, variance = 0.3),
+                "near1" to EpRankingEngine.Score(mean = -0.35, variance = 0.4),
+                "near2" to EpRankingEngine.Score(mean = 0.1, variance = 0.4),
+                "far" to EpRankingEngine.Score(mean = 0.3, variance = 0.2),
+            )
+        val sel =
+            EpRankingEngine.selectClusterPrioritized(
+                scores = scores,
+                itemIds = items,
+                maxK = 5,
+                forceRandomSeed = false,
+                seedPool = listOf("focus"),
+                random = Random(7),
+            )
+        assertEquals("hi", sel.orderedIds.first())
+        assertEquals("focus", sel.orderedIds.last())
+        assertEquals("focus", sel.priorityIds[0])
+        assertEquals("near1", sel.priorityIds[1])
+        assertEquals("near2", sel.priorityIds[2])
+    }
+
+    @Test
+    fun `selectClusterPrioritized forceRandomSeed explores beyond k2`() {
+        val items = (0 until 6).map { "i$it" }
+        val scores =
+            items.withIndex().associate { (idx, id) ->
+                id to EpRankingEngine.Score(mean = 0.0, variance = 1.0 - idx * 0.05)
+            }
+        val random = Random(42)
+        val seenSeeds = HashSet<String>()
+        repeat(80) {
+            val sel =
+                EpRankingEngine.selectClusterPrioritized(
+                    scores = scores,
+                    itemIds = items,
+                    maxK = 2,
+                    forceRandomSeed = true,
+                    seedPool = null,
+                    random = random,
+                )
+            assertEquals(2, sel.orderedIds.size)
+            seenSeeds.add(sel.priorityIds.first())
+        }
+        assertTrue(
+            seenSeeds.size >= 3,
+            "expected random seed pool >= MAX_K_DEFAULT even at maxK=2, saw $seenSeeds",
+        )
+    }
 }
 
 private const val TOLERANCE = 1e-6

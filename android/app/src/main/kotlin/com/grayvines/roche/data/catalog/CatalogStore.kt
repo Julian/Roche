@@ -775,8 +775,8 @@ class CatalogStore(
                 seedPool == null &&
                     roundIndex > 0 &&
                     roundIndex % EpRankingEngine.RANDOM_SEED_EVERY == 0
-        val clusterIds =
-            EpRankingEngine.selectCluster(
+        val selected =
+            EpRankingEngine.selectClusterPrioritized(
                 scores = scores,
                 itemIds = memberIds,
                 maxK = maxK,
@@ -784,11 +784,14 @@ class CatalogStore(
                 seedPool = seedPool,
                 random = random,
             )
+        val priorityById = selected.priorityIds.withIndex().associate { (idx, id) -> id to idx }
         val byId = filteredMembers.associateBy { it.entry.id }
-        return if (clusterIds.size < EpRankingEngine.MIN_K) {
+        return if (selected.orderedIds.size < EpRankingEngine.MIN_K) {
             emptyList()
         } else {
-            clusterIds.mapNotNull { id -> byId[id]?.toRankCandidate() }
+            selected.orderedIds.mapIndexedNotNull { idx, id ->
+                byId[id]?.toRankCandidate(selectionPriority = priorityById[id] ?: idx)
+            }
         }
     }
 
@@ -799,11 +802,14 @@ class CatalogStore(
                 val role = CollectionRole.fromWireValue(spec.role)
                 val isPriorityScoped =
                     role == CollectionRole.WANT || spec.collectionId == UP_NEXT_COLLECTION_ID
+                val snap = getOrBuildCatalogSnapshot()
+                val memberCount = snap.entriesByCollectionId[spec.collectionId]?.size ?: 0
                 CollectionRankMeta(
                     collectionId = spec.collectionId,
                     slug = spec.slug ?: spec.collectionId,
                     title = lookupSpecTitle(spec),
                     scopeCollectionId = spec.collectionId.takeIf { isPriorityScoped },
+                    memberCount = memberCount,
                 )
             }
         }
@@ -1128,7 +1134,7 @@ internal data class CachedCatalogState(
     val snapshot: CatalogSnapshot,
 )
 
-internal fun RankedCatalogEntry.toRankCandidate(): RankClusterCandidate =
+internal fun RankedCatalogEntry.toRankCandidate(selectionPriority: Int = 0): RankClusterCandidate =
     RankClusterCandidate(
         entryId = entry.id,
         title = entry.title,
@@ -1136,6 +1142,7 @@ internal fun RankedCatalogEntry.toRankCandidate(): RankClusterCandidate =
         thumbnailUrl = entry.thumbnailUrl,
         mean = mean,
         variance = variance,
+        selectionPriority = selectionPriority,
     )
 
 private const val WANT_SLUG_PREFIX = "want:"

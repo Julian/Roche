@@ -4624,9 +4624,44 @@ ol.queue .by {
 }
 
 .rank-session-lede {
-  margin: 0.35rem 0 1.05rem;
+  margin: 0.35rem 0 0.85rem;
   font-size: 0.91rem;
   color: var(--ink-soft);
+}
+
+.rank-size-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.7rem;
+  margin: 0 0 0.95rem 3.7rem;
+}
+
+.rank-size-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.rank-size-pills {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.rank-size-opt {
+  min-width: 2rem;
+  justify-content: center;
+  font-variant-numeric: tabular-nums;
+  padding: 0.16rem 0.52rem;
+}
+
+.rank-size-hint {
+  font-size: 0.8rem;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
 }
 
 .rank-board {
@@ -4970,6 +5005,84 @@ ol.queue .by {
   font-weight: 600;
 }
 
+.rank-controls .js-card-exclude {
+  color: var(--ink-faint);
+  font-size: 0.95rem;
+  line-height: 1;
+}
+
+.rank-controls .js-card-exclude:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--badge-bg);
+}
+
+.rank-excluded-tray {
+  margin: 0 0 1.05rem 3.7rem;
+  padding: 0.65rem 0.85rem;
+  border: 1px dashed var(--rule);
+  border-radius: 6px;
+  background: var(--paper-deep);
+}
+
+.rank-excluded-tray[hidden] {
+  display: none;
+}
+
+.rank-excluded-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.45rem;
+}
+
+.rank-excluded-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.rank-excluded-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.rank-excluded-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-height: 28px;
+  padding: 0.2rem 0.6rem;
+  border: 1px solid var(--control-border);
+  border-radius: 999px;
+  background: var(--paper-input);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 0.82rem;
+  line-height: 1.25;
+  cursor: pointer;
+  transition: border-color 110ms ease, color 110ms ease, background 110ms ease;
+}
+
+.rank-excluded-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--badge-bg);
+}
+
+.rank-excluded-chip.is-manual-excluded {
+  border-style: dashed;
+}
+
+.rank-excluded-chip-plus {
+  font-weight: 700;
+  color: var(--accent);
+}
+
 .rank-action-bar {
   display: flex;
   align-items: center;
@@ -5154,6 +5267,8 @@ ol.queue .by {
   .rank-bucket.is-drop-after::after {
     left: 2.75rem;
   }
+  .rank-size-bar,
+  .rank-excluded-tray,
   .rank-action-bar {
     margin-left: 0;
   }

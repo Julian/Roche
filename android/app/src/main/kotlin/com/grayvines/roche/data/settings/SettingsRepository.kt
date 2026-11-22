@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
 import com.grayvines.roche.core.runSuspendCatching
@@ -157,6 +158,7 @@ internal constructor(
             prefs[KEY_SKIP_SILENCE_ENABLED] = updated.skipSilenceEnabled
             prefs[KEY_SMART_REWIND_ENABLED] = updated.smartRewindEnabled
             prefs[KEY_SHOW_COLLECTION_DRAWS_ON_HOME] = updated.showCollectionDrawsOnHome
+            prefs[KEY_RANK_CLUSTER_SIZE] = updated.rankClusterSize
             persistedEditCount.incrementAndGet()
             latestSettings = updated
         }
@@ -257,6 +259,7 @@ internal constructor(
                 skipSilenceEnabled = this[KEY_SKIP_SILENCE_ENABLED] ?: false,
                 smartRewindEnabled = this[KEY_SMART_REWIND_ENABLED] ?: true,
                 showCollectionDrawsOnHome = this[KEY_SHOW_COLLECTION_DRAWS_ON_HOME] ?: true,
+                rankClusterSize = this[KEY_RANK_CLUSTER_SIZE] ?: Settings.DEFAULT_RANK_CLUSTER_SIZE,
                 hasUndecryptableToken = rawStoredToken.isNotEmpty() && decodedToken.isEmpty(),
             )
             .clamped()
@@ -281,6 +284,7 @@ internal constructor(
         internal val KEY_SMART_REWIND_ENABLED = booleanPreferencesKey("smart_rewind_enabled")
         internal val KEY_SHOW_COLLECTION_DRAWS_ON_HOME =
             booleanPreferencesKey("show_collection_draws_on_home")
+        internal val KEY_RANK_CLUSTER_SIZE = intPreferencesKey("rank_cluster_size")
 
         fun create(context: Context): SettingsRepository {
             val appContext = context.applicationContext

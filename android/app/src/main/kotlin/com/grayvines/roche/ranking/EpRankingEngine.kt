@@ -30,6 +30,11 @@ object EpRankingEngine {
         val variance: Double = COLD_START_VARIANCE,
     )
 
+    data class SelectedCluster(
+        val orderedIds: List<String>,
+        val priorityIds: List<String>,
+    )
+
     fun tierLabel(quantile: Int): Char =
         if (quantile in 0 until N_QUANTILES) TIER_LETTERS[quantile] else 'S'
 
@@ -237,10 +242,29 @@ object EpRankingEngine {
         forceRandomSeed: Boolean = false,
         seedPool: Collection<String>? = null,
         random: Random = Random.Default,
-    ): List<String> {
+    ): List<String> =
+        selectClusterPrioritized(
+                scores = scores,
+                itemIds = itemIds,
+                maxK = maxK,
+                forceRandomSeed = forceRandomSeed,
+                seedPool = seedPool,
+                random = random,
+            )
+            .orderedIds
+
+    @Suppress("LongParameterList")
+    fun selectClusterPrioritized(
+        scores: Map<String, Score>,
+        itemIds: List<String>,
+        maxK: Int = MAX_K_DEFAULT,
+        forceRandomSeed: Boolean = false,
+        seedPool: Collection<String>? = null,
+        random: Random = Random.Default,
+    ): SelectedCluster {
         val cap = max(maxK, MIN_K)
         val candidates = resolveSeedCandidates(itemIds, seedPool)
-        if (candidates.isEmpty()) return emptyList()
+        if (candidates.isEmpty()) return SelectedCluster(emptyList(), emptyList())
 
         val seedId = pickSeedCandidate(candidates, scores, cap, forceRandomSeed, random)
         val seedScore = scores[seedId] ?: Score()
@@ -256,19 +280,19 @@ object EpRankingEngine {
                     if (c0 != 0) c0 else b.second.compareTo(a.second)
                 }
 
-        val cluster = ArrayList<String>(cap)
-        cluster.add(seedId)
+        val priorityIds = ArrayList<String>(cap)
+        priorityIds.add(seedId)
         for ((conf, _, candId) in neighbors) {
-            if (cluster.size >= cap || conf < MIN_CONFUSABILITY) break
-            cluster.add(candId)
+            if (priorityIds.size >= cap || conf < MIN_CONFUSABILITY) break
+            priorityIds.add(candId)
         }
-        cluster.sortWith { a, b ->
+        val orderedIds = priorityIds.sortedWith { a, b ->
             val ma = (scores[a] ?: Score()).mean
             val mb = (scores[b] ?: Score()).mean
             val cmp = mb.compareTo(ma)
             if (cmp != 0) cmp else a.compareTo(b)
         }
-        return cluster
+        return SelectedCluster(orderedIds = orderedIds, priorityIds = priorityIds)
     }
 
     private fun resolveSeedCandidates(
@@ -299,7 +323,7 @@ object EpRankingEngine {
                         val c0 = b.first.compareTo(a.first)
                         if (c0 != 0) c0 else b.second.compareTo(a.second)
                     }
-                    .take(cap)
+                    .take(max(cap, MAX_K_DEFAULT))
             return ranked[random.nextInt(ranked.size)].third
         }
         var bestVar = Double.NEGATIVE_INFINITY

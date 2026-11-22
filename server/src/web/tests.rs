@@ -2805,15 +2805,18 @@ fn test_web_query_deserialization_with_optional_numbers_and_booleans() {
     assert_eq!(inbox.status.as_deref(), Some("all"));
     assert_eq!(inbox.page, Some(2));
 
-    let Query(rank) = Query::<super::views_rank::RankSessionQuery>::try_from_uri(
-        &Uri::from_static("/rank/movies?want=true&focus=abc&round=2&random=4&covered=x"),
-    )
-    .unwrap();
+    let Query(rank) =
+        Query::<super::views_rank::RankSessionQuery>::try_from_uri(&Uri::from_static(
+            "/rank/movies?want=true&focus=abc&round=2&random=4&covered=x&excluded=aa.bb&k=3",
+        ))
+        .unwrap();
     assert!(rank.want);
     assert_eq!(rank.focus.as_deref(), Some("abc"));
     assert_eq!(rank.round, Some(2));
     assert_eq!(rank.random, Some(4));
     assert_eq!(rank.covered.as_deref(), Some("x"));
+    assert_eq!(rank.excluded.as_deref(), Some("aa.bb"));
+    assert_eq!(rank.k, Some(3));
 
     let Query(rank_defaults) = Query::<super::views_rank::RankSessionQuery>::try_from_uri(
         &Uri::from_static("/rank/movies"),
@@ -3488,8 +3491,18 @@ async fn test_web_search_diary_entry_feeds_rank_and_reader_flows() {
     assert_eq!(db.catalog().list_diary(None, None, 10).await.unwrap().len(), 0);
 
     // 8. Rank: boundary arrows disabled, non-round-burning Skip, Undo comparison, 5-round Keep Refining
+    let fourth_book = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "The Elements of Typographic Style".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     db.catalog().add_collection_entry(&manual.id, &dune.id, None).await.unwrap();
     db.catalog().add_collection_entry(&manual.id, &third_book.id, None).await.unwrap();
+    db.catalog().add_collection_entry(&manual.id, &fourth_book.id, None).await.unwrap();
     let rank_html = read_body_html(
         get_authed(&app, &format!("/rank/favorites?focus={}&round=0", dune.id), &cookie).await,
     )
@@ -3875,4 +3888,172 @@ async fn test_mixed_https_http_localhost_cookie_precedence_and_cleanup() {
     let mixed_html = read_body_html(mixed_resp).await;
     assert!(mixed_html.contains("Fresh HTTP"));
     assert!(!mixed_html.contains("Stale"));
+}
+
+async fn seed_consumed_movies(db: &crate::db::Db, count: i32) -> Vec<String> {
+    let mut movie_ids = Vec::new();
+    for idx in 1..=count {
+        let entry = db
+            .catalog()
+            .upsert_entry(&crate::db::UpsertEntryInput {
+                kind: Some(EntryKind::Movie),
+                title: format!("Cinema Work {idx}"),
+                release_year: Some(2000 + idx),
+                ..crate::db::UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        db.catalog()
+            .log_consumption(&entry.id, ConsumptionStatus::Consumed, None, None)
+            .await
+            .unwrap();
+        movie_ids.push(entry.id);
+    }
+    movie_ids
+}
+
+#[tokio::test]
+async fn test_web_rank_cluster_size_cookie_and_partial_subset_exclusion() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+    let movie_ids = seed_consumed_movies(&db, 6).await;
+
+    // 1. Explicit `?k=3` renders 3 cards, sets `roche_rank_k=3` cookie, and renders size pills + exclude controls
+    let resp_k3 = get_authed(&app, "/rank/movies?k=3", &cookie).await;
+    assert_eq!(resp_k3.status(), StatusCode::OK);
+    let rank_k_cookie_hdr = find_set_cookie(&resp_k3, "roche_rank_k=3").unwrap();
+    let rank_k_pair = extract_cookie_header(rank_k_cookie_hdr);
+    let html_k3 = read_body_html(resp_k3).await;
+    assert_eq!(html_k3.matches("class=\"rank-card js-rank-card").count(), 3);
+    assert!(html_k3.contains("data-rank-k=\"2\""));
+    assert!(html_k3.contains("data-rank-k=\"3\""));
+    assert!(html_k3.contains("data-rank-k=\"5\""));
+    assert!(html_k3.contains("js-card-exclude"));
+    assert!(html_k3.contains("data-priority=\"0\""));
+
+    // 2. Subsequent GET without `?k=` honors `roche_rank_k=3` cookie
+    let cookie_with_k3 = format!("{cookie}; {rank_k_pair}");
+    let resp_cookie_k3 = get_authed(&app, "/rank/movies", &cookie_with_k3).await;
+    assert_eq!(resp_cookie_k3.status(), StatusCode::OK);
+    let html_cookie_k3 = read_body_html(resp_cookie_k3).await;
+    assert_eq!(html_cookie_k3.matches("class=\"rank-card js-rank-card").count(), 3);
+
+    // 3. Submitting a 2-item subset while excluding a 3rd item records ONLY the 2 submitted IDs
+    //    in `covered`, propagates the excluded token in `excluded`, and updates `roche_rank_k=2`.
+    let (kept_first, kept_second, dropped_third) = (&movie_ids[0], &movie_ids[1], &movie_ids[2]);
+    let ord_json = serde_json::to_string(&vec![vec![kept_first], vec![kept_second]]).unwrap();
+    let post_resp = post_form(
+        &app,
+        "/rank/movies",
+        &cookie_with_k3,
+        &[
+            ("_csrf", &csrf),
+            ("want", "false"),
+            ("round", "0"),
+            ("k", "2"),
+            ("round_excluded", dropped_third),
+            ("ordering_json", &ord_json),
+        ],
+    )
+    .await;
+    assert_eq!(post_resp.status(), StatusCode::SEE_OTHER);
+    assert!(find_set_cookie(&post_resp, "roche_rank_k=2").is_some());
+    let next_loc = post_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
+    let dropped_tok: String = dropped_third.chars().take(8).collect();
+    let first_tok: String = kept_first.chars().take(8).collect();
+    let second_tok: String = kept_second.chars().take(8).collect();
+    assert!(next_loc.contains("k=2"), "expected k=2 in redirect: {next_loc}");
+    assert!(
+        next_loc.contains(&format!("excluded={dropped_tok}")),
+        "expected excluded token in redirect: {next_loc}"
+    );
+    let covered_param = next_loc
+        .split('?')
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .find_map(|p| p.strip_prefix("covered="))
+        .unwrap();
+    assert!(covered_param.contains(&first_tok));
+    assert!(covered_param.contains(&second_tok));
+    assert!(
+        !covered_param.contains(&dropped_tok),
+        "excluded item must NOT be marked covered: {covered_param}"
+    );
+
+    // 4. Following the redirect renders 2 cards, avoids pulling the excluded item back immediately,
+    //    and builds an Undo return_to URL that reverts the undone round's exclusion.
+    let next_html = read_body_html(get_authed(&app, &next_loc, &cookie).await).await;
+    assert_eq!(next_html.matches("class=\"rank-card js-rank-card").count(), 2);
+    assert!(
+        !next_html.contains(&format!("data-entry-id=\"{dropped_third}\"")),
+        "excluded item should stay on cooldown in the next round"
+    );
+    assert!(next_loc.contains("undo_excluded="), "expected undo_excluded in redirect: {next_loc}");
+    let undo_section = next_html.split("rank-undo-bar").nth(1).unwrap();
+    let undo_return_to = undo_section
+        .split("name=\"return_to\" value=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    assert!(
+        !undo_return_to.contains(&dropped_tok),
+        "Undo return_to must revert exclusions added in the undone round: {undo_return_to}"
+    );
+}
+
+#[tokio::test]
+async fn test_web_rank_noscript_min_k_and_keep_refining_preserves_excluded() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+    let movie_ids = seed_consumed_movies(&db, 4).await;
+    let (kept_first, kept_second, dropped_third) = (&movie_ids[0], &movie_ids[1], &movie_ids[2]);
+    let dropped_tok: String = dropped_third.chars().take(8).collect();
+    let ord_json = serde_json::to_string(&vec![vec![kept_first], vec![kept_second]]).unwrap();
+
+    // 1. `<noscript>` exclusion that leaves fewer than MIN_K=2 ranked items MUST be rejected
+    //    instead of silently falling back to `ordering_json`.
+    let noscript_too_few = post_form(
+        &app,
+        "/rank/movies",
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("want", "false"),
+            ("round", "0"),
+            ("k", "5"),
+            ("ordering_json", &ord_json),
+            (&format!("pos_{kept_first}"), "1"),
+            (&format!("pos_{kept_second}"), "exclude"),
+            (&format!("pos_{dropped_third}"), "exclude"),
+        ],
+    )
+    .await;
+    assert_eq!(noscript_too_few.status(), StatusCode::SEE_OTHER);
+    assert!(find_set_cookie(&noscript_too_few, "roche_flash=e:").is_some());
+    assert!(find_set_cookie(&noscript_too_few, "roche_rank_k=5").is_some());
+    let after_count = crate::service::CatalogService::new(&db)
+        .get_ranked_collection("movies", false)
+        .await
+        .unwrap()
+        .comparison_count;
+    assert_eq!(
+        0, after_count,
+        "<noscript> exclusion leaving < 2 items must not record a comparison"
+    );
+
+    // 2. Settled focused view's "Keep Refining" link preserves session `excluded` cooldown tokens
+    let settled_html = read_body_html(
+        get_authed(
+            &app,
+            &format!("/rank/movies?focus={kept_first}&round=5&excluded={dropped_tok}"),
+            &cookie,
+        )
+        .await,
+    )
+    .await;
+    assert!(settled_html.contains("Keep Refining"));
+    assert!(settled_html.contains(&format!("excluded={dropped_tok}")));
 }

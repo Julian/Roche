@@ -1,7 +1,9 @@
 package com.grayvines.roche.ranking
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class RankDragBoardTest {
@@ -99,5 +101,99 @@ class RankDragBoardTest {
             RankDropTarget(1, RankDropZone.BEFORE),
             resolveRankDropTarget(215f, 2, bounds),
         )
+    }
+
+    private fun prioritizedCandidates(): List<RankClusterCandidate> =
+        listOf(
+            RankClusterCandidate(
+                "hi",
+                "High",
+                "",
+                null,
+                mean = 1.2,
+                variance = 0.2,
+                selectionPriority = 4,
+            ),
+            RankClusterCandidate(
+                "mid",
+                "Mid",
+                "",
+                null,
+                mean = 0.5,
+                variance = 0.3,
+                selectionPriority = 3,
+            ),
+            RankClusterCandidate(
+                "near2",
+                "Near 2",
+                "",
+                null,
+                mean = 0.1,
+                variance = 0.4,
+                selectionPriority = 2,
+            ),
+            RankClusterCandidate(
+                "near1",
+                "Near 1",
+                "",
+                null,
+                mean = -0.1,
+                variance = 0.4,
+                selectionPriority = 1,
+            ),
+            RankClusterCandidate(
+                "focus",
+                "Focus",
+                "",
+                null,
+                mean = -0.3,
+                variance = 0.8,
+                selectionPriority = 0,
+            ),
+        )
+
+    @Test
+    fun `exclude enforces focus guard and MIN_K floor while restore puts items back`() {
+        var board = RankBoardState.fromCandidates(prioritizedCandidates())
+        assertFalse(board.canExclude("focus", focusEntryId = "focus"))
+        assertEquals(board, board.exclude("focus", focusEntryId = "focus"))
+
+        board = board.exclude("hi", "focus").exclude("mid", "focus").exclude("near2", "focus")
+        assertEquals(2, board.size)
+        assertEquals(setOf("hi", "mid", "near2"), board.manuallyExcludedIds)
+        assertFalse(board.canExclude("near1", focusEntryId = "focus"))
+
+        board = board.restore("near2")
+        assertEquals(3, board.size)
+        assertEquals(setOf("hi", "mid"), board.manuallyExcludedIds)
+
+        board = board.restoreAll()
+        assertEquals(5, board.size)
+        assertTrue(board.excluded.isEmpty())
+        assertTrue(board.manuallyExcludedIds.isEmpty())
+    }
+
+    @Test
+    fun `resizeTo drops least confusable items and preserves manual exclusions`() {
+        var board = RankBoardState.fromCandidates(prioritizedCandidates())
+
+        // Resizing 5 -> 3 drops least-confusable ("hi" p=4, "mid" p=3), NEVER "focus" (p=0)
+        board = board.resizeTo(3, focusEntryId = "focus")
+        assertEquals(
+            listOf(listOf("near2"), listOf("near1"), listOf("focus")),
+            board.toOrderingGroups(),
+        )
+        assertEquals(setOf("hi", "mid"), board.excluded.map { it.entryId }.toSet())
+        assertTrue(board.manuallyExcludedIds.isEmpty())
+
+        // Reordering/tying preserves excluded items
+        board = board.moveUp("focus").toggleTieWithAbove("near1")
+        assertEquals(setOf("hi", "mid"), board.excluded.map { it.entryId }.toSet())
+
+        // Manually excluding "near2" then growing to 5 restores size-trimmed items only
+        board = board.exclude("near2", focusEntryId = "focus").resizeTo(5, focusEntryId = "focus")
+        assertEquals(4, board.size)
+        assertEquals(listOf("near2"), board.excluded.map { it.entryId })
+        assertEquals(setOf("near2"), board.manuallyExcludedIds)
     }
 }

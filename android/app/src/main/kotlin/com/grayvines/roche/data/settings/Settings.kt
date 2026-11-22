@@ -9,6 +9,7 @@ import com.grayvines.roche.core.isTailscaleCgnatIpv4
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
+import com.grayvines.roche.ranking.EpRankingEngine
 import java.net.URI
 
 data class Settings(
@@ -28,6 +29,7 @@ data class Settings(
     val skipSilenceEnabled: Boolean = false,
     val smartRewindEnabled: Boolean = true,
     val showCollectionDrawsOnHome: Boolean = true,
+    val rankClusterSize: Int = DEFAULT_RANK_CLUSTER_SIZE,
     val hasUndecryptableToken: Boolean = false,
 ) {
     override fun toString(): String {
@@ -40,6 +42,7 @@ data class Settings(
             "defaultPlaybackSpeed=$defaultPlaybackSpeed, skipSilenceEnabled=$skipSilenceEnabled, " +
             "smartRewindEnabled=$smartRewindEnabled, " +
             "showCollectionDrawsOnHome=$showCollectionDrawsOnHome, " +
+            "rankClusterSize=$rankClusterSize, " +
             "hasUndecryptableToken=$hasUndecryptableToken)"
     }
 
@@ -54,6 +57,9 @@ data class Settings(
         const val MIN_PLAYBACK_SPEED = 0.50f
         const val MAX_PLAYBACK_SPEED = 3.50f
         const val PLAYBACK_SPEED_STEP = 0.05f
+        const val MIN_RANK_CLUSTER_SIZE = EpRankingEngine.MIN_K
+        const val MAX_RANK_CLUSTER_SIZE = EpRankingEngine.MAX_K_DEFAULT
+        const val DEFAULT_RANK_CLUSTER_SIZE = EpRankingEngine.MAX_K_DEFAULT
     }
 }
 
@@ -87,6 +93,11 @@ fun Settings.clamped(): Settings =
         lastPeerSyncCursor = lastPeerSyncCursor.trim(),
         queueItemIds = queueItemIds.map { it.trim() }.filter { it.isNotBlank() }.distinct(),
         defaultPlaybackSpeed = clampPlaybackSpeed(defaultPlaybackSpeed),
+        rankClusterSize =
+            rankClusterSize.coerceIn(
+                Settings.MIN_RANK_CLUSTER_SIZE,
+                Settings.MAX_RANK_CLUSTER_SIZE,
+            ),
     )
 
 fun Settings.redactedForUi(): Settings = copy(bearerToken = "")

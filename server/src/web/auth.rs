@@ -32,15 +32,19 @@ pub(super) const HOST_LOGGED_OUT_COOKIE_NAME: &str = "__Host-roche_logged_out";
 pub(super) const FLASH_COOKIE_NAME: &str = "roche_flash";
 pub(super) const HOST_FLASH_COOKIE_NAME: &str = "__Host-roche_flash";
 pub(super) const THEME_COOKIE_NAME: &str = "roche_theme";
+pub(super) const RANK_K_COOKIE_NAME: &str = "roche_rank_k";
 pub(super) const CSRF_HEADER_NAME: &str = "x-roche-csrf";
 const TAILSCALE_LOGIN_HEADER: &str = "tailscale-user-login";
 const FLASH_MAX_AGE_SECS: u64 = 60;
+const PREF_COOKIE_MAX_AGE_SECS: u64 = 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub(super) struct WebSession {
     pub raw_token: String,
     pub csrf_token: String,
     pub theme: Option<&'static str>,
+    pub rank_k: Option<usize>,
+    pub secure_cookie: bool,
     pub flash: FlashQuery,
 }
 
@@ -182,6 +186,22 @@ pub(super) fn extract_theme_cookie(headers: &HeaderMap) -> Option<&'static str> 
         Some("light") => Some("light"),
         _ => None,
     }
+}
+
+#[must_use]
+pub(super) fn extract_rank_k_cookie(headers: &HeaderMap) -> Option<usize> {
+    let raw = extract_named_cookie(headers, RANK_K_COOKIE_NAME)?;
+    let parsed = raw.parse::<usize>().ok()?;
+    (crate::ranking::MIN_K..=crate::ranking::MAX_K_DEFAULT).contains(&parsed).then_some(parsed)
+}
+
+pub(super) fn append_rank_k_set_cookie(resp: &mut Response, rank_k: usize, secure: bool) {
+    let clamped = rank_k.clamp(crate::ranking::MIN_K, crate::ranking::MAX_K_DEFAULT);
+    let secure_part = if secure { "; Secure" } else { "" };
+    let val = format!(
+        "{RANK_K_COOKIE_NAME}={clamped}; Path=/; Max-Age={PREF_COOKIE_MAX_AGE_SECS}; SameSite=Lax{secure_part}"
+    );
+    append_set_cookie(resp, &val);
 }
 
 #[must_use]
@@ -608,6 +628,7 @@ pub(super) async fn require_web_auth_and_csrf(
     let peer_addr = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0);
     let secure_cookie = is_forwarded_https(peer_addr, req.headers());
     let theme = extract_theme_cookie(req.headers());
+    let rank_k = extract_rank_k_cookie(req.headers());
     let had_host_session = extract_named_cookie(req.headers(), HOST_SESSION_COOKIE_NAME).is_some();
 
     let mut active_token =
@@ -656,8 +677,14 @@ pub(super) async fn require_web_auth_and_csrf(
         (FlashQuery::default(), FlashCookiesPresent::default())
     };
     let csrf_token = service.auth().csrf_token_for_session(&raw_token);
-    let session =
-        WebSession { raw_token: raw_token.clone(), csrf_token: csrf_token.clone(), theme, flash };
+    let session = WebSession {
+        raw_token: raw_token.clone(),
+        csrf_token: csrf_token.clone(),
+        theme,
+        rank_k,
+        secure_cookie,
+        flash,
+    };
 
     let final_req = if is_safe_method {
         let mut req = req;

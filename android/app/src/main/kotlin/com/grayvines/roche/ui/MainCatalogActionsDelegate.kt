@@ -5,6 +5,7 @@ import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
+import com.grayvines.roche.ranking.EpRankingEngine
 import com.grayvines.roche.ranking.RankClusterCandidate
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -35,8 +36,16 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                 performAbandonDraw(action.collectionId, action.notes)
             is MainAction.StartRankingSession ->
                 rankDelegate.startSession(action.collectionIdOrSlug, action.focusEntryId)
-            is MainAction.SubmitRankCluster -> rankDelegate.submitCluster(action.ordering)
-            MainAction.SkipRankCluster -> rankDelegate.skipCluster()
+            is MainAction.SubmitRankCluster ->
+                rankDelegate.submitCluster(action.ordering, action.excludedEntryIds)
+            is MainAction.SetRankClusterSize ->
+                rankDelegate.setClusterSize(
+                    action.clusterSize,
+                    action.reloadCluster,
+                    action.manualExcludedIds,
+                )
+            is MainAction.SkipRankCluster ->
+                rankDelegate.skipCluster(action.activeEntryIds, action.manualExcludedIds)
             MainAction.UndoLastRankRound -> rankDelegate.undoLastRound()
             MainAction.FinishRankEarly -> rankDelegate.finishEarly()
             MainAction.KeepRefiningRank -> rankDelegate.keepRefining()
@@ -414,6 +423,7 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
     }
 }
 
+@Suppress("TooManyFunctions")
 internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
     suspend fun startSession(collectionIdOrSlug: String, focusEntryId: String?) {
         if (!openSession(collectionIdOrSlug, focusEntryId)) {
@@ -425,12 +435,15 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
         val rankMeta = host.repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
         val title = rankMeta?.title ?: "Rankings"
         val scopeId = rankMeta?.scopeCollectionId
+        val preferredK = readPreferredClusterSize()
         val cluster =
             host.repository.catalog.selectNextRankCluster(
                 collectionIdOrSlug = collectionIdOrSlug,
                 focusEntryId = focusEntryId,
                 roundIndex = 0,
+                maxK = preferredK,
             )
+        val memberCount = (rankMeta?.memberCount ?: 0).coerceAtLeast(cluster.size)
         val nextSession =
             if (cluster.isNotEmpty()) {
                 ActiveRankSessionUiState(
@@ -439,6 +452,9 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
                     scopeCollectionId = scopeId,
                     focusEntryId = focusEntryId,
                     roundIndex = 0,
+                    targetClusterSize = preferredK,
+                    loadedMaxK = preferredK,
+                    collectionMemberCount = memberCount,
                     cluster = cluster,
                     settlement = null,
                 )
@@ -456,6 +472,9 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
                         scopeCollectionId = scopeId,
                         focusEntryId = focusEntryId,
                         roundIndex = 0,
+                        targetClusterSize = preferredK,
+                        loadedMaxK = preferredK,
+                        collectionMemberCount = it.totalCount.coerceAtLeast(memberCount),
                         cluster = emptyList(),
                         settlement = it,
                     )
@@ -469,7 +488,67 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
         return nextSession != null
     }
 
-    suspend fun submitCluster(ordering: List<List<String>>) {
+    suspend fun setClusterSize(
+        clusterSize: Int,
+        reloadCluster: Boolean,
+        manualExcludedIds: Set<String> = emptySet(),
+    ) {
+        val clampedK = clusterSize.coerceIn(EpRankingEngine.MIN_K, EpRankingEngine.MAX_K_DEFAULT)
+        var captured: ActiveRankSessionUiState? = null
+        host.updateTransient { state ->
+            val cur = state.rankSession
+            if (cur == null) {
+                state
+            } else {
+                val nextExcluded =
+                    if (reloadCluster) {
+                        cur.excludedOpponents + manualExcludedIds
+                    } else {
+                        cur.excludedOpponents
+                    }
+                val updated =
+                    cur.copy(targetClusterSize = clampedK, excludedOpponents = nextExcluded)
+                captured = updated
+                state.copy(rankSession = updated)
+            }
+        }
+        runSuspendCatching {
+            host.settingsRepository.update { it.copy(rankClusterSize = clampedK) }
+        }
+        val session = captured ?: return
+        if (!reloadCluster) return
+        val initialReload =
+            selectDeduplicatedNextCluster(
+                session = session,
+                nextRound = session.roundIndex,
+                forceRandomNext = false,
+                extraExcluded = session.skippedOpponents,
+            )
+        val reloaded =
+            if (initialReload.isNotEmpty() || session.skippedOpponents.isEmpty()) {
+                initialReload
+            } else {
+                selectDeduplicatedNextCluster(
+                    session = session,
+                    nextRound = session.roundIndex,
+                    forceRandomNext = false,
+                    extraExcluded = emptySet(),
+                )
+            }
+        updateLiveRankSession(session) { cur ->
+            cur.copy(
+                targetClusterSize = clampedK,
+                loadedMaxK = clampedK,
+                cluster = reloaded.ifEmpty { cur.cluster },
+                settlement = null,
+            )
+        }
+    }
+
+    suspend fun submitCluster(
+        ordering: List<List<String>>,
+        excludedEntryIds: Set<String> = emptySet(),
+    ) {
         val session = host.currentTransientState().rankSession ?: return
         val compId = runSuspendCatching {
             host.repository.catalog.recordComparison(
@@ -481,32 +560,42 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
                 host.showStatusMessage("Invalid ordering (${err.message ?: "error"})")
                 return
             }
-        val judgedSet = session.cluster.map { it.entryId }.toSet()
+        val judgedSet = ordering.flatten().toSet()
+        val nextExcluded = session.excludedOpponents + excludedEntryIds - judgedSet
         val undoStep =
             RankRoundUndoStep(
                 comparisonId = compId,
                 previousRoundIndex = session.roundIndex,
                 previousCluster = session.cluster,
                 previousJudgedClusters = session.judgedClusters,
+                previousExcludedOpponents = session.excludedOpponents,
+                previousTargetClusterSize = session.targetClusterSize,
+                previousLoadedMaxK = session.loadedMaxK,
             )
         advanceRankSession(
             session =
                 session.copy(
                     judgedClusters = session.judgedClusters + listOf(judgedSet),
                     skippedOpponents = emptySet(),
+                    excludedOpponents = nextExcluded,
                     history = session.history + undoStep,
                 ),
             forceRandomNext = false,
         )
     }
 
-    suspend fun skipCluster() {
+    suspend fun skipCluster(
+        activeEntryIds: List<String> = emptyList(),
+        manualExcludedIds: Set<String> = emptySet(),
+    ) {
         val session = host.currentTransientState().rankSession ?: return
-        val currentSet = session.cluster.mapTo(HashSet()) { it.entryId }
+        val currentSet = activeEntryIds.ifEmpty { session.cluster.map { it.entryId } }.toSet()
         val currentOpponents = currentSet.filterTo(HashSet()) { it != session.focusEntryId }
         val combinedSkipped = session.skippedOpponents + currentOpponents
+        val nextExcluded = session.excludedOpponents + manualExcludedIds
         val attempts =
             listOf(
+                    combinedSkipped + nextExcluded to combinedSkipped,
                     combinedSkipped to combinedSkipped,
                     currentOpponents to currentOpponents,
                     emptySet<String>() to emptySet(),
@@ -517,14 +606,13 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
             host.showStatusMessage("No other combinations to compare right now")
             return
         }
-        host.updateTransient {
-            it.copy(
-                rankSession =
-                    session.copy(
-                        cluster = chosen.first,
-                        skippedOpponents = chosen.second,
-                        settlement = null,
-                    )
+        updateLiveRankSession(session) { cur ->
+            cur.copy(
+                loadedMaxK = cur.targetClusterSize,
+                cluster = chosen.first,
+                skippedOpponents = chosen.second,
+                excludedOpponents = nextExcluded,
+                settlement = null,
             )
         }
     }
@@ -541,6 +629,7 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
                     focusEntryId = session.focusEntryId,
                     roundIndex = session.roundIndex,
                     forceRandomNext = true,
+                    maxK = session.targetClusterSize,
                     excludedOpponentIds = excluded,
                 )
             if (cluster.isNotEmpty() && cluster.mapTo(HashSet()) { it.entryId } != currentSet) {
@@ -558,17 +647,27 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
                 host.showStatusMessage("Could not undo round (${err.message ?: "error"})")
                 return
             }
-        host.updateTransient {
-            it.copy(
-                rankSession =
-                    session.copy(
-                        roundIndex = lastStep.previousRoundIndex,
-                        cluster = lastStep.previousCluster,
-                        judgedClusters = lastStep.previousJudgedClusters,
-                        skippedOpponents = emptySet(),
-                        history = session.history.dropLast(1),
-                        settlement = null,
-                    )
+        val restoredK =
+            lastStep.previousTargetClusterSize.coerceIn(
+                EpRankingEngine.MIN_K,
+                EpRankingEngine.MAX_K_DEFAULT,
+            )
+        if (restoredK != session.targetClusterSize) {
+            runSuspendCatching {
+                host.settingsRepository.update { it.copy(rankClusterSize = restoredK) }
+            }
+        }
+        updateLiveRankSession(session) { cur ->
+            cur.copy(
+                roundIndex = lastStep.previousRoundIndex,
+                targetClusterSize = restoredK,
+                loadedMaxK = lastStep.previousLoadedMaxK,
+                cluster = lastStep.previousCluster,
+                judgedClusters = lastStep.previousJudgedClusters,
+                skippedOpponents = emptySet(),
+                excludedOpponents = lastStep.previousExcludedOpponents,
+                history = cur.history.dropLast(1),
+                settlement = null,
             )
         }
     }
@@ -580,8 +679,8 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
                 host.repository.catalog.resolveEntrySettlement(it, session.collectionIdOrSlug)
             }
         if (settlement != null) {
-            host.updateTransient {
-                it.copy(rankSession = session.copy(cluster = emptyList(), settlement = settlement))
+            updateLiveRankSession(session) { cur ->
+                cur.copy(cluster = emptyList(), settlement = settlement)
             }
         } else {
             host.updateTransient { it.copy(rankSession = null) }
@@ -592,9 +691,8 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
         val session = host.currentTransientState().rankSession ?: return
         val extendedCap = session.roundIndex + MAX_FOCUSED_RANK_ROUNDS
         val nextCluster =
-            host.repository.catalog.selectNextRankCluster(
-                collectionIdOrSlug = session.collectionIdOrSlug,
-                focusEntryId = session.focusEntryId,
+            selectClusterWithFallback(
+                session = session,
                 roundIndex = session.roundIndex,
                 forceRandomNext = true,
             )
@@ -602,16 +700,14 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
             host.showStatusMessage("No more entries available to compare")
             return
         }
-        host.updateTransient {
-            it.copy(
-                rankSession =
-                    session.copy(
-                        roundCap = extendedCap,
-                        cluster = nextCluster,
-                        judgedClusters = emptyList(),
-                        skippedOpponents = emptySet(),
-                        settlement = null,
-                    )
+        updateLiveRankSession(session) { cur ->
+            cur.copy(
+                roundCap = extendedCap,
+                loadedMaxK = cur.targetClusterSize,
+                cluster = nextCluster,
+                judgedClusters = emptyList(),
+                skippedOpponents = emptySet(),
+                settlement = null,
             )
         }
     }
@@ -623,14 +719,12 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
         val nextRound = session.roundIndex + 1
         val nextCluster = selectDeduplicatedNextCluster(session, nextRound, forceRandomNext)
         if (nextCluster.isNotEmpty()) {
-            host.updateTransient {
-                it.copy(
-                    rankSession =
-                        session.copy(
-                            roundIndex = nextRound,
-                            cluster = nextCluster,
-                            settlement = null,
-                        )
+            updateLiveRankSession(session) {
+                session.copy(
+                    roundIndex = nextRound,
+                    loadedMaxK = session.targetClusterSize,
+                    cluster = nextCluster,
+                    settlement = null,
                 )
             }
             return
@@ -640,18 +734,17 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
                 host.repository.catalog.resolveEntrySettlement(it, session.collectionIdOrSlug)
             }
         if (settlement != null) {
-            host.updateTransient {
-                it.copy(
-                    rankSession =
-                        session.copy(
-                            roundIndex = nextRound,
-                            cluster = emptyList(),
-                            settlement = settlement,
-                        )
+            updateLiveRankSession(session) {
+                session.copy(
+                    roundIndex = nextRound,
+                    cluster = emptyList(),
+                    settlement = settlement,
                 )
             }
         } else {
-            host.updateTransient { it.copy(rankSession = null) }
+            host.updateTransient { state ->
+                if (state.rankSession == null) state else state.copy(rankSession = null)
+            }
             host.showStatusMessage("Rankings settled for ${session.collectionTitle}")
         }
     }
@@ -660,36 +753,158 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
         session: ActiveRankSessionUiState,
         nextRound: Int,
         forceRandomNext: Boolean,
+        extraExcluded: Set<String> = emptySet(),
     ): List<RankClusterCandidate> {
         if (session.focusEntryId != null && nextRound >= session.roundCap) {
             return emptyList()
         }
-        val candidate =
+        val primaryPass =
+            findUncoveredClusterPass(
+                session = session,
+                nextRound = nextRound,
+                forceRandomNext = forceRandomNext,
+                baseExcluded = session.excludedOpponents + extraExcluded,
+            )
+        if (primaryPass.isNotEmpty() || session.excludedOpponents.isEmpty()) {
+            return primaryPass
+        }
+        return findUncoveredClusterPass(
+            session = session,
+            nextRound = nextRound,
+            forceRandomNext = forceRandomNext,
+            baseExcluded = extraExcluded,
+        )
+    }
+
+    private suspend fun findUncoveredClusterPass(
+        session: ActiveRankSessionUiState,
+        nextRound: Int,
+        forceRandomNext: Boolean,
+        baseExcluded: Set<String>,
+    ): List<RankClusterCandidate> {
+        val primary =
             host.repository.catalog.selectNextRankCluster(
                 collectionIdOrSlug = session.collectionIdOrSlug,
                 focusEntryId = session.focusEntryId,
                 roundIndex = nextRound,
                 forceRandomNext = forceRandomNext,
+                maxK = session.targetClusterSize,
+                excludedOpponentIds = baseExcluded,
             )
-        if (candidate.isEmpty() || !isAlreadyCoveredCluster(candidate, session.judgedClusters)) {
-            return candidate
+        if (primary.isEmpty() || !isAlreadyCoveredCluster(primary, session.judgedClusters)) {
+            return primary
         }
-        val excluded =
-            if (session.focusEntryId != null) {
-                candidate.mapTo(HashSet()) { it.entryId }.apply { remove(session.focusEntryId) }
-            } else {
-                emptySet()
+        return if (session.focusEntryId != null) {
+            retryFocusedUncoveredCluster(session, nextRound, primary, baseExcluded)
+        } else {
+            retryGeneralUncoveredCluster(session, nextRound, baseExcluded)
+        }
+    }
+
+    private suspend fun retryFocusedUncoveredCluster(
+        session: ActiveRankSessionUiState,
+        nextRound: Int,
+        colliding: List<RankClusterCandidate>,
+        baseExcluded: Set<String>,
+    ): List<RankClusterCandidate> {
+        val focusId = session.focusEntryId ?: return emptyList()
+        val previouslyFaced =
+            session.judgedClusters
+                .filter { focusId in it }
+                .flatten()
+                .filterTo(HashSet()) { it != focusId }
+        val collidingOpponents = colliding.mapTo(HashSet()) { it.entryId }.apply { remove(focusId) }
+        val fresh =
+            host.repository.catalog.selectNextRankCluster(
+                collectionIdOrSlug = session.collectionIdOrSlug,
+                focusEntryId = focusId,
+                roundIndex = nextRound,
+                forceRandomNext = false,
+                maxK = session.targetClusterSize,
+                excludedOpponentIds = baseExcluded + previouslyFaced + collidingOpponents,
+            )
+        return fresh
+            .takeUnless {
+                it.isEmpty() || isAlreadyCoveredCluster(it, session.judgedClusters)
             }
-        return host.repository.catalog
-            .selectNextRankCluster(
+            .orEmpty()
+    }
+
+    private suspend fun retryGeneralUncoveredCluster(
+        session: ActiveRankSessionUiState,
+        nextRound: Int,
+        baseExcluded: Set<String>,
+    ): List<RankClusterCandidate> {
+        for (attempt in 0 until MAX_NON_FOCUSED_COVERED_RETRIES) {
+            val cand =
+                host.repository.catalog.selectNextRankCluster(
+                    collectionIdOrSlug = session.collectionIdOrSlug,
+                    focusEntryId = null,
+                    roundIndex = nextRound + attempt,
+                    forceRandomNext = true,
+                    maxK = session.targetClusterSize,
+                    excludedOpponentIds = baseExcluded,
+                )
+            if (cand.isNotEmpty() && !isAlreadyCoveredCluster(cand, session.judgedClusters)) {
+                return cand
+            }
+        }
+        return emptyList()
+    }
+
+    private suspend fun selectClusterWithFallback(
+        session: ActiveRankSessionUiState,
+        roundIndex: Int,
+        forceRandomNext: Boolean,
+    ): List<RankClusterCandidate> {
+        val primary =
+            host.repository.catalog.selectNextRankCluster(
                 collectionIdOrSlug = session.collectionIdOrSlug,
                 focusEntryId = session.focusEntryId,
-                roundIndex = nextRound,
-                forceRandomNext = true,
-                excludedOpponentIds = excluded,
+                roundIndex = roundIndex,
+                forceRandomNext = forceRandomNext,
+                maxK = session.targetClusterSize,
+                excludedOpponentIds = session.excludedOpponents,
             )
-            .takeUnless { it.isEmpty() || isAlreadyCoveredCluster(it, session.judgedClusters) }
-            .orEmpty()
+        if (primary.isNotEmpty() || session.excludedOpponents.isEmpty()) {
+            return primary
+        }
+        return host.repository.catalog.selectNextRankCluster(
+            collectionIdOrSlug = session.collectionIdOrSlug,
+            focusEntryId = session.focusEntryId,
+            roundIndex = roundIndex,
+            forceRandomNext = forceRandomNext,
+            maxK = session.targetClusterSize,
+            excludedOpponentIds = emptySet(),
+        )
+    }
+
+    private fun updateLiveRankSession(
+        expected: ActiveRankSessionUiState,
+        transform: (ActiveRankSessionUiState) -> ActiveRankSessionUiState,
+    ) {
+        host.updateTransient { state ->
+            val cur = state.rankSession
+            if (
+                cur != null &&
+                    cur.collectionIdOrSlug == expected.collectionIdOrSlug &&
+                    cur.roundIndex == expected.roundIndex
+            ) {
+                state.copy(rankSession = transform(cur))
+            } else {
+                state
+            }
+        }
+    }
+
+    private suspend fun readPreferredClusterSize(): Int {
+        val current =
+            host.settingsRepository.latestSettings
+                ?: runSuspendCatching { host.settingsRepository.prewarm() }.getOrNull()
+        return (current?.rankClusterSize ?: EpRankingEngine.MAX_K_DEFAULT).coerceIn(
+            EpRankingEngine.MIN_K,
+            EpRankingEngine.MAX_K_DEFAULT,
+        )
     }
 
     private fun isAlreadyCoveredCluster(
@@ -702,5 +917,6 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
 
     private companion object {
         private const val MIN_RANKABLE_COLLECTION_COUNT = 2
+        private const val MAX_NON_FOCUSED_COVERED_RETRIES = 4
     }
 }

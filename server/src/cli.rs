@@ -683,6 +683,7 @@ async fn run_rank_cmd(db: &Db, args: &RankArgs) -> anyhow::Result<()> {
             recent_limit: args.recent,
             by_creator: args.by.clone(),
             from_parent_id: parent_id.clone(),
+            ..ClusterSelectFilter::default()
         };
         let (summary, cluster, _) = catalog
             .select_next_uncovered_cluster(&args.target, effective_want, &filter, |cand| {

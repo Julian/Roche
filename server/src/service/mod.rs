@@ -25,7 +25,7 @@ use tokio::sync::Semaphore;
 pub use self::{
     auth::WEB_SESSION_MAX_AGE_SECS,
     catalog::{
-        CatalogService, ClusterSelectFilter, EntryListAppearance, EpScoreCache,
+        CatalogService, ClusterSelectFilter, EntryListAppearance, EpScoreCache, PrioritizedCluster,
         RankedCollectionFilter, RankedCollectionView, RankedEntryRow,
     },
     error::AppError,

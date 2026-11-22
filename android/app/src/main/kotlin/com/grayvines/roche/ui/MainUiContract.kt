@@ -27,6 +27,7 @@ import com.grayvines.roche.model.TagItem
 import com.grayvines.roche.model.ThemeMode
 import com.grayvines.roche.playback.PlayerDrawerTab
 import com.grayvines.roche.playback.findNextQueuedAudioEntry
+import com.grayvines.roche.ranking.EpRankingEngine
 import com.grayvines.roche.ranking.RankClusterCandidate
 import java.util.Locale
 import kotlinx.serialization.Serializable
@@ -65,6 +66,9 @@ data class RankRoundUndoStep(
     val previousRoundIndex: Int,
     val previousCluster: List<RankClusterCandidate>,
     val previousJudgedClusters: List<Set<String>>,
+    val previousExcludedOpponents: Set<String> = emptySet(),
+    val previousTargetClusterSize: Int = EpRankingEngine.MAX_K_DEFAULT,
+    val previousLoadedMaxK: Int = EpRankingEngine.MAX_K_DEFAULT,
 )
 
 data class ActiveRankSessionUiState(
@@ -74,12 +78,19 @@ data class ActiveRankSessionUiState(
     val focusEntryId: String? = null,
     val roundIndex: Int = 0,
     val roundCap: Int = MAX_FOCUSED_RANK_ROUNDS,
+    val targetClusterSize: Int = EpRankingEngine.MAX_K_DEFAULT,
+    val loadedMaxK: Int = targetClusterSize,
+    val collectionMemberCount: Int = EpRankingEngine.MAX_K_DEFAULT,
     val cluster: List<RankClusterCandidate> = emptyList(),
     val judgedClusters: List<Set<String>> = emptyList(),
     val skippedOpponents: Set<String> = emptySet(),
+    val excludedOpponents: Set<String> = emptySet(),
     val history: List<RankRoundUndoStep> = emptyList(),
     val settlement: RankSettlementSummary? = null,
 )
+
+internal fun ActiveRankSessionUiState.maxSelectableClusterSize(): Int =
+    collectionMemberCount.coerceAtLeast(cluster.size).coerceAtMost(EpRankingEngine.MAX_K_DEFAULT)
 
 sealed interface UndoActionKind {
     data class RestoreEntryArchive(
@@ -588,9 +599,21 @@ sealed interface MainAction {
         val focusEntryId: String? = null,
     ) : CatalogMutation
 
-    data class SubmitRankCluster(val ordering: List<List<String>>) : CatalogMutation
+    data class SubmitRankCluster(
+        val ordering: List<List<String>>,
+        val excludedEntryIds: Set<String> = emptySet(),
+    ) : CatalogMutation
 
-    data object SkipRankCluster : CatalogMutation
+    data class SetRankClusterSize(
+        val clusterSize: Int,
+        val reloadCluster: Boolean = false,
+        val manualExcludedIds: Set<String> = emptySet(),
+    ) : CatalogMutation
+
+    data class SkipRankCluster(
+        val activeEntryIds: List<String> = emptyList(),
+        val manualExcludedIds: Set<String> = emptySet(),
+    ) : CatalogMutation
 
     data object UndoLastRankRound : CatalogMutation
 

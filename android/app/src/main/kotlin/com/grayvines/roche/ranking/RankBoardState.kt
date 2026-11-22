@@ -7,15 +7,23 @@ data class RankClusterCandidate(
     val thumbnailUrl: String?,
     val mean: Double,
     val variance: Double,
+    val selectionPriority: Int = 0,
 )
 
-@Suppress("DataClassContainsFunctions")
-internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>) {
+@Suppress("DataClassContainsFunctions", "TooManyFunctions")
+internal data class RankBoardState(
+    val buckets: List<List<RankClusterCandidate>>,
+    val excluded: List<RankClusterCandidate> = emptyList(),
+    val manuallyExcludedIds: Set<String> = emptySet(),
+) {
     val isEmpty: Boolean
         get() = buckets.isEmpty()
 
     val size: Int
         get() = buckets.sumOf { it.size }
+
+    val totalCandidateCount: Int
+        get() = size + excluded.size
 
     val isAllTied: Boolean
         get() = buckets.size == 1 && size >= EpRankingEngine.MIN_K
@@ -49,6 +57,101 @@ internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>
     fun toOrderingGroups(): List<List<String>> =
         buckets.filter { it.isNotEmpty() }.map { bucket -> bucket.map { it.entryId } }
 
+    fun canExclude(entryId: String, focusEntryId: String? = null): Boolean =
+        size > EpRankingEngine.MIN_K &&
+            entryId != focusEntryId &&
+            findBucketCoords(buckets, entryId) != null
+
+    fun exclude(entryId: String, focusEntryId: String? = null): RankBoardState {
+        if (!canExclude(entryId, focusEntryId)) return this
+        val (bIdx, iIdx) = findBucketCoords(buckets, entryId) ?: return this
+        val next = buckets.map { it.toMutableList() }.toMutableList()
+        val removed = next[bIdx].removeAt(iIdx)
+        if (next[bIdx].isEmpty()) {
+            next.removeAt(bIdx)
+        }
+        val nextExcluded =
+            if (excluded.any { it.entryId == removed.entryId }) excluded else excluded + removed
+        return copy(
+            buckets = next,
+            excluded = nextExcluded,
+            manuallyExcludedIds = manuallyExcludedIds + removed.entryId,
+        )
+    }
+
+    fun restore(entryId: String): RankBoardState {
+        val candidate = excluded.firstOrNull { it.entryId == entryId } ?: return this
+        val next = buckets.map { it.toMutableList() }.toMutableList()
+        insertCandidateByScore(next, candidate)
+        return copy(
+            buckets = next,
+            excluded = excluded.filterNot { it.entryId == entryId },
+            manuallyExcludedIds = manuallyExcludedIds - entryId,
+        )
+    }
+
+    fun restoreAll(): RankBoardState {
+        if (excluded.isEmpty()) return this
+        val next = buckets.map { it.toMutableList() }.toMutableList()
+        for (candidate in excluded) {
+            insertCandidateByScore(next, candidate)
+        }
+        return copy(
+            buckets = next,
+            excluded = emptyList(),
+            manuallyExcludedIds = emptySet(),
+        )
+    }
+
+    fun resizeTo(targetK: Int, focusEntryId: String? = null): RankBoardState {
+        val clampedTarget = targetK.coerceAtLeast(EpRankingEngine.MIN_K)
+        return when {
+            clampedTarget < size -> shrinkTo(clampedTarget, focusEntryId)
+            clampedTarget > size -> growFromTrimmed(clampedTarget)
+            else -> this
+        }
+    }
+
+    private fun shrinkTo(targetK: Int, focusEntryId: String?): RankBoardState {
+        val activeFlat = buckets.flatten()
+        val removable =
+            activeFlat
+                .withIndex()
+                .filter { (_, c) -> c.entryId != focusEntryId }
+                .sortedWith(
+                    compareByDescending<IndexedValue<RankClusterCandidate>> {
+                            it.value.selectionPriority
+                        }
+                        .thenByDescending { it.index }
+                )
+        val dropCount = (size - targetK).coerceAtMost(removable.size)
+        if (dropCount <= 0) return this
+        val toDrop = removable.take(dropCount).map { it.value }
+        val dropIds = toDrop.mapTo(HashSet()) { it.entryId }
+        val nextBuckets =
+            buckets.map { b -> b.filterNot { it.entryId in dropIds } }.filter { it.isNotEmpty() }
+        val nextExcluded =
+            excluded + toDrop.filter { c -> excluded.none { it.entryId == c.entryId } }
+        return copy(buckets = nextBuckets, excluded = nextExcluded)
+    }
+
+    private fun growFromTrimmed(targetK: Int): RankBoardState {
+        val trimmed =
+            excluded.filter { it.entryId !in manuallyExcludedIds }.sortedBy { it.selectionPriority }
+        val addCount = (targetK - size).coerceAtMost(trimmed.size)
+        if (addCount <= 0) return this
+        val toRestore = trimmed.take(addCount)
+        val restoreIds = toRestore.mapTo(HashSet()) { it.entryId }
+        val next = buckets.map { it.toMutableList() }.toMutableList()
+        for (candidate in toRestore) {
+            insertCandidateByScore(next, candidate)
+        }
+        return copy(
+            buckets = next,
+            excluded = excluded.filterNot { it.entryId in restoreIds },
+        )
+    }
+
     fun moveUp(entryId: String): RankBoardState {
         val (bIdx, iIdx) = findBucketCoords(buckets, entryId) ?: return this
         val next = buckets.map { it.toMutableList() }.toMutableList()
@@ -60,7 +163,7 @@ internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>
             next[bIdx - 1] = next[bIdx]
             next[bIdx] = prev
         }
-        return RankBoardState(next)
+        return copy(buckets = next)
     }
 
     fun moveDown(entryId: String): RankBoardState {
@@ -74,7 +177,7 @@ internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>
             next[bIdx + 1] = next[bIdx]
             next[bIdx] = below
         }
-        return RankBoardState(next)
+        return copy(buckets = next)
     }
 
     fun moveToRankSlot(entryId: String, targetZeroBased: Int): RankBoardState {
@@ -90,7 +193,7 @@ internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>
         }
         val insertIdx = computeSlotInsertIndex(next, target, oldFlat)
         next.add(insertIdx, mutableListOf(item))
-        return RankBoardState(next)
+        return copy(buckets = next)
     }
 
     fun toggleTieWithAbove(entryId: String): RankBoardState {
@@ -105,21 +208,21 @@ internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>
             val merged = next.removeAt(bIdx)
             next[bIdx - 1].addAll(merged)
         }
-        return RankBoardState(next)
+        return copy(buckets = next)
     }
 
     fun tieAll(): RankBoardState {
         val flat = buckets.flatten()
-        return if (flat.isEmpty()) RankBoardState(emptyList()) else RankBoardState(listOf(flat))
+        return if (flat.isEmpty()) copy(buckets = emptyList()) else copy(buckets = listOf(flat))
     }
 
     fun toggleTieAll(): RankBoardState {
         if (size <= 1) return this
         val flat = buckets.flatten()
         return if (buckets.size == 1) {
-            RankBoardState(flat.map(::listOf))
+            copy(buckets = flat.map(::listOf))
         } else {
-            RankBoardState(listOf(flat))
+            copy(buckets = listOf(flat))
         }
     }
 
@@ -173,7 +276,7 @@ internal fun applyRankBoardDrop(
     val item = next[srcB].removeAt(srcI)
     if (target.zone == RankDropZone.TIE) {
         next[target.bucketIndex].add(item)
-        return RankBoardState(next.filter { it.isNotEmpty() })
+        return board.copy(buckets = next.filter { it.isNotEmpty() })
     }
     val removedSrcBucket = next[srcB].isEmpty()
     if (removedSrcBucket) {
@@ -183,8 +286,29 @@ internal fun applyRankBoardDrop(
         if (target.zone == RankDropZone.BEFORE) target.bucketIndex else target.bucketIndex + 1
     val adjusted = if (removedSrcBucket && srcB < rawInsert) rawInsert - 1 else rawInsert
     next.add(adjusted.coerceIn(0, next.size), mutableListOf(item))
-    return RankBoardState(next)
+    return board.copy(buckets = next)
 }
+
+internal fun insertCandidateByScore(
+    buckets: MutableList<MutableList<RankClusterCandidate>>,
+    candidate: RankClusterCandidate,
+) {
+    val insertIdx = buckets.indexOfFirst { bucket ->
+        val head = bucket.firstOrNull()
+        head != null && shouldInsertBefore(candidate, head)
+    }
+    if (insertIdx >= 0) {
+        buckets.add(insertIdx, mutableListOf(candidate))
+    } else {
+        buckets.add(mutableListOf(candidate))
+    }
+}
+
+private fun shouldInsertBefore(
+    candidate: RankClusterCandidate,
+    head: RankClusterCandidate,
+): Boolean =
+    candidate.mean > head.mean || candidate.mean == head.mean && candidate.entryId < head.entryId
 
 internal fun resolveRankDropTarget(
     pointerY: Float,
