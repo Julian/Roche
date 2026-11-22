@@ -311,25 +311,7 @@ private fun InboxHeaderSection(
         } else {
             NumberFormat.getIntegerInstance(Locale.US).format(entries.size)
         }
-    val navAction: (@Composable () -> Unit)? =
-        when {
-            hasScopeFilter -> {
-                {
-                    HeaderActionButton(
-                        label = "←",
-                        contentDescription = "Back",
-                        onClick = { onAction(MainAction.NavigateBackFromScope) },
-                        modifier = Modifier.testTag("clear_scope_btn"),
-                    )
-                }
-            }
-            state.isUnpinnedDestination(AppTab.INBOX) -> {
-                {
-                    UnpinnedTabBackButton(onBack = { onAction(MainAction.SelectTab(AppTab.HOME)) })
-                }
-            }
-            else -> null
-        }
+    val navAction = resolveInboxNavAction(hasScopeFilter, state, onAction)
 
     RocheTopHeader(
         title = title,
@@ -338,10 +320,15 @@ private fun InboxHeaderSection(
     ) {
         InboxHeaderActions(
             state = state,
+            selectedFeedId = selectedFeedId,
             selectedTag = selectedTag,
             unarchivedCount = unarchivedCount,
             showTagFilterDrawer = showTagFilterDrawer,
             onToggleTagDrawer = onToggleTagDrawer,
+            onOpenFeedSettings =
+                selectedFeedId?.let { feedId ->
+                    { onAction(MainAction.OpenFeedContextSheet(feedId)) }
+                },
             onShowArchiveConfirm = { showArchiveAllConfirm = true },
             onOpenSearch = { onAction(MainAction.OpenSearch) },
         )
@@ -359,6 +346,28 @@ private fun InboxHeaderSection(
     }
 }
 
+private fun resolveInboxNavAction(
+    hasScopeFilter: Boolean,
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+): (@Composable () -> Unit)? =
+    when {
+        hasScopeFilter -> {
+            {
+                HeaderActionButton(
+                    label = "←",
+                    contentDescription = "Back",
+                    onClick = { onAction(MainAction.NavigateBackFromScope) },
+                    modifier = Modifier.testTag("clear_scope_btn"),
+                )
+            }
+        }
+        state.isUnpinnedDestination(AppTab.INBOX) -> {
+            { UnpinnedTabBackButton(onBack = { onAction(MainAction.SelectTab(AppTab.HOME)) }) }
+        }
+        else -> null
+    }
+
 private fun resolveInboxHeaderTitle(
     state: MainUiState,
     selectedFeedId: String?,
@@ -375,14 +384,31 @@ private fun resolveInboxHeaderTitle(
 @Suppress("LongParameterList")
 internal fun InboxHeaderActions(
     state: MainUiState,
+    selectedFeedId: String? = null,
     selectedTag: String?,
     unarchivedCount: Int,
     showTagFilterDrawer: Boolean,
     onToggleTagDrawer: () -> Unit,
+    onOpenFeedSettings: (() -> Unit)? = null,
     onShowArchiveConfirm: () -> Unit,
     onOpenSearch: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    if (selectedFeedId != null && onOpenFeedSettings != null) {
+        RocheIconActionButton(
+            contentDescription = "Feed settings",
+            outlined = false,
+            onClick = onOpenFeedSettings,
+            modifier = Modifier.testTag("inbox_scoped_feed_settings_btn"),
+        ) {
+            Text(
+                text = "⋯",
+                color = colors.textSecondary,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+    }
     if (state.tags.isNotEmpty()) {
         val filterTint =
             if (showTagFilterDrawer || selectedTag != null) {

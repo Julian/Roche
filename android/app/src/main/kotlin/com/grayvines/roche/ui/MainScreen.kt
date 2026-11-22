@@ -580,6 +580,7 @@ internal fun MainOverlaySheets(
             entry = contextEntry,
             availableTags = state.tags.map { it.name },
             isInQueue = state.isEntryInQueue(contextEntry.id),
+            isDownloadingOffline = contextEntry.id in state.inFlightOfflineEntryIds,
             onAction = onAction,
             onShareEntry = onShareEntry,
             onOpenExternalUrl = onOpenExternalUrl,
@@ -660,6 +661,7 @@ internal fun MainOverlaySheets(
             prefillTitle = state.quickLogPrefillTitle,
             prefillCreators = state.quickLogPrefillCreators,
             prefillReleaseYear = state.quickLogPrefillReleaseYear,
+            existingEntryId = state.quickLogExistingEntryId,
             onAction = onAction,
         )
     }

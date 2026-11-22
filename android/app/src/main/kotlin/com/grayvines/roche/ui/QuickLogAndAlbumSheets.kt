@@ -110,7 +110,7 @@ private fun DrawNoteSheetHeader(
     val draw = generator?.currentDraw
     val listTitle = generator?.collectionTitle ?: "List"
     Text(
-        text = if (isAbandon) "Abandon Draw" else "Finish & Rank",
+        text = if (isAbandon) "Skip Draw" else "Finish & Rank",
         color = colors.textPrimary,
         fontFamily = currentHeadlineFontFamily(),
         fontSize = 20.sp,
@@ -129,7 +129,7 @@ private fun DrawNoteSheetHeader(
     Text(
         text =
             if (isAbandon) {
-                "Records this entry as abandoned in your Diary and draws your next item from $listTitle."
+                "Records this entry as skipped in your Diary and draws your next item from $listTitle."
             } else {
                 "Logs this entry as finished, settles its ranking, and draws your next item from $listTitle."
             },
@@ -148,7 +148,7 @@ private fun DrawNoteSheetFooter(
     onAction: (MainAction) -> Unit,
 ) {
     SheetActionFooter(
-        confirmLabel = if (isAbandon) "Abandon & Draw Next" else "Finish & Rank",
+        confirmLabel = if (isAbandon) "Skip & Draw Next" else "Finish & Rank",
         confirmEnabled = canConfirm,
         confirmTestTag = "draw_confirm_action_btn",
         onCancel = { onAction(MainAction.CloseDrawNoteDialog) },
@@ -165,6 +165,7 @@ private fun DrawNoteSheetFooter(
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
+@Suppress("LongParameterList")
 @Composable
 internal fun QuickLogBottomSheet(
     defaultToWant: Boolean,
@@ -174,6 +175,7 @@ internal fun QuickLogBottomSheet(
     prefillTitle: String = "",
     prefillCreators: String = "",
     prefillReleaseYear: Int? = null,
+    existingEntryId: String? = null,
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -189,6 +191,7 @@ internal fun QuickLogBottomSheet(
             prefillTitle = prefillTitle,
             prefillCreators = prefillCreators,
             prefillReleaseYear = prefillReleaseYear,
+            existingEntryId = existingEntryId,
             onAction = onAction,
         )
     }
@@ -209,6 +212,7 @@ private fun QuickLogSheetBody(
     prefillTitle: String,
     prefillCreators: String,
     prefillReleaseYear: Int?,
+    existingEntryId: String?,
     onAction: (MainAction) -> Unit,
 ) {
     val hasTargetList = !targetCollectionId.isNullOrBlank()
@@ -283,6 +287,7 @@ private fun QuickLogSheetBody(
                 addToListOnly = addToListOnly,
                 rankAfterLog = rankAfterLog,
                 targetCollectionId = targetCollectionId,
+                existingEntryId = existingEntryId,
             )
         val submitLabel =
             when {
@@ -313,6 +318,7 @@ private fun buildQuickLogAction(
     addToListOnly: Boolean,
     rankAfterLog: Boolean,
     targetCollectionId: String?,
+    existingEntryId: String?,
 ): MainAction =
     MainAction.SubmitQuickLog(
         kind = kind,
@@ -325,6 +331,7 @@ private fun buildQuickLogAction(
         rankAfterLog = rankAfterLog && !addToListOnly && status == ConsumptionStatus.CONSUMED,
         targetCollectionId = targetCollectionId,
         addToListOnly = addToListOnly,
+        existingEntryId = existingEntryId,
     )
 
 @Suppress("LongParameterList")

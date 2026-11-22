@@ -27,15 +27,17 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -81,6 +83,7 @@ import com.grayvines.roche.ui.components.SkipDrawIcon
 import com.grayvines.roche.ui.components.TierBadgePill
 import com.grayvines.roche.ui.components.TopHeaderCountPill
 import com.grayvines.roche.ui.components.UnpinnedTabBackButton
+import com.grayvines.roche.ui.components.lazyGroupedCardRow
 import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
@@ -671,21 +674,18 @@ private fun ListDetailSubHeader(
     val colors = LocalRocheColors.current
     val headlineFamily = currentHeadlineFontFamily()
     Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier =
+            Modifier.fillMaxWidth().padding(start = 6.dp, end = 12.dp, top = 4.dp, bottom = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier =
-                Modifier.minimumInteractiveComponentSize()
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable(onClick = onBack)
-                    .semantics { role = Role.Button }
-                    .padding(horizontal = 4.dp, vertical = 4.dp)
-                    .testTag("lists_back_to_overview_btn"),
+        RocheIconActionButton(
+            contentDescription = "Back to Lists",
+            outlined = false,
+            onClick = onBack,
+            modifier = Modifier.testTag("lists_back_to_overview_btn"),
         ) {
-            Text(text = "← Lists", color = colors.accentBlue, fontSize = 12.5.sp)
+            Text(text = "←", color = colors.accentBlue, fontSize = 18.sp)
         }
         Text(
             text = list.title,
@@ -709,29 +709,80 @@ private fun ListDetailHeaderActions(
     canEditManualList: Boolean,
     onAction: (MainAction) -> Unit,
 ) {
-    if (canEditManualList && list.collectionId != STARRED_COLLECTION_ID) {
-        HeaderActionButton(
-            label = if (list.generatorEnabled) "Pause Draw" else "Enable Draw",
-            horizontalPadding = 10.dp,
-            onClick = {
-                onAction(
-                    MainAction.SetCollectionGeneratorEnabled(
-                        collectionIdOrSlug = list.collectionId,
-                        enabled = !list.generatorEnabled,
-                    )
-                )
-            },
-            modifier = Modifier.testTag("companion_toggle_draw_btn"),
-        )
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (canRank) {
+            HeaderActionButton(
+                label = "Rank",
+                style = RocheButtonStyle.PRIMARY,
+                horizontalPadding = 12.dp,
+                onClick = { onAction(MainAction.StartRankingSession(list.collectionId)) },
+                modifier = Modifier.testTag("companion_rank_list_btn"),
+            )
+        }
+        if (canEditManualList && list.collectionId != STARRED_COLLECTION_ID) {
+            ManualListOverflowMenu(list = list, onAction = onAction)
+        }
     }
-    if (canRank) {
-        HeaderActionButton(
-            label = "Rank",
-            style = RocheButtonStyle.PRIMARY,
-            horizontalPadding = 12.dp,
-            onClick = { onAction(MainAction.StartRankingSession(list.collectionId)) },
-            modifier = Modifier.testTag("companion_rank_list_btn"),
-        )
+}
+
+@Composable
+private fun ManualListOverflowMenu(
+    list: CatalogListSummary,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    var menuExpanded by rememberSaveable(list.collectionId) { mutableStateOf(false) }
+    val drawLabel = if (list.generatorEnabled) "Pause Daily Draw" else "Enable Daily Draw"
+    Box {
+        RocheIconActionButton(
+            contentDescription = "List options",
+            outlined = false,
+            onClick = { menuExpanded = true },
+            modifier = Modifier.testTag("companion_list_more_btn"),
+        ) {
+            Text(
+                text = "⋯",
+                color = colors.textSecondary,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+        DropdownMenu(
+            expanded = menuExpanded,
+            onDismissRequest = { menuExpanded = false },
+            containerColor = colors.surfaceElevated,
+        ) {
+            DropdownMenuItem(
+                text = { Text(text = drawLabel, color = colors.textPrimary) },
+                onClick = {
+                    menuExpanded = false
+                    onAction(
+                        MainAction.SetCollectionGeneratorEnabled(
+                            collectionIdOrSlug = list.collectionId,
+                            enabled = !list.generatorEnabled,
+                        )
+                    )
+                },
+                modifier = Modifier.testTag("companion_toggle_draw_btn"),
+            )
+            DropdownMenuItem(
+                text = { Text("+ Log & Add Entry", color = colors.accentBlue) },
+                onClick = {
+                    menuExpanded = false
+                    onAction(
+                        MainAction.OpenQuickLogSheet(
+                            defaultToWant = false,
+                            targetCollectionId = list.collectionId,
+                            targetCollectionTitle = list.title,
+                            prefillKind = EntryKind.inferForCollection(list),
+                        )
+                    )
+                },
+            )
+        }
     }
 }
 
@@ -783,29 +834,15 @@ private fun RankedDetailBody(
     onOpenExternalUrl: (String) -> Unit,
 ) {
     if (rankedEntries.isEmpty() && activeDraw == null) {
-        CompanionEmptyCard(
-            title = "No entries in ${activeList.title} yet",
-            body = "Log movies, albums, books, games, or star/finish items to build this list.",
-            ctaLabel = if (canEditManualList) "+ Log & Add Entry" else "+ Log Entry",
-            onCta = {
-                onAction(
-                    MainAction.OpenQuickLogSheet(
-                        defaultToWant = false,
-                        targetCollectionId = activeList.collectionId.takeIf { canEditManualList },
-                        targetCollectionTitle = activeList.title.takeIf { canEditManualList },
-                        prefillKind = EntryKind.inferForCollection(activeList),
-                    )
-                )
-            },
-        )
+        RankedDetailEmptyCard(activeList, canEditManualList, onAction)
         return
     }
+    val colors = LocalRocheColors.current
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val isWide = maxWidth >= LISTS_WIDE_BREAKPOINT
         LazyColumn(
             state = listState,
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
             modifier = Modifier.fillMaxSize(),
         ) {
             if (activeDraw != null) {
@@ -815,75 +852,116 @@ private fun RankedDetailBody(
                         onAction = onAction,
                         onOpen = { onOpenCollectionDraw(activeDraw) },
                     )
+                    Spacer(modifier = Modifier.height(12.dp))
                 }
             }
-            if (rankedEntries.isNotEmpty()) {
-                item(key = "ranked_card_${activeList.collectionId}") {
-                    RankedEntriesCardGroup(
-                        activeList = activeList,
-                        canEditManualList = canEditManualList,
-                        rankedEntries = rankedEntries,
-                        readableIds = readableIds,
-                        isWide = isWide,
-                        onAction = onAction,
-                        onOpenExternalUrl = onOpenExternalUrl,
-                    )
-                }
+            itemsIndexed(
+                items = rankedEntries,
+                key = { _, item -> "${activeList.collectionId}_${item.entry.id}" },
+            ) { idx, item ->
+                val isFirst = idx == 0
+                val isLast = idx == rankedEntries.lastIndex
+                val prevTier = if (idx > 0) rankedEntries[idx - 1].tier else null
+                val isTierBreak = idx > 0 && item.tier != prevTier && prevTier != null
+                RankedLazyCardRowItem(
+                    item = item,
+                    activeList = activeList,
+                    canEditManualList = canEditManualList,
+                    readableIds = readableIds,
+                    isWide = isWide,
+                    isFirst = isFirst,
+                    isLast = isLast,
+                    isTierBreak = isTierBreak,
+                    onAction = onAction,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                    colors = colors,
+                )
             }
-            item { Spacer(modifier = Modifier.height(72.dp)) }
+            item(key = "ranked_bottom_spacer") { Spacer(modifier = Modifier.height(72.dp)) }
         }
     }
 }
 
-@Suppress("LongParameterList")
 @Composable
-private fun RankedEntriesCardGroup(
+private fun RankedDetailEmptyCard(
     activeList: CatalogListSummary,
     canEditManualList: Boolean,
-    rankedEntries: List<RankedCatalogEntry>,
+    onAction: (MainAction) -> Unit,
+) {
+    CompanionEmptyCard(
+        title = "No entries in ${activeList.title} yet",
+        body = "Log movies, albums, books, games, or star/finish items to build this list.",
+        ctaLabel = if (canEditManualList) "+ Log & Add Entry" else "+ Log Entry",
+        onCta = {
+            onAction(
+                MainAction.OpenQuickLogSheet(
+                    defaultToWant = false,
+                    targetCollectionId = activeList.collectionId.takeIf { canEditManualList },
+                    targetCollectionTitle = activeList.title.takeIf { canEditManualList },
+                    prefillKind = EntryKind.inferForCollection(activeList),
+                )
+            )
+        },
+    )
+}
+
+@Suppress("LongParameterList")
+@Composable
+private fun RankedLazyCardRowItem(
+    item: RankedCatalogEntry,
+    activeList: CatalogListSummary,
+    canEditManualList: Boolean,
     readableIds: Set<String>,
     isWide: Boolean,
+    isFirst: Boolean,
+    isLast: Boolean,
+    isTierBreak: Boolean,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
+    colors: com.grayvines.roche.ui.theme.RocheColors,
 ) {
-    val colors = LocalRocheColors.current
-    RocheSurfaceCard {
-        rankedEntries.forEachIndexed { idx, item ->
-            if (idx > 0) {
-                val prevTier = rankedEntries[idx - 1].tier
-                val isBreak = item.tier != prevTier && prevTier != null
-                HorizontalDivider(
-                    color = colors.border,
-                    thickness = if (isBreak) 2.dp else 1.dp,
+    val onOpen =
+        resolveCatalogEntryOpenAction(
+            entryId = item.entry.id,
+            externalUrl = item.entry.url,
+            readableIds = readableIds,
+            onOpenReader = { onAction(MainAction.OpenReader(it)) },
+            onOpenExternalUrl = onOpenExternalUrl,
+            entryKind = item.entry.kind,
+            onOpenCatalogDetail = { onAction(MainAction.OpenCatalogDetailSheet(it)) },
+        )
+    val removeAction =
+        if (canEditManualList && !activeList.hasGenerator) {
+            { onAction(MainAction.RemoveWantEntry(activeList.collectionId, item.entry.id)) }
+        } else {
+            null
+        }
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .lazyGroupedCardRow(
+                    isFirst = isFirst,
+                    isLast = isLast,
+                    surfaceColor = colors.surface,
+                    borderColor = colors.border,
                 )
-            }
-            val onOpen =
-                resolveCatalogEntryOpenAction(
-                    entryId = item.entry.id,
-                    externalUrl = item.entry.url,
-                    readableIds = readableIds,
-                    onOpenReader = { onAction(MainAction.OpenReader(it)) },
-                    onOpenExternalUrl = onOpenExternalUrl,
-                    entryKind = item.entry.kind,
-                    onOpenCatalogDetail = { onAction(MainAction.OpenCatalogDetailSheet(it)) },
-                )
-            val removeAction =
-                if (canEditManualList && !activeList.hasGenerator) {
-                    { onAction(MainAction.RemoveWantEntry(activeList.collectionId, item.entry.id)) }
-                } else {
-                    null
-                }
-            RankedEntryTableRow(
-                item = item,
-                isWide = isWide,
-                showQualityMeta = !activeList.isPriorityScoped,
-                onOpen = onOpen,
-                onFocusRank = {
-                    onAction(MainAction.StartRankingSession(activeList.collectionId, item.entry.id))
-                },
-                onRemoveFromList = removeAction,
+    ) {
+        if (!isFirst) {
+            HorizontalDivider(
+                color = colors.border,
+                thickness = if (isTierBreak) 2.dp else 1.dp,
             )
         }
+        RankedEntryTableRow(
+            item = item,
+            isWide = isWide,
+            showQualityMeta = !activeList.isPriorityScoped,
+            onOpen = onOpen,
+            onFocusRank = {
+                onAction(MainAction.StartRankingSession(activeList.collectionId, item.entry.id))
+            },
+            onRemoveFromList = removeAction,
+        )
     }
 }
 

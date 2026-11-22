@@ -208,6 +208,7 @@ private fun reduceCatalogSheetUiAction(
                 quickLogPrefillTitle = action.prefillTitle,
                 quickLogPrefillCreators = action.prefillCreators,
                 quickLogPrefillReleaseYear = action.prefillReleaseYear,
+                quickLogExistingEntryId = action.existingEntryId,
             )
         MainAction.CloseQuickLogSheet ->
             state.copy(
@@ -218,6 +219,7 @@ private fun reduceCatalogSheetUiAction(
                 quickLogPrefillTitle = "",
                 quickLogPrefillCreators = "",
                 quickLogPrefillReleaseYear = null,
+                quickLogExistingEntryId = null,
             )
         is MainAction.OpenDrawNoteDialog ->
             state.copy(drawNoteDialog = DrawNoteDialogState(action.collectionId, action.mode))

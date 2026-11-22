@@ -60,14 +60,24 @@ data class DrawNoteDialogState(
     val mode: DrawNoteDialogMode,
 )
 
+data class RankRoundUndoStep(
+    val comparisonId: String,
+    val previousRoundIndex: Int,
+    val previousCluster: List<RankClusterCandidate>,
+    val previousJudgedClusters: List<Set<String>>,
+)
+
 data class ActiveRankSessionUiState(
     val collectionIdOrSlug: String,
     val collectionTitle: String,
     val scopeCollectionId: String? = null,
     val focusEntryId: String? = null,
     val roundIndex: Int = 0,
+    val roundCap: Int = MAX_FOCUSED_RANK_ROUNDS,
     val cluster: List<RankClusterCandidate> = emptyList(),
     val judgedClusters: List<Set<String>> = emptyList(),
+    val skippedOpponents: Set<String> = emptySet(),
+    val history: List<RankRoundUndoStep> = emptyList(),
     val settlement: RankSettlementSummary? = null,
 )
 
@@ -122,6 +132,8 @@ data class MainUiState(
     val activePlayerNotesContent: ReaderItemContent? = null,
     val hydratingEntryIds: Set<String> = emptySet(),
     val inFlightOfflineEntryIds: Set<String> = emptySet(),
+    val refreshingFeedIds: Set<String> = emptySet(),
+    val enrichingCatalogEntryIds: Set<String> = emptySet(),
     val contextSheetEntryId: String? = null,
     val feedContextSheetId: String? = null,
     val isAddSheetOpen: Boolean = false,
@@ -174,6 +186,7 @@ data class MainUiState(
     val quickLogPrefillTitle: String = "",
     val quickLogPrefillCreators: String = "",
     val quickLogPrefillReleaseYear: Int? = null,
+    val quickLogExistingEntryId: String? = null,
     val drawNoteDialog: DrawNoteDialogState? = null,
     val rankSession: ActiveRankSessionUiState? = null,
     val isPlayerFullscreenOpen: Boolean = false,
@@ -455,6 +468,8 @@ sealed interface MainAction {
 
     data class CacheEntryOffline(val entryId: String) : EntryMutation
 
+    data object EvictPlayedOfflineEntries : EntryMutation
+
     data class ToggleTagOnEntry(val entryId: String, val tagName: String) : EntryMutation
 
     data class UpdateReadProgress(val entryId: String, val progress: Double) : EntryMutation
@@ -540,6 +555,7 @@ sealed interface MainAction {
         val prefillTitle: String = "",
         val prefillCreators: String = "",
         val prefillReleaseYear: Int? = null,
+        val existingEntryId: String? = null,
     ) : CatalogUi
 
     data object CloseQuickLogSheet : CatalogUi
@@ -576,6 +592,33 @@ sealed interface MainAction {
     data class SubmitRankCluster(val ordering: List<List<String>>) : CatalogMutation
 
     data object SkipRankCluster : CatalogMutation
+
+    data object UndoLastRankRound : CatalogMutation
+
+    data object FinishRankEarly : CatalogMutation
+
+    data object KeepRefiningRank : CatalogMutation
+
+    data class UpdateConsumptionLog(
+        val logId: String,
+        val status: ConsumptionStatus? = null,
+        val notes: String? = null,
+        val clearNotes: Boolean = false,
+        val tsIso: String? = null,
+    ) : CatalogMutation
+
+    data class DeleteConsumptionLog(val logId: String) : CatalogMutation
+
+    data class ToggleCatalogStar(val entryId: String) : CatalogMutation
+
+    data class ToggleCatalogWant(val entryId: String) : CatalogMutation
+
+    data class AddCatalogEntryToList(
+        val collectionId: String,
+        val entryId: String,
+    ) : CatalogMutation
+
+    data class RefreshCatalogEntryMetadata(val entryId: String) : CatalogMutation
 
     data class MarkFeedEntryFinished(
         val entryId: String,
@@ -642,6 +685,8 @@ internal data class TransientUiState(
     val readerContent: ReaderItemContent? = null,
     val activePlayerNotesContent: ReaderItemContent? = null,
     val hydratingEntryIds: Set<String> = emptySet(),
+    val refreshingFeedIds: Set<String> = emptySet(),
+    val enrichingCatalogEntryIds: Set<String> = emptySet(),
     val contextSheetEntryId: String? = null,
     val feedContextSheetId: String? = null,
     val isAddSheetOpen: Boolean = false,
@@ -662,6 +707,7 @@ internal data class TransientUiState(
     val quickLogPrefillTitle: String = "",
     val quickLogPrefillCreators: String = "",
     val quickLogPrefillReleaseYear: Int? = null,
+    val quickLogExistingEntryId: String? = null,
     val drawNoteDialog: DrawNoteDialogState? = null,
     val rankSession: ActiveRankSessionUiState? = null,
     val isPlayerFullscreenOpen: Boolean = false,
@@ -814,6 +860,8 @@ internal fun assembleMainUiState(
         activePlayerNotesContent = local.activePlayerNotesContent,
         hydratingEntryIds = local.hydratingEntryIds,
         inFlightOfflineEntryIds = inboxDerived.inFlightOfflineEntryIds,
+        refreshingFeedIds = local.refreshingFeedIds,
+        enrichingCatalogEntryIds = local.enrichingCatalogEntryIds,
         contextSheetEntryId = local.contextSheetEntryId,
         feedContextSheetId = local.feedContextSheetId,
         isAddSheetOpen = local.isAddSheetOpen,
@@ -865,6 +913,7 @@ internal fun assembleMainUiState(
         quickLogPrefillTitle = local.quickLogPrefillTitle,
         quickLogPrefillCreators = local.quickLogPrefillCreators,
         quickLogPrefillReleaseYear = local.quickLogPrefillReleaseYear,
+        quickLogExistingEntryId = local.quickLogExistingEntryId,
         drawNoteDialog = local.drawNoteDialog,
         rankSession = local.rankSession,
         isPlayerFullscreenOpen = local.isPlayerFullscreenOpen,
@@ -1008,3 +1057,4 @@ internal fun computeOfflineEntries(allEntries: List<InboxEntry>): List<InboxEntr
 internal fun entryCountNoun(count: Int): String = if (count == 1) "entry" else "entries"
 
 internal const val SNACKBAR_TITLE_LIMIT = 36
+internal const val MAX_FOCUSED_RANK_ROUNDS = 5

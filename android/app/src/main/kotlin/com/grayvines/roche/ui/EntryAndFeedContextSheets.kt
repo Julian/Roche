@@ -12,8 +12,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalBottomSheet
@@ -40,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.core.isLikelyFeedUrl
 import com.grayvines.roche.core.isLocalPdfUrl
+import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
@@ -60,6 +63,7 @@ import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import java.net.URI
 
 @OptIn(ExperimentalMaterial3Api::class)
+@Suppress("LongParameterList")
 @Composable
 fun EntryContextBottomSheet(
     entry: InboxEntry,
@@ -68,6 +72,7 @@ fun EntryContextBottomSheet(
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     isInQueue: Boolean = false,
+    isDownloadingOffline: Boolean = false,
 ) {
     val colors = LocalRocheColors.current
     val allTags = remember(availableTags, entry.tags) { (availableTags + entry.tags).distinct() }
@@ -93,6 +98,7 @@ fun EntryContextBottomSheet(
             ContextSheetActionsList(
                 entry = entry,
                 isInQueue = isInQueue,
+                isDownloadingOffline = isDownloadingOffline,
                 onAction = onAction,
                 onShare = {
                     onAction(MainAction.CloseContextSheet)
@@ -177,6 +183,7 @@ private data class ContextActionSpec(
     val label: String,
     val onClick: () -> Unit,
     val textColor: Color? = null,
+    val isLoading: Boolean = false,
     val modifier: Modifier = Modifier,
 )
 
@@ -192,6 +199,7 @@ private fun ContextActionCardGroup(actions: List<ContextActionSpec>) {
             ContextActionItem(
                 label = spec.label,
                 textColor = spec.textColor ?: colors.textPrimary,
+                isLoading = spec.isLoading,
                 onClick = spec.onClick,
                 modifier = spec.modifier,
             )
@@ -199,10 +207,12 @@ private fun ContextActionCardGroup(actions: List<ContextActionSpec>) {
     }
 }
 
+@Suppress("LongParameterList")
 @Composable
 private fun ContextSheetActionsList(
     entry: InboxEntry,
     isInQueue: Boolean,
+    isDownloadingOffline: Boolean,
     onAction: (MainAction) -> Unit,
     onShare: () -> Unit,
     onOpenExternalUrl: () -> Unit,
@@ -217,6 +227,7 @@ private fun ContextSheetActionsList(
             entry = entry,
             isAudio = isAudio,
             isInQueue = isInQueue,
+            isDownloadingOffline = isDownloadingOffline,
             accentBlue = colors.accentBlue,
             accentVerdigris = colors.accentVerdigris,
             onAction = onAction,
@@ -270,6 +281,7 @@ private fun buildEntryPrimaryActions(
     entry: InboxEntry,
     isAudio: Boolean,
     isInQueue: Boolean,
+    isDownloadingOffline: Boolean,
     accentBlue: Color,
     accentVerdigris: Color,
     onAction: (MainAction) -> Unit,
@@ -321,13 +333,39 @@ private fun buildEntryPrimaryActions(
         )
     )
     add(
-        ContextActionSpec(
-            resolveOfflineActionLabel(entry, isAudio),
-            {
+        buildOfflineActionSpec(
+            entry = entry,
+            isAudio = isAudio,
+            isDownloadingOffline = isDownloadingOffline,
+            accentBlue = accentBlue,
+            onAction = onAction,
+        )
+    )
+}
+
+private fun buildOfflineActionSpec(
+    entry: InboxEntry,
+    isAudio: Boolean,
+    isDownloadingOffline: Boolean,
+    accentBlue: Color,
+    onAction: (MainAction) -> Unit,
+): ContextActionSpec {
+    val label =
+        if (isDownloadingOffline) {
+            if (isAudio) "Downloading Episode…" else "Saving Offline Copy…"
+        } else {
+            resolveOfflineActionLabel(entry, isAudio)
+        }
+    return ContextActionSpec(
+        label = label,
+        onClick = {
+            if (!isDownloadingOffline) {
                 onAction(MainAction.CloseContextSheet)
                 onAction(MainAction.ToggleOfflineCache(entry.id))
-            },
-        )
+            }
+        },
+        textColor = if (isDownloadingOffline) accentBlue else null,
+        isLoading = isDownloadingOffline,
     )
 }
 
@@ -362,6 +400,7 @@ fun FeedContextBottomSheet(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             FeedContextHeaderRow(feed = feed)
+            FeedHealthDetailsCard(feed = feed, onAction = onAction)
             FeedRenameRow(feed = feed, onAction = onAction)
             FeedPodcastSettingsSection(feed = feed, onAction = onAction)
             FeedBulkTagRow(feed = feed, availableTags = availableTags, onAction = onAction)
@@ -621,25 +660,134 @@ private fun DestructiveConfirmDialog(
 }
 
 @Composable
+private fun FeedHealthDetailsCard(
+    feed: FeedItem,
+    onAction: (MainAction) -> Unit,
+) {
+    val lastPolledLabel = remember(feed.lastPolled) { formatFeedPolledLabel(feed.lastPolled) }
+    val errorText = feed.lastError?.trim()?.takeIf { it.isNotEmpty() }
+    if (errorText == null && feed.lastPolled.isNullOrBlank()) return
+
+    RocheSurfaceCard {
+        Column(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 11.dp)
+                    .testTag("feed_health_card_${feed.id}"),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            FeedHealthHeaderRow(
+                lastPolledLabel = lastPolledLabel,
+                consecutiveFailures = feed.consecutiveFailures,
+            )
+            if (errorText != null) {
+                FeedHealthErrorBlock(feed = feed, errorText = errorText, onAction = onAction)
+            }
+        }
+    }
+}
+
+@Composable
+private fun FeedHealthHeaderRow(
+    lastPolledLabel: String,
+    consecutiveFailures: Int,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "Last polled: $lastPolledLabel",
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+        )
+        if (consecutiveFailures > 0) {
+            val failWord = if (consecutiveFailures == 1) "failure" else "failures"
+            Text(
+                text = "$consecutiveFailures $failWord",
+                color = colors.accentIndianRed,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FeedHealthErrorBlock(
+    feed: FeedItem,
+    errorText: String,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Text(
+        text = errorText,
+        color = colors.accentIndianRed,
+        fontSize = 12.sp,
+        lineHeight = 17.sp,
+        modifier = Modifier.testTag("feed_full_error_text"),
+    )
+    if (!feed.isArchived) {
+        HeaderActionButton(
+            label = "Retry Now",
+            style = RocheButtonStyle.PRIMARY,
+            onClick = {
+                onAction(MainAction.CloseFeedContextSheet)
+                onAction(MainAction.RefreshFeed(feed.id))
+            },
+            modifier = Modifier.testTag("feed_retry_now_btn"),
+        )
+    }
+}
+
+private fun formatFeedPolledLabel(lastPolledIso: String?): String {
+    val parsed = parseIsoInstant(lastPolledIso) ?: return "Never"
+    val elapsedSecs =
+        java.time.Duration.between(parsed, java.time.Instant.now()).seconds.coerceAtLeast(0L)
+    return when {
+        elapsedSecs < SECONDS_PER_MINUTE -> "just now"
+        elapsedSecs < SECONDS_PER_HOUR -> "${elapsedSecs / SECONDS_PER_MINUTE}m ago"
+        elapsedSecs < SECONDS_PER_DAY -> "${elapsedSecs / SECONDS_PER_HOUR}h ago"
+        else -> "${elapsedSecs / SECONDS_PER_DAY}d ago"
+    }
+}
+
+@Composable
 private fun ContextActionItem(
     label: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     textColor: Color = LocalRocheColors.current.textPrimary,
+    isLoading: Boolean = false,
 ) {
-    Text(
-        text = label,
-        color = textColor,
-        fontSize = 14.sp,
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
         modifier =
             modifier
                 .fillMaxWidth()
                 .heightIn(min = 48.dp)
-                .clickable(onClick = onClick)
+                .clickable(enabled = !isLoading, onClick = onClick)
                 .semantics { role = Role.Button }
                 .padding(vertical = 13.dp, horizontal = 16.dp),
-    )
+    ) {
+        if (isLoading) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                strokeWidth = 2.dp,
+                color = textColor,
+            )
+        }
+        Text(text = label, color = textColor, fontSize = 14.sp)
+    }
 }
+
+private const val SECONDS_PER_MINUTE = 60L
+private const val SECONDS_PER_HOUR = 3_600L
+private const val SECONDS_PER_DAY = 86_400L
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

@@ -158,8 +158,8 @@ enum class CollectionRole(val wireValue: String) {
 
 enum class ConsumptionStatus(val wireValue: String, val displayLabel: String) {
     STARTED("started", "Started"),
-    CONSUMED("consumed", "Consumed"),
-    ABANDONED("abandoned", "Abandoned");
+    CONSUMED("consumed", "Finished"),
+    ABANDONED("abandoned", "Skipped");
 
     companion object {
         fun fromWireValue(raw: String?): ConsumptionStatus = fromWireValueOrNull(raw) ?: CONSUMED

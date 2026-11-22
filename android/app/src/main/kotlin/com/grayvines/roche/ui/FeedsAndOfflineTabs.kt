@@ -32,10 +32,12 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -50,6 +52,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
@@ -71,7 +74,9 @@ import com.grayvines.roche.ui.components.FilterFunnelIcon
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.PredictiveBackDrawerContainer
 import com.grayvines.roche.ui.components.RefreshIcon
+import com.grayvines.roche.ui.components.RocheAlertDialog
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheMetaPill
 import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
 import com.grayvines.roche.ui.components.RocheStripTab
 import com.grayvines.roche.ui.components.RocheSurfaceCard
@@ -80,6 +85,7 @@ import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.SortArrowsIcon
 import com.grayvines.roche.ui.components.UnpinnedTabBackButton
+import com.grayvines.roche.ui.components.formatHumanByteSize
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
@@ -161,6 +167,7 @@ fun FeedsAndTagsTabContent(
     ) {
         SubscribedFeedsCardList(
             feeds = derived.visibleFeeds,
+            refreshingFeedIds = state.refreshingFeedIds,
             hasActiveFeeds = state.activeFeeds.isNotEmpty(),
             archivedCount = state.archivedFeeds.size,
             showArchived = showArchived,
@@ -569,9 +576,11 @@ private fun sortFeeds(feeds: List<FeedItem>, sortOrder: FeedSortOrder): List<Fee
     }
 }
 
+@Suppress("LongParameterList")
 @Composable
 private fun SubscribedFeedsCardList(
     feeds: List<FeedItem>,
+    refreshingFeedIds: Set<String>,
     hasActiveFeeds: Boolean,
     archivedCount: Int,
     showArchived: Boolean,
@@ -580,12 +589,14 @@ private fun SubscribedFeedsCardList(
     onAction: (MainAction) -> Unit,
     scrollState: ScrollState = rememberScrollState(),
 ) {
-    val colors = LocalRocheColors.current
+    val activeRows = remember(feeds) { feeds.filter { !it.isArchived } }
+    val archivedRows = remember(feeds) { feeds.filter { it.isArchived } }
     Column(
         modifier =
             Modifier.fillMaxSize()
                 .verticalScroll(scrollState)
-                .padding(horizontal = 14.dp, vertical = 14.dp)
+                .padding(horizontal = 14.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         if (feeds.isEmpty()) {
             FeedsEmptyState(
@@ -596,34 +607,83 @@ private fun SubscribedFeedsCardList(
                 onShowArchived = onShowArchived,
             )
         } else {
-            RocheSurfaceCard {
-                feeds.forEachIndexed { index, feed ->
-                    if (index > 0) {
-                        HorizontalDivider(
-                            color = colors.border,
-                            thickness = 1.dp,
-                            modifier = Modifier.padding(start = 52.dp),
-                        )
-                    }
-                    if (feed.isArchived) {
-                        ArchivedFeedRow(
-                            feed = feed,
-                            onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
-                            onLongPress = { onAction(MainAction.OpenFeedContextSheet(feed.id)) },
-                            onUnarchive = { onAction(MainAction.ToggleFeedArchive(feed.id)) },
-                        )
-                    } else {
-                        SubscribedFeedRow(
-                            feed = feed,
-                            onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
-                            onLongPress = { onAction(MainAction.OpenFeedContextSheet(feed.id)) },
-                            onRefresh = { onAction(MainAction.RefreshFeed(feed.id)) },
-                        )
-                    }
-                }
+            if (activeRows.isNotEmpty()) {
+                ActiveFeedsCardSection(
+                    feeds = activeRows,
+                    refreshingFeedIds = refreshingFeedIds,
+                    onAction = onAction,
+                )
+            }
+            if (archivedRows.isNotEmpty()) {
+                ArchivedFeedsCardSection(feeds = archivedRows, onAction = onAction)
             }
         }
         Spacer(modifier = Modifier.height(72.dp))
+    }
+}
+
+@Composable
+private fun ActiveFeedsCardSection(
+    feeds: List<FeedItem>,
+    refreshingFeedIds: Set<String>,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    RocheSurfaceCard {
+        feeds.forEachIndexed { index, feed ->
+            if (index > 0) {
+                HorizontalDivider(
+                    color = colors.border,
+                    thickness = 1.dp,
+                    modifier = Modifier.padding(start = 52.dp),
+                )
+            }
+            SubscribedFeedRow(
+                feed = feed,
+                isRefreshing = feed.id in refreshingFeedIds,
+                onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+                onOpenMenu = { onAction(MainAction.OpenFeedContextSheet(feed.id)) },
+                onRefresh = { onAction(MainAction.RefreshFeed(feed.id)) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ArchivedFeedsCardSection(
+    feeds: List<FeedItem>,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            text = "ARCHIVED FEEDS (${feeds.size})",
+            color = colors.textMuted,
+            fontSize = 10.5.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.8.sp,
+            modifier =
+                Modifier.padding(horizontal = 4.dp)
+                    .semantics { heading() }
+                    .testTag("archived_feeds_section_header"),
+        )
+        RocheSurfaceCard {
+            feeds.forEachIndexed { index, feed ->
+                if (index > 0) {
+                    HorizontalDivider(
+                        color = colors.border,
+                        thickness = 1.dp,
+                        modifier = Modifier.padding(start = 52.dp),
+                    )
+                }
+                ArchivedFeedRow(
+                    feed = feed,
+                    onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+                    onOpenMenu = { onAction(MainAction.OpenFeedContextSheet(feed.id)) },
+                    onUnarchive = { onAction(MainAction.ToggleFeedArchive(feed.id)) },
+                )
+            }
+        }
     }
 }
 
@@ -673,7 +733,7 @@ private fun FeedsEmptyState(
 private fun ArchivedFeedRow(
     feed: FeedItem,
     onClick: () -> Unit,
-    onLongPress: () -> Unit,
+    onOpenMenu: () -> Unit,
     onUnarchive: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -686,9 +746,9 @@ private fun ArchivedFeedRow(
     Row(
         modifier =
             Modifier.fillMaxWidth()
-                .combinedClickable(onClick = onClick, onLongClick = onLongPress)
+                .combinedClickable(onClick = onClick, onLongClick = onOpenMenu)
                 .semantics { role = Role.Button }
-                .padding(vertical = 10.dp, horizontal = 12.dp)
+                .padding(start = 12.dp, end = 4.dp, top = 10.dp, bottom = 10.dp)
                 .testTag("archived_feed_row_${feed.id}"),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
@@ -699,13 +759,23 @@ private fun ArchivedFeedRow(
             subtitle = subtitle,
             errorText = null,
             isArchived = true,
-            modifier = Modifier.weight(1f).padding(end = 10.dp),
+            modifier = Modifier.weight(1f).padding(end = 8.dp),
         )
-        HeaderActionButton(
-            label = "Unarchive",
-            onClick = onUnarchive,
-            modifier = Modifier.testTag("unarchive_feed_${feed.id}"),
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            HeaderActionButton(
+                label = "Unarchive",
+                onClick = onUnarchive,
+                modifier = Modifier.testTag("unarchive_feed_${feed.id}"),
+            )
+            RocheIconActionButton(
+                contentDescription = "Feed options for ${feed.title}",
+                onClick = onOpenMenu,
+                outlined = false,
+                modifier = Modifier.testTag("feed_more_${feed.id}"),
+            ) {
+                Text(text = "⋯", color = colors.textSecondary, fontSize = 18.sp)
+            }
+        }
     }
 }
 
@@ -713,17 +783,18 @@ private fun ArchivedFeedRow(
 @Composable
 private fun SubscribedFeedRow(
     feed: FeedItem,
+    isRefreshing: Boolean,
     onClick: () -> Unit,
-    onLongPress: () -> Unit,
+    onOpenMenu: () -> Unit,
     onRefresh: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
     Row(
         modifier =
             Modifier.fillMaxWidth()
-                .combinedClickable(onClick = onClick, onLongClick = onLongPress)
+                .combinedClickable(onClick = onClick, onLongClick = onOpenMenu)
                 .semantics { role = Role.Button }
-                .padding(vertical = 10.dp, horizontal = 12.dp)
+                .padding(start = 12.dp, end = 4.dp, top = 10.dp, bottom = 10.dp)
                 .testTag("feed_row_${feed.id}"),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
@@ -734,9 +805,14 @@ private fun SubscribedFeedRow(
             subtitle = feed.displayDomain,
             errorText = feed.lastError?.takeIf { feed.hasPollError },
             isArchived = false,
-            modifier = Modifier.weight(1f).padding(end = 10.dp),
+            modifier = Modifier.weight(1f).padding(end = 8.dp),
         )
-        SubscribedFeedTrailingActions(feed = feed, onRefresh = onRefresh)
+        SubscribedFeedTrailingActions(
+            feed = feed,
+            isRefreshing = isRefreshing,
+            onRefresh = onRefresh,
+            onOpenMenu = onOpenMenu,
+        )
     }
 }
 
@@ -859,11 +935,13 @@ private fun ArchivedFeedBadge() {
 @Composable
 internal fun SubscribedFeedTrailingActions(
     feed: FeedItem,
+    isRefreshing: Boolean = false,
     onRefresh: () -> Unit,
+    onOpenMenu: (() -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
     Row(
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (feed.unreadCount > 0) {
@@ -883,12 +961,31 @@ internal fun SubscribedFeedTrailingActions(
             }
         }
         RocheIconActionButton(
-            contentDescription = "Refresh ${feed.title}",
-            onClick = onRefresh,
+            contentDescription =
+                if (isRefreshing) "Refreshing ${feed.title}" else "Refresh ${feed.title}",
+            onClick = { if (!isRefreshing) onRefresh() },
             outlined = false,
             modifier = Modifier.testTag("refresh_feed_${feed.id}"),
         ) {
-            RefreshIcon(tint = colors.textMuted, size = 16.dp)
+            if (isRefreshing) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(15.dp),
+                    strokeWidth = 1.8.dp,
+                    color = colors.accentBlue,
+                )
+            } else {
+                RefreshIcon(tint = colors.textMuted, size = 16.dp)
+            }
+        }
+        if (onOpenMenu != null) {
+            RocheIconActionButton(
+                contentDescription = "Feed options for ${feed.title}",
+                onClick = onOpenMenu,
+                outlined = false,
+                modifier = Modifier.testTag("feed_more_${feed.id}"),
+            ) {
+                Text(text = "⋯", color = colors.textSecondary, fontSize = 18.sp)
+            }
         }
     }
 }
@@ -901,44 +998,145 @@ fun OfflineTabContent(
 ) {
     val colors = LocalRocheColors.current
     val offlineEntries = state.offlineEntries
+    val downloadingOnly =
+        remember(state.inFlightOfflineEntryIds, state.entryById, offlineEntries) {
+            val cachedIds = offlineEntries.mapTo(HashSet()) { it.id }
+            state.inFlightOfflineEntryIds.mapNotNull { id ->
+                if (id in cachedIds) null else state.entryById[id]
+            }
+        }
+    val playedCount =
+        remember(offlineEntries) { offlineEntries.count(::isPlayedOrReadOfflineEntry) }
+    var confirmRemovePlayed by rememberSaveable { mutableStateOf(false) }
 
     RocheRefreshableTabScaffold(
         isRefreshing = state.isManualRefreshing,
         onRefresh = { onAction(MainAction.ManualRefresh) },
         pullToRefreshTestTag = "offline_pull_to_refresh",
         header = {
-            OfflineTopHeaderBar(state = state, count = offlineEntries.size, onAction = onAction)
-        },
-    ) {
-        if (offlineEntries.isEmpty()) {
-            Box(
-                modifier =
-                    Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(32.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    "No offline entries cached on this device.",
-                    color = colors.textMuted,
-                    fontSize = 13.sp,
+            OfflineTopHeaderBar(
+                state = state,
+                count = offlineEntries.size,
+                onAction = onAction,
+            )
+            if (offlineEntries.isNotEmpty() || state.totalOfflineCacheBytes > 0L) {
+                OfflineVaultSubHeader(
+                    totalBytes = state.totalOfflineCacheBytes,
+                    playedCount = playedCount,
+                    onRemovePlayed = { confirmRemovePlayed = true },
                 )
             }
+        },
+    ) {
+        if (offlineEntries.isEmpty() && downloadingOnly.isEmpty()) {
+            OfflineVaultEmptyState()
         } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
-                contentPadding = PaddingValues(top = 4.dp, bottom = 96.dp),
-            ) {
-                items(items = offlineEntries, key = { it.id }) { entry ->
-                    OfflineVaultEntryRow(
-                        entry = entry,
-                        onOpen = { onAction(MainAction.OpenReader(entry.id)) },
-                        onEvict = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
-                    )
-                    HorizontalDivider(color = colors.border, thickness = 1.dp)
-                }
-            }
+            OfflineVaultListBody(
+                downloadingOnly = downloadingOnly,
+                offlineEntries = offlineEntries,
+                state = state,
+                listState = listState,
+                onAction = onAction,
+            )
         }
     }
+    if (confirmRemovePlayed) {
+        OfflineRemovePlayedDialog(
+            playedCount = playedCount,
+            onDismiss = { confirmRemovePlayed = false },
+            onConfirm = {
+                confirmRemovePlayed = false
+                onAction(MainAction.EvictPlayedOfflineEntries)
+            },
+        )
+    }
+}
+
+@Composable
+private fun OfflineVaultEmptyState() {
+    val colors = LocalRocheColors.current
+    Box(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(32.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            "No offline entries cached on this device.",
+            color = colors.textMuted,
+            fontSize = 13.sp,
+        )
+    }
+}
+
+@Composable
+private fun OfflineVaultListBody(
+    downloadingOnly: List<InboxEntry>,
+    offlineEntries: List<InboxEntry>,
+    state: MainUiState,
+    listState: LazyListState,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    LazyColumn(
+        state = listState,
+        modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        contentPadding = PaddingValues(top = 4.dp, bottom = 96.dp),
+    ) {
+        if (downloadingOnly.isNotEmpty()) {
+            items(items = downloadingOnly, key = { "dl_${it.id}" }) { entry ->
+                OfflineVaultEntryRow(
+                    entry = entry,
+                    cachedBytes = null,
+                    isDownloading = true,
+                    isPlayedOrRead = isPlayedOrReadOfflineEntry(entry),
+                    onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                    onRemove = {},
+                )
+                HorizontalDivider(color = colors.border, thickness = 1.dp)
+            }
+        }
+        items(items = offlineEntries, key = { it.id }) { entry ->
+            OfflineVaultEntryRow(
+                entry = entry,
+                cachedBytes = state.offlineBytesByEntryId[entry.id],
+                isDownloading = entry.id in state.inFlightOfflineEntryIds,
+                isPlayedOrRead = isPlayedOrReadOfflineEntry(entry),
+                onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                onRemove = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
+            )
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+        }
+    }
+}
+
+@Composable
+private fun OfflineRemovePlayedDialog(
+    playedCount: Int,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val noun = if (playedCount == 1) "item" else "items"
+    RocheAlertDialog(
+        title = "Remove played downloads?",
+        onDismissRequest = onDismiss,
+        text = {
+            Text(
+                text = "Free device storage by removing $playedCount played or read offline $noun?",
+                color = colors.textSecondary,
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onConfirm,
+                modifier = Modifier.testTag("offline_confirm_remove_played_btn"),
+            ) {
+                Text("Remove", color = colors.accentIndianRed)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = colors.textSecondary) }
+        },
+    )
 }
 
 @Composable
@@ -970,40 +1168,129 @@ private fun OfflineTopHeaderBar(
 }
 
 @Composable
-private fun OfflineVaultEntryRow(
-    entry: InboxEntry,
-    onOpen: () -> Unit,
-    onEvict: () -> Unit,
+private fun OfflineVaultSubHeader(
+    totalBytes: Long,
+    playedCount: Int,
+    onRemovePlayed: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily = currentHeadlineFontFamily()
+    val sizeSummary = buildString {
+        append(if (totalBytes > 0L) "${formatHumanByteSize(totalBytes)} cached" else "Cached")
+        if (playedCount > 0) {
+            append(" · ")
+            append("$playedCount played")
+        }
+    }
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 6.dp)
+                .testTag("offline_vault_subheader"),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = sizeSummary,
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.5.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f).padding(end = 8.dp),
+        )
+        if (playedCount > 0) {
+            HeaderActionButton(
+                label = "Remove Played ($playedCount)",
+                horizontalPadding = 10.dp,
+                onClick = onRemovePlayed,
+                modifier = Modifier.testTag("offline_remove_played_btn"),
+            )
+        }
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+}
+
+@Suppress("LongParameterList")
+@Composable
+private fun OfflineVaultEntryRow(
+    entry: InboxEntry,
+    cachedBytes: Long?,
+    isDownloading: Boolean,
+    isPlayedOrRead: Boolean,
+    onOpen: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
     Row(
         modifier =
             Modifier.fillMaxWidth()
                 .clickable(onClick = onOpen)
                 .semantics { role = Role.Button }
-                .padding(vertical = 12.dp),
+                .padding(vertical = 12.dp)
+                .testTag("offline_row_${entry.id}"),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(
-                text = entry.title,
-                color = colors.textPrimary,
-                fontFamily = headlineFamily,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Normal,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+        OfflineVaultMetaColumn(
+            entry = entry,
+            cachedBytes = cachedBytes,
+            isPlayedOrRead = isPlayedOrRead,
+            modifier = Modifier.weight(1f).padding(end = 12.dp),
+        )
+        if (isDownloading) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(18.dp).testTag("offline_downloading_${entry.id}"),
+                strokeWidth = 2.dp,
+                color = colors.accentBlue,
             )
+        } else {
+            HeaderActionButton(
+                label = "Remove",
+                onClick = onRemove,
+                modifier = Modifier.testTag("offline_remove_${entry.id}"),
+            )
+        }
+    }
+}
+
+@Composable
+private fun OfflineVaultMetaColumn(
+    entry: InboxEntry,
+    cachedBytes: Long?,
+    isPlayedOrRead: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val sizePart =
+        cachedBytes?.takeIf { it > 0L }?.let { " · ${formatHumanByteSize(it)}" }.orEmpty()
+    val playedLabel =
+        if (entry.contentType == com.grayvines.roche.model.ContentType.AUDIO) "Played" else "Read"
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Text(
+            text = entry.title,
+            color = colors.textPrimary,
+            fontFamily = currentHeadlineFontFamily(),
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (isPlayedOrRead) {
+                RocheMetaPill(text = playedLabel, textColor = colors.accentVerdigris)
+            }
             Text(
-                text =
-                    "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
+                text = "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()}$sizePart",
                 color = colors.textMuted,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
             )
         }
-        HeaderActionButton(label = "Evict", onClick = onEvict)
     }
 }

@@ -4,7 +4,6 @@ package com.grayvines.roche.ui
 
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -67,13 +66,15 @@ import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheMetaPill
 import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
 import com.grayvines.roche.ui.components.RocheStripTab
-import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.components.StarIcon
+import com.grayvines.roche.ui.components.TierBadgePill
 import com.grayvines.roche.ui.components.UnpinnedTabBackButton
+import com.grayvines.roche.ui.components.lazyGroupedCardRow
 import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
@@ -114,22 +115,43 @@ private fun buildOrderedStarredRows(state: MainUiState): List<StarredDisplayRow>
     }
 }
 
-private fun matchesStarredTypeFilter(row: StarredDisplayRow, filter: ContentType?): Boolean {
-    if (filter == null) return true
-    return when (row) {
-        is StarredDisplayRow.ReaderRow -> row.entry.contentType == filter
+private enum class StarredFilterTab(
+    val label: String,
+    val emptyPluralLabel: String,
+    val testTag: String,
+) {
+    ALL("All", "items", "starred_filter_all"),
+    ARTICLES("Articles", "articles", "starred_filter_articles"),
+    PAPERS("Papers", "papers", "starred_filter_papers"),
+    VIDEOS("Videos", "videos", "starred_filter_videos"),
+    PODCASTS("Podcasts", "podcasts", "starred_filter_podcasts"),
+    CATALOG("Catalog", "catalog items", "starred_filter_catalog"),
+}
+
+private fun matchesStarredFilter(row: StarredDisplayRow, filter: StarredFilterTab): Boolean =
+    when (filter) {
+        StarredFilterTab.ALL -> true
+        StarredFilterTab.CATALOG -> row is StarredDisplayRow.CatalogRow
+        StarredFilterTab.ARTICLES -> matchesStarredContentType(row, ContentType.ARTICLE)
+        StarredFilterTab.PAPERS -> matchesStarredContentType(row, ContentType.PDF)
+        StarredFilterTab.VIDEOS -> matchesStarredContentType(row, ContentType.VIDEO)
+        StarredFilterTab.PODCASTS -> matchesStarredContentType(row, ContentType.AUDIO)
+    }
+
+private fun matchesStarredContentType(row: StarredDisplayRow, target: ContentType): Boolean =
+    when (row) {
+        is StarredDisplayRow.ReaderRow -> row.entry.contentType == target
         is StarredDisplayRow.CatalogRow ->
             when (row.item.entry.kind) {
                 EntryKind.PODCAST_EPISODE,
-                EntryKind.PODCAST -> filter == ContentType.AUDIO
-                EntryKind.ARTICLE -> filter == ContentType.ARTICLE
-                EntryKind.PAPER -> filter == ContentType.PDF
+                EntryKind.PODCAST -> target == ContentType.AUDIO
+                EntryKind.ARTICLE -> target == ContentType.ARTICLE
+                EntryKind.PAPER -> target == ContentType.PDF
                 EntryKind.VIDEO,
-                EntryKind.CHANNEL -> filter == ContentType.VIDEO
+                EntryKind.CHANNEL -> target == ContentType.VIDEO
                 else -> false
             }
     }
-}
 
 @Composable
 fun StarredTabContent(
@@ -139,14 +161,14 @@ fun StarredTabContent(
     activeAudioEntryId: String? = null,
     onOpenExternalUrl: (String) -> Unit = {},
 ) {
-    var selectedTypeFilter by rememberSaveable { mutableStateOf<ContentType?>(null) }
+    var selectedFilter by rememberSaveable { mutableStateOf(StarredFilterTab.ALL) }
     val orderedRows =
         remember(state.starredEntries, state.catalog.entriesByCollectionId) {
             buildOrderedStarredRows(state)
         }
     val visibleRows =
-        remember(orderedRows, selectedTypeFilter) {
-            orderedRows.filter { matchesStarredTypeFilter(it, selectedTypeFilter) }
+        remember(orderedRows, selectedFilter) {
+            orderedRows.filter { matchesStarredFilter(it, selectedFilter) }
         }
     val totalCount = orderedRows.size
 
@@ -162,13 +184,13 @@ fun StarredTabContent(
             )
             StarredTypeFilterStrip(
                 allCount = totalCount,
-                selectedType = selectedTypeFilter,
-                onSelectType = { selectedTypeFilter = it },
+                selectedFilter = selectedFilter,
+                onSelectFilter = { selectedFilter = it },
             )
         },
     ) {
         if (visibleRows.isEmpty()) {
-            StarredEmptyPlaceholder(selectedTypeFilter = selectedTypeFilter)
+            StarredEmptyPlaceholder(selectedFilter = selectedFilter)
         } else {
             StarredEntriesList(
                 rows = visibleRows,
@@ -183,13 +205,13 @@ fun StarredTabContent(
 }
 
 @Composable
-private fun StarredEmptyPlaceholder(selectedTypeFilter: ContentType?) {
+private fun StarredEmptyPlaceholder(selectedFilter: StarredFilterTab) {
     val colors = LocalRocheColors.current
     val message =
-        if (selectedTypeFilter == null) {
-            "No starred entries yet. Tap ★ on any post or tap + to add an item to Stars."
+        if (selectedFilter == StarredFilterTab.ALL) {
+            "No starred entries yet. Tap ★ on any post or catalog item to collect favorites here."
         } else {
-            "No starred ${selectedTypeFilter.wireValue} items yet."
+            "No starred ${selectedFilter.emptyPluralLabel} yet."
         }
     Box(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(32.dp),
@@ -239,8 +261,8 @@ private fun StarredListHeaderBar(
 @Composable
 private fun StarredTypeFilterStrip(
     allCount: Int,
-    selectedType: ContentType?,
-    onSelectType: (ContentType?) -> Unit,
+    selectedFilter: StarredFilterTab,
+    onSelectFilter: (StarredFilterTab) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     Row(
@@ -251,36 +273,15 @@ private fun StarredTypeFilterStrip(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        RocheStripTab(
-            label = "All ($allCount)",
-            selected = selectedType == null,
-            onClick = { onSelectType(null) },
-            modifier = Modifier.testTag("starred_filter_all"),
-        )
-        RocheStripTab(
-            label = "Articles",
-            selected = selectedType == ContentType.ARTICLE,
-            onClick = { onSelectType(ContentType.ARTICLE) },
-            modifier = Modifier.testTag("starred_filter_articles"),
-        )
-        RocheStripTab(
-            label = "Papers",
-            selected = selectedType == ContentType.PDF,
-            onClick = { onSelectType(ContentType.PDF) },
-            modifier = Modifier.testTag("starred_filter_papers"),
-        )
-        RocheStripTab(
-            label = "Videos",
-            selected = selectedType == ContentType.VIDEO,
-            onClick = { onSelectType(ContentType.VIDEO) },
-            modifier = Modifier.testTag("starred_filter_videos"),
-        )
-        RocheStripTab(
-            label = "Podcasts",
-            selected = selectedType == ContentType.AUDIO,
-            onClick = { onSelectType(ContentType.AUDIO) },
-            modifier = Modifier.testTag("starred_filter_podcasts"),
-        )
+        StarredFilterTab.entries.forEach { tab ->
+            val label = if (tab == StarredFilterTab.ALL) "All ($allCount)" else tab.label
+            RocheStripTab(
+                label = label,
+                selected = selectedFilter == tab,
+                onClick = { onSelectFilter(tab) },
+                modifier = Modifier.testTag(tab.testTag),
+            )
+        }
     }
     HorizontalDivider(color = colors.border, thickness = 1.dp)
 }
@@ -403,15 +404,39 @@ private fun StarredCatalogEntryRow(
                 size = 38.dp,
             )
         }
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(
-                text = item.entry.title,
-                color = colors.textPrimary,
-                fontFamily = headlineFamily,
-                fontSize = 14.5.sp,
-                fontWeight = FontWeight.Normal,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
+        StarredCatalogMetaColumn(item = item, modifier = Modifier.weight(1f))
+        if (item.tier != null) {
+            TierBadgePill(tier = item.tier)
+        }
+    }
+}
+
+@Composable
+private fun StarredCatalogMetaColumn(
+    item: RankedCatalogEntry,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Text(
+            text = item.entry.title,
+            color = colors.textPrimary,
+            fontFamily = headlineFamily,
+            fontSize = 14.5.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            RocheMetaPill(
+                text = item.entry.kind.displayLabel,
+                textColor = colors.textSecondary,
+                backgroundColor = colors.surfaceElevated,
+                borderColor = colors.border,
             )
             if (item.entry.subtitleLine.isNotBlank()) {
                 Text(
@@ -420,6 +445,7 @@ private fun StarredCatalogEntryRow(
                     fontSize = 11.5.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
                 )
             }
         }
@@ -729,7 +755,6 @@ private fun WantQueueEntriesList(
     LazyColumn(
         state = listState,
         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.fillMaxSize(),
     ) {
         if (activeQueue != null) {
@@ -739,44 +764,73 @@ private fun WantQueueEntriesList(
                     canPrioritize = entries.size >= 2,
                     onAction = onAction,
                 )
+                Spacer(modifier = Modifier.height(8.dp))
             }
         }
-        item(key = "want_card_${activeQueue?.collectionId ?: "all"}") {
-            RocheSurfaceCard {
-                entries.forEachIndexed { idx, item ->
-                    if (idx > 0) {
-                        HorizontalDivider(color = colors.border, thickness = 1.dp)
-                    }
-                    val onOpen =
-                        resolveCatalogEntryOpenAction(
-                            entryId = item.entry.id,
-                            externalUrl = item.entry.url,
-                            readableIds = readableIds,
-                            onOpenReader = { onAction(MainAction.OpenReader(it)) },
-                            onOpenExternalUrl = onOpenExternalUrl,
-                            entryKind = item.entry.kind,
-                            onOpenCatalogDetail = {
-                                onAction(MainAction.OpenCatalogDetailSheet(it))
-                            },
-                        )
-                    WantQueueRow(
-                        item = item,
-                        onOpen = onOpen,
-                        onComplete = {
-                            onAction(
-                                MainAction.CompleteWantEntry(item.entry.id, rankImmediately = true)
-                            )
-                        },
-                        onRemove = {
-                            activeQueue?.collectionId?.let { qId ->
-                                onAction(MainAction.RemoveWantEntry(qId, item.entry.id))
-                            }
-                        },
-                    )
+        itemsIndexed(
+            items = entries,
+            key = { _, item -> "${activeQueue?.collectionId ?: "all"}_${item.entry.id}" },
+        ) { idx, item ->
+            WantQueueLazyRowItem(
+                item = item,
+                activeQueue = activeQueue,
+                readableIds = readableIds,
+                isFirst = idx == 0,
+                isLast = idx == entries.lastIndex,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+                colors = colors,
+            )
+        }
+        item(key = "want_bottom_spacer") { Spacer(modifier = Modifier.height(72.dp)) }
+    }
+}
+
+@Suppress("LongParameterList")
+@Composable
+private fun WantQueueLazyRowItem(
+    item: RankedCatalogEntry,
+    activeQueue: CatalogListSummary?,
+    readableIds: Set<String>,
+    isFirst: Boolean,
+    isLast: Boolean,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+    colors: com.grayvines.roche.ui.theme.RocheColors,
+) {
+    val onOpen =
+        resolveCatalogEntryOpenAction(
+            entryId = item.entry.id,
+            externalUrl = item.entry.url,
+            readableIds = readableIds,
+            onOpenReader = { onAction(MainAction.OpenReader(it)) },
+            onOpenExternalUrl = onOpenExternalUrl,
+            entryKind = item.entry.kind,
+            onOpenCatalogDetail = { onAction(MainAction.OpenCatalogDetailSheet(it)) },
+        )
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .lazyGroupedCardRow(
+                    isFirst = isFirst,
+                    isLast = isLast,
+                    surfaceColor = colors.surface,
+                    borderColor = colors.border,
+                )
+    ) {
+        if (!isFirst) HorizontalDivider(color = colors.border, thickness = 1.dp)
+        WantQueueRow(
+            item = item,
+            onOpen = onOpen,
+            onComplete = {
+                onAction(MainAction.CompleteWantEntry(item.entry.id, rankImmediately = true))
+            },
+            onRemove = {
+                activeQueue?.collectionId?.let { qId ->
+                    onAction(MainAction.RemoveWantEntry(qId, item.entry.id))
                 }
-            }
-        }
-        item { Spacer(modifier = Modifier.height(72.dp)) }
+            },
+        )
     }
 }
 
@@ -826,6 +880,7 @@ private fun WantQueueSectionHeader(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun WantQueueRow(
     item: RankedCatalogEntry,
@@ -836,22 +891,21 @@ private fun WantQueueRow(
     val colors = LocalRocheColors.current
     val headlineFamily = currentHeadlineFontFamily()
     val meta = remember(item.entry) { buildWantMetaLine(item) }
-    val clickMod =
-        if (onOpen != null) {
-            Modifier.clickable(onClick = onOpen).semantics { role = Role.Button }
-        } else {
-            Modifier
-        }
+    var menuExpanded by rememberSaveable(item.entry.id) { mutableStateOf(false) }
 
     Row(
         modifier =
             Modifier.fillMaxWidth()
                 .heightIn(min = 52.dp)
-                .then(clickMod)
-                .padding(horizontal = 12.dp, vertical = 9.dp)
+                .combinedClickable(
+                    onClick = onOpen ?: { menuExpanded = true },
+                    onLongClick = { menuExpanded = true },
+                )
+                .semantics { role = Role.Button }
+                .padding(start = 12.dp, end = 4.dp, top = 9.dp, bottom = 9.dp)
                 .testTag("want_row_${item.entry.id}"),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text(
             text = item.rank.toString(),
@@ -882,12 +936,61 @@ private fun WantQueueRow(
             }
         }
         HeaderActionButton(label = "✓ Done", onClick = onComplete, horizontalPadding = 10.dp)
+        WantQueueRowOverflowMenu(
+            entryId = item.entry.id,
+            title = item.entry.title,
+            expanded = menuExpanded,
+            onExpandedChange = { menuExpanded = it },
+            onComplete = onComplete,
+            onRemove = onRemove,
+        )
+    }
+}
+
+@Composable
+private fun WantQueueRowOverflowMenu(
+    entryId: String,
+    title: String,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    onComplete: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Box {
         RocheIconActionButton(
-            contentDescription = "Remove ${item.entry.title} from want queue",
+            contentDescription = "Options for $title",
             outlined = false,
-            onClick = onRemove,
+            onClick = { onExpandedChange(true) },
+            modifier = Modifier.testTag("want_more_btn_$entryId"),
         ) {
-            Text(text = "✕", color = colors.textMuted, fontSize = 13.sp)
+            Text(
+                text = "⋯",
+                color = colors.textSecondary,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { onExpandedChange(false) },
+            containerColor = colors.surfaceElevated,
+        ) {
+            DropdownMenuItem(
+                text = { Text("Finish & Rank", color = colors.textPrimary) },
+                onClick = {
+                    onExpandedChange(false)
+                    onComplete()
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Remove from Want Queue", color = colors.accentIndianRed) },
+                onClick = {
+                    onExpandedChange(false)
+                    onRemove()
+                },
+                modifier = Modifier.testTag("want_remove_item_$entryId"),
+            )
         }
     }
 }

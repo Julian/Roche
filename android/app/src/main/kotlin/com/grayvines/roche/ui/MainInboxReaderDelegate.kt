@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.first
 @Suppress("TooManyFunctions")
 internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
     internal val inFlightStarCounts = mutableMapOf<String, Int>()
+    private val queueDelegate = MainQueueActionsDelegate(host)
 
     internal suspend fun execute(action: MainAction.InboxReaderMutation) {
         when (action) {
@@ -34,6 +35,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
             is MainAction.ToggleReadState -> performToggleReadState(action.entryId)
             is MainAction.ToggleOfflineCache -> performToggleOffline(action.entryId)
             is MainAction.CacheEntryOffline -> performCacheOffline(action.entryId)
+            MainAction.EvictPlayedOfflineEntries -> performEvictPlayedOffline(host)
             is MainAction.ToggleTagOnEntry ->
                 host.repository.toggleTagOnItem(itemId = action.entryId, tagName = action.tagName)
             is MainAction.UpdateReadProgress ->
@@ -106,12 +108,12 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                 performSetFeedAutoDownload(action.feedId, action.enabled)
             is MainAction.SetFeedPlaybackSpeed ->
                 performSetFeedPlaybackSpeed(action.feedId, action.speed)
-            is MainAction.ToggleQueueMembership -> performToggleQueueMembership(action.entryId)
-            is MainAction.AddToQueue -> performAddToQueue(action.entryId, action.playNext)
+            is MainAction.ToggleQueueMembership -> queueDelegate.toggleMembership(action.entryId)
+            is MainAction.AddToQueue -> queueDelegate.addToQueue(action.entryId, action.playNext)
             is MainAction.RemoveFromQueue ->
-                performRemoveFromQueue(action.entryId, showBanner = true)
-            is MainAction.MoveQueueItemUp -> performMoveQueueItemUp(action.entryId)
-            is MainAction.MoveQueueItemToTop -> performMoveQueueItemToTop(action.entryId)
+                queueDelegate.removeFromQueue(action.entryId, showBanner = true)
+            is MainAction.MoveQueueItemUp -> queueDelegate.moveUp(action.entryId)
+            is MainAction.MoveQueueItemToTop -> queueDelegate.moveToTop(action.entryId)
         }
     }
 
@@ -555,17 +557,19 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
             host.playerController.setPlaybackSpeed(clamped)
         }
     }
+}
 
-    private suspend fun performToggleQueueMembership(entryId: String) {
+internal class MainQueueActionsDelegate(private val host: InboxReaderHost) {
+    suspend fun toggleMembership(entryId: String) {
         val inQueue = entryId in host.settingsRepository.settings.first().queueItemIds
         if (inQueue) {
-            performRemoveFromQueue(entryId, showBanner = true)
+            removeFromQueue(entryId, showBanner = true)
         } else {
-            performAddToQueue(entryId, playNext = false)
+            addToQueue(entryId, playNext = false)
         }
     }
 
-    private suspend fun performAddToQueue(entryId: String, playNext: Boolean) {
+    suspend fun addToQueue(entryId: String, playNext: Boolean) {
         val activeAudioId = host.playerController.state.value.currentEntryId
         host.settingsRepository.update { current ->
             val withoutTarget = current.queueItemIds.filterNot { it == entryId }.toMutableList()
@@ -587,7 +591,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         host.showStatusMessage(if (playNext) "Queued to play next" else "Added to Queue")
     }
 
-    private suspend fun performRemoveFromQueue(entryId: String, showBanner: Boolean) {
+    suspend fun removeFromQueue(entryId: String, showBanner: Boolean) {
         var previousIndex = -1
         host.settingsRepository.update { current ->
             previousIndex = current.queueItemIds.indexOf(entryId)
@@ -615,7 +619,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         }
     }
 
-    private suspend fun performMoveQueueItemUp(entryId: String) {
+    suspend fun moveUp(entryId: String) {
         host.settingsRepository.update { current ->
             val list = current.queueItemIds.toMutableList()
             val idx = list.indexOf(entryId)
@@ -629,7 +633,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         host.playbackOrchestrator.syncActivePlayerQueueState(host.playerController)
     }
 
-    private suspend fun performMoveQueueItemToTop(entryId: String) {
+    suspend fun moveToTop(entryId: String) {
         val activeAudioId = host.playerController.state.value.currentEntryId
         host.settingsRepository.update { current ->
             val withoutTarget = current.queueItemIds.filterNot { it == entryId }.toMutableList()
@@ -646,3 +650,27 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         host.showStatusMessage("Moved to top of Queue")
     }
 }
+
+internal suspend fun performEvictPlayedOffline(host: InboxReaderHost) {
+    val targets =
+        host.latestEntries().filter { it.isCachedOffline && isPlayedOrReadOfflineEntry(it) }
+    if (targets.isEmpty()) {
+        host.showStatusMessage("No played or read offline copies to remove")
+        return
+    }
+    var removedCount = 0
+    for (entry in targets) {
+        runSuspendCatching { host.repository.removeOfflineCache(entry.id) }
+            .onSuccess { removedCount += 1 }
+    }
+    host.refreshOfflineSizes()
+    val noun = if (removedCount == 1) "copy" else "copies"
+    host.showStatusMessage("Removed $removedCount played/read offline $noun")
+}
+
+internal fun isPlayedOrReadOfflineEntry(entry: InboxEntry): Boolean =
+    entry.isArchived ||
+        entry.isRead ||
+        entry.contentType == ContentType.AUDIO && entry.readProgress >= PLAYED_OFFLINE_THRESHOLD
+
+private const val PLAYED_OFFLINE_THRESHOLD = 0.90

@@ -12,8 +12,21 @@ import kotlinx.coroutines.sync.withLock
 @Suppress("TooManyFunctions")
 internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
     private val catalogActionMutex = Mutex()
+    private val rankDelegate = MainRankSessionDelegate(host)
 
-    internal suspend fun execute(action: MainAction.CatalogMutation) = catalogActionMutex.withLock {
+    internal suspend fun execute(action: MainAction.CatalogMutation) {
+        if (action is MainAction.RefreshCatalogEntryMetadata) {
+            performRefreshCatalogMetadata(action.entryId)
+            return
+        }
+        catalogActionMutex.withLock {
+            if (!executeRankOrDraw(action)) {
+                executeCatalogEntryOrList(action)
+            }
+        }
+    }
+
+    private suspend fun executeRankOrDraw(action: MainAction.CatalogMutation): Boolean {
         when (action) {
             is MainAction.SetCollectionGeneratorEnabled ->
                 performToggleGenerator(action.collectionIdOrSlug, action.enabled)
@@ -21,9 +34,25 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
             is MainAction.ConfirmAbandonDraw ->
                 performAbandonDraw(action.collectionId, action.notes)
             is MainAction.StartRankingSession ->
-                performStartRankingSession(action.collectionIdOrSlug, action.focusEntryId)
-            is MainAction.SubmitRankCluster -> performSubmitRankCluster(action.ordering)
-            MainAction.SkipRankCluster -> performSkipRankCluster()
+                rankDelegate.startSession(action.collectionIdOrSlug, action.focusEntryId)
+            is MainAction.SubmitRankCluster -> rankDelegate.submitCluster(action.ordering)
+            MainAction.SkipRankCluster -> rankDelegate.skipCluster()
+            MainAction.UndoLastRankRound -> rankDelegate.undoLastRound()
+            MainAction.FinishRankEarly -> rankDelegate.finishEarly()
+            MainAction.KeepRefiningRank -> rankDelegate.keepRefining()
+            else -> return false
+        }
+        return true
+    }
+
+    private suspend fun executeCatalogEntryOrList(action: MainAction.CatalogMutation) {
+        when (action) {
+            is MainAction.UpdateConsumptionLog -> performUpdateConsumptionLog(action)
+            is MainAction.DeleteConsumptionLog -> performDeleteConsumptionLog(action.logId)
+            is MainAction.ToggleCatalogStar -> performToggleCatalogStar(action.entryId)
+            is MainAction.ToggleCatalogWant -> performToggleCatalogWant(action.entryId)
+            is MainAction.AddCatalogEntryToList ->
+                performAddCatalogEntryToList(action.collectionId, action.entryId)
             is MainAction.MarkFeedEntryFinished ->
                 performMarkFeedEntryFinished(action.entryId, action.rankImmediately)
             is MainAction.SubmitQuickLog -> performSubmitQuickLog(action)
@@ -32,6 +61,7 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                 performCompleteWantEntry(action.entryId, action.rankImmediately)
             is MainAction.RemoveWantEntry ->
                 performRemoveWantEntry(action.collectionId, action.entryId)
+            else -> Unit
         }
     }
 
@@ -66,7 +96,7 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
         runSuspendCatching { host.repository.catalog.finishActiveDraw(collectionId, notes) }
             .onSuccess { step ->
                 val openedInList =
-                    openRankSessionForCollection(
+                    rankDelegate.openSession(
                         collectionIdOrSlug = step.collectionId,
                         focusEntryId = step.entryId,
                     )
@@ -74,7 +104,7 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                     openedInList ||
                         host.repository.catalog.resolveEntrySystemListSlug(step.entryId)?.let { slug
                             ->
-                            openRankSessionForCollection(slug, step.entryId)
+                            rankDelegate.openSession(slug, step.entryId)
                         } == true
                 if (!openedRank) {
                     val nextPart = step.nextDraw?.let { " · Next: ${it.title}" }.orEmpty()
@@ -94,181 +124,120 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
         runSuspendCatching { host.repository.catalog.abandonActiveDraw(collectionId, notes) }
             .onSuccess { step ->
                 val nextPart = step.nextDraw?.let { " · Next: ${it.title}" }.orEmpty()
-                host.showStatusMessage("Abandoned draw$nextPart")
+                host.showStatusMessage("Skipped draw$nextPart")
             }
             .onFailure { err ->
-                host.showStatusMessage("Could not abandon draw (${err.message ?: "error"})")
+                host.showStatusMessage("Could not skip draw (${err.message ?: "error"})")
             }
     }
 
-    private suspend fun performStartRankingSession(
-        collectionIdOrSlug: String,
-        focusEntryId: String?,
-    ) {
-        val opened =
-            openRankSessionForCollection(
-                collectionIdOrSlug = collectionIdOrSlug,
-                focusEntryId = focusEntryId,
-            )
-        if (!opened) {
-            host.showStatusMessage("Need at least 2 entries in this list to compare")
-        }
-    }
-
-    private suspend fun openRankSessionForCollection(
-        collectionIdOrSlug: String,
-        focusEntryId: String?,
-    ): Boolean {
-        val rankMeta = host.repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
-        val title = rankMeta?.title ?: "Rankings"
-        val scopeId = rankMeta?.scopeCollectionId
-        val cluster =
-            host.repository.catalog.selectNextRankCluster(
-                collectionIdOrSlug = collectionIdOrSlug,
-                focusEntryId = focusEntryId,
-                roundIndex = 0,
-            )
-        val nextSession =
-            if (cluster.isNotEmpty()) {
-                ActiveRankSessionUiState(
-                    collectionIdOrSlug = collectionIdOrSlug,
-                    collectionTitle = title,
-                    scopeCollectionId = scopeId,
-                    focusEntryId = focusEntryId,
-                    roundIndex = 0,
-                    cluster = cluster,
-                    settlement = null,
-                )
-            } else {
-                val settlement =
-                    focusEntryId
-                        ?.let {
-                            host.repository.catalog.resolveEntrySettlement(it, collectionIdOrSlug)
-                        }
-                        ?.takeIf { it.totalCount >= MIN_RANKABLE_COLLECTION_COUNT }
-                settlement?.let {
-                    ActiveRankSessionUiState(
-                        collectionIdOrSlug = collectionIdOrSlug,
-                        collectionTitle = title,
-                        scopeCollectionId = scopeId,
-                        focusEntryId = focusEntryId,
-                        roundIndex = 0,
-                        cluster = emptyList(),
-                        settlement = it,
-                    )
-                }
-            }
-        if (nextSession != null) {
-            host.updateTransient {
-                it.copy(rankSession = nextSession, catalogDetailStack = emptyList())
-            }
-        }
-        return nextSession != null
-    }
-
-    private suspend fun performSubmitRankCluster(ordering: List<List<String>>) {
-        val session = host.currentTransientState().rankSession ?: return
+    private suspend fun performUpdateConsumptionLog(action: MainAction.UpdateConsumptionLog) {
         runSuspendCatching {
-            host.repository.catalog.recordComparison(
-                ordering = ordering,
-                scopeCollectionId = session.scopeCollectionId,
+            host.repository.catalog.updateConsumptionLog(
+                logId = action.logId,
+                status = action.status,
+                notes = action.notes,
+                clearNotes = action.clearNotes,
+                tsIso = action.tsIso,
             )
         }
+            .onSuccess { updated ->
+                if (updated) host.showStatusMessage("Updated diary entry")
+            }
             .onFailure { err ->
-                host.showStatusMessage("Invalid ordering (${err.message ?: "error"})")
-                return
+                host.showStatusMessage("Could not update diary (${err.message ?: "error"})")
             }
-        val judgedSet = session.cluster.map { it.entryId }.toSet()
-        advanceRankSession(
-            session = session.copy(judgedClusters = session.judgedClusters + listOf(judgedSet)),
-            forceRandomNext = false,
-        )
     }
 
-    private suspend fun performSkipRankCluster() {
-        val session = host.currentTransientState().rankSession ?: return
-        advanceRankSession(session = session, forceRandomNext = true)
+    private suspend fun performDeleteConsumptionLog(logId: String) {
+        runSuspendCatching { host.repository.catalog.deleteConsumptionLog(logId) }
+            .onSuccess { deleted ->
+                if (deleted) host.showStatusMessage("Deleted diary entry")
+            }
+            .onFailure { err ->
+                host.showStatusMessage("Could not delete diary (${err.message ?: "error"})")
+            }
     }
 
-    private suspend fun advanceRankSession(
-        session: ActiveRankSessionUiState,
-        forceRandomNext: Boolean,
-    ) {
-        val nextRound = session.roundIndex + 1
-        val nextCluster = selectDeduplicatedNextCluster(session, nextRound, forceRandomNext)
-        if (nextCluster.isNotEmpty()) {
-            host.updateTransient {
-                it.copy(
-                    rankSession =
-                        session.copy(
-                            roundIndex = nextRound,
-                            cluster = nextCluster,
-                            settlement = null,
-                        )
-                )
+    private suspend fun performToggleCatalogStar(entryId: String) {
+        val snap = host.repository.catalog.getSnapshot()
+        val isStarred =
+            snap.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().any {
+                it.entry.id == entryId
             }
+        if (isStarred) {
+            performRemoveWantEntry(STARRED_COLLECTION_ID, entryId)
             return
         }
-        val settlement =
-            session.focusEntryId?.let {
-                host.repository.catalog.resolveEntrySettlement(it, session.collectionIdOrSlug)
+        runSuspendCatching {
+            host.repository.catalog.addCollectionEntry(STARRED_COLLECTION_ID, entryId)
+        }
+            .onSuccess { host.showStatusMessage("Added to Stars") }
+            .onFailure { err ->
+                host.showStatusMessage("Could not star (${err.message ?: "error"})")
             }
-        if (settlement != null) {
+    }
+
+    private suspend fun performToggleCatalogWant(entryId: String) {
+        val snap = host.repository.catalog.getSnapshot()
+        val existingQueue =
+            snap.wantQueues.firstOrNull { queue ->
+                snap.entriesByCollectionId[queue.collectionId].orEmpty().any {
+                    it.entry.id == entryId
+                }
+            }
+        if (existingQueue != null) {
+            performRemoveWantEntry(existingQueue.collectionId, entryId)
+            return
+        }
+        runSuspendCatching { host.repository.catalog.wantExistingEntry(entryId) }
+            .onSuccess { pair ->
+                val title = pair?.second ?: "Want Queue"
+                host.showStatusMessage("Added to $title")
+            }
+            .onFailure { err ->
+                host.showStatusMessage("Could not queue (${err.message ?: "error"})")
+            }
+    }
+
+    private suspend fun performAddCatalogEntryToList(collectionId: String, entryId: String) {
+        val meta = host.repository.catalog.resolveCollectionRankMeta(collectionId)
+        val title = meta?.title ?: "list"
+        runSuspendCatching { host.repository.catalog.addCollectionEntry(collectionId, entryId) }
+            .onSuccess { host.showStatusMessage("Added to $title") }
+            .onFailure { err ->
+                host.showStatusMessage("Could not add to list (${err.message ?: "error"})")
+            }
+    }
+
+    private suspend fun performRefreshCatalogMetadata(entryId: String) {
+        val cleanId = entryId.trim()
+        if (cleanId.isEmpty() || cleanId in host.currentTransientState().enrichingCatalogEntryIds) {
+            return
+        }
+        host.updateTransient {
+            it.copy(enrichingCatalogEntryIds = it.enrichingCatalogEntryIds + cleanId)
+        }
+        try {
+            host.repository
+                .enrichCatalogEntryOnline(cleanId)
+                .onSuccess { enriched ->
+                    val msg =
+                        if (enriched) {
+                            "Refreshed metadata from server"
+                        } else {
+                            "Server unavailable for online refresh"
+                        }
+                    host.showStatusMessage(msg)
+                }
+                .onFailure { err ->
+                    host.showStatusMessage("Refresh failed (${err.message ?: "error"})")
+                }
+        } finally {
             host.updateTransient {
-                it.copy(
-                    rankSession =
-                        session.copy(
-                            roundIndex = nextRound,
-                            cluster = emptyList(),
-                            settlement = settlement,
-                        )
-                )
+                it.copy(enrichingCatalogEntryIds = it.enrichingCatalogEntryIds - cleanId)
             }
-        } else {
-            host.updateTransient { it.copy(rankSession = null) }
-            host.showStatusMessage("Rankings settled for ${session.collectionTitle}")
         }
-    }
-
-    private suspend fun selectDeduplicatedNextCluster(
-        session: ActiveRankSessionUiState,
-        nextRound: Int,
-        forceRandomNext: Boolean,
-    ): List<RankClusterCandidate> {
-        if (session.focusEntryId != null && nextRound >= MAX_FOCUSED_RANK_ROUNDS) {
-            return emptyList()
-        }
-        val candidate =
-            host.repository.catalog.selectNextRankCluster(
-                collectionIdOrSlug = session.collectionIdOrSlug,
-                focusEntryId = session.focusEntryId,
-                roundIndex = nextRound,
-                forceRandomNext = forceRandomNext,
-            )
-        if (candidate.isEmpty() || !isAlreadyCoveredCluster(candidate, session.judgedClusters)) {
-            return candidate
-        }
-        return if (session.focusEntryId == null) {
-            host.repository.catalog
-                .selectNextRankCluster(
-                    collectionIdOrSlug = session.collectionIdOrSlug,
-                    focusEntryId = null,
-                    roundIndex = nextRound,
-                    forceRandomNext = true,
-                )
-                .takeUnless { isAlreadyCoveredCluster(it, session.judgedClusters) }
-                .orEmpty()
-        } else {
-            emptyList()
-        }
-    }
-
-    private fun isAlreadyCoveredCluster(
-        cluster: List<RankClusterCandidate>,
-        judgedClusters: List<Set<String>>,
-    ): Boolean {
-        val ids = cluster.map { it.entryId }
-        return ids.isNotEmpty() && judgedClusters.any { prev -> prev.containsAll(ids) }
     }
 
     private suspend fun performMarkFeedEntryFinished(
@@ -284,7 +253,7 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
         if (rankImmediately) {
             val pair = host.repository.prepareFeedItemForRank(entryId)
             val slug = (pair?.second ?: EntryKind.ARTICLE).systemListSlug
-            val opened = openRankSessionForCollection(slug, resolvedId)
+            val opened = rankDelegate.openSession(slug, resolvedId)
             if (!opened) {
                 host.showStatusMessage(
                     "Logged to Diary (rank #1 — log at least 2 items to compare)"
@@ -355,12 +324,13 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                 quickLogPrefillTitle = "",
                 quickLogPrefillCreators = "",
                 quickLogPrefillReleaseYear = null,
+                quickLogExistingEntryId = null,
                 optimisticFavorites = it.optimisticFavorites - entryId,
             )
         }
         if (!action.addToWant && !action.addToListOnly && action.rankAfterLog) {
             val rankTarget = targetListId ?: action.kind.systemListSlug
-            if (!openRankSessionForCollection(rankTarget, entryId)) {
+            if (!rankDelegate.openSession(rankTarget, entryId)) {
                 host.showStatusMessage(
                     "Logged \"$cleanTitle\" (rank #1 — log at least 2 items to compare)"
                 )
@@ -401,7 +371,7 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                 val targetId = resolvedId ?: entryId
                 val listSlug = host.repository.catalog.resolveEntrySystemListSlug(targetId)
                 if (rankImmediately && listSlug != null) {
-                    val opened = openRankSessionForCollection(listSlug, targetId)
+                    val opened = rankDelegate.openSession(listSlug, targetId)
                     if (!opened) {
                         host.showStatusMessage(
                             "Completed & logged to Diary (rank #1 — log at least 2 items to compare)"
@@ -442,9 +412,295 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                 host.showStatusMessage("Could not remove (${err.message ?: "error"})")
             }
     }
+}
+
+internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
+    suspend fun startSession(collectionIdOrSlug: String, focusEntryId: String?) {
+        if (!openSession(collectionIdOrSlug, focusEntryId)) {
+            host.showStatusMessage("Need at least 2 entries in this list to compare")
+        }
+    }
+
+    suspend fun openSession(collectionIdOrSlug: String, focusEntryId: String?): Boolean {
+        val rankMeta = host.repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
+        val title = rankMeta?.title ?: "Rankings"
+        val scopeId = rankMeta?.scopeCollectionId
+        val cluster =
+            host.repository.catalog.selectNextRankCluster(
+                collectionIdOrSlug = collectionIdOrSlug,
+                focusEntryId = focusEntryId,
+                roundIndex = 0,
+            )
+        val nextSession =
+            if (cluster.isNotEmpty()) {
+                ActiveRankSessionUiState(
+                    collectionIdOrSlug = collectionIdOrSlug,
+                    collectionTitle = title,
+                    scopeCollectionId = scopeId,
+                    focusEntryId = focusEntryId,
+                    roundIndex = 0,
+                    cluster = cluster,
+                    settlement = null,
+                )
+            } else {
+                val settlement =
+                    focusEntryId
+                        ?.let {
+                            host.repository.catalog.resolveEntrySettlement(it, collectionIdOrSlug)
+                        }
+                        ?.takeIf { it.totalCount >= MIN_RANKABLE_COLLECTION_COUNT }
+                settlement?.let {
+                    ActiveRankSessionUiState(
+                        collectionIdOrSlug = collectionIdOrSlug,
+                        collectionTitle = title,
+                        scopeCollectionId = scopeId,
+                        focusEntryId = focusEntryId,
+                        roundIndex = 0,
+                        cluster = emptyList(),
+                        settlement = it,
+                    )
+                }
+            }
+        if (nextSession != null) {
+            host.updateTransient {
+                it.copy(rankSession = nextSession, catalogDetailStack = emptyList())
+            }
+        }
+        return nextSession != null
+    }
+
+    suspend fun submitCluster(ordering: List<List<String>>) {
+        val session = host.currentTransientState().rankSession ?: return
+        val compId = runSuspendCatching {
+            host.repository.catalog.recordComparison(
+                ordering = ordering,
+                scopeCollectionId = session.scopeCollectionId,
+            )
+        }
+            .getOrElse { err ->
+                host.showStatusMessage("Invalid ordering (${err.message ?: "error"})")
+                return
+            }
+        val judgedSet = session.cluster.map { it.entryId }.toSet()
+        val undoStep =
+            RankRoundUndoStep(
+                comparisonId = compId,
+                previousRoundIndex = session.roundIndex,
+                previousCluster = session.cluster,
+                previousJudgedClusters = session.judgedClusters,
+            )
+        advanceRankSession(
+            session =
+                session.copy(
+                    judgedClusters = session.judgedClusters + listOf(judgedSet),
+                    skippedOpponents = emptySet(),
+                    history = session.history + undoStep,
+                ),
+            forceRandomNext = false,
+        )
+    }
+
+    suspend fun skipCluster() {
+        val session = host.currentTransientState().rankSession ?: return
+        val currentSet = session.cluster.mapTo(HashSet()) { it.entryId }
+        val currentOpponents = currentSet.filterTo(HashSet()) { it != session.focusEntryId }
+        val combinedSkipped = session.skippedOpponents + currentOpponents
+        val attempts =
+            listOf(
+                    combinedSkipped to combinedSkipped,
+                    currentOpponents to currentOpponents,
+                    emptySet<String>() to emptySet(),
+                )
+                .distinctBy { it.first }
+        val chosen = pickSkipClusterAttempt(session, currentSet, attempts)
+        if (chosen == null) {
+            host.showStatusMessage("No other combinations to compare right now")
+            return
+        }
+        host.updateTransient {
+            it.copy(
+                rankSession =
+                    session.copy(
+                        cluster = chosen.first,
+                        skippedOpponents = chosen.second,
+                        settlement = null,
+                    )
+            )
+        }
+    }
+
+    private suspend fun pickSkipClusterAttempt(
+        session: ActiveRankSessionUiState,
+        currentSet: Set<String>,
+        attempts: List<Pair<Set<String>, Set<String>>>,
+    ): Pair<List<RankClusterCandidate>, Set<String>>? {
+        for ((excluded, nextSkipped) in attempts) {
+            val cluster =
+                host.repository.catalog.selectNextRankCluster(
+                    collectionIdOrSlug = session.collectionIdOrSlug,
+                    focusEntryId = session.focusEntryId,
+                    roundIndex = session.roundIndex,
+                    forceRandomNext = true,
+                    excludedOpponentIds = excluded,
+                )
+            if (cluster.isNotEmpty() && cluster.mapTo(HashSet()) { it.entryId } != currentSet) {
+                return cluster to nextSkipped
+            }
+        }
+        return null
+    }
+
+    suspend fun undoLastRound() {
+        val session = host.currentTransientState().rankSession ?: return
+        val lastStep = session.history.lastOrNull() ?: return
+        runSuspendCatching { host.repository.catalog.deleteComparison(lastStep.comparisonId) }
+            .onFailure { err ->
+                host.showStatusMessage("Could not undo round (${err.message ?: "error"})")
+                return
+            }
+        host.updateTransient {
+            it.copy(
+                rankSession =
+                    session.copy(
+                        roundIndex = lastStep.previousRoundIndex,
+                        cluster = lastStep.previousCluster,
+                        judgedClusters = lastStep.previousJudgedClusters,
+                        skippedOpponents = emptySet(),
+                        history = session.history.dropLast(1),
+                        settlement = null,
+                    )
+            )
+        }
+    }
+
+    suspend fun finishEarly() {
+        val session = host.currentTransientState().rankSession ?: return
+        val settlement =
+            session.focusEntryId?.let {
+                host.repository.catalog.resolveEntrySettlement(it, session.collectionIdOrSlug)
+            }
+        if (settlement != null) {
+            host.updateTransient {
+                it.copy(rankSession = session.copy(cluster = emptyList(), settlement = settlement))
+            }
+        } else {
+            host.updateTransient { it.copy(rankSession = null) }
+        }
+    }
+
+    suspend fun keepRefining() {
+        val session = host.currentTransientState().rankSession ?: return
+        val extendedCap = session.roundIndex + MAX_FOCUSED_RANK_ROUNDS
+        val nextCluster =
+            host.repository.catalog.selectNextRankCluster(
+                collectionIdOrSlug = session.collectionIdOrSlug,
+                focusEntryId = session.focusEntryId,
+                roundIndex = session.roundIndex,
+                forceRandomNext = true,
+            )
+        if (nextCluster.isEmpty()) {
+            host.showStatusMessage("No more entries available to compare")
+            return
+        }
+        host.updateTransient {
+            it.copy(
+                rankSession =
+                    session.copy(
+                        roundCap = extendedCap,
+                        cluster = nextCluster,
+                        judgedClusters = emptyList(),
+                        skippedOpponents = emptySet(),
+                        settlement = null,
+                    )
+            )
+        }
+    }
+
+    private suspend fun advanceRankSession(
+        session: ActiveRankSessionUiState,
+        forceRandomNext: Boolean,
+    ) {
+        val nextRound = session.roundIndex + 1
+        val nextCluster = selectDeduplicatedNextCluster(session, nextRound, forceRandomNext)
+        if (nextCluster.isNotEmpty()) {
+            host.updateTransient {
+                it.copy(
+                    rankSession =
+                        session.copy(
+                            roundIndex = nextRound,
+                            cluster = nextCluster,
+                            settlement = null,
+                        )
+                )
+            }
+            return
+        }
+        val settlement =
+            session.focusEntryId?.let {
+                host.repository.catalog.resolveEntrySettlement(it, session.collectionIdOrSlug)
+            }
+        if (settlement != null) {
+            host.updateTransient {
+                it.copy(
+                    rankSession =
+                        session.copy(
+                            roundIndex = nextRound,
+                            cluster = emptyList(),
+                            settlement = settlement,
+                        )
+                )
+            }
+        } else {
+            host.updateTransient { it.copy(rankSession = null) }
+            host.showStatusMessage("Rankings settled for ${session.collectionTitle}")
+        }
+    }
+
+    private suspend fun selectDeduplicatedNextCluster(
+        session: ActiveRankSessionUiState,
+        nextRound: Int,
+        forceRandomNext: Boolean,
+    ): List<RankClusterCandidate> {
+        if (session.focusEntryId != null && nextRound >= session.roundCap) {
+            return emptyList()
+        }
+        val candidate =
+            host.repository.catalog.selectNextRankCluster(
+                collectionIdOrSlug = session.collectionIdOrSlug,
+                focusEntryId = session.focusEntryId,
+                roundIndex = nextRound,
+                forceRandomNext = forceRandomNext,
+            )
+        if (candidate.isEmpty() || !isAlreadyCoveredCluster(candidate, session.judgedClusters)) {
+            return candidate
+        }
+        val excluded =
+            if (session.focusEntryId != null) {
+                candidate.mapTo(HashSet()) { it.entryId }.apply { remove(session.focusEntryId) }
+            } else {
+                emptySet()
+            }
+        return host.repository.catalog
+            .selectNextRankCluster(
+                collectionIdOrSlug = session.collectionIdOrSlug,
+                focusEntryId = session.focusEntryId,
+                roundIndex = nextRound,
+                forceRandomNext = true,
+                excludedOpponentIds = excluded,
+            )
+            .takeUnless { it.isEmpty() || isAlreadyCoveredCluster(it, session.judgedClusters) }
+            .orEmpty()
+    }
+
+    private fun isAlreadyCoveredCluster(
+        cluster: List<RankClusterCandidate>,
+        judgedClusters: List<Set<String>>,
+    ): Boolean {
+        val ids = cluster.map { it.entryId }
+        return ids.isNotEmpty() && judgedClusters.any { prev -> prev.containsAll(ids) }
+    }
 
     private companion object {
-        private const val MAX_FOCUSED_RANK_ROUNDS = 8
         private const val MIN_RANKABLE_COLLECTION_COUNT = 2
     }
 }

@@ -63,6 +63,9 @@ import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.CatalogSearchMatch
 import com.grayvines.roche.data.CatalogSearchResult
 import com.grayvines.roche.data.SearchScopeFilter
+import com.grayvines.roche.data.catalog.CatalogListSummary
+import com.grayvines.roche.data.catalog.CollectionRole
+import com.grayvines.roche.data.catalog.DiaryEntryItem
 import com.grayvines.roche.data.extractSearchMatchSnippet
 import com.grayvines.roche.data.matchesSearchScopeFilter
 import com.grayvines.roche.data.searchCatalogEntriesWithTotal
@@ -81,6 +84,10 @@ private data class SearchOverlayComputed(
     val visibleResults: List<InboxEntry>,
     val shownCatalogMatches: List<CatalogSearchMatch>,
     val catalogTotalCount: Int,
+    val shownListMatches: List<CatalogListSummary>,
+    val listTotalCount: Int,
+    val shownDiaryMatches: List<DiaryEntryItem>,
+    val diaryTotalCount: Int,
     val scopeCounts: Map<SearchScopeFilter, Int>,
 )
 
@@ -92,6 +99,7 @@ private fun rememberSearchOverlayComputed(
 ): SearchOverlayComputed =
     remember(
         displayState.searchResults,
+        displayState.workspaceSearch,
         displayState.catalog,
         displayState.searchQuery,
         scopeFilter,
@@ -100,9 +108,31 @@ private fun rememberSearchOverlayComputed(
         val visibleResults =
             displayState.searchResults.filter { matchesSearchScopeFilter(it, scopeFilter) }
         val catalogResult = resolveSearchCatalogResult(displayState, scopeFilter, catalogLimit)
+        val allListMatches =
+            resolveSearchListMatches(
+                state = displayState,
+                includeWhenBlank = scopeFilter == SearchScopeFilter.LISTS,
+            )
+        val allDiaryMatches =
+            resolveSearchDiaryMatches(
+                state = displayState,
+                includeWhenBlank = scopeFilter == SearchScopeFilter.DIARY,
+            )
         val shownCatalogMatches =
             if (scopeFilter == SearchScopeFilter.ALL || scopeFilter == SearchScopeFilter.CATALOG) {
                 catalogResult.matches
+            } else {
+                emptyList()
+            }
+        val shownListMatches =
+            if (scopeFilter == SearchScopeFilter.ALL || scopeFilter == SearchScopeFilter.LISTS) {
+                allListMatches
+            } else {
+                emptyList()
+            }
+        val shownDiaryMatches =
+            if (scopeFilter == SearchScopeFilter.ALL || scopeFilter == SearchScopeFilter.DIARY) {
+                allDiaryMatches
             } else {
                 emptyList()
             }
@@ -110,15 +140,57 @@ private fun rememberSearchOverlayComputed(
             computeSearchScopeCounts(
                 searchResults = displayState.searchResults,
                 catalogTotalCount = catalogResult.totalCount,
+                listTotalCount = allListMatches.size,
+                diaryTotalCount = allDiaryMatches.size,
                 hasQuery = displayState.searchQuery.isNotBlank(),
             )
         SearchOverlayComputed(
             visibleResults = visibleResults,
             shownCatalogMatches = shownCatalogMatches,
             catalogTotalCount = catalogResult.totalCount,
+            shownListMatches = shownListMatches,
+            listTotalCount = allListMatches.size,
+            shownDiaryMatches = shownDiaryMatches,
+            diaryTotalCount = allDiaryMatches.size,
             scopeCounts = scopeCounts,
         )
     }
+
+private fun resolveSearchListMatches(
+    state: MainUiState,
+    includeWhenBlank: Boolean,
+): List<CatalogListSummary> {
+    val cleanQuery = state.searchQuery.trim().trimStart('#').trim()
+    val allCollections = state.catalog.lists + state.catalog.wantQueues
+    val seen = HashSet<String>()
+    val deduped = allCollections.filter { seen.add(it.collectionId) }
+    if (cleanQuery.isEmpty()) {
+        return if (includeWhenBlank) deduped else emptyList()
+    }
+    val ftsIds = state.workspaceSearch.matchedCollectionIds.toHashSet()
+    return deduped.filter { col ->
+        col.collectionId in ftsIds ||
+            col.title.contains(cleanQuery, ignoreCase = true) ||
+            col.slug.contains(cleanQuery, ignoreCase = true)
+    }
+}
+
+private fun resolveSearchDiaryMatches(
+    state: MainUiState,
+    includeWhenBlank: Boolean,
+): List<DiaryEntryItem> {
+    val cleanQuery = state.searchQuery.trim().trimStart('#').trim()
+    if (cleanQuery.isEmpty()) {
+        return if (includeWhenBlank) state.catalog.diaryEntries else emptyList()
+    }
+    val ftsIds = state.workspaceSearch.matchedDiaryLogs.mapTo(HashSet()) { it.id }
+    return state.catalog.diaryEntries.filter { diary ->
+        diary.id in ftsIds ||
+            diary.title.contains(cleanQuery, ignoreCase = true) ||
+            diary.notes?.contains(cleanQuery, ignoreCase = true) == true ||
+            diary.creators.any { it.contains(cleanQuery, ignoreCase = true) }
+    }
+}
 
 @Composable
 fun SearchOverlay(
@@ -168,6 +240,10 @@ fun SearchOverlay(
             results = computed.visibleResults,
             catalogMatches = computed.shownCatalogMatches,
             catalogTotalCount = computed.catalogTotalCount,
+            listMatches = computed.shownListMatches,
+            listTotalCount = computed.listTotalCount,
+            diaryMatches = computed.shownDiaryMatches,
+            diaryTotalCount = computed.diaryTotalCount,
             onShowMoreCatalog = { catalogLimit += DEFAULT_CATALOG_SEARCH_LIMIT },
             onSelectAllScope = { scopeFilter = SearchScopeFilter.ALL },
             state = state,
@@ -195,17 +271,27 @@ private fun resolveSearchCatalogResult(
 private fun computeSearchScopeCounts(
     searchResults: List<InboxEntry>,
     catalogTotalCount: Int,
+    listTotalCount: Int,
+    diaryTotalCount: Int,
     hasQuery: Boolean,
 ): Map<SearchScopeFilter, Int> {
     if (!hasQuery) {
-        return if (catalogTotalCount > 0) {
-            mapOf(SearchScopeFilter.CATALOG to catalogTotalCount)
-        } else {
-            emptyMap()
+        return buildMap {
+            if (catalogTotalCount > 0) put(SearchScopeFilter.CATALOG, catalogTotalCount)
+            if (listTotalCount > 0) put(SearchScopeFilter.LISTS, listTotalCount)
+            if (diaryTotalCount > 0) put(SearchScopeFilter.DIARY, diaryTotalCount)
         }
     }
     return SearchScopeFilter.entries
-        .associateWith { scope -> countForSearchScope(scope, searchResults, catalogTotalCount) }
+        .associateWith { scope ->
+            countForSearchScope(
+                scope = scope,
+                searchResults = searchResults,
+                catalogTotalCount = catalogTotalCount,
+                listTotalCount = listTotalCount,
+                diaryTotalCount = diaryTotalCount,
+            )
+        }
         .filterValues { it > 0 }
 }
 
@@ -213,10 +299,15 @@ private fun countForSearchScope(
     scope: SearchScopeFilter,
     searchResults: List<InboxEntry>,
     catalogTotalCount: Int,
+    listTotalCount: Int,
+    diaryTotalCount: Int,
 ): Int =
     when (scope) {
         SearchScopeFilter.CATALOG -> catalogTotalCount
-        SearchScopeFilter.ALL -> searchResults.size + catalogTotalCount
+        SearchScopeFilter.LISTS -> listTotalCount
+        SearchScopeFilter.DIARY -> diaryTotalCount
+        SearchScopeFilter.ALL ->
+            searchResults.size + catalogTotalCount + listTotalCount + diaryTotalCount
         else -> searchResults.count { matchesSearchScopeFilter(it, scope) }
     }
 
@@ -362,6 +453,10 @@ internal fun SearchResultsBody(
     state: MainUiState,
     selectedScope: SearchScopeFilter = SearchScopeFilter.ALL,
     catalogTotalCount: Int = catalogMatches.size,
+    listMatches: List<CatalogListSummary> = emptyList(),
+    listTotalCount: Int = listMatches.size,
+    diaryMatches: List<DiaryEntryItem> = emptyList(),
+    diaryTotalCount: Int = diaryMatches.size,
     onShowMoreCatalog: (() -> Unit)? = null,
     onSelectAllScope: (() -> Unit)? = null,
     playingEntryId: String? = null,
@@ -369,11 +464,15 @@ internal fun SearchResultsBody(
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
 ) {
-    val hasAnyResults = results.isNotEmpty() || catalogMatches.isNotEmpty()
+    val hasAnyResults =
+        results.isNotEmpty() ||
+            catalogMatches.isNotEmpty() ||
+            listMatches.isNotEmpty() ||
+            diaryMatches.isNotEmpty()
     if (!hasAnyResults) {
-        val hasOtherScopeMatches =
-            selectedScope != SearchScopeFilter.ALL &&
-                (state.searchResults.isNotEmpty() || catalogTotalCount > 0)
+        val totalElsewhere =
+            state.searchResults.size + catalogTotalCount + listTotalCount + diaryTotalCount
+        val hasOtherScopeMatches = selectedScope != SearchScopeFilter.ALL && totalElsewhere > 0
         SearchEmptyState(
             searchQuery = state.searchQuery,
             selectedScope = selectedScope,
@@ -389,6 +488,8 @@ internal fun SearchResultsBody(
         SearchResultsList(
             results = results,
             catalogMatches = catalogMatches,
+            listMatches = listMatches,
+            diaryMatches = diaryMatches,
             state = state,
             catalogTotalCount = catalogTotalCount,
             onShowMoreCatalog = onShowMoreCatalog,
@@ -406,6 +507,8 @@ internal fun SearchResultsBody(
 private fun SearchResultsList(
     results: List<InboxEntry>,
     catalogMatches: List<CatalogSearchMatch>,
+    listMatches: List<CatalogListSummary>,
+    diaryMatches: List<DiaryEntryItem>,
     state: MainUiState,
     catalogTotalCount: Int,
     onShowMoreCatalog: (() -> Unit)?,
@@ -416,6 +519,8 @@ private fun SearchResultsList(
     listState: LazyListState,
 ) {
     val colors = LocalRocheColors.current
+    val hasUpperSections =
+        catalogMatches.isNotEmpty() || listMatches.isNotEmpty() || diaryMatches.isNotEmpty()
     LazyColumn(
         state = listState,
         modifier = Modifier.fillMaxSize().testTag("search_results_list"),
@@ -424,6 +529,11 @@ private fun SearchResultsList(
         if (state.tags.isNotEmpty()) {
             item(key = "search_tags_strip") {
                 SearchQuickTagStrip(state = state, onAction = onAction)
+            }
+        }
+        if (listMatches.isNotEmpty()) {
+            item(key = "search_lists_section") {
+                SearchListMatchesSection(lists = listMatches, onAction = onAction)
             }
         }
         if (catalogMatches.isNotEmpty()) {
@@ -436,8 +546,17 @@ private fun SearchResultsList(
                 )
             }
         }
+        if (diaryMatches.isNotEmpty()) {
+            item(key = "search_diary_section") {
+                SearchDiaryMatchesSection(
+                    diaryMatches = diaryMatches,
+                    state = state,
+                    onAction = onAction,
+                )
+            }
+        }
         if (results.isNotEmpty()) {
-            if (catalogMatches.isNotEmpty()) {
+            if (hasUpperSections) {
                 item(key = "search_inbox_section_head") {
                     SearchSectionLabelRow(title = "Inbox & Archive", count = results.size)
                 }
@@ -454,6 +573,163 @@ private fun SearchResultsList(
                 HorizontalDivider(color = colors.border, thickness = 1.dp)
             }
         }
+    }
+}
+
+@Composable
+private fun SearchListMatchesSection(
+    lists: List<CatalogListSummary>,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        SearchSectionLabelRow(title = "Lists", count = lists.size, horizontalPadding = 2.dp)
+        RocheSurfaceCard {
+            lists.forEachIndexed { idx, list ->
+                if (idx > 0) HorizontalDivider(color = colors.border, thickness = 1.dp)
+                SearchListMatchRow(
+                    list = list,
+                    onClick = {
+                        val subTab =
+                            if (list.role == CollectionRole.WANT) {
+                                CompanionSubTab.WANT
+                            } else {
+                                CompanionSubTab.LISTS
+                            }
+                        onAction(MainAction.OpenCompanionSection(subTab, list.collectionId))
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchListMatchRow(
+    list: CatalogListSummary,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .heightIn(min = 48.dp)
+                .clickable(onClick = onClick)
+                .semantics { role = Role.Button }
+                .padding(horizontal = 12.dp, vertical = 9.dp)
+                .testTag("search_list_match_${list.collectionId}"),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = list.title,
+            color = colors.textPrimary,
+            fontFamily = currentHeadlineFontFamily(),
+            fontSize = 14.5.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f).padding(end = 8.dp),
+        )
+        Text(
+            text = "${list.entryCount} items",
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+        )
+    }
+}
+
+@Composable
+private fun SearchDiaryMatchesSection(
+    diaryMatches: List<DiaryEntryItem>,
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val shown = remember(diaryMatches) { diaryMatches.take(MAX_DIARY_SEARCH_RESULTS) }
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        SearchSectionLabelRow(
+            title = "Diary",
+            countLabel =
+                if (diaryMatches.size > shown.size) {
+                    "Showing ${shown.size} of ${diaryMatches.size}"
+                } else {
+                    diaryMatches.size.toString()
+                },
+            horizontalPadding = 2.dp,
+        )
+        RocheSurfaceCard {
+            shown.forEachIndexed { idx, log ->
+                if (idx > 0) HorizontalDivider(color = colors.border, thickness = 1.dp)
+                SearchDiaryMatchRow(
+                    log = log,
+                    onClick = {
+                        if (log.entryId in state.readableEntryIds) {
+                            onAction(MainAction.OpenReader(log.entryId))
+                        } else {
+                            onAction(MainAction.OpenCatalogDetailSheet(log.entryId))
+                        }
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchDiaryMatchRow(
+    log: DiaryEntryItem,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .heightIn(min = 50.dp)
+                .clickable(onClick = onClick)
+                .semantics { role = Role.Button }
+                .padding(horizontal = 12.dp, vertical = 9.dp)
+                .testTag("search_diary_match_${log.id}"),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = log.dateLabel,
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+        )
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                text = log.title,
+                color = colors.textPrimary,
+                fontFamily = currentHeadlineFontFamily(),
+                fontSize = 14.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (!log.notes.isNullOrBlank()) {
+                Text(
+                    text = log.notes,
+                    color = colors.accentEcru,
+                    fontSize = 11.5.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Text(
+            text = log.status.displayLabel,
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
+        )
     }
 }
 
@@ -656,9 +932,11 @@ private fun SearchInboxMatchRow(
         onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
         onDownloadOffline = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
     )
+    val ftsSnippet = state.workspaceSearch.snippetsByEntryId[entry.id]
     val matchSnippet =
-        remember(entry.id, entry.contentText, state.searchQuery) {
-            extractSearchMatchSnippet(entry = entry, rawQuery = state.searchQuery)
+        remember(entry.id, entry.contentText, state.searchQuery, ftsSnippet) {
+            ftsSnippet?.takeIf { it.isNotBlank() }
+                ?: extractSearchMatchSnippet(entry = entry, rawQuery = state.searchQuery)
         }
     if (matchSnippet != null) {
         SearchMatchContextBanner(
@@ -787,3 +1065,4 @@ private fun SearchQuickTagChip(
 }
 
 private const val DEFAULT_CATALOG_SEARCH_LIMIT = 24
+private const val MAX_DIARY_SEARCH_RESULTS = 20

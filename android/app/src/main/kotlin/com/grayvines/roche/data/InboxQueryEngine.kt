@@ -52,6 +52,8 @@ internal fun matchesInboxFilter(entry: InboxEntry, filter: InboxFilter): Boolean
 internal enum class SearchScopeFilter(val label: String) {
     ALL("All"),
     CATALOG("Catalog"),
+    LISTS("Lists"),
+    DIARY("Diary"),
     UNREAD("Unread"),
     STARRED("Starred"),
     ARTICLES("Articles"),
@@ -73,7 +75,9 @@ internal data class CatalogSearchResult(
 internal fun matchesSearchScopeFilter(entry: InboxEntry, scope: SearchScopeFilter): Boolean =
     when (scope) {
         SearchScopeFilter.ALL -> true
-        SearchScopeFilter.CATALOG -> false
+        SearchScopeFilter.CATALOG,
+        SearchScopeFilter.LISTS,
+        SearchScopeFilter.DIARY -> false
         SearchScopeFilter.UNREAD -> entry.isUnread
         SearchScopeFilter.STARRED -> entry.isFavorite
         SearchScopeFilter.ARTICLES -> entry.contentType == ContentType.ARTICLE

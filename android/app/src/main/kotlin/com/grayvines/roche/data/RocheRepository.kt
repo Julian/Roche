@@ -550,6 +550,9 @@ class RocheRepository(
     suspend fun cacheEntryOffline(itemId: String): Boolean =
         offlineCacheManager.setOfflineCacheState(itemId = itemId, enabled = true)
 
+    suspend fun removeOfflineCache(itemId: String): Boolean =
+        offlineCacheManager.setOfflineCacheState(itemId = itemId, enabled = false)
+
     internal suspend fun hydrateItemContentIfNeeded(
         itemId: String,
         onLocalLoaded: (ReaderItemContent) -> Unit = {},

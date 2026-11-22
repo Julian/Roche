@@ -98,6 +98,7 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
 
     private suspend fun performRefreshFeed(feedId: String) {
         if (!host.tryAcquireSyncLock()) return
+        host.updateTransient { it.copy(refreshingFeedIds = it.refreshingFeedIds + feedId) }
         try {
             host.repository
                 .refreshFeed(feedId)
@@ -110,7 +111,9 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
                     )
                 }
         } finally {
-            host.updateTransient { it.copy(isSyncing = false) }
+            host.updateTransient {
+                it.copy(isSyncing = false, refreshingFeedIds = it.refreshingFeedIds - feedId)
+            }
         }
     }
 

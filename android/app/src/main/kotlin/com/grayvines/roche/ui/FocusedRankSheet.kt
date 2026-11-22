@@ -28,9 +28,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
+import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -107,6 +110,7 @@ private data class ActiveRankDragState(
     val startTopInRoot: Float,
     val widthPx: Int,
     val heightPx: Int,
+    val frozenBucketBounds: List<Pair<Float, Float>> = emptyList(),
     val deltaX: Float = 0f,
     val deltaY: Float = 0f,
     val dropTarget: RankDropTarget? = null,
@@ -127,11 +131,23 @@ internal fun FocusedRankBottomSheet(
     catalog: CatalogSnapshot = CatalogSnapshot(),
 ) {
     val colors = LocalRocheColors.current
+    val sheetState =
+        rememberBottomSheetState(
+            initialValue = SheetValue.Hidden,
+            enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded),
+        )
+    var isDraggingCard by remember { mutableStateOf(false) }
+    val settlement = session.settlement
+    LaunchedEffect(settlement != null) {
+        if (settlement != null) isDraggingCard = false
+    }
+
     ModalBottomSheet(
         onDismissRequest = { onAction(MainAction.CloseRankSession) },
+        sheetState = sheetState,
+        sheetGesturesEnabled = !isDraggingCard,
         containerColor = colors.surface,
     ) {
-        val settlement = session.settlement
         if (settlement != null) {
             RankSettlementSheetBody(
                 session = session,
@@ -142,6 +158,8 @@ internal fun FocusedRankBottomSheet(
         } else {
             ActiveClusterRankBody(
                 session = session,
+                catalog = catalog,
+                onDragActiveChange = { isDraggingCard = it },
                 onAction = onAction,
             )
         }
@@ -190,9 +208,15 @@ private fun RankSettlementSheetBody(
             )
         }
         SettlementFooterRow(
-            canKeepComparing = settlement.totalCount >= 2,
-            onKeepComparing = {
-                onAction(MainAction.StartRankingSession(session.collectionIdOrSlug, null))
+            canUndoLast = session.history.isNotEmpty(),
+            canKeepRefining = settlement.totalCount >= 2,
+            onUndoLast = { onAction(MainAction.UndoLastRankRound) },
+            onKeepRefining = {
+                if (session.focusEntryId != null) {
+                    onAction(MainAction.KeepRefiningRank)
+                } else {
+                    onAction(MainAction.StartRankingSession(session.collectionIdOrSlug, null))
+                }
             },
             onDone = { onAction(MainAction.CloseRankSession) },
         )
@@ -353,19 +377,28 @@ private fun SettlementNeighborRow(row: RankedCatalogEntry, isFocus: Boolean) {
 
 @Composable
 private fun SettlementFooterRow(
-    canKeepComparing: Boolean,
-    onKeepComparing: () -> Unit,
+    canUndoLast: Boolean,
+    canKeepRefining: Boolean,
+    onUndoLast: () -> Unit,
+    onKeepRefining: () -> Unit,
     onDone: () -> Unit,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End),
+        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (canKeepComparing) {
+        if (canUndoLast) {
             HeaderActionButton(
-                label = "Keep Comparing",
-                onClick = onKeepComparing,
+                label = "Undo",
+                onClick = onUndoLast,
+                modifier = Modifier.testTag("rank_settlement_undo_btn"),
+            )
+        }
+        if (canKeepRefining) {
+            HeaderActionButton(
+                label = "Keep Refining",
+                onClick = onKeepRefining,
                 modifier = Modifier.testTag("rank_keep_comparing_btn"),
             )
         }
@@ -403,6 +436,8 @@ private fun rankBoardStateSaver(
 @Composable
 private fun ActiveClusterRankBody(
     session: ActiveRankSessionUiState,
+    catalog: CatalogSnapshot,
+    onDragActiveChange: (Boolean) -> Unit,
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -415,6 +450,11 @@ private fun ActiveClusterRankBody(
         }
     var activeDrag by
         remember(session.roundIndex, clusterKey) { mutableStateOf<ActiveRankDragState?>(null) }
+    LaunchedEffect(activeDrag != null) { onDragActiveChange(activeDrag != null) }
+    val provisionalRank =
+        remember(session.collectionIdOrSlug, session.focusEntryId, catalog) {
+            resolveProvisionalFocusRank(session, catalog)
+        }
 
     BoxWithConstraints(modifier = Modifier.fillMaxWidth().testTag("focused_rank_sheet")) {
         val isWide = maxWidth >= RANK_WIDE_BREAKPOINT
@@ -422,30 +462,33 @@ private fun ActiveClusterRankBody(
         Column(modifier = Modifier.fillMaxWidth()) {
             ClusterRankHeader(
                 session = session,
+                provisionalRank = provisionalRank,
                 horizontalPad = hPad,
-                onClose = { onAction(MainAction.CloseRankSession) },
+                onDonePlacing = {
+                    if (session.focusEntryId != null && session.roundIndex > 0) {
+                        onAction(MainAction.FinishRankEarly)
+                    } else {
+                        onAction(MainAction.CloseRankSession)
+                    }
+                },
             )
             HorizontalDivider(color = colors.border, thickness = 1.dp)
-            Column(
-                modifier =
-                    Modifier.fillMaxWidth()
-                        .verticalScroll(rememberScrollState(), enabled = activeDrag == null)
-                        .padding(horizontal = hPad, vertical = 14.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                ClusterRankProgressAndHint(session = session)
-                DraggableRankBoard(
-                    board = board,
-                    focusEntryId = session.focusEntryId,
-                    isWide = isWide,
-                    activeDrag = activeDrag,
-                    onActiveDragChange = { activeDrag = it },
-                    onBoardChange = { board = it },
-                )
-            }
+            ClusterRankBoardScrollArea(
+                session = session,
+                board = board,
+                isWide = isWide,
+                horizontalPad = hPad,
+                activeDrag = activeDrag,
+                onActiveDragChange = { next ->
+                    activeDrag = next
+                    onDragActiveChange(next != null)
+                },
+                onBoardChange = { board = it },
+            )
             HorizontalDivider(color = colors.border, thickness = 1.dp)
             ClusterRankFooter(
                 board = board,
+                canUndo = session.history.isNotEmpty(),
                 horizontalPad = hPad,
                 onToggleTieAll = { board = board.toggleTieAll() },
                 onAction = onAction,
@@ -454,11 +497,42 @@ private fun ActiveClusterRankBody(
     }
 }
 
+@Suppress("LongParameterList")
+@Composable
+private fun ClusterRankBoardScrollArea(
+    session: ActiveRankSessionUiState,
+    board: RankBoardState,
+    isWide: Boolean,
+    horizontalPad: Dp,
+    activeDrag: ActiveRankDragState?,
+    onActiveDragChange: (ActiveRankDragState?) -> Unit,
+    onBoardChange: (RankBoardState) -> Unit,
+) {
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .verticalScroll(rememberScrollState(), enabled = activeDrag == null)
+                .padding(horizontal = horizontalPad, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        ClusterRankProgressAndHint(session = session)
+        DraggableRankBoard(
+            board = board,
+            focusEntryId = session.focusEntryId,
+            isWide = isWide,
+            activeDrag = activeDrag,
+            onActiveDragChange = onActiveDragChange,
+            onBoardChange = onBoardChange,
+        )
+    }
+}
+
 @Composable
 private fun ClusterRankHeader(
     session: ActiveRankSessionUiState,
+    provisionalRank: ProvisionalFocusRank?,
     horizontalPad: Dp,
-    onClose: () -> Unit,
+    onDonePlacing: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val heading =
@@ -467,6 +541,8 @@ private fun ClusterRankHeader(
         } else {
             "Order best to worst"
         }
+    val doneLabel =
+        if (session.focusEntryId != null && session.roundIndex > 0) "Done Placing" else "Done"
     Row(
         modifier =
             Modifier.fillMaxWidth()
@@ -483,21 +559,57 @@ private fun ClusterRankHeader(
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Normal,
             )
+            if (provisionalRank != null) {
+                ProvisionalRankBadgeRow(provisional = provisionalRank)
+            }
         }
         Box(
             contentAlignment = Alignment.Center,
             modifier =
                 Modifier.minimumInteractiveComponentSize()
                     .clip(RoundedCornerShape(8.dp))
-                    .clickable(onClick = onClose)
+                    .clickable(onClick = onDonePlacing)
                     .semantics { role = Role.Button }
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                    .testTag("rank_done_placing_btn"),
         ) {
             Text(
-                text = "Done",
-                color = colors.textSecondary,
+                text = doneLabel,
+                color =
+                    if (session.focusEntryId != null && session.roundIndex > 0) {
+                        colors.accentBlue
+                    } else {
+                        colors.textSecondary
+                    },
                 fontSize = 13.5.sp,
+                fontWeight = FontWeight.Medium,
             )
+        }
+    }
+}
+
+private data class ProvisionalFocusRank(
+    val rank: Int,
+    val totalCount: Int,
+    val tier: Char?,
+)
+
+@Composable
+private fun ProvisionalRankBadgeRow(provisional: ProvisionalFocusRank) {
+    val colors = LocalRocheColors.current
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.testTag("rank_provisional_badge"),
+    ) {
+        Text(
+            text = "Provisional #${provisional.rank} of ${provisional.totalCount}",
+            color = colors.textSecondary,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+        )
+        if (provisional.tier != null) {
+            TierBadgePill(tier = provisional.tier)
         }
     }
 }
@@ -513,7 +625,7 @@ private fun ClusterRankKickerRow(session: ActiveRankSessionUiState) {
         }
     val roundLabel =
         if (session.focusEntryId != null) {
-            "Round ${session.roundIndex + 1} of $FOCUSED_ROUND_CAP"
+            "Round ${session.roundIndex + 1} of ${session.roundCap}"
         } else {
             "Round ${session.roundIndex + 1}"
         }
@@ -552,8 +664,8 @@ private fun ClusterRankKickerRow(session: ActiveRankSessionUiState) {
 private fun ClusterRankProgressAndHint(session: ActiveRankSessionUiState) {
     val colors = LocalRocheColors.current
     if (session.focusEntryId != null) {
-        val fraction =
-            ((session.roundIndex + 1).toFloat() / FOCUSED_ROUND_CAP.toFloat()).coerceIn(0.15f, 1f)
+        val cap = session.roundCap.coerceAtLeast(1)
+        val fraction = ((session.roundIndex + 1).toFloat() / cap.toFloat()).coerceIn(0.15f, 1f)
         Box(
             modifier =
                 Modifier.fillMaxWidth()
@@ -642,6 +754,8 @@ private fun rememberRankDragHandlers(
             onStart = { candidate, bIdx ->
                 cardBounds[candidate.entryId]?.let { bounds ->
                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    val frozenBounds =
+                        currentBoard.buckets.indices.mapNotNull { idx -> bucketBounds[idx] }
                     onActiveDragChange(
                         ActiveRankDragState(
                             candidate = candidate,
@@ -650,6 +764,7 @@ private fun rememberRankDragHandlers(
                             startTopInRoot = bounds.top,
                             widthPx = bounds.widthPx,
                             heightPx = bounds.heightPx,
+                            frozenBucketBounds = frozenBounds,
                         )
                     )
                 }
@@ -683,7 +798,12 @@ private fun advanceRankDragState(
 ): ActiveRankDragState {
     val nextDeltaY = drag.deltaY + delta.y
     val centerY = drag.startTopInRoot + drag.heightPx * 0.5f + nextDeltaY
-    val orderedBounds = board.buckets.indices.mapNotNull { idx -> bucketBounds[idx] }
+    val orderedBounds =
+        if (drag.frozenBucketBounds.size == board.buckets.size) {
+            drag.frozenBucketBounds
+        } else {
+            board.buckets.indices.mapNotNull { idx -> bucketBounds[idx] }
+        }
     val nextTarget =
         if (orderedBounds.size == board.buckets.size) {
             resolveRankDropTarget(centerY, drag.sourceBucketIndex, orderedBounds)
@@ -760,16 +880,13 @@ private fun RankBucketRow(
     val isTiedBucket = bucket.size > 1
     val isDropTie = dropZone == RankDropZone.TIE
     val showDashed = isTiedBucket || isDropTie
-    Column(
+    Box(
         modifier =
             Modifier.fillMaxWidth().onGloballyPositioned { coords ->
                 val top = coords.positionInRoot().y
                 onBucketPositioned(bucketIndex, top, top + coords.size.height)
-            },
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+            }
     ) {
-        if (dropZone == RankDropZone.BEFORE) DropInsertionBar()
-        if (isDropTie) DropTieHintBadge()
         Row(
             modifier = Modifier.fillMaxWidth().bucketChrome(isTiedBucket, isDropTie, colors),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -792,7 +909,18 @@ private fun RankBucketRow(
                 Modifier.weight(1f),
             )
         }
-        if (dropZone == RankDropZone.AFTER) DropInsertionBar()
+        if (dropZone == RankDropZone.BEFORE) {
+            DropInsertionBar(modifier = Modifier.align(Alignment.TopCenter).zIndex(5f))
+        }
+        if (isDropTie) {
+            DropTieHintBadge(
+                modifier =
+                    Modifier.align(Alignment.TopEnd).padding(top = 3.dp, end = 6.dp).zIndex(5f)
+            )
+        }
+        if (dropZone == RankDropZone.AFTER) {
+            DropInsertionBar(modifier = Modifier.align(Alignment.BottomCenter).zIndex(5f))
+        }
     }
 }
 
@@ -813,8 +941,8 @@ private fun Modifier.bucketChrome(
         .background(bg)
         .then(if (showDashed) Modifier.dashedRoundBorder(dashColor, 12.dp) else Modifier)
         .padding(
-            horizontal = if (showDashed) 6.dp else 0.dp,
-            vertical = if (showDashed) 7.dp else 0.dp,
+            horizontal = if (isTiedBucket) 6.dp else 0.dp,
+            vertical = if (isTiedBucket) 7.dp else 0.dp,
         )
 }
 
@@ -1370,11 +1498,12 @@ private fun RankCoverThumb(
 }
 
 @Composable
-private fun DropInsertionBar() {
+private fun DropInsertionBar(modifier: Modifier = Modifier) {
     val colors = LocalRocheColors.current
     Box(
         modifier =
-            Modifier.fillMaxWidth()
+            modifier
+                .fillMaxWidth()
                 .padding(start = 38.dp)
                 .height(3.dp)
                 .clip(RoundedCornerShape(999.dp))
@@ -1383,35 +1512,33 @@ private fun DropInsertionBar() {
 }
 
 @Composable
-private fun DropTieHintBadge() {
+private fun DropTieHintBadge(modifier: Modifier = Modifier) {
     val colors = LocalRocheColors.current
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-        Box(
-            modifier =
-                Modifier.clip(RoundedCornerShape(999.dp))
-                    .background(colors.surface)
-                    .border(1.dp, colors.accentEcru, RoundedCornerShape(999.dp))
-                    .padding(horizontal = 8.dp, vertical = 2.dp)
-        ) {
-            Text(
-                text = "= Drop to tie",
-                color = colors.accentEcru,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 10.sp,
-            )
-        }
+    Box(
+        modifier =
+            modifier
+                .clip(RoundedCornerShape(999.dp))
+                .background(colors.surface)
+                .border(1.dp, colors.accentEcru, RoundedCornerShape(999.dp))
+                .padding(horizontal = 8.dp, vertical = 2.dp)
+    ) {
+        Text(
+            text = "= Drop to tie",
+            color = colors.accentEcru,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
+        )
     }
 }
 
 @Composable
 private fun ClusterRankFooter(
     board: RankBoardState,
+    canUndo: Boolean,
     horizontalPad: Dp,
     onToggleTieAll: () -> Unit,
     onAction: (MainAction) -> Unit,
 ) {
-    val colors = LocalRocheColors.current
-    val tieAllActive = board.isAllTied
     Row(
         modifier =
             Modifier.fillMaxWidth()
@@ -1419,41 +1546,58 @@ private fun ClusterRankFooter(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            val tieShape = RoundedCornerShape(9.dp)
-            val tieBg =
-                if (tieAllActive) colors.accentEcru.copy(alpha = 0.16f) else Color.Transparent
-            val tieBorder =
-                if (tieAllActive) colors.accentEcru.copy(alpha = 0.65f) else colors.border
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier =
-                    Modifier.heightIn(min = 38.dp)
-                        .clip(tieShape)
-                        .background(tieBg)
-                        .border(1.dp, tieBorder, tieShape)
-                        .clickable(onClick = onToggleTieAll)
-                        .semantics { role = Role.Button }
-                        .padding(horizontal = 12.dp, vertical = 8.dp)
-                        .testTag("rank_tie_all_btn"),
-            ) {
-                Text(
-                    text = "= Tie All",
-                    color = if (tieAllActive) colors.accentEcru else colors.textSecondary,
-                    fontSize = 12.5.sp,
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            RankTieAllButton(active = board.isAllTied, onClick = onToggleTieAll)
+            if (canUndo) {
+                HeaderActionButton(
+                    label = "Undo",
+                    horizontalPadding = 10.dp,
+                    onClick = { onAction(MainAction.UndoLastRankRound) },
+                    modifier = Modifier.testTag("rank_undo_btn"),
                 )
             }
             HeaderActionButton(
                 label = "Skip",
+                horizontalPadding = 10.dp,
                 onClick = { onAction(MainAction.SkipRankCluster) },
                 modifier = Modifier.testTag("rank_skip_btn"),
             )
         }
         HeaderActionButton(
-            label = "Submit Order",
+            label = "Submit",
             style = RocheButtonStyle.PRIMARY,
+            horizontalPadding = 14.dp,
             onClick = { onAction(MainAction.SubmitRankCluster(board.toOrderingGroups())) },
             modifier = Modifier.testTag("rank_submit_btn"),
+        )
+    }
+}
+
+@Composable
+private fun RankTieAllButton(active: Boolean, onClick: () -> Unit) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(9.dp)
+    val bg = if (active) colors.accentEcru.copy(alpha = 0.16f) else Color.Transparent
+    val border = if (active) colors.accentEcru.copy(alpha = 0.65f) else colors.border
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.heightIn(min = 38.dp)
+                .clip(shape)
+                .background(bg)
+                .border(1.dp, border, shape)
+                .clickable(onClick = onClick)
+                .semantics { role = Role.Button }
+                .padding(horizontal = 10.dp, vertical = 8.dp)
+                .testTag("rank_tie_all_btn"),
+    ) {
+        Text(
+            text = "= Tie",
+            color = if (active) colors.accentEcru else colors.textSecondary,
+            fontSize = 12.sp,
         )
     }
 }
@@ -1471,23 +1615,35 @@ private fun Modifier.dashedRoundBorder(color: Color, radius: Dp): Modifier = dra
     )
 }
 
+private fun resolveProvisionalFocusRank(
+    session: ActiveRankSessionUiState,
+    catalog: CatalogSnapshot,
+): ProvisionalFocusRank? {
+    val focusId = session.focusEntryId ?: return null
+    val colId = resolveCatalogCollectionId(session.collectionIdOrSlug, catalog)
+    val entries = catalog.entriesByCollectionId[colId].orEmpty()
+    val match = entries.firstOrNull { it.entry.id == focusId } ?: return null
+    return ProvisionalFocusRank(rank = match.rank, totalCount = entries.size, tier = match.tier)
+}
+
+private fun resolveCatalogCollectionId(
+    collectionIdOrSlug: String,
+    catalog: CatalogSnapshot,
+): String =
+    catalog.lists
+        .firstOrNull { it.collectionId == collectionIdOrSlug || it.slug == collectionIdOrSlug }
+        ?.collectionId
+        ?: catalog.wantQueues
+            .firstOrNull { it.collectionId == collectionIdOrSlug || it.slug == collectionIdOrSlug }
+            ?.collectionId
+        ?: collectionIdOrSlug
+
 private fun resolveSettlementNeighbors(
     collectionIdOrSlug: String,
     focusEntryId: String,
     catalog: CatalogSnapshot,
 ): List<RankedCatalogEntry> {
-    val colId =
-        catalog.lists
-            .firstOrNull {
-                it.collectionId == collectionIdOrSlug || it.slug == collectionIdOrSlug
-            }
-            ?.collectionId
-            ?: catalog.wantQueues
-                .firstOrNull {
-                    it.collectionId == collectionIdOrSlug || it.slug == collectionIdOrSlug
-                }
-                ?.collectionId
-            ?: collectionIdOrSlug
+    val colId = resolveCatalogCollectionId(collectionIdOrSlug, catalog)
     val entries = catalog.entriesByCollectionId[colId].orEmpty()
     val idx = entries.indexOfFirst { it.entry.id == focusEntryId }
     if (idx < 0 || entries.size < 2) return emptyList()
@@ -1508,4 +1664,3 @@ internal fun buildOrderingGroups(
     RankBoardState.fromCandidates(orderedItems, tiedWithAboveIds).toOrderingGroups()
 
 private val RANK_WIDE_BREAKPOINT = 600.dp
-private const val FOCUSED_ROUND_CAP = 8

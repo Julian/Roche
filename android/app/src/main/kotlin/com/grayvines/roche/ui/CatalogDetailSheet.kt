@@ -2,11 +2,13 @@
 
 package com.grayvines.roche.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -25,13 +27,22 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.ModalBottomSheetProperties
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -56,9 +67,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.data.catalog.AlbumTrackItem
 import com.grayvines.roche.data.catalog.CatalogEntryItem
+import com.grayvines.roche.data.catalog.CatalogListSummary
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionMode
 import com.grayvines.roche.data.catalog.ConsumptionStatus
@@ -72,6 +85,8 @@ import com.grayvines.roche.data.catalog.extractMetadataGenres
 import com.grayvines.roche.data.catalog.resolveWikipediaUrl
 import com.grayvines.roche.data.catalog.toMusicLaunchSnapshot
 import com.grayvines.roche.ui.components.CatalogCoverThumbnail
+import com.grayvines.roche.ui.components.FilterChipPill
+import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.TierBadgePill
 import com.grayvines.roche.ui.components.WikipediaIcon
@@ -109,6 +124,9 @@ private data class CatalogDetailModel(
     val wikiUrl: String?,
     val artistLibraryAlbums: List<ArtistLibraryAlbum>,
     val artistExternalDiscography: List<DiscographyAlbumItem>,
+    val isStarred: Boolean,
+    val isInWantQueue: Boolean,
+    val addableManualLists: List<CatalogListSummary>,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -124,61 +142,294 @@ internal fun CatalogDetailBottomSheet(
     val model = remember(entryId, state.catalog) { buildCatalogDetailModel(entryId, state) }
     if (model == null) return
     val colors = LocalRocheColors.current
+    val scrollState = rememberScrollState()
+    val previousEntryId = state.catalogDetailStack.dropLast(1).lastOrNull()
+    val previousTitle =
+        remember(previousEntryId, state.catalog) {
+            previousEntryId?.let { resolveCatalogEntryById(it, state)?.title }
+        }
+    val isEnriching = entryId in state.enrichingCatalogEntryIds
+    var editingLogId by rememberSaveable(entryId) { mutableStateOf<String?>(null) }
+    val editingLog =
+        remember(editingLogId, model.diaryLogs) {
+            editingLogId?.let { id -> model.diaryLogs.firstOrNull { it.id == id } }
+        }
+
+    LaunchedEffect(entryId) { scrollState.scrollTo(0) }
 
     ModalBottomSheet(
         onDismissRequest = { onAction(MainAction.CloseCatalogDetailSheet) },
         containerColor = colors.surface,
+        properties = ModalBottomSheetProperties(shouldDismissOnBackPress = false),
     ) {
-        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-            val isWide = maxWidth >= CATALOG_DETAIL_WIDE_BREAKPOINT
-            val horizontalPad = if (isWide) 20.dp else 16.dp
-            Column(
-                modifier =
-                    Modifier.fillMaxWidth()
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = horizontalPad, vertical = 6.dp)
-                        .testTag("catalog_detail_sheet"),
-                verticalArrangement = Arrangement.spacedBy(20.dp),
-            ) {
-                when (model.entry.kind) {
-                    EntryKind.ALBUM ->
-                        AlbumDetailSheetBody(
-                            model = model,
-                            isWide = isWide,
-                            onAction = onAction,
-                            onPlayAlbum = {
-                                onOpenCollectionDraw(model.entry.toMusicLaunchSnapshot())
-                            },
-                            onPlayMusicTrack = onPlayMusicTrack,
-                            onOpenExternalUrl = onOpenExternalUrl,
-                        )
-                    EntryKind.ARTIST ->
-                        ArtistDetailSheetBody(
-                            model = model,
-                            isWide = isWide,
-                            onAction = onAction,
-                            onOpenExternalUrl = onOpenExternalUrl,
-                        )
-                    else ->
-                        GenericCatalogDetailBody(
-                            model = model,
-                            isWide = isWide,
-                            onAction = onAction,
-                            onPlayMusicTrack = onPlayMusicTrack,
-                            onOpenExternalUrl = onOpenExternalUrl,
-                        )
-                }
-                Spacer(modifier = Modifier.height(20.dp))
+        CatalogDetailModalBody(
+            model = model,
+            state = state,
+            previousTitle = previousTitle,
+            isEnriching = isEnriching,
+            scrollState = scrollState,
+            onAction = onAction,
+            onEditDiaryLog = { editingLogId = it.id },
+            onOpenCollectionDraw = onOpenCollectionDraw,
+            onPlayMusicTrack = onPlayMusicTrack,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+    }
+    if (editingLog != null) {
+        DiaryEditLogDialogHost(
+            log = editingLog,
+            onDismiss = { editingLogId = null },
+            onAction = onAction,
+        )
+    }
+}
+
+@Suppress("LongParameterList")
+@Composable
+private fun CatalogDetailModalBody(
+    model: CatalogDetailModel,
+    state: MainUiState,
+    previousTitle: String?,
+    isEnriching: Boolean,
+    scrollState: androidx.compose.foundation.ScrollState,
+    onAction: (MainAction) -> Unit,
+    onEditDiaryLog: (DiaryEntryItem) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+    onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    BackHandler(enabled = true) {
+        if (state.catalogDetailStack.size > 1) {
+            onAction(MainAction.PopCatalogDetailSheet)
+        } else {
+            onAction(MainAction.CloseCatalogDetailSheet)
+        }
+    }
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        val isWide = maxWidth >= CATALOG_DETAIL_WIDE_BREAKPOINT
+        val horizontalPad = if (isWide) 20.dp else 16.dp
+        Column(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .verticalScroll(scrollState)
+                    .padding(horizontal = horizontalPad, vertical = 6.dp)
+                    .testTag("catalog_detail_sheet"),
+            verticalArrangement = Arrangement.spacedBy(18.dp),
+        ) {
+            if (state.catalogDetailStack.size > 1) {
+                CatalogDetailBackChip(
+                    previousTitle = previousTitle,
+                    onBack = { onAction(MainAction.PopCatalogDetailSheet) },
+                )
+            }
+            CatalogDetailSheetContent(
+                model = model,
+                isWide = isWide,
+                canRefreshOnline = state.hasBearerToken,
+                isEnriching = isEnriching,
+                onAction = onAction,
+                onEditDiaryLog = onEditDiaryLog,
+                onOpenCollectionDraw = onOpenCollectionDraw,
+                onPlayMusicTrack = onPlayMusicTrack,
+                onOpenExternalUrl = onOpenExternalUrl,
+            )
+            Spacer(modifier = Modifier.height(20.dp))
+        }
+    }
+}
+
+@Composable
+private fun CatalogDetailBackChip(
+    previousTitle: String?,
+    onBack: () -> Unit,
+) {
+    val label = if (!previousTitle.isNullOrBlank()) "← $previousTitle" else "← Back"
+    FilterChipPill(
+        label = label,
+        selected = false,
+        onClick = onBack,
+        modifier = Modifier.testTag("catalog_detail_back_btn"),
+    )
+}
+
+private data class CatalogMetaRefreshState(
+    val canRefreshOnline: Boolean,
+    val isEnriching: Boolean,
+)
+
+@Suppress("LongParameterList")
+@Composable
+private fun CatalogDetailSheetContent(
+    model: CatalogDetailModel,
+    isWide: Boolean,
+    canRefreshOnline: Boolean,
+    isEnriching: Boolean,
+    onAction: (MainAction) -> Unit,
+    onEditDiaryLog: (DiaryEntryItem) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+    onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val refreshState = CatalogMetaRefreshState(canRefreshOnline, isEnriching)
+    when (model.entry.kind) {
+        EntryKind.ALBUM ->
+            AlbumDetailSheetBody(
+                model = model,
+                isWide = isWide,
+                refreshState = refreshState,
+                onAction = onAction,
+                onEditDiaryLog = onEditDiaryLog,
+                onPlayAlbum = { onOpenCollectionDraw(model.entry.toMusicLaunchSnapshot()) },
+                onPlayMusicTrack = onPlayMusicTrack,
+                onOpenExternalUrl = onOpenExternalUrl,
+            )
+        EntryKind.ARTIST ->
+            ArtistDetailSheetBody(
+                model = model,
+                isWide = isWide,
+                refreshState = refreshState,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+            )
+        else ->
+            GenericCatalogDetailBody(
+                model = model,
+                isWide = isWide,
+                refreshState = refreshState,
+                onAction = onAction,
+                onEditDiaryLog = onEditDiaryLog,
+                onPlayMusicTrack = onPlayMusicTrack,
+                onOpenExternalUrl = onOpenExternalUrl,
+            )
+    }
+}
+
+@Composable
+private fun CatalogDetailActionStrip(
+    model: CatalogDetailModel,
+    refreshState: CatalogMetaRefreshState,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val entry = model.entry
+    Row(
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        FilterChipPill(
+            label = if (model.isStarred) "★ Starred" else "☆ Star",
+            selected = model.isStarred,
+            onClick = { onAction(MainAction.ToggleCatalogStar(entry.id)) },
+            modifier = Modifier.testTag("catalog_detail_star_btn"),
+        )
+        if (entry.kind != EntryKind.ARTIST) {
+            FilterChipPill(
+                label = if (model.isInWantQueue) "✓ In Queue" else "+ Queue",
+                selected = model.isInWantQueue,
+                onClick = { onAction(MainAction.ToggleCatalogWant(entry.id)) },
+                modifier = Modifier.testTag("catalog_detail_queue_btn"),
+            )
+        }
+        if (model.addableManualLists.isNotEmpty()) {
+            AddToManualListChip(
+                entryId = entry.id,
+                lists = model.addableManualLists,
+                onSelectList = { colId ->
+                    onAction(MainAction.AddCatalogEntryToList(colId, entry.id))
+                },
+            )
+        }
+        if (refreshState.canRefreshOnline) {
+            RefreshMetadataChip(
+                isEnriching = refreshState.isEnriching,
+                accentColor = colors.accentBlue,
+                onClick = { onAction(MainAction.RefreshCatalogEntryMetadata(entry.id)) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun AddToManualListChip(
+    entryId: String,
+    lists: List<CatalogListSummary>,
+    onSelectList: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    var expanded by rememberSaveable(entryId) { mutableStateOf(false) }
+    Box {
+        FilterChipPill(
+            label = "+ List",
+            selected = expanded,
+            onClick = { expanded = true },
+            modifier = Modifier.testTag("catalog_detail_add_list_btn"),
+        )
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            containerColor = colors.surfaceElevated,
+        ) {
+            lists.forEach { list ->
+                DropdownMenuItem(
+                    text = { Text(list.title, color = colors.textPrimary) },
+                    onClick = {
+                        expanded = false
+                        onSelectList(list.collectionId)
+                    },
+                    modifier = Modifier.testTag("catalog_add_to_list_${list.collectionId}"),
+                )
             }
         }
     }
 }
 
 @Composable
+private fun RefreshMetadataChip(
+    isEnriching: Boolean,
+    accentColor: Color,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(999.dp)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier =
+            Modifier.minimumInteractiveComponentSize()
+                .clip(shape)
+                .background(
+                    if (isEnriching) accentColor.copy(alpha = 0.14f) else colors.surfaceElevated
+                )
+                .border(1.dp, if (isEnriching) accentColor else colors.border, shape)
+                .clickable(enabled = !isEnriching, onClick = onClick)
+                .semantics { role = Role.Button }
+                .padding(horizontal = 12.dp, vertical = 7.dp)
+                .testTag("catalog_detail_refresh_meta_btn"),
+    ) {
+        if (isEnriching) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(12.dp),
+                strokeWidth = 1.6.dp,
+                color = accentColor,
+            )
+        }
+        Text(
+            text = if (isEnriching) "Refreshing…" else "↻ Refresh Metadata",
+            color = if (isEnriching) accentColor else colors.textSecondary,
+            fontSize = 12.sp,
+        )
+    }
+}
+
+@Suppress("LongParameterList")
+@Composable
 private fun AlbumDetailSheetBody(
     model: CatalogDetailModel,
     isWide: Boolean,
+    refreshState: CatalogMetaRefreshState,
     onAction: (MainAction) -> Unit,
+    onEditDiaryLog: (DiaryEntryItem) -> Unit,
     onPlayAlbum: () -> Unit,
     onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
@@ -195,6 +446,7 @@ private fun AlbumDetailSheetBody(
             },
         onRank = { startFocusedRank(model.primaryAppearance, model.entry.id, onAction) },
     )
+    CatalogDetailActionStrip(model, refreshState, onAction)
     if (isWide) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -215,13 +467,13 @@ private fun AlbumDetailSheetBody(
                     openList,
                     onOpenExternalUrl,
                 )
-                CatalogDiarySection(model.entry, model.diaryLogs, onAction)
+                CatalogDiarySection(model.entry, model.diaryLogs, onAction, onEditDiaryLog)
             }
         }
     } else {
         AlbumTracklistSection(model.entry, model.tracks, onPlayAlbum, onPlayMusicTrack)
         CatalogListsSection(model.appearances, model.wikiUrl, null, openList, onOpenExternalUrl)
-        CatalogDiarySection(model.entry, model.diaryLogs, onAction)
+        CatalogDiarySection(model.entry, model.diaryLogs, onAction, onEditDiaryLog)
     }
 }
 
@@ -716,6 +968,7 @@ private fun CatalogDiaryAddLogButton(entry: CatalogEntryItem, onAction: (MainAct
                             prefillTitle = entry.title,
                             prefillCreators = entry.creators.joinToString(", "),
                             prefillReleaseYear = entry.releaseYear,
+                            existingEntryId = entry.id,
                         )
                     )
                 }
@@ -732,6 +985,7 @@ private fun CatalogDiarySection(
     entry: CatalogEntryItem,
     logs: List<DiaryEntryItem>,
     onAction: (MainAction) -> Unit,
+    onEditDiaryLog: (DiaryEntryItem) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -763,7 +1017,7 @@ private fun CatalogDiarySection(
                     if (idx > 0) {
                         HorizontalDivider(color = colors.border, thickness = 1.dp)
                     }
-                    CatalogDiaryHistoryRow(log = log)
+                    CatalogDiaryHistoryRow(log = log, onEdit = { onEditDiaryLog(log) })
                 }
             }
         }
@@ -771,30 +1025,61 @@ private fun CatalogDiarySection(
 }
 
 @Composable
-private fun CatalogDiaryHistoryRow(log: DiaryEntryItem) {
+private fun CatalogDiaryHistoryRow(
+    log: DiaryEntryItem,
+    onEdit: () -> Unit,
+) {
     val colors = LocalRocheColors.current
     val dateText = remember(log.ts, log.dateLabel) { formatDiaryFullDate(log.ts, log.dateLabel) }
-    val (statusLabel, statusTint) =
-        when (log.status) {
-            ConsumptionStatus.CONSUMED -> "Finished" to colors.accentVerdigris
-            ConsumptionStatus.STARTED -> "Started" to colors.accentBlue
-            ConsumptionStatus.ABANDONED -> "Abandoned" to colors.accentIndianRed
-        }
     Column(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 11.dp),
-        verticalArrangement = Arrangement.spacedBy(5.dp),
+        modifier =
+            Modifier.fillMaxWidth()
+                .clickable(onClick = onEdit)
+                .semantics { role = Role.Button }
+                .padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
+        CatalogDiaryHistoryHeader(log = log, dateText = dateText, onEdit = onEdit)
+        if (!log.notes.isNullOrBlank()) {
             Text(
-                text = dateText,
-                color = colors.textSecondary,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.5.sp,
+                text = log.notes,
+                color = colors.accentEcru,
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+                modifier = Modifier.padding(end = 8.dp),
             )
+        }
+    }
+}
+
+@Composable
+private fun CatalogDiaryHistoryHeader(
+    log: DiaryEntryItem,
+    dateText: String,
+    onEdit: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val statusTint =
+        when (log.status) {
+            ConsumptionStatus.CONSUMED -> colors.accentVerdigris
+            ConsumptionStatus.STARTED -> colors.accentBlue
+            ConsumptionStatus.ABANDONED -> colors.accentIndianRed
+        }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = dateText,
+            color = colors.textSecondary,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.5.sp,
+        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
             Box(
                 modifier =
                     Modifier.clip(RoundedCornerShape(6.dp))
@@ -802,20 +1087,20 @@ private fun CatalogDiaryHistoryRow(log: DiaryEntryItem) {
                         .padding(horizontal = 8.dp, vertical = 2.dp)
             ) {
                 Text(
-                    text = statusLabel,
+                    text = log.status.displayLabel,
                     color = statusTint,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 10.5.sp,
                 )
             }
-        }
-        if (!log.notes.isNullOrBlank()) {
-            Text(
-                text = log.notes,
-                color = colors.accentEcru,
-                fontSize = 12.sp,
-                lineHeight = 17.sp,
-            )
+            RocheIconActionButton(
+                contentDescription = "Edit diary log",
+                outlined = false,
+                onClick = onEdit,
+                modifier = Modifier.testTag("catalog_diary_edit_${log.id}"),
+            ) {
+                Text(text = "⋯", color = colors.textMuted, fontSize = 15.sp)
+            }
         }
     }
 }
@@ -824,6 +1109,7 @@ private fun CatalogDiaryHistoryRow(log: DiaryEntryItem) {
 private fun ArtistDetailSheetBody(
     model: CatalogDetailModel,
     isWide: Boolean,
+    refreshState: CatalogMetaRefreshState,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
@@ -840,6 +1126,11 @@ private fun ArtistDetailSheetBody(
         primaryAppearance = model.primaryAppearance,
         onRank = { startFocusedRank(model.primaryAppearance, model.entry.id, onAction) },
     )
+    CatalogDetailActionStrip(model, refreshState, onAction)
+    val bio = model.entry.summary?.trim()
+    if (!bio.isNullOrEmpty()) {
+        ArtistBioCard(entryId = model.entry.id, bio = bio)
+    }
     ArtistDiscographySection(
         artistName = model.entry.title,
         inLibraryAlbums = model.artistLibraryAlbums,
@@ -1181,10 +1472,52 @@ private fun DiscographyExternalCard(album: DiscographyAlbumItem, onClick: () -> 
 }
 
 @Composable
+private fun ArtistBioCard(entryId: String, bio: String) {
+    val colors = LocalRocheColors.current
+    var expanded by rememberSaveable(entryId) { mutableStateOf(false) }
+    val isLong = bio.length > ARTIST_BIO_COLLAPSE_CHARS
+    RocheSurfaceCard {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp).testTag("catalog_artist_bio"),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = bio,
+                color = colors.textSecondary,
+                fontSize = 13.sp,
+                lineHeight = 19.sp,
+                maxLines = if (expanded || !isLong) Int.MAX_VALUE else 4,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (isLong) {
+                Box(
+                    contentAlignment = Alignment.CenterStart,
+                    modifier =
+                        Modifier.minimumInteractiveComponentSize()
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { expanded = !expanded }
+                            .semantics { role = Role.Button }
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                ) {
+                    Text(
+                        text = if (expanded) "Show less" else "Read more",
+                        color = colors.accentBlue,
+                        fontSize = 12.sp,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Suppress("LongParameterList")
+@Composable
 private fun GenericCatalogDetailBody(
     model: CatalogDetailModel,
     isWide: Boolean,
+    refreshState: CatalogMetaRefreshState,
     onAction: (MainAction) -> Unit,
+    onEditDiaryLog: (DiaryEntryItem) -> Unit,
     onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
@@ -1195,6 +1528,7 @@ private fun GenericCatalogDetailBody(
     }
     val onPlaySong = buildSongPlayCallback(entry, onPlayMusicTrack)
     GenericCatalogDetailHero(model = model, onAction = onAction, onPlaySong = onPlaySong)
+    CatalogDetailActionStrip(model, refreshState, onAction)
     if (!entry.summary.isNullOrBlank()) {
         RocheSurfaceCard {
             Text(
@@ -1222,7 +1556,7 @@ private fun GenericCatalogDetailBody(
                 )
             }
             Box(modifier = Modifier.weight(1f)) {
-                CatalogDiarySection(entry, model.diaryLogs, onAction)
+                CatalogDiarySection(entry, model.diaryLogs, onAction, onEditDiaryLog)
             }
         }
     } else {
@@ -1233,7 +1567,7 @@ private fun GenericCatalogDetailBody(
             openList,
             onOpenExternalUrl,
         )
-        CatalogDiarySection(entry, model.diaryLogs, onAction)
+        CatalogDiarySection(entry, model.diaryLogs, onAction, onEditDiaryLog)
     }
 }
 
@@ -1380,6 +1714,7 @@ private fun buildCatalogDetailModel(entryId: String, state: MainUiState): Catalo
         } else {
             emptyList()
         }
+    val membership = resolveCatalogDetailMembership(entry.id, appearances, catalog)
     return CatalogDetailModel(
         entry = entry,
         appearances = appearances,
@@ -1396,7 +1731,41 @@ private fun buildCatalogDetailModel(entryId: String, state: MainUiState): Catalo
         wikiUrl = entry.resolveWikipediaUrl(),
         artistLibraryAlbums = artistAlbums,
         artistExternalDiscography = externalDiscog,
+        isStarred = membership.isStarred,
+        isInWantQueue = membership.isInWantQueue,
+        addableManualLists = membership.addableManualLists,
     )
+}
+
+private data class CatalogDetailMembership(
+    val isStarred: Boolean,
+    val isInWantQueue: Boolean,
+    val addableManualLists: List<CatalogListSummary>,
+)
+
+private fun resolveCatalogDetailMembership(
+    entryId: String,
+    appearances: List<CatalogListAppearance>,
+    catalog: com.grayvines.roche.data.catalog.CatalogSnapshot,
+): CatalogDetailMembership {
+    val isStarred =
+        catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().any {
+            it.entry.id == entryId
+        }
+    val isInWantQueue =
+        catalog.wantQueues.any { queue ->
+            catalog.entriesByCollectionId[queue.collectionId].orEmpty().any {
+                it.entry.id == entryId
+            }
+        }
+    val appearanceIds = appearances.mapTo(HashSet()) { it.collectionId }
+    val addableManualLists =
+        catalog.lists.filter { list ->
+            isEditableManualUserList(list) &&
+                list.collectionId != STARRED_COLLECTION_ID &&
+                list.collectionId !in appearanceIds
+        }
+    return CatalogDetailMembership(isStarred, isInWantQueue, addableManualLists)
 }
 
 private fun resolveCatalogEntryById(entryId: String, state: MainUiState): CatalogEntryItem? =
@@ -1521,6 +1890,7 @@ private fun formatDiaryFullDate(rawIso: String, fallback: String): String {
 }
 
 private val CATALOG_DETAIL_WIDE_BREAKPOINT = 480.dp
+private const val ARTIST_BIO_COLLAPSE_CHARS = 220
 private const val ALBUM_TRACKLIST_WEIGHT = 1.55f
 private const val ALBUM_SIDE_WEIGHT = 1f
 private const val MS_PER_SECOND = 1_000L

@@ -6,6 +6,7 @@ import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
 import com.grayvines.roche.core.HlcTimestamp
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_GENERATOR
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_COMPARISON
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_CONSUMPTION_LOG
 import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
 import com.grayvines.roche.core.canonicalOrderingJson
@@ -458,6 +459,37 @@ class CatalogStore(
         return entryId
     }
 
+    suspend fun wantExistingEntry(entryId: String): Pair<String, String>? {
+        val result = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val resolved = followMergedId(entryId) ?: entryId.trim()
+            dao.getEntryById(resolved)?.let { existing ->
+                val nowIso = nowUtcIso()
+                val nodeId = resolveLocalPeerId()
+                val kind = EntryKind.fromWireValue(existing.kind)
+                var queuePair: Pair<String, String>? = null
+                dao.executeInTransaction {
+                    val queueSpec = ensureWantCollectionInDao(dao, kind, null, nowIso, nodeId)
+                    addCollectionMemberInDao(
+                        dao = dao,
+                        spec = queueSpec,
+                        entryId = resolved,
+                        position = null,
+                        nowIso = nowIso,
+                        markDirty = true,
+                        nodeId = nodeId,
+                    )
+                    queuePair = queueSpec.collectionId to lookupSpecTitle(queueSpec)
+                }
+                queuePair
+            }
+        }
+        if (result != null) {
+            notifyLocalMutation()
+        }
+        return result
+    }
+
     suspend fun createCustomList(
         title: String,
         role: CollectionRole = CollectionRole.LIST,
@@ -652,12 +684,46 @@ class CatalogStore(
         return compId
     }
 
+    suspend fun deleteComparison(comparisonId: String): Boolean {
+        val cleanId = comparisonId.trim()
+        if (cleanId.isEmpty()) return false
+        val deleted = mutationMutex.withLock {
+            ensureSystemSeeded()
+            if (dao.getComparisonById(cleanId) == null) {
+                false
+            } else {
+                val nowIso = nowUtcIso()
+                val nodeId = resolveLocalPeerId()
+                dao.executeInTransaction {
+                    val hlc = nextLocalHlc(dao, nodeId)
+                    dao.deleteComparisonById(cleanId)
+                    dao.upsertTombstone(
+                        TombstoneEntity(
+                            entityType = TOMBSTONE_ENTITY_COMPARISON,
+                            naturalKey = cleanId,
+                            deletedAt = nowIso,
+                            hlc = hlc,
+                            isLocalDirty = true,
+                        )
+                    )
+                }
+                true
+            }
+        }
+        if (deleted) {
+            notifyLocalMutation()
+        }
+        return deleted
+    }
+
+    @Suppress("LongParameterList")
     suspend fun selectNextRankCluster(
         collectionIdOrSlug: String,
         focusEntryId: String? = null,
         roundIndex: Int = 0,
         forceRandomNext: Boolean = false,
         maxK: Int = EpRankingEngine.MAX_K_DEFAULT,
+        excludedOpponentIds: Set<String> = emptySet(),
     ): List<RankClusterCandidate> = mutationMutex.withLock {
         ensureSystemSeeded()
         val spec = resolveCollectionSpec(collectionIdOrSlug)
@@ -666,22 +732,43 @@ class CatalogStore(
         if (members.size < EpRankingEngine.MIN_K) {
             emptyList()
         } else {
-            pickClusterForMembers(members, focusEntryId, roundIndex, forceRandomNext, maxK)
+            pickClusterForMembers(
+                members = members,
+                focusEntryId = focusEntryId,
+                roundIndex = roundIndex,
+                forceRandomNext = forceRandomNext,
+                maxK = maxK,
+                excludedOpponentIds = excludedOpponentIds,
+            )
         }
     }
 
+    @Suppress("LongParameterList")
     private suspend fun pickClusterForMembers(
         members: List<RankedCatalogEntry>,
         focusEntryId: String?,
         roundIndex: Int,
         forceRandomNext: Boolean,
         maxK: Int,
+        excludedOpponentIds: Set<String> = emptySet(),
     ): List<RankClusterCandidate> {
-        val memberIds = members.map { it.entry.id }
-        val scores = members.associate { ranked ->
+        val resolvedFocus = focusEntryId?.let { followMergedId(it) ?: it }
+        val filteredMembers =
+            if (excludedOpponentIds.isEmpty()) {
+                members
+            } else {
+                val reduced = members.filter { ranked ->
+                    ranked.entry.id == resolvedFocus || ranked.entry.id !in excludedOpponentIds
+                }
+                if (reduced.size < EpRankingEngine.MIN_K) {
+                    return emptyList()
+                }
+                reduced
+            }
+        val memberIds = filteredMembers.map { it.entry.id }
+        val scores = filteredMembers.associate { ranked ->
             ranked.entry.id to EpRankingEngine.Score(ranked.mean, ranked.variance)
         }
-        val resolvedFocus = focusEntryId?.let { followMergedId(it) ?: it }
         val seedPool = resolvedFocus?.takeIf { it in scores }?.let(::listOf)
         val forceRandom =
             forceRandomNext ||
@@ -697,7 +784,7 @@ class CatalogStore(
                 seedPool = seedPool,
                 random = random,
             )
-        val byId = members.associateBy { it.entry.id }
+        val byId = filteredMembers.associateBy { it.entry.id }
         return if (clusterIds.size < EpRankingEngine.MIN_K) {
             emptyList()
         } else {
