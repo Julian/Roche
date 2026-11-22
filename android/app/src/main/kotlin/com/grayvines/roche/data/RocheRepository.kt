@@ -863,6 +863,7 @@ class RocheRepository(
     suspend fun refreshFeed(feedId: String): Result<String> = withSyncIndicator {
         withContext(Dispatchers.Default) {
             runSuspendCatching {
+                catalog.ensureSystemSeeded()
                 val currentSettings = settings.settings.first()
                 val localFeed = dao.getFeedById(feedId) ?: error("Feed not found: $feedId")
                 val existingTitle = localFeed.title
@@ -1505,6 +1506,7 @@ class RocheRepository(
         withContext(Dispatchers.Default) {
             syncMutex.withLock {
                 val result = runSuspendCatching {
+                    catalog.ensureSystemSeeded()
                     val currentSettings = settings.settings.first()
                     val currentTier = networkTierProvider.currentNetworkTier()
                     if (currentSettings.serverUrl.isBlank()) {
@@ -1587,6 +1589,7 @@ class RocheRepository(
         withContext(Dispatchers.Default) {
             syncMutex.withLock {
                 runSuspendCatching {
+                    catalog.ensureSystemSeeded()
                     val currentTier = networkTierProvider.currentNetworkTier()
                     check(currentTier != NetworkTier.OFFLINE) { "Device is currently offline" }
                     val currentSettings = settings.settings.first()
@@ -1636,6 +1639,7 @@ class RocheRepository(
         return withSyncIndicator {
             syncMutex.withLock {
                 runSuspendCatching {
+                    catalog.ensureSystemSeeded()
                     pollCooperativeFeedsOnDevice(
                             dao = dao,
                             publicWebFetcher = publicWebFetcher,

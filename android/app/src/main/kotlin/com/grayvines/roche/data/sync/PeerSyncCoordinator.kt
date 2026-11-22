@@ -101,6 +101,7 @@ internal class PeerSyncCoordinator(
         initialWeightOverride: Double?,
         sinceSeqOverride: Long?,
     ): Int? {
+        catalogStore?.ensureSystemSeeded()
         val initialCycle =
             runFullSyncCycle(
                 currentSettings = currentSettings,

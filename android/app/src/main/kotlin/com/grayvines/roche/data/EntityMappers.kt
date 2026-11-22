@@ -94,28 +94,15 @@ internal fun buildSnapshot(
             .groupingBy { it.feedId!! }
             .eachCount()
 
-    val podcastFeedIds =
-        domainEntries
-            .filter { it.contentType == ContentType.AUDIO && it.feedId != null }
-            .mapNotNull { it.feedId }
-            .toSet()
-
     val domainFeeds =
         feeds
             .map { feed ->
-                val baseType = FeedType.fromWireValue(feed.feedType)
-                val effectiveType =
-                    if (baseType == FeedType.RSS && feed.id in podcastFeedIds) {
-                        FeedType.PODCAST
-                    } else {
-                        baseType
-                    }
                 FeedItem(
                     id = feed.id,
                     title = feed.title,
                     url = feed.url,
                     siteUrl = feed.siteUrl,
-                    feedType = effectiveType,
+                    feedType = FeedType.fromWireValue(feed.feedType),
                     unreadCount = unreadByFeedId[feed.id] ?: 0,
                     lastPolled = feed.lastPolled,
                     lastPolledBy = feed.lastPolledBy,

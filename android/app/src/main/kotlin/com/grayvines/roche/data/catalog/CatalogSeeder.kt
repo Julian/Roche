@@ -85,10 +85,12 @@ internal class CatalogSeeder(
             }
             if (wasEmptyDatabase) {
                 dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_MIGRATED_MANUAL_WANT_READ, "1"))
+                dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_REPAIRED_IMPLICIT_PODCASTS, "1"))
             }
         }
         if (!wasEmptyDatabase) {
             migrateManualInboxOnce()
+            repairPodcastDataOnce()
         }
     }
 
@@ -191,6 +193,16 @@ internal class CatalogSeeder(
             promoteManualToWantRead(manualStates)
         }
         dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_MIGRATED_MANUAL_WANT_READ, "1"))
+    }
+
+    private suspend fun repairPodcastDataOnce() {
+        if (dao.getLocalSyncFlag(FLAG_REPAIRED_IMPLICIT_PODCASTS) != null) return
+        val nowIso = nowUtcIso()
+        val nodeId = localPeerIdProvider().ifBlank { DEFAULT_LOCAL_HLC_NODE }
+        dao.executeInTransaction {
+            repairPodcastDataInTx(dao, nowIso, nodeId)
+            dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_REPAIRED_IMPLICIT_PODCASTS, "1"))
+        }
     }
 
     private suspend fun findLegacyManualUnreadStates():

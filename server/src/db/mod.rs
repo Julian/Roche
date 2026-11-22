@@ -171,11 +171,199 @@ impl Db {
 
     async fn run_startup_maintenance(&self) {
         const CANONICALIZE_URL_IDENTIFIERS_TASK: &str = "canonicalize_entry_url_identifiers";
+        const REPAIR_IMPLICIT_PODCASTS_TASK: &str = "repair_implicit_podcast_misclassifications_v1";
 
         self.run_maintenance_task_once(CANONICALIZE_URL_IDENTIFIERS_TASK, async {
             self.canonicalize_entry_url_identifiers().await
         })
         .await;
+        self.run_maintenance_task_once(REPAIR_IMPLICIT_PODCASTS_TASK, async {
+            self.repair_implicit_podcast_misclassifications().await
+        })
+        .await;
+    }
+
+    async fn repair_implicit_podcast_misclassifications(&self) -> Result<()> {
+        let mut tx = begin_write(&self.pool).await?;
+        let now = crate::util::clock::now_utc();
+        let deleted_media_entry_ids =
+            Self::delete_bogus_webpage_audio_enclosures_in_tx(&mut tx).await?;
+        let reverted_entry_ids = Self::revert_orphan_audio_entries_in_tx(&mut tx, now).await?;
+        for entry_id in deleted_media_entry_ids.difference(&reverted_entry_ids) {
+            let entry_hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET updated_at = ?, hlc = ? WHERE id = ?")
+                .bind(now)
+                .bind(&entry_hlc)
+                .bind(entry_id)
+                .execute(tx.conn())
+                .await?;
+        }
+        Self::revert_majority_non_audio_podcast_feeds_in_tx(&mut tx, now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_bogus_webpage_audio_enclosures_in_tx(
+        tx: &mut WriteTx<'_>,
+    ) -> Result<std::collections::HashSet<String>> {
+        let audio_media_rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT em.id, em.entry_id, em.remote_url, e.url
+             FROM entry_media em
+             JOIN entries e ON e.id = em.entry_id
+             WHERE em.media_type = 'audio'
+               AND em.local_path IS NULL
+               AND (em.duration IS NULL OR em.duration <= 0)
+               AND em.remote_url IS NOT NULL
+               AND e.url IS NOT NULL",
+        )
+        .fetch_all(tx.conn())
+        .await?;
+
+        let mut affected_entries = std::collections::HashSet::new();
+        for (media_id, entry_id, remote_url, entry_url) in audio_media_rows {
+            let same_url =
+                sync::canonicalize_sync_url(&remote_url) == sync::canonicalize_sync_url(&entry_url);
+            let is_direct_audio = url::Url::parse(remote_url.trim())
+                .is_ok_and(|parsed| crate::util::media_urls::is_direct_audio_url(&parsed));
+            if same_url && !is_direct_audio {
+                sqlx::query("DELETE FROM entry_media WHERE id = ?")
+                    .bind(&media_id)
+                    .execute(tx.conn())
+                    .await?;
+                affected_entries.insert(entry_id);
+            }
+        }
+        Ok(affected_entries)
+    }
+
+    async fn revert_orphan_audio_entries_in_tx(
+        tx: &mut WriteTx<'_>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<std::collections::HashSet<String>> {
+        let orphan_audio_entries: Vec<(String, EntryKind, Option<String>)> = sqlx::query_as(
+            "SELECT e.id, e.kind, e.url
+             FROM entries e
+             JOIN entry_content ec ON ec.entry_id = e.id
+             WHERE e.merged_into_id IS NULL
+               AND ec.content_type = 'audio'
+               AND NOT EXISTS (
+                   SELECT 1 FROM entry_media em
+                   WHERE em.entry_id = e.id
+                     AND em.media_type = 'audio'
+                     AND (em.remote_url IS NOT NULL OR em.local_path IS NOT NULL)
+               )",
+        )
+        .fetch_all(tx.conn())
+        .await?;
+
+        let mut reverted_entries = std::collections::HashSet::new();
+        for (entry_id, existing_kind, entry_url) in orphan_audio_entries {
+            let reclassified_ct = entry_url
+                .as_deref()
+                .and_then(|raw| url::Url::parse(raw.trim()).ok())
+                .map_or(ContentType::Article, |parsed| roche_core::classify::classify_url(&parsed));
+            if reclassified_ct == ContentType::Audio {
+                continue;
+            }
+            sqlx::query("UPDATE entry_content SET content_type = ? WHERE entry_id = ?")
+                .bind(reclassified_ct)
+                .bind(&entry_id)
+                .execute(tx.conn())
+                .await?;
+            sqlx::query(
+                "DELETE FROM entry_media
+                 WHERE entry_id = ?
+                   AND media_type = 'audio'
+                   AND remote_url IS NULL
+                   AND local_path IS NULL",
+            )
+            .bind(&entry_id)
+            .execute(tx.conn())
+            .await?;
+            let target_kind = if existing_kind == EntryKind::PodcastEpisode {
+                EntryKind::from_content_type(reclassified_ct)
+            } else {
+                existing_kind
+            };
+            let entry_hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET kind = ?, updated_at = ?, hlc = ? WHERE id = ?")
+                .bind(target_kind)
+                .bind(now)
+                .bind(&entry_hlc)
+                .bind(&entry_id)
+                .execute(tx.conn())
+                .await?;
+            reverted_entries.insert(entry_id);
+        }
+        Ok(reverted_entries)
+    }
+
+    async fn revert_majority_non_audio_podcast_feeds_in_tx(
+        tx: &mut WriteTx<'_>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let podcast_feeds: Vec<(String, FeedType, EntryKind)> = sqlx::query_as(
+            "SELECT fs.collection_id, fs.source_type, e.kind
+             FROM feed_sources fs
+             JOIN entries e ON e.id = fs.collection_id
+             WHERE e.merged_into_id IS NULL
+               AND (fs.source_type = 'podcast' OR e.kind = 'podcast')",
+        )
+        .fetch_all(tx.conn())
+        .await?;
+
+        for (feed_id, source_type, entry_kind) in podcast_feeds {
+            let majority_non_audio = if source_type == FeedType::Podcast {
+                let (total_items, audio_items): (i64, i64) = sqlx::query_as(
+                    "SELECT COUNT(*),
+                            COALESCE(SUM(CASE
+                                WHEN ec.content_type = 'audio'
+                                  OR EXISTS (
+                                      SELECT 1 FROM entry_media em
+                                      WHERE em.entry_id = ie.id
+                                        AND em.media_type = 'audio'
+                                        AND (em.remote_url IS NOT NULL OR em.local_path IS NOT NULL)
+                                  )
+                                THEN 1 ELSE 0 END), 0)
+                     FROM collection_entries ce
+                     JOIN entries ie ON ie.id = ce.entry_id
+                     JOIN entry_content ec ON ec.entry_id = ie.id
+                     WHERE ce.collection_id = ?
+                       AND ie.merged_into_id IS NULL",
+                )
+                .bind(&feed_id)
+                .fetch_one(tx.conn())
+                .await?;
+                total_items > 0 && audio_items * 2 < total_items
+            } else {
+                false
+            };
+
+            let target_source_type = if majority_non_audio { FeedType::Rss } else { source_type };
+            let expected_kind = feeds::entry_kind_for_feed_type(target_source_type);
+            if target_source_type != source_type {
+                let fs_hlc = tx.next_hlc().await?;
+                sqlx::query(
+                    "UPDATE feed_sources SET source_type = ?, hlc = ? WHERE collection_id = ?",
+                )
+                .bind(target_source_type)
+                .bind(&fs_hlc)
+                .bind(&feed_id)
+                .execute(tx.conn())
+                .await?;
+            }
+            if entry_kind != expected_kind {
+                let entry_hlc = tx.next_hlc().await?;
+                sqlx::query("UPDATE entries SET kind = ?, updated_at = ?, hlc = ? WHERE id = ?")
+                    .bind(expected_kind)
+                    .bind(now)
+                    .bind(&entry_hlc)
+                    .bind(&feed_id)
+                    .execute(tx.conn())
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn canonicalize_entry_url_identifiers(&self) -> Result<()> {
@@ -503,7 +691,7 @@ mod tests {
                 .fetch_one(db1.pool())
                 .await
                 .unwrap();
-        assert_eq!(recorded_count, 1);
+        assert_eq!(recorded_count, 2);
 
         // Simulate a legacy database needing one-shot task execution
         let url1 = Url::parse("https://example.com/legacy-post").unwrap();
@@ -545,7 +733,7 @@ mod tests {
         assert_eq!(normalized_item.thumbnail_url.as_deref(), Some("https://example.com/hero.jpg"));
 
         let first_runs = list_maintenance_runs(&db2).await;
-        assert_eq!(first_runs.len(), 2);
+        assert_eq!(first_runs.len(), 3);
 
         // Inject raw unnormalized state while maintenance_runs already marks tasks completed
         let url2 = Url::parse("https://example.com/post-after-maint").unwrap();
@@ -1108,5 +1296,372 @@ mod tests {
         db.pool().close().await;
         drop(db);
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_repair_implicit_podcast_misclassifications_cleans_bogus_audio_and_majority_non_audio_feeds()
+     {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        // 1. Substack-style blog accidentally marked podcast: 1 real .mp3, 1 bogus webpage audio URL, 1 orphan audio item
+        let blog_url = Url::parse("https://blog.example.com/feed").unwrap();
+        let blog = db
+            .feeds()
+            .create(FeedType::Podcast, &blog_url, Some("Substack Blog"), None)
+            .await
+            .unwrap();
+
+        let real_ep_url = Url::parse("https://blog.example.com/p/interview").unwrap();
+        let bogus_post_url = Url::parse("https://blog.example.com/p/text-post-1").unwrap();
+        let orphan_post_url = Url::parse("https://blog.example.com/p/text-post-2").unwrap();
+        let batch = PollBatch {
+            title: Some("Substack Blog".to_owned()),
+            description: None,
+            language: None,
+            items: vec![
+                PollItemCandidate {
+                    title: "Real Audio Interview".to_owned(),
+                    url: real_ep_url.clone(),
+                    creators: Vec::new(),
+                    published_at: None,
+                    summary: String::new(),
+                    content_html: Some("<p>Interview</p>".to_owned()),
+                    thumbnail_url: None,
+                    audio_url: Some("https://api.substack.com/feed/podcast/1/ep.mp3".to_owned()),
+                    duration: Some(1200),
+                    content_type: ContentType::Audio,
+                },
+                PollItemCandidate {
+                    title: "Bogus Webpage Audio".to_owned(),
+                    url: bogus_post_url.clone(),
+                    creators: Vec::new(),
+                    published_at: None,
+                    summary: String::new(),
+                    content_html: Some("<p>Essay 1</p>".to_owned()),
+                    thumbnail_url: None,
+                    audio_url: Some(bogus_post_url.to_string()),
+                    duration: None,
+                    content_type: ContentType::Audio,
+                },
+                PollItemCandidate {
+                    title: "Orphan Audio Without Media".to_owned(),
+                    url: orphan_post_url.clone(),
+                    creators: Vec::new(),
+                    published_at: None,
+                    summary: String::new(),
+                    content_html: Some("<p>Essay 2</p>".to_owned()),
+                    thumbnail_url: None,
+                    audio_url: None,
+                    duration: None,
+                    content_type: ContentType::Audio,
+                },
+            ],
+        };
+        let inserted = db.feeds().record_poll_batch(&blog.id, &batch).await.unwrap();
+        let id_by_title: std::collections::HashMap<_, _> =
+            inserted.iter().map(|(id, cand)| (cand.title.as_str(), id.clone())).collect();
+
+        // 2. Genuine majority-audio podcast feed + empty explicit podcast feed must remain untouched
+        let real_pod_url = Url::parse("https://shows.example.com/rss.xml").unwrap();
+        let real_pod = db
+            .feeds()
+            .create(FeedType::Podcast, &real_pod_url, Some("True Podcast"), None)
+            .await
+            .unwrap();
+        db.feeds()
+            .record_poll_batch(
+                &real_pod.id,
+                &PollBatch {
+                    title: Some("True Podcast".to_owned()),
+                    description: None,
+                    language: None,
+                    items: vec![PollItemCandidate {
+                        title: "Ep 1".to_owned(),
+                        url: Url::parse("https://shows.example.com/ep-1").unwrap(),
+                        creators: Vec::new(),
+                        published_at: None,
+                        summary: String::new(),
+                        content_html: None,
+                        thumbnail_url: None,
+                        audio_url: Some("https://cdn.example.com/ep-1.mp3".to_owned()),
+                        duration: Some(900),
+                        content_type: ContentType::Audio,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        let empty_pod_url = Url::parse("https://empty.example.com/podcast.xml").unwrap();
+        let empty_pod = db
+            .feeds()
+            .create(FeedType::Podcast, &empty_pod_url, Some("Empty Podcast"), None)
+            .await
+            .unwrap();
+
+        // 3. Manually logged catalog podcast_episode (no entry_content) must stay podcast_episode
+        let manual_ep = db
+            .catalog()
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::PodcastEpisode),
+                title: "Logged Episode".to_owned(),
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+
+        db.repair_implicit_podcast_misclassifications().await.unwrap();
+
+        // Substack blog reverted to RSS / publication
+        let repaired_blog = db.feeds().get(&blog.id).await.unwrap().unwrap();
+        assert_eq!(repaired_blog.feed_type, FeedType::Rss);
+        let repaired_blog_entry = db.catalog().get_entry(&blog.id).await.unwrap().unwrap();
+        assert_eq!(repaired_blog_entry.kind, EntryKind::Publication);
+
+        // Real .mp3 post stayed playable audio
+        let real_ep = db.items().get(&id_by_title["Real Audio Interview"]).await.unwrap().unwrap();
+        assert_eq!(real_ep.content_type, ContentType::Audio);
+        assert_eq!(
+            real_ep.audio_url.as_deref(),
+            Some("https://api.substack.com/feed/podcast/1/ep.mp3")
+        );
+
+        // Both text-only posts reverted to article and bogus audio_url cleared
+        for title in ["Bogus Webpage Audio", "Orphan Audio Without Media"] {
+            let item = db.items().get(&id_by_title[title]).await.unwrap().unwrap();
+            assert_eq!(item.content_type, ContentType::Article, "{title}");
+            assert!(item.audio_url.is_none(), "{title}");
+            let entry = db.catalog().get_entry(&item.id).await.unwrap().unwrap();
+            assert_eq!(entry.kind, EntryKind::Article, "{title}");
+        }
+
+        // Genuine podcast, empty podcast, and manual catalog episode stayed intact
+        assert_eq!(
+            db.feeds().get(&real_pod.id).await.unwrap().unwrap().feed_type,
+            FeedType::Podcast
+        );
+        assert_eq!(
+            db.feeds().get(&empty_pod.id).await.unwrap().unwrap().feed_type,
+            FeedType::Podcast
+        );
+        assert_eq!(
+            db.catalog().get_entry(&manual_ep.id).await.unwrap().unwrap().kind,
+            EntryKind::PodcastEpisode
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_repair_implicit_podcast_edge_cases_and_sync_propagation() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        // 1. Genuine podcast with 1 linkless extensionless episode (duration > 0)
+        //    + 3 deleted-with-history episodes (entry_content deleted) must stay Podcast.
+        let pod_url = Url::parse("https://pod-hist.example.com/rss").unwrap();
+        let pod = db
+            .feeds()
+            .create(FeedType::Podcast, &pod_url, Some("History Pod"), None)
+            .await
+            .unwrap();
+        let linkless_url = Url::parse("https://stream.example.com/episodes/42").unwrap();
+        let inserted_pod = db
+            .feeds()
+            .record_poll_batch(
+                &pod.id,
+                &PollBatch {
+                    title: Some("History Pod".to_owned()),
+                    description: None,
+                    language: None,
+                    items: vec![
+                        PollItemCandidate {
+                            title: "Linkless Episode".to_owned(),
+                            url: linkless_url.clone(),
+                            creators: Vec::new(),
+                            published_at: None,
+                            summary: String::new(),
+                            content_html: None,
+                            thumbnail_url: None,
+                            audio_url: Some(linkless_url.to_string()),
+                            duration: Some(1110),
+                            content_type: ContentType::Audio,
+                        },
+                        PollItemCandidate {
+                            title: "Deleted Ep 1".to_owned(),
+                            url: Url::parse("https://pod-hist.example.com/ep-1").unwrap(),
+                            creators: Vec::new(),
+                            published_at: None,
+                            summary: String::new(),
+                            content_html: None,
+                            thumbnail_url: None,
+                            audio_url: Some("https://cdn.example.com/ep-1.mp3".to_owned()),
+                            duration: Some(600),
+                            content_type: ContentType::Audio,
+                        },
+                        PollItemCandidate {
+                            title: "Deleted Ep 2".to_owned(),
+                            url: Url::parse("https://pod-hist.example.com/ep-2").unwrap(),
+                            creators: Vec::new(),
+                            published_at: None,
+                            summary: String::new(),
+                            content_html: None,
+                            thumbnail_url: None,
+                            audio_url: Some("https://cdn.example.com/ep-2.mp3".to_owned()),
+                            duration: Some(600),
+                            content_type: ContentType::Audio,
+                        },
+                        PollItemCandidate {
+                            title: "Deleted Ep 3".to_owned(),
+                            url: Url::parse("https://pod-hist.example.com/ep-3").unwrap(),
+                            creators: Vec::new(),
+                            published_at: None,
+                            summary: String::new(),
+                            content_html: None,
+                            thumbnail_url: None,
+                            audio_url: Some("https://cdn.example.com/ep-3.mp3".to_owned()),
+                            duration: Some(600),
+                            content_type: ContentType::Audio,
+                        },
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        let pod_ids: std::collections::HashMap<_, _> =
+            inserted_pod.iter().map(|(id, c)| (c.title.as_str(), id.clone())).collect();
+        for title in ["Deleted Ep 1", "Deleted Ep 2", "Deleted Ep 3"] {
+            sqlx::query("DELETE FROM entry_content WHERE entry_id = ?")
+                .bind(&pod_ids[title])
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM entry_media WHERE entry_id = ?")
+                .bind(&pod_ids[title])
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+
+        // 2. Split-brain RSS feed (source_type='rss', entries.kind='podcast') must heal to Publication.
+        let split_url = Url::parse("https://split.example.com/rss").unwrap();
+        let split_feed =
+            db.feeds().create(FeedType::Rss, &split_url, Some("Split RSS"), None).await.unwrap();
+        sqlx::query("UPDATE entries SET kind = 'podcast' WHERE id = ?")
+            .bind(&split_feed.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        // 3. Already-article item with a stray bogus webpage audio entry_media row:
+        //    repair must delete the bogus media row AND bump entries.sync_seq so peers receive it!
+        let art_url = Url::parse("https://split.example.com/p/bogus-media-only").unwrap();
+        let art_item = db
+            .items()
+            .create(&NewItem {
+                feed_id: Some(&split_feed.id),
+                title: "Article With Bogus Audio Media",
+                url: &art_url,
+                author: None,
+                published_at: None,
+                summary: None,
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO entry_media (id, entry_id, media_type, remote_url, duration)
+             VALUES ('bogus-media-row', ?, 'audio', ?, NULL)",
+        )
+        .bind(&art_item.id)
+        .bind(art_url.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        // 4. Orphan audio item with a duration-only entry_media row (no remote_url, no local_path):
+        //    repair must revert it to Article AND delete the duration-only entry_media row.
+        let orphan_url = Url::parse("https://split.example.com/p/orphan-dur").unwrap();
+        let orphan_item = db
+            .items()
+            .create(&NewItem {
+                feed_id: Some(&split_feed.id),
+                title: "Orphan With Duration Only",
+                url: &orphan_url,
+                author: None,
+                published_at: None,
+                summary: None,
+                content_type: ContentType::Audio,
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, duration)
+             VALUES ('dur-only-media-row', ?, 'audio', NULL, NULL, 720)",
+        )
+        .bind(&orphan_item.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let seq_before: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(sync_seq), 0) FROM entries")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        db.repair_implicit_podcast_misclassifications().await.unwrap();
+
+        // Linkless extensionless episode & deleted-history podcast preserved
+        let linkless = db.items().get(&pod_ids["Linkless Episode"]).await.unwrap().unwrap();
+        assert_eq!(linkless.content_type, ContentType::Audio);
+        assert_eq!(linkless.audio_url.as_deref(), Some(linkless_url.as_str()));
+        assert_eq!(linkless.duration, Some(1110));
+        assert_eq!(db.feeds().get(&pod.id).await.unwrap().unwrap().feed_type, FeedType::Podcast);
+        assert_eq!(
+            db.catalog().get_entry(&pod.id).await.unwrap().unwrap().kind,
+            EntryKind::Podcast
+        );
+
+        // Split-brain RSS feed healed
+        assert_eq!(
+            db.catalog().get_entry(&split_feed.id).await.unwrap().unwrap().kind,
+            EntryKind::Publication
+        );
+
+        // Bogus media deleted on already-article item, and duration-only media deleted on orphan audio
+        let art_after = db.items().get(&art_item.id).await.unwrap().unwrap();
+        assert_eq!(art_after.content_type, ContentType::Article);
+        assert!(art_after.audio_url.is_none());
+        let orphan_after = db.items().get(&orphan_item.id).await.unwrap().unwrap();
+        assert_eq!(orphan_after.content_type, ContentType::Article);
+        assert!(orphan_after.audio_url.is_none());
+        assert!(orphan_after.duration.is_none());
+        assert_eq!(
+            db.catalog().get_entry(&orphan_item.id).await.unwrap().unwrap().kind,
+            EntryKind::Article
+        );
+
+        // Incremental peer sync since seq_before MUST emit split_feed, art_item, AND orphan_item!
+        let sync_resp = db
+            .sync()
+            .collect_peer_sync_response_with_budget(
+                seq_before,
+                100,
+                usize::MAX,
+                String::new(),
+                crate::util::clock::now_utc(),
+            )
+            .await
+            .unwrap();
+        let emitted_ids: std::collections::HashSet<&str> =
+            sync_resp.entries.iter().map(|e| e.id.as_str()).collect();
+        assert!(emitted_ids.contains(split_feed.id.as_str()), "split_feed must propagate via sync");
+        assert!(
+            emitted_ids.contains(art_item.id.as_str()),
+            "article with deleted bogus entry_media must propagate via sync"
+        );
+        assert!(
+            emitted_ids.contains(orphan_item.id.as_str()),
+            "reverted orphan audio item must propagate via sync"
+        );
     }
 }

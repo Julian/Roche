@@ -276,18 +276,10 @@ internal object LocalFeedPoller {
                     !it.equals(extractHostTitle(feed.url), ignoreCase = true) &&
                     it != "YouTube Channel"
             } ?: batch.title?.takeIf { it.isNotBlank() } ?: feed.title
-        val hasAudio =
-            batch.items.any { it.contentType == CONTENT_TYPE_AUDIO || !it.audioUrl.isNullOrBlank() }
-        val resolvedFeedType =
-            if (hasAudio && feed.feedType.equals("rss", ignoreCase = true)) {
-                "podcast"
-            } else {
-                feed.feedType
-            }
         return feed.copy(
             title = resolvedTitle,
             siteUrl = feed.siteUrl ?: batch.siteUrl,
-            feedType = resolvedFeedType,
+            feedType = feed.feedType,
             description = feed.description ?: batch.description,
             language = feed.language ?: batch.language,
             lastPolled = nowIso,
@@ -496,13 +488,18 @@ internal object LocalFeedPoller {
         val thumbnailUrl =
             extractItunesImageHref(entry, feedUrl)
                 ?: extractAtomThumbnail(entry, mediaGroup, sanitizedHtml, feedUrl, resolvedUrl)
-        val duration = extractPodcastDurationLabel(entry, mediaGroup)
         val effectiveAudioUrl = audioUrl ?: resolvedUrl.takeIf(::isDirectAudioUrl)
         val effectiveType =
             if (effectiveAudioUrl != null) {
                 CONTENT_TYPE_AUDIO
             } else {
                 resolveCandidateContentType(feedType, resolvedUrl)
+            }
+        val duration =
+            if (effectiveType == CONTENT_TYPE_AUDIO) {
+                extractPodcastDurationLabel(entry, mediaGroup)
+            } else {
+                null
             }
 
         return ParsedFeedCandidateItem(
@@ -581,13 +578,18 @@ internal object LocalFeedPoller {
         val sanitizedHtml = sanitizeCandidateHtml(primaryHtml, resolvedUrl)
         val summarySource = extractRssSummarySource(item, mediaGroup)
         val summaryText = summarySource?.let(::plainTextExcerpt).orEmpty().ifBlank { rawTitle }
-        val duration = extractPodcastDurationLabel(item, mediaGroup)
         val effectiveAudioUrl = audioUrl ?: resolvedUrl.takeIf(::isDirectAudioUrl)
         val effectiveType =
             if (effectiveAudioUrl != null) {
                 CONTENT_TYPE_AUDIO
             } else {
                 resolveCandidateContentType(feedType, resolvedUrl)
+            }
+        val duration =
+            if (effectiveType == CONTENT_TYPE_AUDIO) {
+                extractPodcastDurationLabel(item, mediaGroup)
+            } else {
+                null
             }
         val thumbnailUrl =
             extractRssThumbnailUrl(
@@ -723,8 +725,7 @@ internal fun resolveCandidateContentType(feedType: String, itemUrl: String): Str
     when {
         feedType.equals("arxiv", ignoreCase = true) || isArxivUrl(itemUrl) -> "paper"
         feedType.equals("youtube", ignoreCase = true) || isYoutubeUrl(itemUrl) -> "video"
-        feedType.equals("podcast", ignoreCase = true) || isDirectAudioUrl(itemUrl) ->
-            CONTENT_TYPE_AUDIO
+        isDirectAudioUrl(itemUrl) -> CONTENT_TYPE_AUDIO
         else -> "article"
     }
 

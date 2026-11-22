@@ -5031,3 +5031,543 @@ async fn test_all_local_repo_writes_stamp_valid_causal_hlcs_and_single_insert_me
         "consumption_log insert must bump sync_seq exactly once"
     );
 }
+
+#[tokio::test]
+async fn test_sync_never_auto_upgrades_rss_to_podcast_and_reverts_via_newer_hlc() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let feed_url = Url::parse("https://newsletter.example.com/feed").unwrap();
+    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Newsletter"), None).await.unwrap();
+
+    let ep_url = Url::parse("https://newsletter.example.com/p/audio-post").unwrap();
+    let ep_id = deterministic_item_id(Some(feed_url.as_str()), ep_url.as_str());
+    let now = crate::util::clock::now_utc();
+    let hlc_t1 =
+        HlcTimestamp::from_datetime(now + chrono::Duration::seconds(10), "phone-1").encode();
+    let hlc_t2 =
+        HlcTimestamp::from_datetime(now + chrono::Duration::seconds(20), "phone-1").encode();
+    let hlc_t3 =
+        HlcTimestamp::from_datetime(now + chrono::Duration::seconds(30), "phone-1").encode();
+
+    // 1. Syncing an audio entry into an RSS feed must NOT auto-upgrade the feed to Podcast.
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            device_name: Some("Android".to_owned()),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![SyncEntryRecord {
+                id: ep_id.clone(),
+                kind: EntryKind::PodcastEpisode,
+                title: "Audio Post".to_owned(),
+                creators: Vec::new(),
+                url: Some(ep_url.to_string()),
+                published_at: None,
+                release_year: None,
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(now),
+                updated_at: Some(now),
+                hlc: hlc_t1.clone(),
+                content: Some(SyncEntryContent {
+                    content_type: ContentType::Audio,
+                    content_html: Some("<p>Show notes</p>".to_owned()),
+                    audio_url: Some("https://cdn.example.com/audio.mp3".to_owned()),
+                    duration: Some(600),
+                }),
+                state: Some(SyncEntryState {
+                    inbox_state: InboxState::Unread,
+                    read_at: None,
+                    progress: 0.0,
+                    interaction_updated_at: Some(now),
+                    hlc: hlc_t1.clone(),
+                }),
+                collection_spec: None,
+                feed_source: None,
+            }],
+            collection_entries: vec![SyncCollectionEntryRecord {
+                collection_id: feed.id.clone(),
+                entry_id: ep_id.clone(),
+                position: None,
+                added_at: now,
+                hlc: hlc_t1.clone(),
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().feed_type, FeedType::Rss);
+    assert_eq!(
+        db.catalog().get_entry(&feed.id).await.unwrap().unwrap().kind,
+        EntryKind::Publication
+    );
+
+    // 2. Newer HLC can explicitly switch feed Podcast -> RSS and item PodcastEpisode -> Article,
+    //    clearing remote-only audio enclosure, while an older HLC cannot revert it back.
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            device_name: Some("Android".to_owned()),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![SyncEntryRecord {
+                id: feed.id.clone(),
+                kind: EntryKind::Podcast,
+                title: "Newsletter".to_owned(),
+                creators: Vec::new(),
+                url: Some(feed_url.to_string()),
+                published_at: None,
+                release_year: None,
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(now),
+                updated_at: Some(now),
+                hlc: hlc_t2.clone(),
+                content: None,
+                state: None,
+                collection_spec: None,
+                feed_source: Some(SyncFeedSource {
+                    feed_url: feed_url.to_string(),
+                    source_type: FeedType::Podcast,
+                    feed_title: Some("Newsletter".to_owned()),
+                    language: None,
+                    poll_interval: 30,
+                    is_active: true,
+                    last_polled_at: None,
+                    last_polled_by: None,
+                    last_error: None,
+                    last_error_by: None,
+                    consecutive_failures: 0,
+                    hlc: hlc_t2.clone(),
+                }),
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().feed_type, FeedType::Podcast);
+
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            device_name: Some("Android".to_owned()),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![
+                SyncEntryRecord {
+                    id: feed.id.clone(),
+                    kind: EntryKind::Publication,
+                    title: "Newsletter".to_owned(),
+                    creators: Vec::new(),
+                    url: Some(feed_url.to_string()),
+                    published_at: None,
+                    release_year: None,
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: None,
+                    identifiers: Vec::new(),
+                    merged_into_id: None,
+                    created_at: Some(now),
+                    updated_at: Some(now),
+                    hlc: hlc_t3.clone(),
+                    content: None,
+                    state: None,
+                    collection_spec: None,
+                    feed_source: Some(SyncFeedSource {
+                        feed_url: feed_url.to_string(),
+                        source_type: FeedType::Rss,
+                        feed_title: Some("Newsletter".to_owned()),
+                        language: None,
+                        poll_interval: 30,
+                        is_active: true,
+                        last_polled_at: None,
+                        last_polled_by: None,
+                        last_error: None,
+                        last_error_by: None,
+                        consecutive_failures: 0,
+                        hlc: hlc_t3.clone(),
+                    }),
+                },
+                SyncEntryRecord {
+                    id: ep_id.clone(),
+                    kind: EntryKind::Article,
+                    title: "Audio Post".to_owned(),
+                    creators: Vec::new(),
+                    url: Some(ep_url.to_string()),
+                    published_at: None,
+                    release_year: None,
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: None,
+                    identifiers: Vec::new(),
+                    merged_into_id: None,
+                    created_at: Some(now),
+                    updated_at: Some(now),
+                    hlc: hlc_t3.clone(),
+                    content: Some(SyncEntryContent {
+                        content_type: ContentType::Article,
+                        content_html: Some("<p>Show notes</p>".to_owned()),
+                        audio_url: None,
+                        duration: None,
+                    }),
+                    state: None,
+                    collection_spec: None,
+                    feed_source: None,
+                },
+            ],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().feed_type, FeedType::Rss);
+    assert_eq!(
+        db.catalog().get_entry(&feed.id).await.unwrap().unwrap().kind,
+        EntryKind::Publication
+    );
+    let reverted_item = db.items().get(&ep_id).await.unwrap().unwrap();
+    assert_eq!(reverted_item.content_type, ContentType::Article);
+    assert!(reverted_item.audio_url.is_none());
+    assert_eq!(db.catalog().get_entry(&ep_id).await.unwrap().unwrap().kind, EntryKind::Article);
+
+    // 3. Replaying the stale t1/t2 Podcast & Audio payload must NOT re-corrupt the repaired rows.
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-old".to_owned(),
+            device_name: Some("Old Phone".to_owned()),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![
+                SyncEntryRecord {
+                    id: feed.id.clone(),
+                    kind: EntryKind::Podcast,
+                    title: "Newsletter".to_owned(),
+                    creators: Vec::new(),
+                    url: Some(feed_url.to_string()),
+                    published_at: None,
+                    release_year: None,
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: None,
+                    identifiers: Vec::new(),
+                    merged_into_id: None,
+                    created_at: Some(now),
+                    updated_at: Some(now),
+                    hlc: hlc_t2.clone(),
+                    content: None,
+                    state: None,
+                    collection_spec: None,
+                    feed_source: Some(SyncFeedSource {
+                        feed_url: feed_url.to_string(),
+                        source_type: FeedType::Podcast,
+                        feed_title: Some("Newsletter".to_owned()),
+                        language: None,
+                        poll_interval: 30,
+                        is_active: true,
+                        last_polled_at: None,
+                        last_polled_by: None,
+                        last_error: None,
+                        last_error_by: None,
+                        consecutive_failures: 0,
+                        hlc: hlc_t2,
+                    }),
+                },
+                SyncEntryRecord {
+                    id: ep_id.clone(),
+                    kind: EntryKind::PodcastEpisode,
+                    title: "Audio Post".to_owned(),
+                    creators: Vec::new(),
+                    url: Some(ep_url.to_string()),
+                    published_at: None,
+                    release_year: None,
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: None,
+                    identifiers: Vec::new(),
+                    merged_into_id: None,
+                    created_at: Some(now),
+                    updated_at: Some(now),
+                    hlc: hlc_t1,
+                    content: Some(SyncEntryContent {
+                        content_type: ContentType::Audio,
+                        content_html: Some("<p>Show notes</p>".to_owned()),
+                        audio_url: Some(ep_url.to_string()),
+                        duration: None,
+                    }),
+                    state: None,
+                    collection_spec: None,
+                    feed_source: None,
+                },
+            ],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().feed_type, FeedType::Rss);
+    let still_article = db.items().get(&ep_id).await.unwrap().unwrap();
+    assert_eq!(still_article.content_type, ContentType::Article);
+    assert!(still_article.audio_url.is_none());
+    assert_eq!(db.catalog().get_entry(&ep_id).await.unwrap().unwrap().kind, EntryKind::Article);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_sync_audio_reclassification_duration_paper_video_and_feed_split_brain() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let now = Utc::now();
+
+    let feed_url = Url::parse("https://notes.example.com/feed").unwrap();
+    let feed = db.feeds().create(FeedType::Podcast, &feed_url, Some("Notes"), None).await.unwrap();
+
+    // Seed feed with newer entry HLC (e.g. from a title rename) than feed_sources HLC
+    let hlc_t1 = "001794000000000-0001-server".to_owned();
+    let hlc_t2 = "001795000000000-0001-server".to_owned();
+    let hlc_t3 = "001796000000000-0001-phone".to_owned();
+    let hlc_t4 = "001797000000000-0001-phone".to_owned();
+    let hlc_t5 = "001798000000000-0001-phone".to_owned();
+
+    sqlx::query("UPDATE feed_sources SET hlc = ? WHERE collection_id = ?")
+        .bind(&hlc_t1)
+        .bind(&feed.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE entries SET hlc = ? WHERE id = ?")
+        .bind(&hlc_t4)
+        .bind(&feed.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // 1. Incoming feed_source HLC (t3 > t1) wins while incoming entry HLC (t2 < t4) loses:
+    //    source_type reverts Podcast -> RSS AND entries.kind MUST align to Publication (no split-brain),
+    //    keeping entries.hlc >= max(t4, t3) = t4.
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            device_name: Some("Android".to_owned()),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![SyncEntryRecord {
+                id: feed.id.clone(),
+                kind: EntryKind::Publication,
+                title: "Stale Title".to_owned(),
+                creators: Vec::new(),
+                url: Some(feed_url.to_string()),
+                published_at: None,
+                release_year: None,
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(now),
+                updated_at: Some(now),
+                hlc: hlc_t2.clone(),
+                content: None,
+                state: None,
+                collection_spec: None,
+                feed_source: Some(SyncFeedSource {
+                    feed_url: feed_url.to_string(),
+                    source_type: FeedType::Rss,
+                    feed_title: Some("Notes".to_owned()),
+                    language: None,
+                    poll_interval: 30,
+                    is_active: true,
+                    last_polled_at: None,
+                    last_polled_by: None,
+                    last_error: None,
+                    last_error_by: None,
+                    consecutive_failures: 0,
+                    hlc: hlc_t3.clone(),
+                }),
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().feed_type, FeedType::Rss);
+    let aligned_feed_entry = db.catalog().get_entry(&feed.id).await.unwrap().unwrap();
+    assert_eq!(aligned_feed_entry.kind, EntryKind::Publication);
+    let stored_feed_entry_hlc: String = sqlx::query_scalar("SELECT hlc FROM entries WHERE id = ?")
+        .bind(&feed.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(stored_feed_entry_hlc >= hlc_t3);
+
+    // 2. Syncing a repaired Article (even with stray leftover duration) onto a bogus Audio item
+    //    deletes bogus entry_media and does NOT insert a duration-only audio row;
+    //    syncing PodcastEpisode -> Paper and PodcastEpisode -> Video updates entries.kind;
+    //    syncing a Video with duration does NOT insert a duration-only audio media row;
+    //    legitimately upgrading Article -> PodcastEpisode with real .mp3 via newer HLC still works.
+    let art_id = deterministic_item_id(Some(feed_url.as_str()), "https://notes.example.com/post-1");
+    let paper_id =
+        deterministic_item_id(Some(feed_url.as_str()), "https://arxiv.org/pdf/2501.00001.pdf");
+    let video_id = deterministic_item_id(
+        Some(feed_url.as_str()),
+        "https://www.youtube.com/watch?v=abc123def45",
+    );
+
+    let make_item = |id: &str,
+                     kind: EntryKind,
+                     url: &str,
+                     hlc: &str,
+                     ct: ContentType,
+                     audio_url: Option<&str>,
+                     duration: Option<i64>| SyncEntryRecord {
+        id: id.to_owned(),
+        kind,
+        title: id.to_owned(),
+        creators: Vec::new(),
+        url: Some(url.to_owned()),
+        published_at: None,
+        release_year: None,
+        summary: None,
+        thumbnail_url: None,
+        metadata: None,
+        identifiers: Vec::new(),
+        merged_into_id: None,
+        created_at: Some(now),
+        updated_at: Some(now),
+        hlc: hlc.to_owned(),
+        content: Some(SyncEntryContent {
+            content_type: ct,
+            content_html: Some("<p>Body</p>".to_owned()),
+            audio_url: audio_url.map(str::to_owned),
+            duration,
+        }),
+        state: None,
+        collection_spec: None,
+        feed_source: None,
+    };
+
+    // Initial misclassified state at t1
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![
+                make_item(
+                    &art_id,
+                    EntryKind::PodcastEpisode,
+                    "https://notes.example.com/post-1",
+                    &hlc_t1,
+                    ContentType::Audio,
+                    Some("https://notes.example.com/post-1"),
+                    Some(600),
+                ),
+                make_item(
+                    &paper_id,
+                    EntryKind::PodcastEpisode,
+                    "https://arxiv.org/pdf/2501.00001.pdf",
+                    &hlc_t1,
+                    ContentType::Audio,
+                    Some("https://arxiv.org/pdf/2501.00001.pdf"),
+                    None,
+                ),
+                make_item(
+                    &video_id,
+                    EntryKind::PodcastEpisode,
+                    "https://www.youtube.com/watch?v=abc123def45",
+                    &hlc_t1,
+                    ContentType::Audio,
+                    Some("https://www.youtube.com/watch?v=abc123def45"),
+                    None,
+                ),
+            ],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    // Repaired state at t3 (Article carries stray leftover duration=600; Video carries duration=300)
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![
+                make_item(
+                    &art_id,
+                    EntryKind::Article,
+                    "https://notes.example.com/post-1",
+                    &hlc_t3,
+                    ContentType::Article,
+                    None,
+                    Some(600),
+                ),
+                make_item(
+                    &paper_id,
+                    EntryKind::Paper,
+                    "https://arxiv.org/pdf/2501.00001.pdf",
+                    &hlc_t3,
+                    ContentType::Paper,
+                    None,
+                    None,
+                ),
+                make_item(
+                    &video_id,
+                    EntryKind::Video,
+                    "https://www.youtube.com/watch?v=abc123def45",
+                    &hlc_t3,
+                    ContentType::Video,
+                    None,
+                    Some(300),
+                ),
+            ],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    for (id, expected_kind, expected_ct) in [
+        (&art_id, EntryKind::Article, ContentType::Article),
+        (&paper_id, EntryKind::Paper, ContentType::Paper),
+        (&video_id, EntryKind::Video, ContentType::Video),
+    ] {
+        let entry = db.catalog().get_entry(id).await.unwrap().unwrap();
+        assert_eq!(entry.kind, expected_kind, "kind mismatch for {id}");
+        let item = db.items().get(id).await.unwrap().unwrap();
+        assert_eq!(item.content_type, expected_ct, "content_type mismatch for {id}");
+        assert!(item.audio_url.is_none(), "audio_url should be cleared for {id}");
+        let audio_media_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entry_media WHERE entry_id = ? AND media_type = 'audio'",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(audio_media_count, 0, "must not retain/create audio entry_media for {id}");
+    }
+
+    // Legitimately upgrading Article -> PodcastEpisode with real .mp3 enclosure at t5 still works
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![make_item(
+                &art_id,
+                EntryKind::PodcastEpisode,
+                "https://notes.example.com/post-1",
+                &hlc_t5,
+                ContentType::Audio,
+                Some("https://cdn.example.com/post-1.mp3"),
+                Some(900),
+            )],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let upgraded = db.items().get(&art_id).await.unwrap().unwrap();
+    assert_eq!(upgraded.content_type, ContentType::Audio);
+    assert_eq!(upgraded.audio_url.as_deref(), Some("https://cdn.example.com/post-1.mp3"));
+    assert_eq!(upgraded.duration, Some(900));
+    assert_eq!(
+        db.catalog().get_entry(&art_id).await.unwrap().unwrap().kind,
+        EntryKind::PodcastEpisode
+    );
+}

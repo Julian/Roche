@@ -929,7 +929,7 @@ class DataSyncRound2FixesTest {
 
         val updatedFeed = dao.getFeedById(feedId)!!
         assertEquals("Great Podcast", updatedFeed.title)
-        assertEquals("podcast", updatedFeed.feedType)
+        assertEquals("rss", updatedFeed.feedType)
         assertTrue(updatedFeed.hlc > staleServerHlc)
         assertTrue(updatedFeed.hlc.endsWith("-android-peer-88"))
         assertTrue(dao.getEntryById(feedId)!!.hlc.endsWith("-android-peer-88"))

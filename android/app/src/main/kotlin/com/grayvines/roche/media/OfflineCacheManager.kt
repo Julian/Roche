@@ -5,6 +5,7 @@ import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.collectionEntryNaturalKey
 import com.grayvines.roche.core.deterministicTagId
+import com.grayvines.roche.core.isDirectAudioUrl
 import com.grayvines.roche.core.isHttpOrHttpsUrl
 import com.grayvines.roche.core.isLocalPdfUrl
 import com.grayvines.roche.core.normalizeTagName
@@ -516,8 +517,9 @@ private fun measureCachedItemDirectory(child: File): CachedItemDirInfo? {
 internal fun resolveOfflineAudioUrl(hydrated: InboxItemRow?, latest: InboxItemRow): String? =
     (hydrated?.audioUrl ?: latest.audioUrl)?.trim()?.takeIf { it.isNotBlank() }
         ?: latest.url.takeIf {
-            latest.contentType.equals(CONTENT_TYPE_AUDIO, ignoreCase = true) ||
-                latest.contentType.equals("podcast", ignoreCase = true)
+            (latest.contentType.equals(CONTENT_TYPE_AUDIO, ignoreCase = true) ||
+                latest.contentType.equals(CONTENT_TYPE_PODCAST, ignoreCase = true)) &&
+                isDirectAudioUrl(it)
         }
 
 internal fun collectExternalImageUrls(hydrated: InboxItemRow?, latest: InboxItemRow): List<String> {
@@ -541,7 +543,8 @@ internal fun isRequiredMediaCached(
     audioEnclosureCached: Boolean,
     cachedPrimaryMediaCount: Int,
 ): Boolean {
-    val requiresAudio = hasAudioUrl || contentType == CONTENT_TYPE_AUDIO || contentType == "podcast"
+    val requiresAudio =
+        hasAudioUrl || contentType == CONTENT_TYPE_AUDIO || contentType == CONTENT_TYPE_PODCAST
     val requiresDocumentOrVideo =
         !requiresAudio && (contentType == "pdf" || contentType == "paper" || contentType == "video")
     return when {
@@ -570,8 +573,21 @@ internal suspend fun resolveTargetItemMediaFile(
 private fun String?.nonBlankOr(fallback: String?): String? =
     this?.takeIf { it.isNotBlank() } ?: fallback
 
-internal fun mergeHydratedItemDetail(local: InboxItemRow, detail: RemoteItemDto): InboxItemRow =
-    local.copy(
+internal fun mergeHydratedItemDetail(local: InboxItemRow, detail: RemoteItemDto): InboxItemRow {
+    val authoritativeDetail = detail.id.isNotBlank() && detail.id == local.id
+    val mergedContentType =
+        if (authoritativeDetail) detail.contentType.ifBlank { local.contentType } else local.contentType
+    val isAudio =
+        mergedContentType.equals(CONTENT_TYPE_AUDIO, ignoreCase = true) ||
+            mergedContentType.equals(CONTENT_TYPE_PODCAST, ignoreCase = true)
+    val wasAudio =
+        local.contentType.equals(CONTENT_TYPE_AUDIO, ignoreCase = true) ||
+            local.contentType.equals(CONTENT_TYPE_PODCAST, ignoreCase = true)
+    val mergedAudioUrl =
+        detail.audioUrl?.trim()?.takeIf { it.isNotEmpty() } ?: local.audioUrl.takeIf { isAudio }
+    val mergedDuration =
+        detail.duration.nonBlankOr(if (wasAudio && !isAudio) null else local.duration)
+    return local.copy(
         title = detail.title.ifBlank { local.title },
         author = detail.author.nonBlankOr(local.author),
         summary = detail.summary.nonBlankOr(local.summary)?.take(MAX_SQLITE_SUMMARY_CHARS),
@@ -580,11 +596,13 @@ internal fun mergeHydratedItemDetail(local: InboxItemRow, detail: RemoteItemDto)
                 .nonBlankOr(local.contentText?.takeIf { it.isNotBlank() && it != local.summary })
                 ?.take(MAX_SQLITE_TEXT_CHARS),
         contentHtml = detail.contentHtml.nonBlankOr(local.contentHtml)?.take(MAX_SQLITE_HTML_CHARS),
+        contentType = mergedContentType,
         thumbnailMediaId = detail.thumbnailMediaId.nonBlankOr(local.thumbnailMediaId),
-        duration = detail.duration.nonBlankOr(local.duration),
+        duration = mergedDuration,
         thumbnailUrl = detail.thumbnailUrl.nonBlankOr(local.thumbnailUrl),
-        audioUrl = detail.audioUrl.nonBlankOr(local.audioUrl),
+        audioUrl = mergedAudioUrl,
     )
+}
 
 internal fun collectEligibleMediaIds(
     remoteMedia: List<RemoteMediaDto>,
@@ -625,6 +643,7 @@ internal fun resolveCachedAudioFile(cacheDir: File?, itemId: String): File? {
 internal const val THUMBNAILS_SUBDIR = "thumbnails"
 internal const val AUDIO_ENCLOSURE_FILE_NAME = "audio_enclosure"
 private const val CONTENT_TYPE_AUDIO = "audio"
+private const val CONTENT_TYPE_PODCAST = "podcast"
 private const val AUTO_DOWNLOAD_FEED_CHUNK_SIZE = 500
 private const val MAX_OFFLINE_MEDIA_BYTES = 50L * 1024L * 1024L
 private const val MAX_OFFLINE_THUMBNAIL_BYTES = 10L * 1024L * 1024L

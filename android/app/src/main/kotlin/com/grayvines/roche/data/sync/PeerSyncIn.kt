@@ -71,6 +71,7 @@ import com.grayvines.roche.data.local.deleteFeedPreservingHistory
 import com.grayvines.roche.data.local.deleteItemPreservingHistory
 import com.grayvines.roche.data.local.ensureStarredSpecExists
 import com.grayvines.roche.data.local.entryHasCatalogHistory
+import com.grayvines.roche.data.local.entryKindForFeedTypeWire
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.data.remote.SyncTombstoneDto
@@ -824,6 +825,8 @@ private suspend fun mergeSingleIncomingEntry(
     val mergedInto = rec.mergedIntoId?.trim()?.takeIf { it.isNotEmpty() && it != targetId }
 
     val existingEntry = dao.getEntryById(targetId)
+    val entryIncomingWins =
+        shouldIncomingWinHlc(entryHlc, existingEntry?.hlc, existingEntry?.isLocalDirty == true)
     val updatedEntry =
         buildMergedEntryEntity(
             rec,
@@ -844,6 +847,7 @@ private suspend fun mergeSingleIncomingEntry(
         rec = rec,
         updatedEntry = updatedEntry,
         entryHlc = entryHlc,
+        entryIncomingWins = entryIncomingWins,
         itemAction = itemAction,
         ctx = ctx,
     )
@@ -859,6 +863,7 @@ private suspend fun mergeIncomingEntrySubtables(
     rec: SyncEntryRecordDto,
     updatedEntry: EntryEntity,
     entryHlc: String,
+    entryIncomingWins: Boolean,
     itemAction: ItemTombstoneAction,
     ctx: IncomingEntriesMergeCtx,
 ) {
@@ -881,6 +886,7 @@ private suspend fun mergeIncomingEntrySubtables(
             rec,
             updatedEntry,
             entryHlc,
+            entryIncomingWins,
             ctx.serverNode,
             ctx.nowIso,
             ctx.nowMs,
@@ -1373,6 +1379,18 @@ private suspend fun mergeIncomingFeedSourceInDao(
         )
     }
     dao.upsertFeedSource(merged)
+    val expectedFeedKind = entryKindForFeedTypeWire(merged.sourceType)
+    dao.getEntryById(targetId)?.let { currentEntry ->
+        if (currentEntry.kind != expectedFeedKind) {
+            dao.upsertEntry(
+                currentEntry.copy(
+                    kind = expectedFeedKind,
+                    hlc = maxHlc(currentEntry.hlc, merged.hlc),
+                    isLocalDirty = currentEntry.isLocalDirty || merged.isLocalDirty,
+                )
+            )
+        }
+    }
     val canonFeedUrl = canonicalizeSyncUrl(merged.feedUrl)
     if (canonFeedUrl.isNotEmpty()) {
         ctx.feedSourceIdByCanonUrl[canonFeedUrl] = targetId
@@ -1482,16 +1500,12 @@ private fun resolveMergedFeedSourceType(
     existing: FeedSourceEntity?,
     fsDto: SyncFeedSourceDto,
     configWins: Boolean,
-): String {
-    val preservePodcast =
-        existing?.sourceType?.equals("podcast", ignoreCase = true) == true &&
-            fsDto.sourceType.equals("rss", ignoreCase = true)
-    return when {
-        preservePodcast -> "podcast"
-        existing == null || configWins -> fsDto.sourceType.ifBlank { "rss" }
-        else -> existing.sourceType
+): String =
+    if (existing == null || configWins) {
+        fsDto.sourceType.ifBlank { "rss" }
+    } else {
+        existing.sourceType
     }
-}
 
 @Suppress("LongParameterList")
 private suspend fun mergeContentAndStateInDao(
@@ -1500,11 +1514,12 @@ private suspend fun mergeContentAndStateInDao(
     rec: SyncEntryRecordDto,
     mergedEntry: EntryEntity,
     entryHlc: String,
+    entryIncomingWins: Boolean,
     serverNode: String,
     nowIso: String,
     nowMs: Long,
 ) {
-    mergeEntryContentRowInDao(dao, targetId, rec.content, mergedEntry.summary)
+    mergeEntryContentRowInDao(dao, targetId, rec.content, mergedEntry.summary, entryIncomingWins)
     rec.state?.let { stateDto ->
         mergeEntryStateRowInDao(
             dao,
@@ -1525,27 +1540,33 @@ private suspend fun mergeEntryContentRowInDao(
     targetId: String,
     contentDto: SyncEntryContentDto?,
     summary: String?,
+    entryIncomingWins: Boolean,
 ) {
     val existingContent = dao.getEntryContentById(targetId)
     if (contentDto == null && existingContent == null) return
     val richerHtml =
         pickRicherString(existingContent?.contentHtml, contentDto?.contentHtml)
             ?.take(MAX_SQLITE_HTML_CHARS)
-    val mergedAudio =
-        contentDto?.audioUrl?.trim()?.takeIf { it.isNotEmpty() } ?: existingContent?.audioUrl
+    val mergedAudio = resolveMergedAudioUrl(existingContent, contentDto, entryIncomingWins)
     val rawType =
-        if (!mergedAudio.isNullOrBlank()) {
-            ContentType.AUDIO.wireValue
-        } else {
-            contentDto?.contentType?.takeIf { it.isNotBlank() }
-                ?: existingContent?.contentType
-                ?: "article"
-        }
+        resolveMergedContentType(existingContent, contentDto, mergedAudio, entryIncomingWins)
+    val revertedFromAudio =
+        entryIncomingWins &&
+            contentDto != null &&
+            isAudioContentWire(existingContent?.contentType) &&
+            !isAudioContentWire(rawType)
+    val effectiveWireDuration =
+        contentDto?.duration
+            ?.takeIf {
+                isAudioContentWire(rawType) ||
+                    rawType.equals(ContentType.VIDEO.wireValue, ignoreCase = true)
+            }
+            ?.let(::formatDurationSecondsLabel)
     val mergedDuration =
         resolveSyncedContentDuration(
             contentType = rawType,
-            wireDuration = contentDto?.duration?.let(::formatDurationSecondsLabel),
-            existingDuration = existingContent?.duration,
+            wireDuration = effectiveWireDuration,
+            existingDuration = if (revertedFromAudio) null else existingContent?.duration,
             summary = summary,
             contentText = existingContent?.contentText,
             contentHtml = richerHtml,
@@ -1562,6 +1583,43 @@ private suspend fun mergeEntryContentRowInDao(
             fallbackFeedTitle = existingContent?.fallbackFeedTitle,
         )
     )
+}
+
+private fun isAudioContentWire(raw: String?): Boolean =
+    raw.equals(ContentType.AUDIO.wireValue, ignoreCase = true) ||
+        raw.equals(EntryKind.PODCAST.wireValue, ignoreCase = true)
+
+private fun resolveMergedAudioUrl(
+    existingContent: EntryContentEntity?,
+    contentDto: SyncEntryContentDto?,
+    entryIncomingWins: Boolean,
+): String? {
+    if (contentDto == null) return existingContent?.audioUrl
+    val incomingAudio = contentDto.audioUrl?.trim()?.takeIf { it.isNotEmpty() }
+    val existingAudio = existingContent?.audioUrl
+    val isExistingAudioType = isAudioContentWire(existingContent?.contentType)
+    return when {
+        existingContent == null || entryIncomingWins -> incomingAudio
+        !existingAudio.isNullOrBlank() -> existingAudio
+        isExistingAudioType -> incomingAudio
+        else -> null
+    }
+}
+
+private fun resolveMergedContentType(
+    existingContent: EntryContentEntity?,
+    contentDto: SyncEntryContentDto?,
+    mergedAudio: String?,
+    entryIncomingWins: Boolean,
+): String {
+    if (!mergedAudio.isNullOrBlank()) return ContentType.AUDIO.wireValue
+    val incomingType = contentDto?.contentType?.takeIf { it.isNotBlank() }
+    val existingType = existingContent?.contentType?.takeIf { it.isNotBlank() }
+    return if (existingContent == null || entryIncomingWins) {
+        incomingType ?: existingType ?: "article"
+    } else {
+        existingType ?: incomingType ?: "article"
+    }
 }
 
 @Suppress("LongParameterList")

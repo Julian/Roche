@@ -360,13 +360,12 @@ impl SyncRepo<'_> {
                 continue;
             }
 
-            let spec_info: Option<CollectionSpecModeRole> = sqlx::query_as(
-                "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
-            )
-            .bind(&col_id)
-            .fetch_optional(tx.conn())
-            .await?;
-            if spec_info.as_ref().is_some_and(|s| s.mode == CollectionMode::Dynamic) {
+            let spec_mode: Option<CollectionMode> =
+                sqlx::query_scalar("SELECT mode FROM collection_specs WHERE collection_id = ?")
+                    .bind(&col_id)
+                    .fetch_optional(tx.conn())
+                    .await?;
+            if spec_mode == Some(CollectionMode::Dynamic) {
                 continue;
             }
             if CatalogRepo::would_introduce_collection_cycle_in_tx(tx.conn(), &col_id, &entry_id)
@@ -415,50 +414,6 @@ impl SyncRepo<'_> {
             .bind(ce.position)
             .bind(safe_added_at)
             .bind(&ce_hlc)
-            .execute(tx.conn())
-            .await?;
-
-            // Auto-upgrade RSS publication feed to Podcast when an audio episode joins it
-            if spec_info.is_some_and(|s| {
-                s.mode == CollectionMode::Feed && s.collection_role == CollectionRole::Feed
-            }) {
-                Self::maybe_upgrade_feed_to_podcast_in_tx(tx, &col_id, &entry_id).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn maybe_upgrade_feed_to_podcast_in_tx(
-        tx: &mut WriteTx<'_>,
-        col_id: &str,
-        entry_id: &str,
-    ) -> Result<()> {
-        let is_audio_entry: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM entries e
-             LEFT JOIN entry_content ec ON ec.entry_id = e.id
-             WHERE e.id = ? AND (e.kind = 'podcast_episode' OR ec.content_type = 'audio')
-             LIMIT 1",
-        )
-        .bind(entry_id)
-        .fetch_optional(tx.conn())
-        .await?;
-        if is_audio_entry.is_some() {
-            let fs_hlc = tx.next_hlc().await?;
-            sqlx::query(
-                "UPDATE feed_sources SET source_type = 'podcast', hlc = ?
-                 WHERE collection_id = ? AND source_type = 'rss'",
-            )
-            .bind(&fs_hlc)
-            .bind(col_id)
-            .execute(tx.conn())
-            .await?;
-            let entry_hlc = tx.next_hlc().await?;
-            sqlx::query(
-                "UPDATE entries SET kind = 'podcast', hlc = ?
-                 WHERE id = ? AND kind = 'publication'",
-            )
-            .bind(&entry_hlc)
-            .bind(col_id)
             .execute(tx.conn())
             .await?;
         }

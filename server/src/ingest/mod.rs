@@ -470,7 +470,8 @@ impl FeedIngester {
                         let audio_url = item.audio_url.map(String::from).or_else(|| {
                             (content_type == ContentType::Audio).then(|| url.as_str().to_owned())
                         });
-                        let duration = item.duration;
+                        let duration =
+                            (content_type == ContentType::Audio).then_some(item.duration).flatten();
                         let clean_desc =
                             HtmlSanitizer::clean_with_base(&item.description, Some(&url));
                         let content_html = item

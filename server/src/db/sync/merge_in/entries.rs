@@ -34,6 +34,7 @@ struct ExistingFeedRow {
     collection_id: String,
     feed_url: String,
     source_type: FeedType,
+    entry_kind: EntryKind,
     feed_title: Option<String>,
     last_polled_at: Option<DateTime<Utc>>,
     is_active: bool,
@@ -257,9 +258,11 @@ impl SyncRepo<'_> {
 
         let det_id = deterministic_feed_id(feed_url);
         let existing: Option<ExistingFeedRow> = sqlx::query_as(
-            "SELECT collection_id, feed_url, source_type, feed_title, last_polled_at, is_active, hlc
-             FROM feed_sources
-             WHERE feed_url = ? OR collection_id = ? OR collection_id = ?
+            "SELECT fs.collection_id, fs.feed_url, fs.source_type, e.kind AS entry_kind,
+                    fs.feed_title, fs.last_polled_at, fs.is_active, fs.hlc
+             FROM feed_sources fs
+             JOIN entries e ON e.id = fs.collection_id
+             WHERE fs.feed_url = ? OR fs.collection_id = ? OR fs.collection_id = ?
              LIMIT 1",
         )
         .bind(feed_url)
@@ -351,14 +354,9 @@ impl SyncRepo<'_> {
         now: DateTime<Utc>,
     ) -> Result<()> {
         let config_newer = fields.fs_hlc.as_str() > existing.hlc.as_str();
-        let merged_type =
-            if existing.source_type == FeedType::Podcast || fs.source_type == FeedType::Podcast {
-                FeedType::Podcast
-            } else if config_newer {
-                fs.source_type
-            } else {
-                existing.source_type
-            };
+        let merged_type = if config_newer { fs.source_type } else { existing.source_type };
+        let target_kind = entry_kind_for_feed_type(merged_type);
+        let kind_mismatch = existing.entry_kind != target_kind;
 
         let target_feed_title = if config_newer {
             fields.clean_feed_title.or(existing.feed_title.as_deref())
@@ -367,6 +365,7 @@ impl SyncRepo<'_> {
         };
 
         if !config_newer
+            && !kind_mismatch
             && target_feed_title == existing.feed_title.as_deref()
             && merged_type == existing.source_type
         {
@@ -408,7 +407,11 @@ impl SyncRepo<'_> {
         .await?;
 
         let entry_title = target_feed_title.unwrap_or(&existing.feed_url);
-        let target_kind = entry_kind_for_feed_type(merged_type);
+        let target_entry_hlc = if config_newer || kind_mismatch {
+            fields.entry_hlc.as_str().max(target_hlc)
+        } else {
+            fields.entry_hlc.as_str()
+        };
         sqlx::query(
             "UPDATE entries
              SET kind = ?,
@@ -422,8 +425,8 @@ impl SyncRepo<'_> {
         .bind(entry_title)
         .bind(fields.clean_desc)
         .bind(now)
-        .bind(&fields.entry_hlc)
-        .bind(&fields.entry_hlc)
+        .bind(target_entry_hlc)
+        .bind(target_entry_hlc)
         .bind(&existing.collection_id)
         .execute(&mut *tx)
         .await?;
@@ -703,22 +706,30 @@ impl SyncRepo<'_> {
             entry_hlc: &entry_hlc,
             now: ctx.now,
         };
-        let Some((target_id, was_created_new)) = Self::upsert_or_merge_work_entry_in_tx(
-            tx,
-            prep,
-            &target,
-            build_work_identifiers(prep),
-            det_inbox_id,
-            is_active_inbox,
-        )
-        .await?
+        let Some((target_id, was_created_new, incoming_won_entry_hlc)) =
+            Self::upsert_or_merge_work_entry_in_tx(
+                tx,
+                prep,
+                &target,
+                build_work_identifiers(prep),
+                det_inbox_id,
+                is_active_inbox,
+            )
+            .await?
         else {
             return Ok(None);
         };
         ctx.id_resolver.record(&rec.id, &target_id);
 
         if !suppress_payload {
-            Self::merge_entry_content_in_tx(tx.conn(), &target_id, prep, ctx.now).await?;
+            Self::merge_entry_content_in_tx(
+                tx.conn(),
+                &target_id,
+                prep,
+                incoming_won_entry_hlc,
+                ctx.now,
+            )
+            .await?;
         }
         let was_new_inbox_item =
             if let Some(st) = (!suppress_payload).then_some(rec.state.as_ref()).flatten() {
@@ -744,7 +755,7 @@ impl SyncRepo<'_> {
         idents: Vec<EntryIdentifier>,
         det_inbox_id: Option<String>,
         is_active_inbox: bool,
-    ) -> Result<Option<(String, bool)>> {
+    ) -> Result<Option<(String, bool, bool)>> {
         let pre_matched_id = Self::resolve_existing_work_or_item_id_in_tx(
             tx.conn(),
             prep,
@@ -757,7 +768,7 @@ impl SyncRepo<'_> {
             if Self::is_immutable_or_collection_target_in_tx(tx.conn(), &existing_id).await? {
                 return Ok(None);
             }
-            Self::merge_into_existing_entry_row_in_tx(
+            let incoming_won_hlc = Self::merge_into_existing_entry_row_in_tx(
                 tx.conn(),
                 &existing_id,
                 prep,
@@ -765,7 +776,7 @@ impl SyncRepo<'_> {
                 &idents,
             )
             .await?;
-            Ok(Some((existing_id, false)))
+            Ok(Some((existing_id, false, incoming_won_hlc)))
         } else {
             let rec_id = prep.record.id.trim();
             let preferred_id = if (is_active_inbox && det_inbox_id.is_some()) || rec_id.is_empty() {
@@ -780,7 +791,7 @@ impl SyncRepo<'_> {
             }
             let created_id =
                 Self::insert_new_work_or_item_in_tx(tx, prep, preferred_id, target, idents).await?;
-            Ok(Some((created_id, true)))
+            Ok(Some((created_id, true, true)))
         }
     }
 
@@ -976,6 +987,7 @@ impl SyncRepo<'_> {
         tx: &mut SqliteConnection,
         target_id: &str,
         prep: &PreparedSyncEntry,
+        incoming_won_entry_hlc: bool,
         now: DateTime<Utc>,
     ) -> Result<()> {
         let rec = &prep.record;
@@ -1001,14 +1013,11 @@ impl SyncRepo<'_> {
             },
         );
         let merged_ct = match &existing_content {
-            Some(ex)
-                if ex.content_type == ContentType::Audio
-                    || prep.resolved_content_type == ContentType::Audio =>
-            {
-                ContentType::Audio
+            None => prep.resolved_content_type,
+            Some(ex) if incoming_won_entry_hlc && rec.content.is_some() => {
+                prep.resolved_content_type
             }
-            Some(ex) if rec.content.is_none() => ex.content_type,
-            _ => prep.resolved_content_type,
+            Some(ex) => ex.content_type,
         };
 
         if existing_content.as_ref().is_none_or(|ex| {
@@ -1028,7 +1037,9 @@ impl SyncRepo<'_> {
             .await?;
         }
 
-        if prep.clean_audio_url.is_some() || prep.clean_duration.is_some() {
+        let should_write_audio = merged_ct == ContentType::Audio
+            && (prep.clean_audio_url.is_some() || prep.clean_duration.is_some());
+        if should_write_audio {
             let safe_created = clamp_incoming_timestamp(rec.created_at.unwrap_or(now), now);
             MediaRepo::upsert_audio_enclosure_in_tx(
                 tx,
@@ -1037,6 +1048,15 @@ impl SyncRepo<'_> {
                 prep.clean_duration,
                 safe_created,
             )
+            .await?;
+        } else if incoming_won_entry_hlc && rec.content.is_some() && merged_ct != ContentType::Audio
+        {
+            sqlx::query(
+                "DELETE FROM entry_media
+                 WHERE entry_id = ? AND media_type = 'audio' AND local_path IS NULL",
+            )
+            .bind(target_id)
+            .execute(&mut *tx)
             .await?;
         }
         Ok(())
@@ -1160,7 +1180,7 @@ impl SyncRepo<'_> {
         prep: &PreparedSyncEntry,
         target: &WorkMergeTarget<'_>,
         idents: &[EntryIdentifier],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(existing) = sqlx::query_as::<_, ExistingEntryRow>(
             "SELECT kind, title, creators_json, url, published_at, release_year,
                     summary, thumbnail_url, metadata_json, hlc
@@ -1170,9 +1190,10 @@ impl SyncRepo<'_> {
         .fetch_optional(&mut *tx)
         .await?
         else {
-            return Ok(());
+            return Ok(false);
         };
 
+        let inc_newer = target.entry_hlc > existing.hlc.as_str();
         let (merged, changed) = compute_merged_entry_row(&existing, prep, target);
         if changed {
             sqlx::query(
@@ -1217,7 +1238,7 @@ impl SyncRepo<'_> {
             }
             entries_core::upsert_entry_identifier_in_tx(tx, existing_id, &scheme, &val).await?;
         }
-        Ok(())
+        Ok(inc_newer)
     }
 }
 
@@ -1257,12 +1278,14 @@ fn compute_merged_entry_row(
 ) -> (ExistingEntryRow, bool) {
     let rec = &prep.record;
     let inc_newer = target.entry_hlc > existing.hlc.as_str();
-    let kind =
-        if target.target_kind == EntryKind::PodcastEpisode && existing.kind == EntryKind::Article {
-            EntryKind::PodcastEpisode
-        } else {
-            existing.kind
-        };
+    let kind = if inc_newer
+        && existing.kind.is_reader_openable()
+        && target.target_kind.is_reader_openable()
+    {
+        target.target_kind
+    } else {
+        existing.kind
+    };
     let title = roche_core::crdt::compute_merged_entry_title(
         &existing.title,
         existing.url.as_deref(),

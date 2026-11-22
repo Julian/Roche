@@ -226,9 +226,7 @@ pub(super) async fn resolve_dedup_entry_id(
 #[derive(sqlx::FromRow)]
 struct ExistingFeedPollMeta {
     feed_url: String,
-    source_type: FeedType,
     feed_title: Option<String>,
-    kind: EntryKind,
     summary: Option<String>,
     language: Option<String>,
 }
@@ -872,15 +870,10 @@ impl<'a> FeedRepo<'a> {
         let new_desc = batch.description.as_deref().filter(|s| !s.is_empty());
         let new_lang = batch.language.as_deref().filter(|s| !s.is_empty());
 
-        let has_audio_items = batch
-            .items
-            .iter()
-            .any(|it| it.content_type == ContentType::Audio || it.audio_url.is_some());
-
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         let existing_meta: Option<ExistingFeedPollMeta> = sqlx::query_as(
-            "SELECT fs.feed_url, fs.source_type, fs.feed_title, e.kind, e.summary, fs.language
+            "SELECT fs.feed_url, fs.feed_title, e.summary, fs.language
              FROM feed_sources fs
              JOIN entries e ON e.id = fs.collection_id
              WHERE fs.collection_id = ?",
@@ -893,12 +886,10 @@ impl<'a> FeedRepo<'a> {
         let feed_config_changed = existing_meta.as_ref().is_some_and(|meta| {
             (meta.feed_title.is_none() && new_title.is_some())
                 || (meta.language.is_none() && new_lang.is_some())
-                || (has_audio_items && meta.source_type == FeedType::Rss)
         });
         let entry_meta_changed = existing_meta.as_ref().is_some_and(|meta| {
             (meta.feed_title.is_none() && new_title.is_some())
                 || (meta.summary.is_none() && new_desc.is_some())
-                || (has_audio_items && meta.kind == EntryKind::Publication)
         });
         let metadata_updated = existing_meta.as_ref().is_some_and(|meta| {
             (meta.feed_title.is_none() && new_title.is_some())
@@ -911,7 +902,6 @@ impl<'a> FeedRepo<'a> {
             "UPDATE feed_sources
              SET feed_title = COALESCE(feed_title, ?),
                  language = COALESCE(language, ?),
-                 source_type = CASE WHEN ? AND source_type = 'rss' THEN 'podcast' ELSE source_type END,
                  last_polled_at = ?,
                  last_polled_by = ?,
                  last_error = NULL,
@@ -922,7 +912,6 @@ impl<'a> FeedRepo<'a> {
         )
         .bind(new_title)
         .bind(new_lang)
-        .bind(has_audio_items)
         .bind(now)
         .bind(peer_id)
         .bind(feed_hlc_opt.as_deref())
@@ -935,14 +924,12 @@ impl<'a> FeedRepo<'a> {
             "UPDATE entries
              SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
                  summary = COALESCE(summary, ?),
-                 kind = CASE WHEN ? AND kind = 'publication' THEN 'podcast' ELSE kind END,
                  updated_at = ?,
                  hlc = COALESCE(?, hlc)
              WHERE id = ?",
         )
         .bind(feed_id)
         .bind(new_desc)
-        .bind(has_audio_items)
         .bind(now)
         .bind(entry_hlc_opt.as_deref())
         .bind(feed_id)
@@ -1350,7 +1337,10 @@ mod tests {
     use url::Url;
 
     use crate::{
-        db::{ActivityAction, ActivityEntityType, ContentType, Db, FeedType, NewItem},
+        db::{
+            ActivityAction, ActivityEntityType, ContentType, Db, EntryKind, FeedType, NewItem,
+            PollBatch, PollItemCandidate,
+        },
         domain::OpmlOutline,
     };
 
@@ -1565,5 +1555,59 @@ mod tests {
         assert!(changes.iter().all(|c| {
             c.entity_type == ActivityEntityType::Feed && c.action == ActivityAction::Unarchive
         }));
+    }
+
+    #[tokio::test]
+    async fn test_poll_batch_with_audio_enclosure_keeps_rss_feed_type() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://blog.example.com/feed").unwrap();
+        let feed = db
+            .feeds()
+            .create(FeedType::Rss, &feed_url, Some("Newsletter Blog"), None)
+            .await
+            .unwrap();
+
+        let batch = PollBatch {
+            title: Some("Newsletter Blog".to_owned()),
+            description: Some("Mostly text".to_owned()),
+            language: Some("en".to_owned()),
+            items: vec![
+                PollItemCandidate {
+                    title: "Written Essay".to_owned(),
+                    url: Url::parse("https://blog.example.com/p/essay").unwrap(),
+                    creators: Vec::new(),
+                    published_at: None,
+                    summary: "Text".to_owned(),
+                    content_html: Some("<p>Text</p>".to_owned()),
+                    thumbnail_url: None,
+                    audio_url: None,
+                    duration: None,
+                    content_type: ContentType::Article,
+                },
+                PollItemCandidate {
+                    title: "Audio Discussion".to_owned(),
+                    url: Url::parse("https://blog.example.com/p/audio").unwrap(),
+                    creators: Vec::new(),
+                    published_at: None,
+                    summary: "Audio".to_owned(),
+                    content_html: Some("<p>Audio</p>".to_owned()),
+                    thumbnail_url: None,
+                    audio_url: Some("https://cdn.example.com/discussion.mp3".to_owned()),
+                    duration: Some(900),
+                    content_type: ContentType::Audio,
+                },
+            ],
+        };
+        let inserted = db.feeds().record_poll_batch(&feed.id, &batch).await.unwrap();
+        assert_eq!(inserted.len(), 2);
+
+        let updated_feed = db.feeds().get(&feed.id).await.unwrap().unwrap();
+        assert_eq!(updated_feed.feed_type, FeedType::Rss);
+        let feed_entry = db.catalog().get_entry(&feed.id).await.unwrap().unwrap();
+        assert_eq!(feed_entry.kind, EntryKind::Publication);
+
+        let audio_item = db.items().get(&inserted[1].0).await.unwrap().unwrap();
+        assert_eq!(audio_item.content_type, ContentType::Audio);
+        assert_eq!(audio_item.audio_url.as_deref(), Some("https://cdn.example.com/discussion.mp3"));
     }
 }
