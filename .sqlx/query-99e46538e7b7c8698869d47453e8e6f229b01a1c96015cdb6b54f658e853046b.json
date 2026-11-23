@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM collection_specs\n             WHERE collection_id = ?\n               AND rule_json IS NULL\n               AND collection_role IN ('list', 'want')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "99e46538e7b7c8698869d47453e8e6f229b01a1c96015cdb6b54f658e853046b"
+}

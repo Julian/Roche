@@ -16,9 +16,7 @@ use super::{
         SyncEntryState, SyncFeedSource,
     },
 };
-use crate::db::{
-    CollectionMode, CollectionRole, ContentType, EntryIdentifier, EntryKind, FeedType, InboxState,
-};
+use crate::db::{CollectionRole, ContentType, EntryIdentifier, EntryKind, FeedType, InboxState};
 
 const SQLITE_BIND_CHUNK: usize = 450;
 
@@ -35,7 +33,7 @@ macro_rules! exclude_dynamic_or_system_collection_sql {
         "NOT EXISTS ( \
             SELECT 1 FROM collection_specs cs \
             WHERE cs.collection_id = entries.id \
-              AND (cs.mode = 'dynamic' OR cs.collection_role = 'system') \
+              AND (cs.rule_json IS NOT NULL OR cs.collection_role = 'system') \
         )"
     };
 }
@@ -100,10 +98,8 @@ struct RawSyncStateRow {
 struct RawSyncSpecRow {
     collection_id: String,
     slug: Option<String>,
-    mode: CollectionMode,
     collection_role: CollectionRole,
     rule_json: Option<String>,
-    show_in_lists: bool,
     color: Option<String>,
 }
 
@@ -311,7 +307,7 @@ impl SyncRepo<'_> {
              FROM collection_entries ce
              LEFT JOIN collection_specs cs ON cs.collection_id = ce.collection_id
              WHERE ce.sync_seq > ? AND ce.sync_seq <= ?
-               AND (cs.mode IS NULL OR cs.mode != 'dynamic')
+               AND cs.rule_json IS NULL
              ORDER BY ce.sync_seq ASC",
         )
         .bind(effective_since)
@@ -526,7 +522,7 @@ impl SyncRepo<'_> {
                  FROM collection_entries ce
                  LEFT JOIN collection_specs cs ON cs.collection_id = ce.collection_id
                  WHERE ce.collection_id = ? AND ce.entry_id = ?
-                   AND (cs.mode IS NULL OR cs.mode != 'dynamic')
+                   AND cs.rule_json IS NULL
                  LIMIT 1",
             )
             .bind(&generator.collection_id)
@@ -778,7 +774,7 @@ async fn load_collection_spec_map(
     let rows: Vec<RawSyncSpecRow> = fetch_chunked_by_ids(
         conn,
         ids,
-        "SELECT collection_id, slug, mode, collection_role, rule_json, show_in_lists, color
+        "SELECT collection_id, slug, collection_role, rule_json, color
          FROM collection_specs WHERE collection_id IN (",
         ")",
     )
@@ -790,10 +786,8 @@ async fn load_collection_spec_map(
                 row.collection_id,
                 SyncCollectionSpec {
                     slug: row.slug,
-                    mode: row.mode,
                     role: row.collection_role,
                     rule_json: row.rule_json,
-                    show_in_lists: row.show_in_lists,
                     color: row.color,
                 },
             )

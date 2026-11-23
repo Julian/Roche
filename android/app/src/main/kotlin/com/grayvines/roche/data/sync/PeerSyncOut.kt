@@ -13,7 +13,6 @@ import com.grayvines.roche.core.isSyncableItemUrl
 import com.grayvines.roche.core.isSyncablePublicUrl
 import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.core.parseDurationToSecondsLong
-import com.grayvines.roche.data.catalog.CollectionMode
 import com.grayvines.roche.data.catalog.CollectionRole
 import com.grayvines.roche.data.catalog.EntryIdentifierDto
 import com.grayvines.roche.data.catalog.SyncCollectionEntryDto
@@ -39,6 +38,7 @@ import com.grayvines.roche.data.local.FeedSourceEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.entryHasCatalogHistory
+import com.grayvines.roche.data.local.isDynamic
 import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
 import com.grayvines.roche.data.remote.SyncTombstoneDto
@@ -710,8 +710,7 @@ private fun isEntryEligibleForPush(
     val spec = snap.specsById[entry.id]
     val isSeededSystemOrDynamic =
         spec != null &&
-            (CollectionRole.fromWireValue(spec.role) == CollectionRole.SYSTEM ||
-                CollectionMode.fromWireValue(spec.mode) == CollectionMode.DYNAMIC)
+            (CollectionRole.fromWireValue(spec.role) == CollectionRole.SYSTEM || spec.isDynamic)
     if (isSeededSystemOrDynamic) return false
     if (entry.id in PROTECTED_SYSTEM_COLLECTION_IDS) {
         return entry.id in config.forcedEntryIds || isAnyPartDirty(entry, snap)
@@ -874,10 +873,8 @@ private fun toSyncEntryStateDto(state: EntryStateEntity): SyncEntryStateDto =
 private fun toSyncCollectionSpecDto(spec: CollectionSpecEntity): SyncCollectionSpecDto =
     SyncCollectionSpecDto(
         slug = spec.slug,
-        mode = spec.mode,
         role = spec.role,
         ruleJson = spec.ruleJson,
-        showInLists = spec.showInLists,
         color = spec.color,
     )
 

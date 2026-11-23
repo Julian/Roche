@@ -521,10 +521,8 @@ private suspend fun seedSingleInitialEntrySubTablesInDao(
             CollectionSpecEntity(
                 collectionId = entry.id,
                 slug = spec.slug,
-                mode = spec.mode,
                 role = spec.role,
                 ruleJson = spec.ruleJson,
-                showInLists = spec.showInLists,
                 color = spec.color,
             )
         )

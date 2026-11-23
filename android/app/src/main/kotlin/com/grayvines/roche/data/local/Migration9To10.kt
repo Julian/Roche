@@ -315,7 +315,7 @@ private fun migrateV9CollectionSpecRows(connection: SQLiteConnection) {
                 insertCollectionSpecNewRow(
                     connection = connection,
                     spec =
-                        CollectionSpecEntity(
+                        V10CollectionSpecRow(
                             collectionId = colId,
                             slug = stmt.textOrNull(COL_3),
                             mode = stmt.getText(COL_4),
@@ -397,7 +397,7 @@ private fun seedV10SystemManualSpecs(connection: SQLiteConnection) {
         insertCollectionSpecIgnoreRow(
             connection = connection,
             spec =
-                CollectionSpecEntity(
+                V10CollectionSpecRow(
                     collectionId = id,
                     slug = slug,
                     mode = "manual",
@@ -469,7 +469,7 @@ private fun migrateSingleV9Feed(
     )
     insertCollectionSpecNewRow(
         connection = connection,
-        spec = CollectionSpecEntity(collectionId = id, slug = null, mode = "feed", role = "feed"),
+        spec = V10CollectionSpecRow(collectionId = id, slug = null, mode = "feed", role = "feed"),
     )
     insertFeedSourceRow(
         connection = connection,
@@ -610,7 +610,7 @@ private fun upsertMigratedTagGraph(
     insertCollectionSpecNewRow(
         connection = connection,
         spec =
-            CollectionSpecEntity(
+            V10CollectionSpecRow(
                 collectionId = id,
                 slug = slug,
                 mode = "manual",
@@ -1435,7 +1435,17 @@ private fun insertFeedSourceRow(connection: SQLiteConnection, source: FeedSource
         }
 }
 
-private fun insertCollectionSpecNewRow(connection: SQLiteConnection, spec: CollectionSpecEntity) {
+private data class V10CollectionSpecRow(
+    val collectionId: String,
+    val slug: String? = null,
+    val mode: String = "manual",
+    val role: String = "list",
+    val ruleJson: String? = null,
+    val showInLists: Boolean = true,
+    val color: String? = null,
+)
+
+private fun insertCollectionSpecNewRow(connection: SQLiteConnection, spec: V10CollectionSpecRow) {
     connection
         .prepare(
             "INSERT OR REPLACE INTO `collection_specs_new` (`collectionId`, `slug`, `mode`, " +
@@ -1449,7 +1459,7 @@ private fun insertCollectionSpecNewRow(connection: SQLiteConnection, spec: Colle
 
 private fun insertCollectionSpecIgnoreRow(
     connection: SQLiteConnection,
-    spec: CollectionSpecEntity,
+    spec: V10CollectionSpecRow,
 ) {
     connection
         .prepare(
@@ -1462,7 +1472,7 @@ private fun insertCollectionSpecIgnoreRow(
         }
 }
 
-private fun bindCollectionSpecStmt(stmt: SQLiteStatement, spec: CollectionSpecEntity) {
+private fun bindCollectionSpecStmt(stmt: SQLiteStatement, spec: V10CollectionSpecRow) {
     stmt.bindText(BIND_1, spec.collectionId)
     stmt.bindNullableText(BIND_2, spec.slug)
     stmt.bindText(BIND_3, spec.mode)

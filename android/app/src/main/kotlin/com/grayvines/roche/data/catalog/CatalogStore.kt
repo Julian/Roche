@@ -26,6 +26,7 @@ import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.deleteCollectionGeneratorWithTombstone
+import com.grayvines.roche.data.local.immutableReason
 import com.grayvines.roche.data.local.nextLocalHlc
 import com.grayvines.roche.ranking.EpRankingEngine
 import com.grayvines.roche.ranking.RankClusterCandidate
@@ -548,9 +549,7 @@ class CatalogStore(
             CollectionSpecEntity(
                 collectionId = newId,
                 slug = slug,
-                mode = CollectionMode.MANUAL.wireValue,
                 role = role.wireValue,
-                showInLists = role == CollectionRole.LIST,
             )
         dao.executeInTransaction {
             val hlc = nextLocalHlc(dao, nodeId)
@@ -608,9 +607,9 @@ class CatalogStore(
                 resolveCollectionSpec(collectionIdOrSlug)
                     ?: error("Collection not found: $collectionIdOrSlug")
             val specTitle = lookupSpecTitle(spec)
-            val mode = CollectionMode.fromWireValue(spec.mode)
-            require(mode == CollectionMode.MANUAL) {
-                "Cannot manually modify entries of ${mode.wireValue} collection '$specTitle'"
+            val reason = spec.immutableReason()
+            require(reason == null) {
+                "Cannot manually modify entries of $reason collection '$specTitle'"
             }
             val resolvedEntry = followMergedId(entryId) ?: entryId.trim()
             val existing =

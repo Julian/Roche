@@ -515,11 +515,11 @@ impl<'a> FeedRepo<'a> {
         .await?;
 
         sqlx::query!(
-            "INSERT INTO collection_specs (collection_id, mode, collection_role, show_in_lists)
-             VALUES (?, 'feed', 'feed', 0)
+            "INSERT INTO collection_specs (collection_id, collection_role)
+             VALUES (?, 'feed')
              ON CONFLICT(collection_id) DO UPDATE SET
-                 mode = 'feed',
-                 collection_role = 'feed'",
+                 collection_role = 'feed',
+                 rule_json = NULL",
             row.id,
         )
         .execute(tx.conn())

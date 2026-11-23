@@ -540,9 +540,7 @@ class CatalogDiaryAndWorkspaceSearchTest {
                                     collectionSpec =
                                         SyncCollectionSpecDto(
                                             slug = STARRED_SLUG,
-                                            mode = "manual",
                                             role = "list",
-                                            showInLists = true,
                                         ),
                                 )
                             ),
@@ -566,9 +564,7 @@ class CatalogDiaryAndWorkspaceSearchTest {
                 CollectionSpecEntity(
                     collectionId = "col-extra",
                     slug = STARRED_SLUG,
-                    mode = "manual",
                     role = "list",
-                    showInLists = true,
                 )
             )
             assertEquals(STARRED_SLUG, dao.getCollectionSpecById(STARRED_COLLECTION_ID)?.slug)
@@ -590,9 +586,7 @@ class CatalogDiaryAndWorkspaceSearchTest {
                 CollectionSpecEntity(
                     collectionId = "col-case-a",
                     slug = "Favorites",
-                    mode = "manual",
                     role = "list",
-                    showInLists = true,
                 )
             )
             // Self-updating casing succeeds cleanly
@@ -600,9 +594,7 @@ class CatalogDiaryAndWorkspaceSearchTest {
                 CollectionSpecEntity(
                     collectionId = "col-case-a",
                     slug = "favorites",
-                    mode = "manual",
                     role = "list",
-                    showInLists = true,
                 )
             )
             assertEquals("favorites", dao.getCollectionSpecById("col-case-a")?.slug)
@@ -611,9 +603,7 @@ class CatalogDiaryAndWorkspaceSearchTest {
                 CollectionSpecEntity(
                     collectionId = "col-extra",
                     slug = "FAVORITES",
-                    mode = "manual",
                     role = "list",
-                    showInLists = true,
                 )
             )
             assertEquals("favorites", dao.getCollectionSpecById("col-case-a")?.slug)

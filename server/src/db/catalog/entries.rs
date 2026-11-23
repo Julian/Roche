@@ -12,14 +12,15 @@ use super::{
     CatalogRepo,
     models::{
         CatalogEntry, CatalogError, CatalogResult, ConsumptionLogRow, EntryDetailView,
-        EntryIdentifier, RawEntryRow, UpsertEntryInput, raw_entry_columns,
+        EntryIdentifier, RawEntryRow, UpsertEntryInput, collection_immutable_reason,
+        is_dynamic_rule, raw_entry_columns,
     },
 };
 use crate::db::{
     WriteTx,
     entries_core::{self, EntryInsertParams},
     sync::{SyncRepo, deterministic_title_entry_id},
-    types::{ActivityAction, ActivityEntityType, CollectionMode, ConsumptionStatus, EntryKind},
+    types::{ActivityAction, ActivityEntityType, CollectionRole, ConsumptionStatus, EntryKind},
 };
 
 impl CatalogRepo<'_> {
@@ -466,14 +467,14 @@ impl CatalogRepo<'_> {
                     "Protected system collection '{existing_id}' cannot be modified via entry upsert"
                 )));
             }
-            let existing_spec: Option<(String, String)> = sqlx::query_as(
-                "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
+            let existing_spec: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT collection_role, rule_json FROM collection_specs WHERE collection_id = ?",
             )
             .bind(existing_id)
             .fetch_optional(tx.conn())
             .await?;
-            if let Some((mode, role)) = existing_spec
-                && (mode != "manual"
+            if let Some((role, rule_json)) = existing_spec
+                && (is_dynamic_rule(rule_json.as_deref())
                     || matches!(role.as_str(), "system" | "feed" | "tag")
                     || kind != EntryKind::Collection)
             {
@@ -540,7 +541,9 @@ impl CatalogRepo<'_> {
                     CatalogError::NotFound(format!("Parent collection '{parent_id}'"))
                 })?;
             let spec_row = sqlx::query!(
-                r#"SELECT e.title as "title!", cs.mode as "mode!: CollectionMode"
+                r#"SELECT e.title as "title!",
+                          cs.collection_role as "collection_role!: CollectionRole",
+                          cs.rule_json as "rule_json?"
                    FROM collection_specs cs
                    JOIN entries e ON e.id = cs.collection_id
                    WHERE cs.collection_id = ?
@@ -550,12 +553,10 @@ impl CatalogRepo<'_> {
             .fetch_optional(tx.conn())
             .await?;
             if let Some(spec) = spec_row
-                && spec.mode != CollectionMode::Manual
+                && let Some(reason) =
+                    collection_immutable_reason(spec.collection_role, spec.rule_json.as_deref())
             {
-                return Err(CatalogError::ImmutableCollection {
-                    title: spec.title,
-                    mode: spec.mode,
-                });
+                return Err(CatalogError::ImmutableCollection { title: spec.title, reason });
             }
             Some(canon_parent)
         } else {

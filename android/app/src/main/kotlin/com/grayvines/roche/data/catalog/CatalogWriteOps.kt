@@ -33,6 +33,7 @@ import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TombstoneEntity
+import com.grayvines.roche.data.local.immutableReason
 import com.grayvines.roche.data.local.nextLocalHlc
 
 suspend fun CatalogStore.attachEntryIdentifiers(
@@ -586,9 +587,7 @@ internal suspend fun ensureWantCollectionInDao(
         CollectionSpecEntity(
             collectionId = id,
             slug = wantSlug,
-            mode = CollectionMode.MANUAL.wireValue,
             role = CollectionRole.WANT.wireValue,
-            showInLists = false,
         )
     dao.upsertEntry(
         EntryEntity(
@@ -617,9 +616,9 @@ internal suspend fun addCollectionMemberInDao(
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     val specTitle = dao.getEntryById(spec.collectionId)?.title ?: spec.slug ?: spec.collectionId
-    val mode = CollectionMode.fromWireValue(spec.mode)
-    require(mode == CollectionMode.MANUAL) {
-        "Cannot manually modify entries of ${mode.wireValue} collection '$specTitle'"
+    val reason = spec.immutableReason()
+    require(reason == null) {
+        "Cannot manually modify entries of $reason collection '$specTitle'"
     }
     require(spec.collectionId != entryId) { "A collection cannot contain itself" }
     require(dao.hasCollectionCycleRaw(spec.collectionId, entryId) == 0) {

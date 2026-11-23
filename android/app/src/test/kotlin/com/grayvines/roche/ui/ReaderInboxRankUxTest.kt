@@ -4,7 +4,6 @@ import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.catalog.CatalogEntryItem
 import com.grayvines.roche.data.catalog.CatalogListSummary
 import com.grayvines.roche.data.catalog.CatalogSnapshot
-import com.grayvines.roche.data.catalog.CollectionMode
 import com.grayvines.roche.data.catalog.CollectionRole
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.matchesScope
@@ -298,7 +297,7 @@ class ReaderInboxRankUxTest {
             collectionId = id,
             slug = slug,
             title = title,
-            mode = CollectionMode.DYNAMIC,
+            isDynamic = true,
             role = role,
             entryCount = entryCount,
             isPriorityScoped = role == CollectionRole.WANT,

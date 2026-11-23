@@ -2,7 +2,6 @@ package com.grayvines.roche.data
 
 import com.grayvines.roche.data.catalog.CatalogEntryItem
 import com.grayvines.roche.data.catalog.CatalogSnapshot
-import com.grayvines.roche.data.catalog.CollectionMode
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
@@ -135,7 +134,7 @@ internal fun searchCatalogEntries(
 
 private fun buildCatalogTierIndex(catalog: CatalogSnapshot): Map<String, Char> = buildMap {
     catalog.lists
-        .filter { it.mode == CollectionMode.DYNAMIC }
+        .filter { it.isDynamic }
         .forEach { summary ->
             catalog.entriesByCollectionId[summary.collectionId].orEmpty().forEach { ranked ->
                 if (ranked.tier != null) put(ranked.entry.id, ranked.tier)

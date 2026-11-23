@@ -8,9 +8,9 @@ use url::Url;
 
 use super::*;
 use crate::db::{
-    ActivityEntityType, CollectionMode, CollectionRole, ConsumptionStatus, ContentType, Db,
-    EntryKind, Feed, FeedType, InboxState, ItemFilter, ItemStatus, ManualItemInput, NewItem,
-    PollBatch, PollItemCandidate,
+    ActivityEntityType, CollectionRole, ConsumptionStatus, ContentType, Db, EntryKind, Feed,
+    FeedType, InboxState, ItemFilter, ItemStatus, ManualItemInput, NewItem, PollBatch,
+    PollItemCandidate,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -52,10 +52,8 @@ fn make_feed_sync_entry(
         state: None,
         collection_spec: Some(SyncCollectionSpec {
             slug: None,
-            mode: CollectionMode::Feed,
             role: CollectionRole::Feed,
             rule_json: None,
-            show_in_lists: false,
             color: None,
         }),
         feed_source: Some(SyncFeedSource {
@@ -96,10 +94,8 @@ fn make_tag_sync_entry(id: &str, name: &str, color: Option<&str>, hlc: &str) -> 
         state: None,
         collection_spec: Some(SyncCollectionSpec {
             slug: Some(format!("tag:{}", name.trim().to_lowercase())),
-            mode: CollectionMode::Manual,
             role: CollectionRole::Tag,
             rule_json: None,
-            show_in_lists: false,
             color: color.map(str::to_owned),
         }),
         feed_source: None,
@@ -1319,10 +1315,8 @@ async fn test_offline_peer_write_propagates_across_sync_seq_regardless_of_wall_c
                 state: None,
                 collection_spec: Some(SyncCollectionSpec {
                     slug: Some("sci-fi-classics".to_owned()),
-                    mode: CollectionMode::Manual,
                     role: CollectionRole::List,
                     rule_json: None,
-                    show_in_lists: true,
                     color: None,
                 }),
                 feed_source: None,
@@ -1707,10 +1701,8 @@ async fn test_peer_sync_referenced_entries_slug_collision_and_idempotent_stabili
                     state: None,
                     collection_spec: Some(SyncCollectionSpec {
                         slug: Some("weekend-movies".to_owned()),
-                        mode: CollectionMode::Manual,
                         role: CollectionRole::List,
                         rule_json: None,
-                        show_in_lists: true,
                         color: None,
                     }),
                     feed_source: None,
@@ -1774,10 +1766,8 @@ async fn test_peer_sync_referenced_entries_slug_collision_and_idempotent_stabili
                     state: None,
                     collection_spec: Some(SyncCollectionSpec {
                         slug: Some("  WEEKEND-MOVIES  ".to_owned()),
-                        mode: CollectionMode::Manual,
                         role: CollectionRole::List,
                         rule_json: None,
-                        show_in_lists: true,
                         color: None,
                     }),
                     feed_source: None,
@@ -2447,10 +2437,8 @@ async fn test_starred_batch_generator_rejected_and_collection_tombstone_enforced
                 state: None,
                 collection_spec: Some(crate::db::SyncCollectionSpec {
                     slug: Some("deleted-list".to_owned()),
-                    mode: CollectionMode::Manual,
                     role: CollectionRole::List,
                     rule_json: None,
-                    show_in_lists: true,
                     color: None,
                 }),
                 feed_source: None,
@@ -3739,10 +3727,8 @@ async fn test_graph_tombstones_resolve_remapped_ids_in_same_sync_batch() {
                     state: None,
                     collection_spec: Some(SyncCollectionSpec {
                         slug: Some("weekend_watch".to_owned()),
-                        mode: CollectionMode::Manual,
                         role: CollectionRole::List,
                         rule_json: None,
-                        show_in_lists: true,
                         color: None,
                     }),
                     feed_source: None,
@@ -4514,10 +4500,8 @@ async fn test_rust_hlc_causal_monotonicity_under_peer_clock_skew() {
                     state: None,
                     collection_spec: Some(SyncCollectionSpec {
                         slug: None,
-                        mode: CollectionMode::Feed,
                         role: CollectionRole::Feed,
                         rule_json: None,
-                        show_in_lists: false,
                         color: None,
                     }),
                     feed_source: Some(SyncFeedSource {
@@ -4640,10 +4624,8 @@ async fn test_rust_hlc_causal_monotonicity_under_peer_clock_skew() {
                     state: None,
                     collection_spec: Some(SyncCollectionSpec {
                         slug: None,
-                        mode: CollectionMode::Feed,
                         role: CollectionRole::Feed,
                         rule_json: None,
-                        show_in_lists: false,
                         color: None,
                     }),
                     feed_source: Some(SyncFeedSource {
@@ -6032,4 +6014,63 @@ async fn test_peer_sync_feed_url_edge_cases_resubscribe_swap_tombstones_and_stal
             .unwrap();
     assert!(item_tomb_keys.contains(&item_natural_key(Some(u1.as_str()), late_item_url)));
     assert!(item_tomb_keys.contains(&item_natural_key(Some(u2.as_str()), late_item_url)));
+}
+
+#[tokio::test]
+async fn test_migration_022_simplifies_collection_specs_and_accepts_legacy_wire_json() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+
+    // Verify `collection_specs` columns omit `mode` and `show_in_lists`.
+    let cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('collection_specs')")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(cols, vec!["collection_id", "slug", "collection_role", "rule_json", "color"]);
+
+    // Verify CHECK rejects blank whitespace rule_json.
+    sqlx::query(
+        "INSERT INTO entries (id, kind, title) VALUES ('e-blank-rule', 'collection', 'Blank')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let blank_err = sqlx::query(
+        "INSERT INTO collection_specs (collection_id, slug, collection_role, rule_json)
+         VALUES ('e-blank-rule', 'blank_rule', 'list', '   ')",
+    )
+    .execute(db.pool())
+    .await;
+    assert!(blank_err.is_err(), "whitespace-only rule_json must be rejected");
+
+    // Verify `collection_specs_sync_seq_au` trigger still bumps `entries.sync_seq`.
+    let custom = db
+        .catalog()
+        .create_manual_collection("Trigger Check", None, CollectionRole::List, None, None)
+        .await
+        .unwrap();
+    let seq_before: i64 = sqlx::query_scalar("SELECT sync_seq FROM entries WHERE id = ?")
+        .bind(&custom.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE collection_specs SET color = '#123456' WHERE collection_id = ?")
+        .bind(&custom.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let seq_after: i64 = sqlx::query_scalar("SELECT sync_seq FROM entries WHERE id = ?")
+        .bind(&custom.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(seq_after > seq_before, "updating collection_specs must bump parent entries.sync_seq");
+
+    // Verify legacy peer-sync JSON carrying `mode` and `show_in_lists` still deserializes cleanly.
+    let legacy_json = r##"{"slug":"legacy_list","mode":"manual","role":"list","show_in_lists":true,"color":"#abcdef"}"##;
+    let parsed: SyncCollectionSpec = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(parsed.slug.as_deref(), Some("legacy_list"));
+    assert_eq!(parsed.role, CollectionRole::List);
+    assert!(!parsed.is_dynamic());
+    assert_eq!(parsed.color.as_deref(), Some("#abcdef"));
 }

@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.title as \"title!\",\n                          cs.collection_role as \"collection_role!: CollectionRole\",\n                          cs.rule_json as \"rule_json?\"\n                   FROM collection_specs cs\n                   JOIN entries e ON e.id = cs.collection_id\n                   WHERE cs.collection_id = ?\n                   LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "title!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "name": "collection_role!: CollectionRole",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "collection_role"
+          }
+        }
+      },
+      {
+        "name": "rule_json?",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "rule_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "5ce3b6ef86745b2e0b01bd3803401452f7996bcf5b1e7018a92ea4c114febc39"
+}

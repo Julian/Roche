@@ -185,12 +185,20 @@ data class FeedSourceEntity(
 data class CollectionSpecEntity(
     @PrimaryKey val collectionId: String,
     val slug: String? = null,
-    val mode: String = "manual",
     val role: String = "list",
     val ruleJson: String? = null,
-    val showInLists: Boolean = true,
     val color: String? = null,
 )
+
+internal val CollectionSpecEntity.isDynamic: Boolean
+    get() = !ruleJson.isNullOrBlank()
+
+internal fun CollectionSpecEntity.immutableReason(): String? =
+    when {
+        isDynamic -> "dynamic"
+        role.equals("feed", ignoreCase = true) -> "feed"
+        else -> null
+    }
 
 @Entity(
     tableName = "collection_entries",

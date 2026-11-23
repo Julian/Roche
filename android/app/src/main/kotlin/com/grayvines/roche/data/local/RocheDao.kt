@@ -784,10 +784,11 @@ interface RocheDao {
     @Transaction
     suspend fun upsertCollectionSpec(spec: CollectionSpecEntity) {
         val cleanSlug = spec.slug?.trim()?.takeIf { it.isNotEmpty() }
+        val cleanRule = spec.ruleJson?.trim()?.takeIf { it.isNotEmpty() }
         val hasConflictingOwner =
             cleanSlug != null && findOtherCollectionIdBySlug(cleanSlug, spec.collectionId) != null
         val safeSlug = if (hasConflictingOwner) null else cleanSlug
-        val safeSpec = spec.copy(slug = safeSlug)
+        val safeSpec = spec.copy(slug = safeSlug, ruleJson = cleanRule)
         if (insertCollectionSpecIgnore(safeSpec) == -1L) {
             updateCollectionSpec(safeSpec)
         }
@@ -805,7 +806,7 @@ interface RocheDao {
 
     @Query(
         "DELETE FROM collection_specs " +
-            "WHERE collectionId = :dupId AND mode = 'manual' AND role IN ('list', 'want')"
+            "WHERE collectionId = :dupId AND ruleJson IS NULL AND role IN ('list', 'want')"
     )
     suspend fun deleteManualCollectionSpec(dupId: String)
 

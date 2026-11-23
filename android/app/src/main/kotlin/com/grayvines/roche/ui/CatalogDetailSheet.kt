@@ -73,7 +73,6 @@ import com.grayvines.roche.data.catalog.AlbumTrackItem
 import com.grayvines.roche.data.catalog.CatalogEntryItem
 import com.grayvines.roche.data.catalog.CatalogListSummary
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
-import com.grayvines.roche.data.catalog.CollectionMode
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.DiaryEntryItem
 import com.grayvines.roche.data.catalog.DiscographyAlbumItem
@@ -1807,7 +1806,7 @@ private fun collectListAppearances(
                 rank = match.rank,
                 totalCount = ranked.size,
                 tier = match.tier,
-                isDynamic = summary.mode == CollectionMode.DYNAMIC,
+                isDynamic = summary.isDynamic,
             )
         )
     }
@@ -1838,7 +1837,7 @@ private fun collectArtistLibraryAlbums(
 ): List<ArtistLibraryAlbum> {
     val tierByEntryId = buildMap {
         state.catalog.lists
-            .filter { it.mode == CollectionMode.DYNAMIC }
+            .filter { it.isDynamic }
             .forEach { list ->
                 state.catalog.entriesByCollectionId[list.collectionId].orEmpty().forEach { ranked ->
                     if (ranked.tier != null) put(ranked.entry.id, ranked.tier)

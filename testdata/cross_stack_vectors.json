@@ -2393,9 +2393,7 @@
             "hlc": "001748772000000-0000-local-peer",
             "collection_spec": {
               "slug": "tomb_list",
-              "mode": "manual",
-              "role": "list",
-              "show_in_lists": true
+              "role": "list"
             }
           },
           {
@@ -2576,9 +2574,7 @@
             "hlc": "001748772000000-0000-local-peer",
             "collection_spec": {
               "slug": "fold_list",
-              "mode": "manual",
-              "role": "list",
-              "show_in_lists": true
+              "role": "list"
             }
           },
           {
@@ -2726,9 +2722,7 @@
             "hlc": "001748772000000-0000-local-peer",
             "collection_spec": {
               "slug": "gen_term_pool",
-              "mode": "manual",
-              "role": "list",
-              "show_in_lists": true
+              "role": "list"
             }
           },
           {
@@ -2829,9 +2823,7 @@
             "hlc": "001748772000000-0000-local-peer",
             "collection_spec": {
               "slug": "gen_rm_pool",
-              "mode": "manual",
-              "role": "list",
-              "show_in_lists": true
+              "role": "list"
             }
           },
           {
@@ -4027,9 +4019,7 @@
           "updated_at": "2026-05-01T09:00:00Z",
           "hlc": "001748771000000-0000-android-pixel-9",
           "collection_spec": {
-            "mode": "feed",
-            "role": "feed",
-            "show_in_lists": false
+            "role": "feed"
           },
           "feed_source": {
             "feed_url": "https://blog.rust-lang.org/feed.xml",
@@ -4078,9 +4068,7 @@
           "hlc": "001748770000000-0001-android-pixel-9",
           "collection_spec": {
             "slug": "favorites_2026",
-            "mode": "manual",
             "role": "list",
-            "show_in_lists": true,
             "color": "#3b82f6"
           }
         }

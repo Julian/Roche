@@ -11,7 +11,7 @@ use crate::{
     db::{
         WriteTx,
         sync::{SyncRepo, canonical_ordering_json, deterministic_comparison_id},
-        types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole},
+        types::{ActivityAction, ActivityEntityType, CollectionRole},
     },
     ranking::validate_ordering,
     util::clock::now_utc,
@@ -180,39 +180,36 @@ impl CatalogRepo<'_> {
         } else {
             Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, true).await?
         };
-        let count = match raw_col.mode {
-            CollectionMode::Manual | CollectionMode::Feed => {
-                let raw_count: i64 = if raw_col.has_generator {
-                    sqlx::query_scalar(
-                        "SELECT COUNT(*)
-                         FROM collection_entries ce
-                         JOIN entries e ON e.id = ce.entry_id
-                         WHERE ce.collection_id = ?
-                           AND e.merged_into_id IS NULL
-                           AND EXISTS (
-                               SELECT 1 FROM consumption_log cl
-                               WHERE cl.entry_id = e.id AND cl.status = 'consumed'
-                           )",
-                    )
-                    .bind(&raw_col.id)
-                    .fetch_one(tx.conn())
-                    .await?
-                } else {
-                    sqlx::query_scalar(
-                        "SELECT COUNT(*)
-                         FROM collection_entries ce
-                         JOIN entries e ON e.id = ce.entry_id
-                         WHERE ce.collection_id = ? AND e.merged_into_id IS NULL",
-                    )
-                    .bind(&raw_col.id)
-                    .fetch_one(tx.conn())
-                    .await?
-                };
-                usize::try_from(raw_count).unwrap_or(0)
-            }
-            CollectionMode::Dynamic => {
-                Self::resolve_rankable_member_ids_in_tx(tx.conn(), &raw_col).await?.len()
-            }
+        let count = if raw_col.is_dynamic() {
+            Self::resolve_rankable_member_ids_in_tx(tx.conn(), &raw_col).await?.len()
+        } else {
+            let raw_count: i64 = if raw_col.has_generator {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*)
+                     FROM collection_entries ce
+                     JOIN entries e ON e.id = ce.entry_id
+                     WHERE ce.collection_id = ?
+                       AND e.merged_into_id IS NULL
+                       AND EXISTS (
+                           SELECT 1 FROM consumption_log cl
+                           WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                       )",
+                )
+                .bind(&raw_col.id)
+                .fetch_one(tx.conn())
+                .await?
+            } else {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*)
+                     FROM collection_entries ce
+                     JOIN entries e ON e.id = ce.entry_id
+                     WHERE ce.collection_id = ? AND e.merged_into_id IS NULL",
+                )
+                .bind(&raw_col.id)
+                .fetch_one(tx.conn())
+                .await?
+            };
+            usize::try_from(raw_count).unwrap_or(0)
         };
         tx.commit().await?;
         Ok(count)

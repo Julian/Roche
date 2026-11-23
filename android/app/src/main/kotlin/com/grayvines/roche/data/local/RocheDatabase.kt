@@ -32,7 +32,7 @@ import kotlin.coroutines.CoroutineContext
             LocalSyncFlagEntity::class,
             TableRevisionEntity::class,
         ],
-    version = 12,
+    version = 13,
     exportSchema = true,
 )
 abstract class RocheDatabase : RoomDatabase() {
@@ -198,6 +198,13 @@ abstract class RocheDatabase : RoomDatabase() {
                 }
             }
 
+        internal val MIGRATION_12_13 =
+            object : Migration(12, 13) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    migrateSchemaV12ToV13(connection)
+                }
+            }
+
         internal fun schemaCallback(): Callback =
             object : Callback() {
                 override suspend fun onCreate(connection: SQLiteConnection) {
@@ -224,6 +231,7 @@ abstract class RocheDatabase : RoomDatabase() {
                 MIGRATION_9_10,
                 MIGRATION_10_11,
                 MIGRATION_11_12,
+                MIGRATION_12_13,
             )
 
         internal fun createInMemory(

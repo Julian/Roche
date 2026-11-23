@@ -524,13 +524,13 @@ async fn run_lists_cmd(db: &Db, include_want: bool, include_system: bool) -> any
     }
     for col in collections {
         let slug = col.slug.as_deref().unwrap_or(col.id.as_str());
+        let kind_label = if col.is_dynamic() { "dynamic" } else { "manual" };
         println!(
-            "{:<22} {:<24} items={:<4} comparisons={:<4} ({:?})",
+            "{:<22} {:<24} items={:<4} comparisons={:<4} ({kind_label})",
             sanitize_terminal_text(slug),
             sanitize_terminal_text(&col.title),
             col.member_count,
             col.comparison_count,
-            col.mode
         );
     }
     Ok(())

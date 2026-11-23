@@ -1352,7 +1352,6 @@ class DataSyncRound2FixesTest {
                 CollectionSpecEntity(
                     collectionId = dupId,
                     slug = "dup_list",
-                    mode = "manual",
                     role = "list",
                 )
             )

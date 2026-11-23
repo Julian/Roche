@@ -10,16 +10,14 @@ use super::{
     collections::derive_manual_collection_slug_and_id,
     models::{
         BatchCollectionInput, BatchComparisonInput, BatchGeneratorInput, CatalogBatchInput,
-        CatalogBatchResult, CatalogError, CatalogResult,
+        CatalogBatchResult, CatalogError, CatalogResult, is_dynamic_rule,
     },
 };
 use crate::{
     db::{
         WriteTx, entries_core,
         sync::SyncRepo,
-        types::{
-            ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind, HexColor,
-        },
+        types::{ActivityAction, ActivityEntityType, CollectionRole, EntryKind, HexColor},
     },
     ranking::validate_ordering,
 };
@@ -197,8 +195,8 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<String> {
         let (clean_title, derived_slug, requested_id) = derive_batch_collection_slug_and_id(col)?;
 
-        let existing: Option<(String, CollectionMode, CollectionRole)> = sqlx::query_as(
-            "SELECT collection_id, mode, collection_role
+        let existing: Option<(String, CollectionRole, Option<String>)> = sqlx::query_as(
+            "SELECT collection_id, collection_role, rule_json
              FROM collection_specs
              WHERE collection_id = ? OR (slug IS NOT NULL AND LOWER(slug) = LOWER(?))
              ORDER BY CASE WHEN collection_id = ? THEN 0 ELSE 1 END ASC
@@ -210,9 +208,9 @@ impl CatalogRepo<'_> {
         .fetch_optional(tx.conn())
         .await?;
 
-        let target_id = if let Some((ex_id, ex_mode, ex_role)) = existing {
+        let target_id = if let Some((ex_id, ex_role, ex_rule)) = existing {
             if crate::db::is_protected_system_collection_id(&ex_id)
-                || ex_mode != CollectionMode::Manual
+                || is_dynamic_rule(ex_rule.as_deref())
                 || matches!(
                     ex_role,
                     CollectionRole::Feed | CollectionRole::Tag | CollectionRole::System
@@ -245,7 +243,6 @@ impl CatalogRepo<'_> {
             )));
         }
 
-        let show_in_lists = col.role == CollectionRole::List;
         let clean_summary = col.summary.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let validated_color = HexColor::parse_optional(col.color.as_deref())
             .map_err(|e| CatalogError::InvalidInput(e.to_string()))?;
@@ -272,17 +269,15 @@ impl CatalogRepo<'_> {
 
         sqlx::query(
             "INSERT INTO collection_specs
-             (collection_id, slug, mode, collection_role, rule_json, show_in_lists, color)
-             VALUES (?, ?, 'manual', ?, NULL, ?, ?)
+             (collection_id, slug, collection_role, rule_json, color)
+             VALUES (?, ?, ?, NULL, ?)
              ON CONFLICT(collection_id) DO UPDATE SET
                 collection_role = excluded.collection_role,
-                show_in_lists = excluded.show_in_lists,
                 color = COALESCE(excluded.color, collection_specs.color)",
         )
         .bind(&target_id)
         .bind(&derived_slug)
         .bind(col.role)
-        .bind(show_in_lists)
         .bind(clean_color)
         .execute(tx.conn())
         .await?;
@@ -352,13 +347,18 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<usize> {
         let mut updated = 0usize;
         for gen_input in generators {
-            let (col_id, col_title, mode, role) = Self::resolve_batch_collection_ref_in_tx(
+            let (col_id, col_title, role, rule_json) = Self::resolve_batch_collection_ref_in_tx(
                 tx.conn(),
                 ref_map,
                 &gen_input.collection_ref,
             )
             .await?;
-            Self::ensure_generator_eligible(&col_id, &col_title, mode, role)?;
+            Self::ensure_generator_eligible(
+                &col_id,
+                &col_title,
+                role,
+                is_dynamic_rule(rule_json.as_deref()),
+            )?;
             let explicit_entry_id = match gen_input
                 .current_entry_ref
                 .as_deref()
@@ -387,12 +387,12 @@ impl CatalogRepo<'_> {
         tx: &mut SqliteConnection,
         ref_map: &HashMap<String, String>,
         raw_ref: &str,
-    ) -> CatalogResult<(String, String, CollectionMode, CollectionRole)> {
+    ) -> CatalogResult<(String, String, CollectionRole, Option<String>)> {
         let trimmed = raw_ref.trim();
         let candidate = ref_map.get(trimmed).map_or(trimmed, String::as_str);
         let norm_slug = candidate.to_ascii_lowercase().replace('-', "_");
-        let row: Option<(String, String, CollectionMode, CollectionRole)> = sqlx::query_as(
-            "SELECT e.id, e.title, cs.mode, cs.collection_role
+        let row: Option<(String, String, CollectionRole, Option<String>)> = sqlx::query_as(
+            "SELECT e.id, e.title, cs.collection_role, cs.rule_json
              FROM collection_specs cs
              JOIN entries e ON e.id = cs.collection_id
              WHERE e.merged_into_id IS NULL

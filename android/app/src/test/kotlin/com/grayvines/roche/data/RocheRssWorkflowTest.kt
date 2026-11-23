@@ -14,7 +14,6 @@ import com.grayvines.roche.core.deterministicTagId
 import com.grayvines.roche.core.isSyncableItemUrl
 import com.grayvines.roche.core.isSyncablePublicUrl
 import com.grayvines.roche.core.systemCollectionUuid
-import com.grayvines.roche.data.catalog.CollectionMode
 import com.grayvines.roche.data.catalog.CollectionRole
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.RocheDatabase
@@ -880,7 +879,7 @@ class RocheRssWorkflowTest {
                 val starredList =
                     snap.catalog.lists.first { it.collectionId == STARRED_COLLECTION_ID }
                 assertEquals(CollectionRole.LIST, starredList.role)
-                assertEquals(CollectionMode.MANUAL, starredList.mode)
+                assertEquals(false, starredList.isDynamic)
                 wantRepo.catalog.addCollectionEntry(STARRED_COLLECTION_ID, enrichedArticle.id)
                 val afterListStar =
                     wantRepo.snapshot.first { s ->

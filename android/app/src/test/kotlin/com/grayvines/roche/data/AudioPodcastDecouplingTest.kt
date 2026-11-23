@@ -824,9 +824,7 @@ class AudioPodcastDecouplingTest {
             CollectionSpecEntity(
                 collectionId = id,
                 slug = null,
-                mode = "feed",
                 role = "feed",
-                showInLists = false,
             )
         )
         dao.upsertFeedSource(

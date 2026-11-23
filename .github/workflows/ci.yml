@@ -324,6 +324,7 @@ jobs:
           ORG_GRADLE_PROJECT_rocheStorePassword: ${{ secrets.ROCHE_RELEASE_KEY_PASSWORD }}
           ORG_GRADLE_PROJECT_rocheVersionName: ${{ github.ref_name }}
         run: |
+          ./android/gradlew -p android --stop
           ./android/gradlew -p android :releasesmoke:pixel10ProApi37ReleaseAndroidTest -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect
           sha256sum -c "$RUNNER_TEMP/app-release.apk.sha256"
       - name: Remove the signing key

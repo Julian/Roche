@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO collection_specs (collection_id, collection_role)\n             VALUES (?, 'feed')\n             ON CONFLICT(collection_id) DO UPDATE SET\n                 collection_role = 'feed',\n                 rule_json = NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "7647d855f4aa9d3fa51ccdb40976396ae2f1565659b40323fa9e52d74130ff69"
+}

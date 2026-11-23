@@ -524,10 +524,7 @@ mod tests {
         PROBLEM_TYPE_PAIRING_RATE_LIMITED, PROBLEM_TYPE_PAYLOAD_TOO_LARGE,
         PROBLEM_TYPE_SSRF_BLOCKED, PROBLEM_TYPE_TOKEN_INVALID,
     };
-    use crate::{
-        db::{CatalogError, CollectionMode},
-        service::AppError,
-    };
+    use crate::{db::CatalogError, service::AppError};
 
     #[test]
     fn test_catalog_internal_error_maps_to_http_500() {
@@ -623,7 +620,7 @@ mod tests {
 
         let immut: ApiError = AppError::from(CatalogError::ImmutableCollection {
             title: "Movies".to_owned(),
-            mode: CollectionMode::Dynamic,
+            reason: "dynamic",
         })
         .into();
         let (immut_status, immut_problem) = immut.to_problem_details();

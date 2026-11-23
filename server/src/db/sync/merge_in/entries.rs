@@ -23,9 +23,9 @@ use super::super::{
 };
 use super::{IndexedTag, MergeContext};
 use crate::db::{
-    ActivityAction, ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole, ContentType,
-    EntryIdentifier, EntryKind, FeedRepo, FeedType, HexColor, InboxState, MediaRepo,
-    PollItemCandidate, UpsertEntryInput, WriteTx, entries_core,
+    ActivityAction, ActivityEntityType, CatalogRepo, CollectionRole, ContentType, EntryIdentifier,
+    EntryKind, FeedRepo, FeedType, HexColor, InboxState, MediaRepo, PollItemCandidate,
+    UpsertEntryInput, WriteTx, entries_core,
     feeds::{NewFeedRow, entry_kind_for_feed_type, resolve_dedup_entry_id},
 };
 
@@ -288,11 +288,11 @@ impl SyncRepo<'_> {
             CollectionRole::Tag => {
                 Self::merge_single_tag_entry_in_tx(tx, prep, cs, ctx).await?;
             }
-            CollectionRole::List | CollectionRole::Want if cs.mode == CollectionMode::Manual => {
+            CollectionRole::List | CollectionRole::Want if !cs.is_dynamic() => {
                 Self::merge_single_collection_entry_in_tx(tx, prep, cs, ctx).await?;
             }
             CollectionRole::System
-                if cs.mode == CollectionMode::Manual
+                if !cs.is_dynamic()
                     && (rec.id.trim() == STARRED_COLLECTION_ID
                         || cs
                             .slug
@@ -301,7 +301,6 @@ impl SyncRepo<'_> {
             {
                 let mut upgraded = cs.clone();
                 upgraded.role = CollectionRole::List;
-                upgraded.show_in_lists = true;
                 Self::merge_single_collection_entry_in_tx(tx, prep, &upgraded, ctx).await?;
             }
             CollectionRole::Feed
@@ -872,8 +871,8 @@ impl SyncRepo<'_> {
         .await?;
 
         sqlx::query(
-            "INSERT INTO collection_specs (collection_id, slug, mode, collection_role, show_in_lists, color)
-             VALUES (?, ?, 'manual', 'tag', 0, ?)
+            "INSERT INTO collection_specs (collection_id, slug, collection_role, color)
+             VALUES (?, ?, 'tag', ?)
              ON CONFLICT(collection_id) DO UPDATE SET
                  slug = excluded.slug,
                  color = COALESCE(excluded.color, collection_specs.color)",

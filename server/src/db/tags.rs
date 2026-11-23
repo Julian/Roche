@@ -337,8 +337,8 @@ impl<'a> TagRepo<'a> {
 
         if inserted {
             sqlx::query!(
-                "INSERT OR IGNORE INTO collection_specs (collection_id, slug, mode, collection_role, show_in_lists, color)
-                 VALUES (?, ?, 'manual', 'tag', 0, ?)",
+                "INSERT OR IGNORE INTO collection_specs (collection_id, slug, collection_role, color)
+                 VALUES (?, ?, 'tag', ?)",
                 new_tag_id,
                 slug,
                 color as _,

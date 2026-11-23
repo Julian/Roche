@@ -4,7 +4,26 @@ use roche_core::external_links::EXTERNAL_ID_DISPLAY_ORDER;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::db::types::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind, HexColor};
+use crate::db::types::{CollectionRole, ConsumptionStatus, EntryKind, HexColor};
+
+#[must_use]
+pub fn is_dynamic_rule(rule_json: Option<&str>) -> bool {
+    rule_json.is_some_and(|s| !s.trim().is_empty())
+}
+
+#[must_use]
+pub fn collection_immutable_reason(
+    role: CollectionRole,
+    rule_json: Option<&str>,
+) -> Option<&'static str> {
+    if is_dynamic_rule(rule_json) {
+        Some("dynamic")
+    } else if role == CollectionRole::Feed {
+        Some("feed")
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum CatalogError {
@@ -17,8 +36,8 @@ pub enum CatalogError {
     #[error("Ambiguous lookup for '{query}': matches {}", .candidates.join(", "))]
     AmbiguousLookup { query: String, candidates: Vec<String> },
 
-    #[error("Cannot manually modify entries of {mode:?} collection '{title}'")]
-    ImmutableCollection { title: String, mode: CollectionMode },
+    #[error("Cannot manually modify entries of {reason} collection '{title}'")]
+    ImmutableCollection { title: String, reason: &'static str },
 
     #[error("Invalid catalog input: {0}")]
     InvalidInput(String),
@@ -113,8 +132,8 @@ pub(super) use raw_entry_columns;
 
 macro_rules! raw_collection_columns {
     () => {
-        "e.id, cs.slug, e.title, e.summary, e.kind, cs.mode, cs.collection_role, \
-         cs.rule_json, cs.show_in_lists, cs.color, \
+        "e.id, cs.slug, e.title, e.summary, e.kind, cs.collection_role, \
+         cs.rule_json, cs.color, \
          EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.collection_id = e.id) AS has_generator, \
          e.created_at, e.updated_at"
     };
@@ -198,16 +217,26 @@ pub struct CollectionSummary {
     pub title: String,
     pub summary: Option<String>,
     pub kind: EntryKind,
-    pub mode: CollectionMode,
     pub role: CollectionRole,
     pub rule_json: Option<String>,
-    pub show_in_lists: bool,
     pub color: Option<HexColor>,
     pub member_count: usize,
     pub comparison_count: usize,
     pub has_generator: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl CollectionSummary {
+    #[must_use]
+    pub fn is_dynamic(&self) -> bool {
+        is_dynamic_rule(self.rule_json.as_deref())
+    }
+
+    #[must_use]
+    pub fn is_manual(&self) -> bool {
+        !self.is_dynamic() && self.role != CollectionRole::Feed
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,10 +306,8 @@ pub(super) struct RawCollectionRow {
     pub title: String,
     pub summary: Option<String>,
     pub kind: EntryKind,
-    pub mode: CollectionMode,
     pub collection_role: CollectionRole,
     pub rule_json: Option<String>,
-    pub show_in_lists: bool,
     pub color: Option<String>,
     pub has_generator: bool,
     pub created_at: DateTime<Utc>,
@@ -289,6 +316,16 @@ pub(super) struct RawCollectionRow {
 
 impl RawCollectionRow {
     #[must_use]
+    pub fn is_dynamic(&self) -> bool {
+        is_dynamic_rule(self.rule_json.as_deref())
+    }
+
+    #[must_use]
+    pub fn immutable_reason(&self) -> Option<&'static str> {
+        collection_immutable_reason(self.collection_role, self.rule_json.as_deref())
+    }
+
+    #[must_use]
     pub fn into_summary(self, member_count: usize, comparison_count: usize) -> CollectionSummary {
         CollectionSummary {
             id: self.id,
@@ -296,10 +333,8 @@ impl RawCollectionRow {
             title: self.title,
             summary: self.summary,
             kind: self.kind,
-            mode: self.mode,
             role: self.collection_role,
             rule_json: self.rule_json,
-            show_in_lists: self.show_in_lists,
             color: HexColor::from_stored_tolerant(self.color.as_deref()),
             member_count,
             comparison_count,

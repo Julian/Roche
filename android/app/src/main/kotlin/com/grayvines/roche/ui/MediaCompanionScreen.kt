@@ -63,7 +63,6 @@ import androidx.compose.ui.unit.sp
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.data.catalog.CatalogListSummary
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
-import com.grayvines.roche.data.catalog.CollectionMode
 import com.grayvines.roche.data.catalog.CollectionRole
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.RankedCatalogEntry
@@ -113,7 +112,7 @@ fun MediaCompanionScreen(
     val overviewCount =
         remember(lists) {
             lists.count {
-                it.mode == CollectionMode.MANUAL || it.entryCount > 0 || it.generatorEnabled
+                !it.isDynamic || it.entryCount > 0 || it.generatorEnabled
             }
         }
     val headerCount =
@@ -236,7 +235,7 @@ private fun ListsOverviewPane(
     val manualLists =
         remember(lists) {
             lists
-                .filter { it.mode == CollectionMode.MANUAL }
+                .filter { !it.isDynamic }
                 .sortedWith(
                     compareByDescending<CatalogListSummary> { it.generatorEnabled }
                         .thenByDescending { it.entryCount }
@@ -246,7 +245,7 @@ private fun ListsOverviewPane(
     val activeDynamic =
         remember(lists) {
             lists
-                .filter { it.mode == CollectionMode.DYNAMIC && it.entryCount > 0 }
+                .filter { it.isDynamic && it.entryCount > 0 }
                 .sortedWith(
                     compareByDescending<CatalogListSummary> { it.entryCount }
                         .thenBy(String.CASE_INSENSITIVE_ORDER) { it.title }
@@ -255,7 +254,7 @@ private fun ListsOverviewPane(
     val emptyDynamic =
         remember(lists) {
             lists
-                .filter { it.mode == CollectionMode.DYNAMIC && it.entryCount == 0 }
+                .filter { it.isDynamic && it.entryCount == 0 }
                 .sortedBy { it.title.lowercase(Locale.US) }
         }
 
@@ -1200,10 +1199,7 @@ private fun RankedScoreMark(scoreOutOfTen: Double, variance: Double) {
 }
 
 internal fun isEditableManualUserList(list: CatalogListSummary?): Boolean =
-    list != null &&
-        list.mode == CollectionMode.MANUAL &&
-        list.role == CollectionRole.LIST &&
-        !list.isPriorityScoped
+    list != null && !list.isDynamic && list.role == CollectionRole.LIST && !list.isPriorityScoped
 
 private fun computeTierCounts(entries: List<RankedCatalogEntry>): List<Pair<Char, Int>> =
     listOf('S', 'A', 'B', 'C', 'D').mapNotNull { tier ->

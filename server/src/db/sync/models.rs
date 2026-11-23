@@ -9,8 +9,8 @@ use super::{
 };
 use crate::{
     db::{
-        CollectionMode, CollectionRole, ConsumptionStatus, ContentType, EntryIdentifier, EntryKind,
-        FeedType, InboxState, PollItemCandidate,
+        CollectionRole, ConsumptionStatus, ContentType, EntryIdentifier, EntryKind, FeedType,
+        InboxState, PollItemCandidate,
     },
     util::media_urls::{extract_arxiv_id, is_direct_audio_url},
 };
@@ -20,10 +20,6 @@ pub const MAX_PEER_SYNC_PAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SYNC_INLINE_HTML_BYTES: usize = 512_000;
 
 pub type InsertedItemCandidate = (String, PollItemCandidate);
-
-const fn default_manual_mode() -> CollectionMode {
-    CollectionMode::Manual
-}
 
 const fn default_poll_interval() -> i64 {
     30
@@ -63,16 +59,19 @@ pub struct SyncEntryState {
 pub struct SyncCollectionSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slug: Option<String>,
-    #[serde(default = "default_manual_mode")]
-    pub mode: CollectionMode,
     #[serde(default)]
     pub role: CollectionRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_json: Option<String>,
-    #[serde(default)]
-    pub show_in_lists: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+}
+
+impl SyncCollectionSpec {
+    #[must_use]
+    pub fn is_dynamic(&self) -> bool {
+        self.rule_json.as_deref().is_some_and(|s| !s.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -323,7 +323,7 @@ class PodcastClassificationAndRepairTest {
                     )
                 )
                 dao.upsertCollectionSpec(
-                    CollectionSpecEntity("f-split", null, "feed", "feed", showInLists = false)
+                    CollectionSpecEntity(collectionId = "f-split", slug = null, role = "feed")
                 )
                 dao.upsertFeedSource(
                     FeedSourceEntity(
@@ -753,9 +753,7 @@ class PodcastClassificationAndRepairTest {
             CollectionSpecEntity(
                 collectionId = id,
                 slug = null,
-                mode = "feed",
                 role = "feed",
-                showInLists = false,
             )
         )
         dao.upsertFeedSource(

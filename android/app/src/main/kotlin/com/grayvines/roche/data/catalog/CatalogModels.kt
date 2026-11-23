@@ -4,6 +4,7 @@ import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.chooseDeterministicEntryIdRaw
 import com.grayvines.roche.core.normalizeIdentifierValueRaw
 import com.grayvines.roche.data.local.CollectionSpecEntity
+import com.grayvines.roche.data.local.isDynamic
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
@@ -132,17 +133,6 @@ enum class EntryKind(
     }
 }
 
-enum class CollectionMode(val wireValue: String) {
-    MANUAL("manual"),
-    FEED("feed"),
-    DYNAMIC("dynamic");
-
-    companion object {
-        fun fromWireValue(raw: String?): CollectionMode =
-            entries.firstOrNull { it.wireValue.equals(raw?.trim(), ignoreCase = true) } ?: MANUAL
-    }
-}
-
 enum class CollectionRole(val wireValue: String) {
     LIST("list"),
     WANT("want"),
@@ -250,7 +240,7 @@ data class CatalogListSummary(
     val collectionId: String,
     val slug: String,
     val title: String,
-    val mode: CollectionMode,
+    val isDynamic: Boolean,
     val role: CollectionRole,
     val entryCount: Int,
     val isPriorityScoped: Boolean,
@@ -378,12 +368,11 @@ data class SyncEntryStateDto(
 )
 
 @Serializable
+@OptIn(ExperimentalSerializationApi::class)
 data class SyncCollectionSpecDto(
     val slug: String? = null,
-    val mode: String = "manual",
-    val role: String = "list",
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS) val role: String = "list",
     @SerialName("rule_json") val ruleJson: String? = null,
-    @SerialName("show_in_lists") val showInLists: Boolean = false,
     val color: String? = null,
 )
 
@@ -470,7 +459,7 @@ data class SyncComparisonDto(
 
 internal fun isGeneratorEligible(spec: CollectionSpecEntity): Boolean =
     spec.collectionId != STARRED_COLLECTION_ID &&
-        CollectionMode.fromWireValue(spec.mode) == CollectionMode.MANUAL &&
+        !spec.isDynamic &&
         CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST
 
 internal fun normalizeIdentifierValue(

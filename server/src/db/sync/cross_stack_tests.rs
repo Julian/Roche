@@ -551,15 +551,13 @@ async fn seed_initial_sync_entries(db: &Db, entries: &[SyncEntryRecord]) {
         if let Some(ref spec) = entry.collection_spec {
             sqlx::query(
                 "INSERT INTO collection_specs
-                 (collection_id, slug, mode, collection_role, rule_json, show_in_lists, color)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (collection_id, slug, collection_role, rule_json, color)
+                 VALUES (?, ?, ?, ?, ?)",
             )
             .bind(&entry.id)
             .bind(spec.slug.as_deref())
-            .bind(spec.mode)
             .bind(spec.role)
             .bind(spec.rule_json.as_deref())
-            .bind(spec.show_in_lists)
             .bind(spec.color.as_deref())
             .execute(db.pool())
             .await

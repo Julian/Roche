@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO collection_specs\n             (collection_id, slug, collection_role, rule_json, color)\n             VALUES (?, ?, ?, NULL, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "e03364e3abe7e4ed91375bb54976bf0c495f36e12db7bc0c73c5ef7e8b945255"
+}

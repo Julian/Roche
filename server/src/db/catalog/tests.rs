@@ -4,7 +4,7 @@ use super::*;
 use crate::db::{
     Db, FeedType, MediaType,
     sync::{deterministic_auto_consumption_log_id, deterministic_catalog_entry_id},
-    types::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind},
+    types::{CollectionRole, ConsumptionStatus, EntryKind},
 };
 
 #[test]
@@ -159,10 +159,7 @@ async fn test_collection_mode_and_cycle_enforcement_on_add_and_upsert() {
     // Dynamic collection (`movies`) rejects manual add & upsert parent_collection_id
     let dyn_col = catalog.get_collection_summary("movies").await.unwrap();
     let dyn_err = catalog.add_collection_entry("movies", &movie.id, None).await.unwrap_err();
-    assert!(matches!(
-        dyn_err,
-        CatalogError::ImmutableCollection { mode: CollectionMode::Dynamic, .. }
-    ));
+    assert!(matches!(dyn_err, CatalogError::ImmutableCollection { reason: "dynamic", .. }));
     let upsert_dyn_err = catalog
         .upsert_entry(&UpsertEntryInput {
             kind: Some(EntryKind::Movie),
@@ -172,19 +169,13 @@ async fn test_collection_mode_and_cycle_enforcement_on_add_and_upsert() {
         })
         .await
         .unwrap_err();
-    assert!(matches!(
-        upsert_dyn_err,
-        CatalogError::ImmutableCollection { mode: CollectionMode::Dynamic, .. }
-    ));
+    assert!(matches!(upsert_dyn_err, CatalogError::ImmutableCollection { reason: "dynamic", .. }));
 
     // Feed collection rejects manual add & upsert parent_collection_id
     let feed_url = Url::parse("https://example.com/feed.xml").unwrap();
     let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Test Blog"), None).await.unwrap();
     let feed_err = catalog.add_collection_entry(&feed.id, &movie.id, None).await.unwrap_err();
-    assert!(matches!(
-        feed_err,
-        CatalogError::ImmutableCollection { mode: CollectionMode::Feed, .. }
-    ));
+    assert!(matches!(feed_err, CatalogError::ImmutableCollection { reason: "feed", .. }));
 
     // Cycle check: Col A -> Col B -> Col A must fail
     let col_a = catalog
@@ -1144,8 +1135,8 @@ async fn test_load_collection_preview_thumbnails_honors_dynamic_creator_filter()
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO collection_specs (collection_id, slug, mode, collection_role, rule_json, show_in_lists)
-         VALUES (?, 'herbert_books', 'dynamic', 'list', '{\"kind\":\"book\",\"consumed\":true,\"creator\":\"herbert\"}', 1)",
+        "INSERT INTO collection_specs (collection_id, slug, collection_role, rule_json)
+         VALUES (?, 'herbert_books', 'list', '{\"kind\":\"book\",\"consumed\":true,\"creator\":\"herbert\"}')",
     )
     .bind(dyn_id)
     .execute(db.pool())

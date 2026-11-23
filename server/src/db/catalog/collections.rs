@@ -17,9 +17,7 @@ use crate::db::{
     WriteTx,
     entries_core::{self, EntryInsertParams},
     sync::{SyncRepo, collection_entry_natural_key, deterministic_system_collection_id},
-    types::{
-        ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind, HexColor,
-    },
+    types::{ActivityAction, ActivityEntityType, CollectionRole, EntryKind, HexColor},
 };
 
 impl CatalogRepo<'_> {
@@ -41,7 +39,7 @@ impl CatalogRepo<'_> {
             qb.push(" AND cs.collection_role != 'want'");
         }
         if !include_system {
-            qb.push(" AND (cs.show_in_lists = 1 OR cs.collection_role = 'want')");
+            qb.push(" AND cs.collection_role IN ('list', 'want')");
         }
         qb.push(" ORDER BY cs.collection_role ASC, LOWER(e.title) ASC");
         let rows: Vec<RawCollectionRow> = qb.build_query_as().fetch_all(tx.conn()).await?;
@@ -62,12 +60,9 @@ impl CatalogRepo<'_> {
             }
         }
 
-        // Batch-load members for all Manual/Feed collections in a single query instead of N queries.
-        let manual_or_feed_ids: Vec<&str> = rows
-            .iter()
-            .filter(|r| matches!(r.mode, CollectionMode::Manual | CollectionMode::Feed))
-            .map(|r| r.id.as_str())
-            .collect();
+        // Batch-load members for all non-dynamic collections in a single query instead of N queries.
+        let manual_or_feed_ids: Vec<&str> =
+            rows.iter().filter(|r| !r.is_dynamic()).map(|r| r.id.as_str()).collect();
         let mut manual_members_by_col: HashMap<String, Vec<(String, bool)>> = HashMap::new();
         for chunk in manual_or_feed_ids.chunks(450) {
             let mut mqb = QueryBuilder::<Sqlite>::new(
@@ -122,18 +117,17 @@ impl CatalogRepo<'_> {
 
         let mut out = Vec::with_capacity(rows.len());
         for raw in rows {
-            let member_ids: Vec<String> = match raw.mode {
-                CollectionMode::Manual | CollectionMode::Feed => manual_members_by_col
+            let member_ids: Vec<String> = if raw.is_dynamic() {
+                Self::resolve_rankable_member_ids_in_tx(tx.conn(), &raw).await?
+            } else {
+                manual_members_by_col
                     .remove(&raw.id)
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|(eid, is_consumed)| {
                         (!raw.has_generator || is_consumed).then_some(eid)
                     })
-                    .collect(),
-                CollectionMode::Dynamic => {
-                    Self::resolve_rankable_member_ids_in_tx(tx.conn(), &raw).await?
-                }
+                    .collect()
             };
             let comp_count = if raw.collection_role == CollectionRole::Want {
                 if member_ids.is_empty() {
@@ -179,7 +173,6 @@ impl CatalogRepo<'_> {
             derive_manual_collection_slug_and_id(title, slug, role)?;
         let clean_title = clean_title.as_str();
         let now = crate::util::clock::now_utc();
-        let show_in_lists = role == CollectionRole::List;
         let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
         let validated_color = HexColor::parse_optional(color)
             .map_err(|e| CatalogError::InvalidInput(e.to_string()))?;
@@ -208,12 +201,11 @@ impl CatalogRepo<'_> {
 
         sqlx::query!(
             "INSERT INTO collection_specs
-             (collection_id, slug, mode, collection_role, rule_json, show_in_lists, color)
-             VALUES (?, ?, 'manual', ?, NULL, ?, ?)",
+             (collection_id, slug, collection_role, rule_json, color)
+             VALUES (?, ?, ?, NULL, ?)",
             &id,
             &derived_slug,
             role as _,
-            show_in_lists as _,
             clean_color,
         )
         .execute(tx.conn())
@@ -327,8 +319,8 @@ impl CatalogRepo<'_> {
         .await?;
         sqlx::query!(
             "INSERT OR IGNORE INTO collection_specs
-             (collection_id, slug, mode, collection_role, rule_json, show_in_lists)
-             VALUES (?, ?, 'manual', 'want', NULL, 0)",
+             (collection_id, slug, collection_role, rule_json)
+             VALUES (?, ?, 'want', NULL)",
             &id,
             &want_slug,
         )
@@ -428,8 +420,8 @@ impl CatalogRepo<'_> {
         let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let col = Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, false).await?;
-        if col.mode != CollectionMode::Manual {
-            return Err(CatalogError::ImmutableCollection { title: col.title, mode: col.mode });
+        if let Some(reason) = col.immutable_reason() {
+            return Err(CatalogError::ImmutableCollection { title: col.title, reason });
         }
         let target_entry_id = Self::follow_merged_id_in_tx(tx.conn(), entry_id)
             .await?
@@ -456,8 +448,8 @@ impl CatalogRepo<'_> {
         let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let col = Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, false).await?;
-        if col.mode != CollectionMode::Manual {
-            return Err(CatalogError::ImmutableCollection { title: col.title, mode: col.mode });
+        if let Some(reason) = col.immutable_reason() {
+            return Err(CatalogError::ImmutableCollection { title: col.title, reason });
         }
         let target_entry_id = Self::follow_merged_id_in_tx(tx.conn(), entry_id)
             .await?
@@ -714,72 +706,65 @@ impl CatalogRepo<'_> {
         conn: &mut SqliteConnection,
         col: &RawCollectionRow,
     ) -> CatalogResult<Vec<String>> {
-        match col.mode {
-            CollectionMode::Manual | CollectionMode::Feed => {
-                if col.has_generator {
-                    Ok(sqlx::query_scalar!(
-                        r#"SELECT e.id as "id!"
-                           FROM collection_entries ce
-                           JOIN entries e ON e.id = ce.entry_id
-                           WHERE ce.collection_id = ?
-                             AND e.merged_into_id IS NULL
-                             AND EXISTS (
-                                 SELECT 1 FROM consumption_log cl
-                                 WHERE cl.entry_id = e.id AND cl.status = 'consumed'
-                             )
-                           ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"#,
-                        &col.id,
-                    )
-                    .fetch_all(&mut *conn)
-                    .await?)
-                } else {
-                    Ok(sqlx::query_scalar!(
-                        r#"SELECT e.id as "id!"
-                           FROM collection_entries ce
-                           JOIN entries e ON e.id = ce.entry_id
-                           WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
-                           ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"#,
-                        &col.id,
-                    )
-                    .fetch_all(&mut *conn)
-                    .await?)
-                }
+        if col.is_dynamic() {
+            let Some(rule) = parse_dynamic_collection_rule(col.rule_json.as_deref()) else {
+                return Ok(Vec::new());
+            };
+            if let Some(creator_needle) =
+                rule.creator.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                let mut qb = QueryBuilder::<Sqlite>::new(
+                    "SELECT e.id, e.creators_json
+                     FROM entries e
+                     WHERE e.merged_into_id IS NULL",
+                );
+                append_dynamic_rule_sql_filters(&mut qb, &rule);
+                qb.push(" ORDER BY LOWER(e.title) ASC, e.id ASC");
+                let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(&mut *conn).await?;
+                let lower_needle = creator_needle.to_lowercase();
+                Ok(rows
+                    .into_iter()
+                    .filter_map(|(id, creators_json)| {
+                        creators_json_matches_needle(&creators_json, &lower_needle).then_some(id)
+                    })
+                    .collect())
+            } else {
+                let mut qb = QueryBuilder::<Sqlite>::new(
+                    "SELECT e.id
+                     FROM entries e
+                     WHERE e.merged_into_id IS NULL",
+                );
+                append_dynamic_rule_sql_filters(&mut qb, &rule);
+                qb.push(" ORDER BY LOWER(e.title) ASC, e.id ASC");
+                Ok(qb.build_query_scalar().fetch_all(&mut *conn).await?)
             }
-            CollectionMode::Dynamic => {
-                let Some(rule) = parse_dynamic_collection_rule(col.rule_json.as_deref()) else {
-                    return Ok(Vec::new());
-                };
-                if let Some(creator_needle) =
-                    rule.creator.as_deref().map(str::trim).filter(|s| !s.is_empty())
-                {
-                    let mut qb = QueryBuilder::<Sqlite>::new(
-                        "SELECT e.id, e.creators_json
-                         FROM entries e
-                         WHERE e.merged_into_id IS NULL",
-                    );
-                    append_dynamic_rule_sql_filters(&mut qb, &rule);
-                    qb.push(" ORDER BY LOWER(e.title) ASC, e.id ASC");
-                    let rows: Vec<(String, String)> =
-                        qb.build_query_as().fetch_all(&mut *conn).await?;
-                    let lower_needle = creator_needle.to_lowercase();
-                    Ok(rows
-                        .into_iter()
-                        .filter_map(|(id, creators_json)| {
-                            creators_json_matches_needle(&creators_json, &lower_needle)
-                                .then_some(id)
-                        })
-                        .collect())
-                } else {
-                    let mut qb = QueryBuilder::<Sqlite>::new(
-                        "SELECT e.id
-                         FROM entries e
-                         WHERE e.merged_into_id IS NULL",
-                    );
-                    append_dynamic_rule_sql_filters(&mut qb, &rule);
-                    qb.push(" ORDER BY LOWER(e.title) ASC, e.id ASC");
-                    Ok(qb.build_query_scalar().fetch_all(&mut *conn).await?)
-                }
-            }
+        } else if col.has_generator {
+            Ok(sqlx::query_scalar!(
+                r#"SELECT e.id as "id!"
+                   FROM collection_entries ce
+                   JOIN entries e ON e.id = ce.entry_id
+                   WHERE ce.collection_id = ?
+                     AND e.merged_into_id IS NULL
+                     AND EXISTS (
+                         SELECT 1 FROM consumption_log cl
+                         WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                     )
+                   ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"#,
+                &col.id,
+            )
+            .fetch_all(&mut *conn)
+            .await?)
+        } else {
+            Ok(sqlx::query_scalar!(
+                r#"SELECT e.id as "id!"
+                   FROM collection_entries ce
+                   JOIN entries e ON e.id = ce.entry_id
+                   WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
+                   ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"#,
+                &col.id,
+            )
+            .fetch_all(&mut *conn)
+            .await?)
         }
     }
 
@@ -787,56 +772,51 @@ impl CatalogRepo<'_> {
         conn: &mut SqliteConnection,
         col: &RawCollectionRow,
     ) -> CatalogResult<Vec<CatalogEntry>> {
-        let raw_rows: Vec<RawEntryRow> = match col.mode {
-            CollectionMode::Manual | CollectionMode::Feed => {
-                let sql = if col.has_generator {
-                    concat!(
-                        "SELECT ",
-                        raw_entry_columns!(e),
-                        " FROM collection_entries ce
-                         JOIN entries e ON e.id = ce.entry_id
-                         WHERE ce.collection_id = ?
-                           AND e.merged_into_id IS NULL
-                           AND EXISTS (
-                               SELECT 1 FROM consumption_log cl
-                               WHERE cl.entry_id = e.id AND cl.status = 'consumed'
-                           )
-                         ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"
-                    )
-                } else {
-                    concat!(
-                        "SELECT ",
-                        raw_entry_columns!(e),
-                        " FROM collection_entries ce
-                         JOIN entries e ON e.id = ce.entry_id
-                         WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
-                         ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"
-                    )
-                };
-                sqlx::query_as(sql).bind(&col.id).fetch_all(&mut *conn).await?
+        let raw_rows: Vec<RawEntryRow> = if col.is_dynamic() {
+            let Some(rule) = parse_dynamic_collection_rule(col.rule_json.as_deref()) else {
+                return Ok(Vec::new());
+            };
+            let mut qb = QueryBuilder::<Sqlite>::new(concat!(
+                "SELECT ",
+                raw_entry_columns!(e),
+                " FROM entries e WHERE e.merged_into_id IS NULL"
+            ));
+            append_dynamic_rule_sql_filters(&mut qb, &rule);
+            qb.push(" ORDER BY LOWER(e.title) ASC, e.id ASC");
+            let mut fetched: Vec<RawEntryRow> = qb.build_query_as().fetch_all(&mut *conn).await?;
+            if let Some(creator_needle) =
+                rule.creator.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                let lower_needle = creator_needle.to_lowercase();
+                fetched.retain(|r| creators_json_matches_needle(&r.creators_json, &lower_needle));
             }
-            CollectionMode::Dynamic => {
-                let Some(rule) = parse_dynamic_collection_rule(col.rule_json.as_deref()) else {
-                    return Ok(Vec::new());
-                };
-                let mut qb = QueryBuilder::<Sqlite>::new(concat!(
+            fetched
+        } else {
+            let sql = if col.has_generator {
+                concat!(
                     "SELECT ",
                     raw_entry_columns!(e),
-                    " FROM entries e WHERE e.merged_into_id IS NULL"
-                ));
-                append_dynamic_rule_sql_filters(&mut qb, &rule);
-                qb.push(" ORDER BY LOWER(e.title) ASC, e.id ASC");
-                let mut fetched: Vec<RawEntryRow> =
-                    qb.build_query_as().fetch_all(&mut *conn).await?;
-                if let Some(creator_needle) =
-                    rule.creator.as_deref().map(str::trim).filter(|s| !s.is_empty())
-                {
-                    let lower_needle = creator_needle.to_lowercase();
-                    fetched
-                        .retain(|r| creators_json_matches_needle(&r.creators_json, &lower_needle));
-                }
-                fetched
-            }
+                    " FROM collection_entries ce
+                     JOIN entries e ON e.id = ce.entry_id
+                     WHERE ce.collection_id = ?
+                       AND e.merged_into_id IS NULL
+                       AND EXISTS (
+                           SELECT 1 FROM consumption_log cl
+                           WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                       )
+                     ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"
+                )
+            } else {
+                concat!(
+                    "SELECT ",
+                    raw_entry_columns!(e),
+                    " FROM collection_entries ce
+                     JOIN entries e ON e.id = ce.entry_id
+                     WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
+                     ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"
+                )
+            };
+            sqlx::query_as(sql).bind(&col.id).fetch_all(&mut *conn).await?
         };
 
         Self::hydrate_entries_in_tx(&mut *conn, raw_rows).await
@@ -860,50 +840,47 @@ impl CatalogRepo<'_> {
             if col.member_count == 0 {
                 continue;
             }
-            let rows: Vec<(String, String)> = match col.mode {
-                CollectionMode::Manual | CollectionMode::Feed => {
-                    let mut qb = QueryBuilder::<Sqlite>::new(
-                        "SELECT e.title, e.thumbnail_url
-                         FROM collection_entries ce
-                         JOIN entries e ON e.id = ce.entry_id
-                         WHERE ce.collection_id = ",
+            let rows: Vec<(String, String)> = if col.is_dynamic() {
+                let Some(rule) = parse_dynamic_collection_rule(col.rule_json.as_deref()) else {
+                    continue;
+                };
+                Self::load_dynamic_preview_thumbnails_in_tx(
+                    tx.conn(),
+                    &rule,
+                    per_collection_limit,
+                    limit_i64,
+                )
+                .await?
+            } else {
+                let mut qb = QueryBuilder::<Sqlite>::new(
+                    "SELECT e.title, e.thumbnail_url
+                     FROM collection_entries ce
+                     JOIN entries e ON e.id = ce.entry_id
+                     WHERE ce.collection_id = ",
+                );
+                qb.push_bind(&col.id).push(
+                    " AND e.merged_into_id IS NULL
+                      AND e.thumbnail_url IS NOT NULL
+                      AND TRIM(e.thumbnail_url) != ''",
+                );
+                if col.has_generator {
+                    qb.push(
+                        " AND EXISTS (
+                            SELECT 1 FROM consumption_log cl
+                            WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                          )
+                          ORDER BY (
+                            SELECT MAX(cl.ts) FROM consumption_log cl
+                            WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                          ) DESC, e.title ASC LIMIT ",
                     );
-                    qb.push_bind(&col.id).push(
-                        " AND e.merged_into_id IS NULL
-                          AND e.thumbnail_url IS NOT NULL
-                          AND TRIM(e.thumbnail_url) != ''",
+                } else {
+                    qb.push(
+                        " ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC LIMIT ",
                     );
-                    if col.has_generator {
-                        qb.push(
-                            " AND EXISTS (
-                                SELECT 1 FROM consumption_log cl
-                                WHERE cl.entry_id = e.id AND cl.status = 'consumed'
-                              )
-                              ORDER BY (
-                                SELECT MAX(cl.ts) FROM consumption_log cl
-                                WHERE cl.entry_id = e.id AND cl.status = 'consumed'
-                              ) DESC, e.title ASC LIMIT ",
-                        );
-                    } else {
-                        qb.push(
-                            " ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC LIMIT ",
-                        );
-                    }
-                    qb.push_bind(limit_i64);
-                    qb.build_query_as().fetch_all(tx.conn()).await?
                 }
-                CollectionMode::Dynamic => {
-                    let Some(rule) = parse_dynamic_collection_rule(col.rule_json.as_deref()) else {
-                        continue;
-                    };
-                    Self::load_dynamic_preview_thumbnails_in_tx(
-                        tx.conn(),
-                        &rule,
-                        per_collection_limit,
-                        limit_i64,
-                    )
-                    .await?
-                }
+                qb.push_bind(limit_i64);
+                qb.build_query_as().fetch_all(tx.conn()).await?
             };
             if !rows.is_empty() {
                 out.insert(col.id.clone(), rows);

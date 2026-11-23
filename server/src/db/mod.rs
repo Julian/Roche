@@ -52,9 +52,9 @@ pub use sync::{
 };
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{
-    ActivityAction, ActivityEntityType, ArchiveBatchScope, CollectionMode, CollectionRole,
-    ConsumptionStatus, ContentType, EntryKind, EntryTriageState, FeedType, HexColor, InboxState,
-    ItemSortField, ItemStatus, ItemStatusFilter, MediaType, ReadAtPatch, SortOrder,
+    ActivityAction, ActivityEntityType, ArchiveBatchScope, CollectionRole, ConsumptionStatus,
+    ContentType, EntryKind, EntryTriageState, FeedType, HexColor, InboxState, ItemSortField,
+    ItemStatus, ItemStatusFilter, MediaType, ReadAtPatch, SortOrder,
 };
 
 /// Domain conflict error mapped to `409 Conflict` by `ApiError`.

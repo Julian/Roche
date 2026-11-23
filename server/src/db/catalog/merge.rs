@@ -6,7 +6,9 @@ use sqlx::SqliteConnection;
 
 use super::{
     CatalogRepo,
-    models::{CatalogEntry, CatalogError, CatalogResult, RawEntryRow, raw_entry_columns},
+    models::{
+        CatalogEntry, CatalogError, CatalogResult, RawEntryRow, is_dynamic_rule, raw_entry_columns,
+    },
 };
 use crate::db::{
     MediaRepo, WriteTx,
@@ -15,7 +17,7 @@ use crate::db::{
         SyncRepo, canonical_ordering_json, deterministic_auto_consumption_log_id,
         deterministic_comparison_id,
     },
-    types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, InboxState},
+    types::{ActivityAction, ActivityEntityType, CollectionRole, InboxState},
 };
 
 impl CatalogRepo<'_> {
@@ -54,53 +56,52 @@ impl CatalogRepo<'_> {
         canon_resolved: &str,
     ) -> CatalogResult<()> {
         let dup_spec = sqlx::query!(
-            r#"SELECT mode as "mode!: CollectionMode",
-                      collection_role as "collection_role!: CollectionRole"
+            r#"SELECT collection_role as "collection_role!: CollectionRole",
+                      rule_json as "rule_json?"
                FROM collection_specs
                WHERE collection_id = ?"#,
             dup_resolved,
         )
         .fetch_optional(&mut *tx)
         .await?
-        .map(|r| (r.mode, r.collection_role));
+        .map(|r| (r.collection_role, is_dynamic_rule(r.rule_json.as_deref())));
         let canon_spec = sqlx::query!(
-            r#"SELECT mode as "mode!: CollectionMode",
-                      collection_role as "collection_role!: CollectionRole"
+            r#"SELECT collection_role as "collection_role!: CollectionRole",
+                      rule_json as "rule_json?"
                FROM collection_specs
                WHERE collection_id = ?"#,
             canon_resolved,
         )
         .fetch_optional(&mut *tx)
         .await?
-        .map(|r| (r.mode, r.collection_role));
+        .map(|r| (r.collection_role, is_dynamic_rule(r.rule_json.as_deref())));
 
         match (dup_spec, canon_spec) {
             (None, None) => {}
-            (Some((dup_mode, dup_role)), _)
-                if dup_mode != CollectionMode::Manual
+            (Some((dup_role, dup_dynamic)), _)
+                if dup_dynamic
                     || crate::db::is_protected_system_collection_id(dup_resolved)
                     || matches!(
                         dup_role,
                         CollectionRole::System | CollectionRole::Feed | CollectionRole::Tag
                     ) =>
             {
+                let kind_label = if dup_dynamic { "dynamic" } else { "protected" };
                 return Err(CatalogError::InvalidInput(format!(
-                    "Cannot merge protected {dup_role:?}/{dup_mode:?} collection '{dup_resolved}' as duplicate"
+                    "Cannot merge {kind_label} {dup_role:?} collection '{dup_resolved}' as duplicate"
                 )));
             }
-            (
-                Some((CollectionMode::Manual, dup_role)),
-                Some((CollectionMode::Manual, canon_role)),
-            ) if dup_role == canon_role => {}
+            (Some((dup_role, false)), Some((canon_role, false))) if dup_role == canon_role => {}
             (Some(_), _) => {
                 return Err(CatalogError::InvalidInput(
                     "Manual collections can only be merged into another manual collection of the same role"
                         .to_owned(),
                 ));
             }
-            (None, Some((canon_mode, canon_role))) => {
+            (None, Some((canon_role, canon_dynamic))) => {
+                let kind_label = if canon_dynamic { "dynamic" } else { "manual" };
                 return Err(CatalogError::InvalidInput(format!(
-                    "Cannot merge non-collection entry '{dup_resolved}' into {canon_role:?}/{canon_mode:?} collection '{canon_resolved}'"
+                    "Cannot merge non-collection entry '{dup_resolved}' into {kind_label} {canon_role:?} collection '{canon_resolved}'"
                 )));
             }
         }
@@ -223,7 +224,7 @@ impl CatalogRepo<'_> {
         sqlx::query!(
             "DELETE FROM collection_specs
              WHERE collection_id = ?
-               AND mode = 'manual'
+               AND rule_json IS NULL
                AND collection_role IN ('list', 'want')",
             dup_resolved,
         )
@@ -526,14 +527,18 @@ impl CatalogRepo<'_> {
         .await?;
 
         if let Some((dup_enabled, mut dup_cur_entry, mut dup_drawn_at)) = dup_gen {
-            let canon_spec: Option<(CollectionMode, CollectionRole)> = sqlx::query_as(
-                "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
+            let canon_spec: Option<(CollectionRole, Option<String>)> = sqlx::query_as(
+                "SELECT collection_role, rule_json FROM collection_specs WHERE collection_id = ?",
             )
             .bind(canon_resolved)
             .fetch_optional(tx.conn())
             .await?;
-            let canon_eligible = canon_spec.is_some_and(|(mode, role)| {
-                Self::is_generator_eligible(canon_resolved, mode, role)
+            let canon_eligible = canon_spec.is_some_and(|(role, rule_json)| {
+                Self::is_generator_eligible(
+                    canon_resolved,
+                    role,
+                    is_dynamic_rule(rule_json.as_deref()),
+                )
             });
             let canon_gen_exists: Option<i64> =
                 sqlx::query_scalar("SELECT 1 FROM collection_generators WHERE collection_id = ?")

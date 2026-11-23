@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT collection_role as \"collection_role!: CollectionRole\",\n                      rule_json as \"rule_json?\"\n               FROM collection_specs\n               WHERE collection_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "collection_role!: CollectionRole",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "collection_role"
+          }
+        }
+      },
+      {
+        "name": "rule_json?",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "rule_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "502d82bc6646a3f1dd0612dfb11dd13e0e8d783a8b9d194043d6001898961464"
+}

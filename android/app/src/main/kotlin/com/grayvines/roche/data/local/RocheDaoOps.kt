@@ -217,10 +217,8 @@ internal fun buildStarredCollectionSpec(existingColor: String? = null): Collecti
     CollectionSpecEntity(
         collectionId = STARRED_COLLECTION_ID,
         slug = STARRED_SLUG,
-        mode = MODE_MANUAL,
         role = "list",
         ruleJson = null,
-        showInLists = true,
         color = existingColor,
     )
 
@@ -228,16 +226,14 @@ internal fun buildWantToReadCollectionSpec(): CollectionSpecEntity =
     CollectionSpecEntity(
         collectionId = WANT_TO_READ_COLLECTION_ID,
         slug = WANT_TO_READ_SLUG,
-        mode = MODE_MANUAL,
         role = "want",
         ruleJson = null,
-        showInLists = false,
         color = null,
     )
 
 internal suspend fun RocheDao.ensureStarredSpecExists() {
     val existingSpec = getCollectionSpecById(STARRED_COLLECTION_ID)
-    if (existingSpec != null && existingSpec.showInLists && existingSpec.role == "list") return
+    if (existingSpec != null && existingSpec.role == "list" && !existingSpec.isDynamic) return
     val seedHlc = HlcTimestamp.fromIsoOrEpoch(SEED_EPOCH_ISO, DEFAULT_LOCAL_HLC_NODE).encode()
     if (getEntryById(STARRED_COLLECTION_ID) == null) {
         upsertEntry(buildSeededCollectionEntry(STARRED_COLLECTION_ID, STARRED_TITLE, seedHlc))
@@ -300,10 +296,8 @@ internal suspend fun RocheDao.upsertFeed(
             CollectionSpecEntity(
                 collectionId = feed.id,
                 slug = null,
-                mode = "feed",
                 role = "feed",
                 ruleJson = null,
-                showInLists = false,
                 color = null,
             )
         )
@@ -653,10 +647,8 @@ internal suspend fun RocheDao.upsertTag(
             CollectionSpecEntity(
                 collectionId = tag.id,
                 slug = "tag:$normName",
-                mode = MODE_MANUAL,
                 role = "tag",
                 ruleJson = null,
-                showInLists = false,
                 color = tag.color,
             )
         )
@@ -1633,7 +1625,6 @@ internal suspend fun RocheDao.deleteFeedPreservingHistory(
     return evictedItemIds
 }
 
-private const val MODE_MANUAL = "manual"
 private const val CONTENT_TYPE_AUDIO = "audio"
 private const val FEED_TYPE_RSS = "rss"
 private const val FEED_TYPE_PODCAST = "podcast"

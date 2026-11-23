@@ -39,7 +39,6 @@ import com.grayvines.roche.core.resolveArticleDuration
 import com.grayvines.roche.core.sanitizeHttpUrl
 import com.grayvines.roche.core.tagNaturalKey
 import com.grayvines.roche.data.catalog.CatalogStore
-import com.grayvines.roche.data.catalog.CollectionMode
 import com.grayvines.roche.data.catalog.CollectionRole
 import com.grayvines.roche.data.catalog.EntryIdentifierDto
 import com.grayvines.roche.data.catalog.EntryKind
@@ -74,6 +73,7 @@ import com.grayvines.roche.data.local.deleteItemPreservingHistory
 import com.grayvines.roche.data.local.ensureStarredSpecExists
 import com.grayvines.roche.data.local.entryHasCatalogHistory
 import com.grayvines.roche.data.local.entryKindForFeedTypeWire
+import com.grayvines.roche.data.local.isDynamic
 import com.grayvines.roche.data.local.replaceEntryIdentifier
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
@@ -531,7 +531,7 @@ private suspend fun applyComparisonTombstone(
 private suspend fun isProtectedTombstoneTarget(dao: RocheDao, entryId: String): Boolean {
     if (entryId in PROTECTED_SYSTEM_COLLECTION_IDS) return true
     val spec = dao.getCollectionSpecById(entryId)
-    return spec != null && (spec.mode == "dynamic" || spec.role in PROTECTED_TOMBSTONE_ROLES)
+    return spec != null && (spec.isDynamic || spec.role in PROTECTED_TOMBSTONE_ROLES)
 }
 
 private suspend fun applyEntryTombstone(
@@ -1402,7 +1402,6 @@ private suspend fun mergeIncomingSpecInDao(
     if (mergeProtectedSystemSpecInDao(dao, targetId, cleanColor)) return
     if (existing != null && isProtectedSpec(existing)) return
     val role = CollectionRole.fromWireValue(specDto.role)
-    val mode = CollectionMode.fromWireValue(specDto.mode)
     if (role == CollectionRole.SYSTEM && targetId != UP_NEXT_COLLECTION_ID) return
     val cleanSlug =
         if (role == CollectionRole.TAG) {
@@ -1411,14 +1410,13 @@ private suspend fun mergeIncomingSpecInDao(
         } else {
             specDto.slug?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: existing?.slug
         }
+    val cleanRule = specDto.ruleJson?.trim()?.takeIf { it.isNotEmpty() } ?: existing?.ruleJson
     dao.upsertCollectionSpec(
         CollectionSpecEntity(
             collectionId = targetId,
             slug = cleanSlug,
-            mode = mode.wireValue,
             role = role.wireValue,
-            ruleJson = specDto.ruleJson ?: existing?.ruleJson,
-            showInLists = specDto.showInLists,
+            ruleJson = cleanRule,
             color = cleanColor,
         )
     )
@@ -1462,10 +1460,8 @@ private suspend fun mergeProtectedSystemSpecInDao(
         CollectionSpecEntity(
             collectionId = targetId,
             slug = slug,
-            mode = CollectionMode.MANUAL.wireValue,
             role = if (isStarred) CollectionRole.LIST.wireValue else CollectionRole.WANT.wireValue,
             ruleJson = null,
-            showInLists = isStarred,
             color = cleanColor,
         )
     )
@@ -1517,9 +1513,7 @@ private suspend fun ensureFeedCollectionSpec(dao: RocheDao, targetId: String) {
         CollectionSpecEntity(
             collectionId = targetId,
             slug = null,
-            mode = TOMBSTONE_ENTITY_FEED,
             role = TOMBSTONE_ENTITY_FEED,
-            showInLists = false,
         )
     )
 }
@@ -2221,7 +2215,7 @@ internal fun shouldIncomingWinHlc(
 internal fun isProtectedSpec(spec: CollectionSpecEntity): Boolean =
     spec.collectionId in PROTECTED_SYSTEM_COLLECTION_IDS ||
         CollectionRole.fromWireValue(spec.role) == CollectionRole.SYSTEM ||
-        CollectionMode.fromWireValue(spec.mode) == CollectionMode.DYNAMIC
+        spec.isDynamic
 
 private fun buildMergeRedirectMap(entries: Collection<EntryEntity>): Map<String, String> =
     buildMap {

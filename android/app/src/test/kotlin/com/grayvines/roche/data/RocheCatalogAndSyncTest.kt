@@ -498,7 +498,9 @@ class RocheCatalogAndSyncTest {
                 )
             val wireJson = buildPeerSyncRequestPayload(built.request)
             assertTrue(wireJson.contains("Sci-Fi Essentials"))
-            assertTrue(wireJson.contains("\"show_in_lists\":true"))
+            assertTrue(wireJson.contains("""role":"list"""))
+            assertFalse(wireJson.contains("show_in_lists"))
+            assertFalse(wireJson.contains("""mode":"""))
             assertTrue(wireJson.contains("Book of the New Sun"))
 
             // Simulate a second fresh peer receiving that catalog state + a server-completed
@@ -1012,9 +1014,7 @@ class RocheCatalogAndSyncTest {
                                 collectionSpec =
                                     SyncCollectionSpecDto(
                                         slug = "parent_list",
-                                        mode = "manual",
                                         role = "list",
-                                        showInLists = true,
                                     ),
                             )
                         ),

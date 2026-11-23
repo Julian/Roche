@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     db::{CatalogEntry, CollectionGeneratorState, CollectionSummary, UpsertEntryInput},
-    domain::{CollectionMode, CollectionRole, EntryKind},
+    domain::{CollectionRole, EntryKind},
     service::{
         AppError, RankedCollectionFilter, RankedCollectionView, RankedEntryRow, RocheService,
     },
@@ -161,7 +161,7 @@ fn render_lists_main(
     search_bundle: Option<&SearchBundle>,
 ) {
     let mut manual_lists: Vec<&CollectionSummary> =
-        data.collections.iter().filter(|c| c.mode == CollectionMode::Manual).collect();
+        data.collections.iter().filter(|c| c.is_manual()).collect();
     manual_lists.sort_by(|a, b| {
         b.comparison_count
             .cmp(&a.comparison_count)
@@ -169,11 +169,8 @@ fn render_lists_main(
             .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
     });
 
-    let mut media_active: Vec<&CollectionSummary> = data
-        .collections
-        .iter()
-        .filter(|c| c.mode == CollectionMode::Dynamic && c.member_count > 0)
-        .collect();
+    let mut media_active: Vec<&CollectionSummary> =
+        data.collections.iter().filter(|c| c.is_dynamic() && c.member_count > 0).collect();
     media_active.sort_by(|a, b| {
         b.comparison_count
             .cmp(&a.comparison_count)
@@ -181,11 +178,8 @@ fn render_lists_main(
             .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
     });
 
-    let mut media_empty: Vec<&CollectionSummary> = data
-        .collections
-        .iter()
-        .filter(|c| c.mode == CollectionMode::Dynamic && c.member_count == 0)
-        .collect();
+    let mut media_empty: Vec<&CollectionSummary> =
+        data.collections.iter().filter(|c| c.is_dynamic() && c.member_count == 0).collect();
     media_empty.sort_by_key(|a| a.title.to_lowercase());
 
     let _ = write!(
@@ -451,11 +445,8 @@ fn render_lists_rail(
     is_searching: bool,
 ) {
     let active_count = collections.iter().filter(|c| c.member_count > 0).count();
-    let media_entries: usize = collections
-        .iter()
-        .filter(|c| c.mode == CollectionMode::Dynamic)
-        .map(|c| c.member_count)
-        .sum();
+    let media_entries: usize =
+        collections.iter().filter(|c| c.is_dynamic()).map(|c| c.member_count).sum();
     let total_entries = if media_entries > 0 {
         media_entries
     } else {
@@ -638,13 +629,11 @@ pub(in crate::web) async fn list_detail_get(
     let start_idx = (page_num - 1) * LIST_PAGE_SIZE;
     let end_idx = (page_num * LIST_PAGE_SIZE).min(total_rows);
 
-    let is_editable_manual = view.collection.mode == CollectionMode::Manual
+    let is_editable_manual = view.collection.is_manual()
         && view.collection.role == CollectionRole::List
         && !view.collection.has_generator;
 
-    let gen_state = if view.collection.mode == CollectionMode::Manual
-        && view.collection.role == CollectionRole::List
-    {
+    let gen_state = if view.collection.is_manual() && view.collection.role == CollectionRole::List {
         service.catalog().get_collection_generator(&view.collection.id).await.ok()
     } else {
         None
@@ -717,8 +706,8 @@ pub(in crate::web) async fn list_detail_get(
 fn render_ranked_list_body(out: &mut String, ctx: &ListDetailRenderCtx<'_>) {
     let view = ctx.view;
     let slug = view.collection.slug.as_deref().unwrap_or(&view.collection.id);
-    let is_manual_list = view.collection.mode == CollectionMode::Manual
-        && view.collection.role == CollectionRole::List;
+    let is_manual_list =
+        view.collection.is_manual() && view.collection.role == CollectionRole::List;
     let is_editable_manual = is_manual_list && !view.collection.has_generator;
     let ranked_mode = view.comparison_count > 0;
     let is_filtered = ctx.active_tier.is_some() || ctx.active_q.is_some();

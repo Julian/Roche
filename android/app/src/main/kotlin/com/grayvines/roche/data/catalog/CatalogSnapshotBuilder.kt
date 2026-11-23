@@ -18,6 +18,7 @@ import com.grayvines.roche.data.local.ComparisonEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
 import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryIdentifierEntity
+import com.grayvines.roche.data.local.isDynamic
 import com.grayvines.roche.ranking.EpRankingEngine
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -203,7 +204,6 @@ private fun buildRankedCollections(input: RankedCollectionsInput): RankedCollect
         val rawRole = CollectionRole.fromWireValue(spec.role)
         val role = if (spec.collectionId == STARRED_COLLECTION_ID) CollectionRole.LIST else rawRole
         if (role == CollectionRole.FEED || role == CollectionRole.TAG) continue
-        val mode = CollectionMode.fromWireValue(spec.mode)
         val isWant = role == CollectionRole.WANT || spec.collectionId == UP_NEXT_COLLECTION_ID
         if (isWant) {
             activeWantScopeIds.add(spec.collectionId)
@@ -211,14 +211,12 @@ private fun buildRankedCollections(input: RankedCollectionsInput): RankedCollect
         val effectiveGen =
             input.generatorsByCollection[spec.collectionId]?.takeIf { isGeneratorEligible(spec) }
         val rawMemberships = input.membershipsByCollection[spec.collectionId].orEmpty()
-        val ranked =
-            resolveAndRankSpec(input, spec, mode, isWant, effectiveGen != null, rawMemberships)
+        val ranked = resolveAndRankSpec(input, spec, isWant, effectiveGen != null, rawMemberships)
         entriesByCollectionId[spec.collectionId] = ranked
         val summary =
             toCatalogListSummary(
                 spec = spec,
                 specTitle = resolveSpecTitle(spec, input.titlesByEntryId),
-                mode = mode,
                 role = role,
                 isWant = isWant,
                 rankedSize = ranked.size,
@@ -230,6 +228,7 @@ private fun buildRankedCollections(input: RankedCollectionsInput): RankedCollect
             )
         collectSummaryBucket(
             spec,
+            role,
             isWant,
             ranked.isNotEmpty(),
             summary,
@@ -251,7 +250,6 @@ private fun buildRankedCollections(input: RankedCollectionsInput): RankedCollect
 private fun resolveAndRankSpec(
     input: RankedCollectionsInput,
     spec: CollectionSpecEntity,
-    mode: CollectionMode,
     isWant: Boolean,
     hasGenerator: Boolean,
     rawMemberships: List<CollectionEntryEntity>,
@@ -259,7 +257,6 @@ private fun resolveAndRankSpec(
     val memberIds =
         resolveCollectionMemberIds(
             spec = spec,
-            mode = mode,
             hasGenerator = hasGenerator,
             domainEntries = input.domainEntries,
             consumedIds = input.consumedIds,
@@ -278,7 +275,6 @@ private fun resolveAndRankSpec(
 private fun toCatalogListSummary(
     spec: CollectionSpecEntity,
     specTitle: String,
-    mode: CollectionMode,
     role: CollectionRole,
     isWant: Boolean,
     rankedSize: Int,
@@ -294,7 +290,7 @@ private fun toCatalogListSummary(
         collectionId = spec.collectionId,
         slug = spec.slug ?: spec.collectionId,
         title = specTitle,
-        mode = mode,
+        isDynamic = spec.isDynamic,
         role = role,
         entryCount = rankedSize,
         isPriorityScoped = isWant,
@@ -350,6 +346,7 @@ private fun sortWantSummaries(summaries: List<CatalogListSummary>): List<Catalog
 @Suppress("LongParameterList")
 private fun collectSummaryBucket(
     spec: CollectionSpecEntity,
+    role: CollectionRole,
     isWant: Boolean,
     hasEntries: Boolean,
     summary: CatalogListSummary,
@@ -363,7 +360,7 @@ private fun collectSummaryBucket(
         if (hasEntries || isPinnedWant) {
             wantSummaries.add(summary)
         }
-    } else if (spec.showInLists || spec.collectionId == STARRED_COLLECTION_ID) {
+    } else if (role == CollectionRole.LIST) {
         listSummaries.add(summary)
     }
 }
@@ -371,41 +368,36 @@ private fun collectSummaryBucket(
 @Suppress("LongParameterList")
 internal fun resolveCollectionMemberIds(
     spec: CollectionSpecEntity,
-    mode: CollectionMode,
     hasGenerator: Boolean,
     domainEntries: Map<String, CatalogEntryItem>,
     consumedIds: Set<String>,
     memberships: List<CollectionEntryEntity>,
     statusesByEntryId: Map<String, Set<ConsumptionStatus>> = emptyMap(),
 ): List<String> =
-    when (mode) {
-        CollectionMode.DYNAMIC -> {
-            val rule = parseDynamicCollectionRule(spec.ruleJson)
-            domainEntries.values
-                .filter { entry ->
-                    val statuses =
-                        statusesByEntryId[entry.id]
-                            ?: if (entry.id in consumedIds) {
-                                setOf(ConsumptionStatus.CONSUMED)
-                            } else {
-                                emptySet()
-                            }
-                    matchesDynamicCollectionRule(
-                        rule = rule,
-                        kind = entry.kind,
-                        creators = entry.creators,
-                        releaseYear = entry.releaseYear,
-                        statuses = statuses,
-                    )
-                }
-                .sortedWith(compareBy<CatalogEntryItem> { it.title.lowercase() }.thenBy { it.id })
-                .map { it.id }
-        }
-        CollectionMode.MANUAL,
-        CollectionMode.FEED -> {
-            val rawIds = memberships.map { it.entryId }.filter { it in domainEntries }.distinct()
-            if (hasGenerator) rawIds.filter { it in consumedIds } else rawIds
-        }
+    if (spec.isDynamic) {
+        val rule = parseDynamicCollectionRule(spec.ruleJson)
+        domainEntries.values
+            .filter { entry ->
+                val statuses =
+                    statusesByEntryId[entry.id]
+                        ?: if (entry.id in consumedIds) {
+                            setOf(ConsumptionStatus.CONSUMED)
+                        } else {
+                            emptySet()
+                        }
+                matchesDynamicCollectionRule(
+                    rule = rule,
+                    kind = entry.kind,
+                    creators = entry.creators,
+                    releaseYear = entry.releaseYear,
+                    statuses = statuses,
+                )
+            }
+            .sortedWith(compareBy<CatalogEntryItem> { it.title.lowercase() }.thenBy { it.id })
+            .map { it.id }
+    } else {
+        val rawIds = memberships.map { it.entryId }.filter { it in domainEntries }.distinct()
+        if (hasGenerator) rawIds.filter { it in consumedIds } else rawIds
     }
 
 internal fun parseDynamicCollectionRule(rawJson: String?): DynamicCollectionRuleDto? =

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO collection_specs (collection_id, slug, collection_role, color)\n                 VALUES (?, ?, 'tag', ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "9f64e98b8d136fc83ff98f18ba92d390d51699f9c76ea384d1cb156a08200478"
+}

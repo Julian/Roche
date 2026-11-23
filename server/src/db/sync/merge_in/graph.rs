@@ -24,8 +24,8 @@ use super::super::{
 use super::MergeContext;
 use crate::{
     db::{
-        ActivityAction, ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole,
-        ConsumptionStatus, EntryKind, HexColor, WriteTx,
+        ActivityAction, ActivityEntityType, CatalogRepo, CollectionRole, ConsumptionStatus,
+        EntryKind, HexColor, WriteTx,
         entries_core::{self, EntryInsertParams},
     },
     ranking::validate_ordering,
@@ -34,14 +34,14 @@ use crate::{
 #[derive(sqlx::FromRow)]
 struct ExistingCollectionSpecRow {
     collection_id: String,
-    mode: CollectionMode,
     collection_role: CollectionRole,
+    rule_json: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
-struct CollectionSpecModeRole {
-    mode: CollectionMode,
+struct CollectionSpecRoleRule {
     collection_role: CollectionRole,
+    rule_json: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -171,29 +171,26 @@ impl SyncRepo<'_> {
             .await?;
         }
 
-        let (effective_slug, effective_role, effective_show_in_lists) =
-            if target_id == STARRED_COLLECTION_ID {
-                (Some("starred".to_owned()), CollectionRole::List, true)
-            } else if target_id == WANT_TO_READ_COLLECTION_ID {
-                (Some(WANT_TO_READ_SLUG.to_owned()), CollectionRole::Want, false)
-            } else {
-                (slug_opt, cs.role, cs.show_in_lists)
-            };
+        let (effective_slug, effective_role) = if target_id == STARRED_COLLECTION_ID {
+            (Some("starred".to_owned()), CollectionRole::List)
+        } else if target_id == WANT_TO_READ_COLLECTION_ID {
+            (Some(WANT_TO_READ_SLUG.to_owned()), CollectionRole::Want)
+        } else {
+            (slug_opt, cs.role)
+        };
 
         if existing_entry.is_none() || (!is_protected && incoming_wins) {
             sqlx::query(
                 "INSERT INTO collection_specs
-                 (collection_id, slug, mode, collection_role, rule_json, show_in_lists, color)
-                 VALUES (?, ?, 'manual', ?, NULL, ?, ?)
+                 (collection_id, slug, collection_role, rule_json, color)
+                 VALUES (?, ?, ?, NULL, ?)
                  ON CONFLICT(collection_id) DO UPDATE SET
                      collection_role = excluded.collection_role,
-                     show_in_lists = excluded.show_in_lists,
                      color = COALESCE(excluded.color, collection_specs.color)",
             )
             .bind(&target_id)
             .bind(&effective_slug)
             .bind(effective_role)
-            .bind(effective_show_in_lists)
             .bind(clean_color)
             .execute(&mut *tx)
             .await?;
@@ -224,7 +221,7 @@ impl SyncRepo<'_> {
         };
 
         let existing_spec: Option<ExistingCollectionSpecRow> = sqlx::query_as(
-            "SELECT collection_id, mode, collection_role
+            "SELECT collection_id, collection_role, rule_json
              FROM collection_specs
              WHERE collection_id = ? OR (slug IS NOT NULL AND LOWER(slug) = LOWER(?))
              ORDER BY CASE WHEN collection_id = ? THEN 0 ELSE 1 END ASC
@@ -237,7 +234,7 @@ impl SyncRepo<'_> {
         .await?;
 
         let target_id = if let Some(ex) = existing_spec {
-            if ex.mode != CollectionMode::Manual
+            if ex.rule_json.as_deref().is_some_and(|s| !s.trim().is_empty())
                 || matches!(
                     ex.collection_role,
                     CollectionRole::Feed | CollectionRole::Tag | CollectionRole::System
@@ -360,12 +357,13 @@ impl SyncRepo<'_> {
                 continue;
             }
 
-            let spec_mode: Option<CollectionMode> =
-                sqlx::query_scalar("SELECT mode FROM collection_specs WHERE collection_id = ?")
-                    .bind(&col_id)
-                    .fetch_optional(tx.conn())
-                    .await?;
-            if spec_mode == Some(CollectionMode::Dynamic) {
+            let spec_rule: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT rule_json FROM collection_specs WHERE collection_id = ?",
+            )
+            .bind(&col_id)
+            .fetch_optional(tx.conn())
+            .await?;
+            if spec_rule.flatten().as_deref().is_some_and(|s| !s.trim().is_empty()) {
                 continue;
             }
             if CatalogRepo::would_introduce_collection_cycle_in_tx(tx.conn(), &col_id, &entry_id)
@@ -717,15 +715,19 @@ impl SyncRepo<'_> {
         else {
             return Ok(());
         };
-        let spec_ok: Option<CollectionSpecModeRole> = sqlx::query_as(
-            "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
+        let spec_ok: Option<CollectionSpecRoleRule> = sqlx::query_as(
+            "SELECT collection_role, rule_json FROM collection_specs WHERE collection_id = ?",
         )
         .bind(&col_id)
         .fetch_optional(tx.conn())
         .await?;
-        if !spec_ok
-            .is_some_and(|s| CatalogRepo::is_generator_eligible(&col_id, s.mode, s.collection_role))
-        {
+        if !spec_ok.is_some_and(|s| {
+            CatalogRepo::is_generator_eligible(
+                &col_id,
+                s.collection_role,
+                s.rule_json.as_deref().is_some_and(|r| !r.trim().is_empty()),
+            )
+        }) {
             return Ok(());
         }
 

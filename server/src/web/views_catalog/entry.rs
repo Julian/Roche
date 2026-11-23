@@ -19,7 +19,7 @@ use crate::{
         CatalogEntry, CollectionSummary, EntryDetailView, EntryIdentifier, UpsertEntryInput,
         WANT_TO_READ_SLUG,
     },
-    domain::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind},
+    domain::{CollectionRole, ConsumptionStatus, EntryKind},
     service::{
         AppError, EntryListAppearance, RocheService,
         enrich::{
@@ -126,7 +126,7 @@ pub(in crate::web) async fn entry_detail_get(
                 slug: col.slug.clone().unwrap_or_else(|| col.id.clone()),
                 title: col.title.clone(),
                 has_generator: col.has_generator,
-                is_editable_manual: col.mode == CollectionMode::Manual
+                is_editable_manual: col.is_manual()
                     && !col.has_generator
                     && col.role == CollectionRole::List,
             })
@@ -136,7 +136,7 @@ pub(in crate::web) async fn entry_detail_get(
     let available_manual_lists: Vec<CollectionSummary> = all_lists
         .iter()
         .filter(|c| {
-            c.mode == CollectionMode::Manual
+            c.is_manual()
                 && !c.has_generator
                 && c.role == CollectionRole::List
                 && !joined_list_ids.contains(c.id.as_str())

@@ -11,9 +11,7 @@ use super::{
 use crate::db::{
     WriteTx,
     sync::SyncRepo,
-    types::{
-        ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, ConsumptionStatus,
-    },
+    types::{ActivityAction, ActivityEntityType, CollectionRole, ConsumptionStatus},
 };
 
 #[derive(sqlx::FromRow)]
@@ -76,7 +74,7 @@ macro_rules! list_generators_sql {
                  GROUP BY ce.collection_id
              ) stats ON stats.collection_id = cg.collection_id
              WHERE e.merged_into_id IS NULL
-               AND cs.mode = 'manual'
+               AND cs.rule_json IS NULL
                AND cs.collection_role = 'list'
                AND cg.collection_id != ? ",
             $extra_where,
@@ -125,21 +123,21 @@ impl CatalogRepo<'_> {
     #[must_use]
     pub(crate) fn is_generator_eligible(
         collection_id: &str,
-        mode: CollectionMode,
         role: CollectionRole,
+        is_dynamic: bool,
     ) -> bool {
         collection_id != crate::db::STARRED_COLLECTION_ID
-            && mode == CollectionMode::Manual
+            && !is_dynamic
             && role == CollectionRole::List
     }
 
     pub(super) fn ensure_generator_eligible(
         collection_id: &str,
         collection_title: &str,
-        mode: CollectionMode,
         role: CollectionRole,
+        is_dynamic: bool,
     ) -> CatalogResult<()> {
-        if !Self::is_generator_eligible(collection_id, mode, role) {
+        if !Self::is_generator_eligible(collection_id, role, is_dynamic) {
             return Err(CatalogError::InvalidInput(format!(
                 "Collection '{collection_title}' cannot use a generator (must be a custom manual list)"
             )));
@@ -333,7 +331,12 @@ impl CatalogRepo<'_> {
         slug_or_id: &str,
     ) -> CatalogResult<RawCollectionRow> {
         let col = Self::lookup_collection_row_in_tx(conn, slug_or_id, false).await?;
-        Self::ensure_generator_eligible(&col.id, &col.title, col.mode, col.collection_role)?;
+        Self::ensure_generator_eligible(
+            &col.id,
+            &col.title,
+            col.collection_role,
+            col.is_dynamic(),
+        )?;
         Ok(col)
     }
 

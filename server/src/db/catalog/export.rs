@@ -13,7 +13,7 @@ use super::{
         RawEntryRow, raw_collection_columns, raw_entry_columns,
     },
 };
-use crate::db::types::{CollectionMode, CollectionRole, ConsumptionStatus};
+use crate::db::types::{CollectionRole, ConsumptionStatus};
 
 #[derive(sqlx::FromRow)]
 struct RawComparisonRow {
@@ -191,40 +191,37 @@ fn collect_rankable_member_ids_for_export<'a>(
     members_by_col: &HashMap<&str, Vec<&'a str>>,
     statuses_by_entry: &HashMap<&str, Vec<ConsumptionStatus>>,
 ) -> Vec<&'a str> {
-    match raw.mode {
-        CollectionMode::Manual | CollectionMode::Feed => {
-            members_by_col.get(raw.id.as_str()).map_or_else(Vec::new, |ids| {
-                ids.iter()
-                    .copied()
-                    .filter(|&eid| {
-                        !raw.has_generator
-                            || statuses_by_entry
-                                .get(eid)
-                                .is_some_and(|st| st.contains(&ConsumptionStatus::Consumed))
-                    })
-                    .collect()
+    if raw.is_dynamic() {
+        let Some(rule) = parse_dynamic_collection_rule(raw.rule_json.as_deref()) else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .filter(|entry| {
+                let statuses =
+                    statuses_by_entry.get(entry.id.as_str()).map_or(&[][..], Vec::as_slice);
+                matches_dynamic_collection_rule(
+                    &rule,
+                    entry.kind,
+                    &entry.creators,
+                    entry.release_year,
+                    statuses,
+                )
             })
-        }
-        CollectionMode::Dynamic => {
-            let Some(rule) = parse_dynamic_collection_rule(raw.rule_json.as_deref()) else {
-                return Vec::new();
-            };
-            entries
-                .iter()
-                .filter(|entry| {
-                    let statuses =
-                        statuses_by_entry.get(entry.id.as_str()).map_or(&[][..], Vec::as_slice);
-                    matches_dynamic_collection_rule(
-                        &rule,
-                        entry.kind,
-                        &entry.creators,
-                        entry.release_year,
-                        statuses,
-                    )
+            .map(|entry| entry.id.as_str())
+            .collect()
+    } else {
+        members_by_col.get(raw.id.as_str()).map_or_else(Vec::new, |ids| {
+            ids.iter()
+                .copied()
+                .filter(|&eid| {
+                    !raw.has_generator
+                        || statuses_by_entry
+                            .get(eid)
+                            .is_some_and(|st| st.contains(&ConsumptionStatus::Consumed))
                 })
-                .map(|entry| entry.id.as_str())
                 .collect()
-        }
+        })
     }
 }
 

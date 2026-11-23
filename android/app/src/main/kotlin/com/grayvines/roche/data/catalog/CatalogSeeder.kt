@@ -26,6 +26,7 @@ import com.grayvines.roche.data.local.buildSeededCollectionEntry
 import com.grayvines.roche.data.local.buildStarredCollectionSpec
 import com.grayvines.roche.data.local.buildWantToReadCollectionSpec
 import com.grayvines.roche.data.local.deleteEntryCascade
+import com.grayvines.roche.data.local.isDynamic
 import com.grayvines.roche.data.local.nextLocalHlc
 
 internal class CatalogSeeder(
@@ -105,12 +106,7 @@ internal class CatalogSeeder(
             if (isUnused) {
                 dao.deleteEntryCascade(LEGACY_PLACEHOLDER_COLLECTION_ID)
             } else if (CollectionRole.fromWireValue(legacySpec.role) == CollectionRole.SYSTEM) {
-                dao.upsertCollectionSpec(
-                    legacySpec.copy(
-                        role = CollectionRole.LIST.wireValue,
-                        showInLists = true,
-                    )
-                )
+                dao.upsertCollectionSpec(legacySpec.copy(role = CollectionRole.LIST.wireValue))
             }
         }
     }
@@ -142,9 +138,7 @@ internal class CatalogSeeder(
                 CollectionSpecEntity(
                     collectionId = UP_NEXT_COLLECTION_ID,
                     slug = UP_NEXT_SLUG,
-                    mode = CollectionMode.MANUAL.wireValue,
                     role = CollectionRole.SYSTEM.wireValue,
-                    showInLists = false,
                 )
             )
             identsToInsert.add(EntryIdentifierEntity("slug", UP_NEXT_SLUG, UP_NEXT_COLLECTION_ID))
@@ -179,7 +173,7 @@ internal class CatalogSeeder(
         val existingStarred = existingSpecs[STARRED_COLLECTION_ID]
         if (
             existingStarred == null ||
-                !existingStarred.showInLists ||
+                existingStarred.isDynamic ||
                 existingStarred.role != CollectionRole.LIST.wireValue
         ) {
             specsToInsert.add(buildStarredCollectionSpec(existingStarred?.color))
@@ -297,10 +291,8 @@ internal class CatalogSeeder(
                     CollectionSpecEntity(
                         collectionId = id,
                         slug = kind.systemListSlug,
-                        mode = CollectionMode.DYNAMIC.wireValue,
                         role = CollectionRole.LIST.wireValue,
                         ruleJson = """{"kind":"${kind.wireValue}","consumed":true}""",
-                        showInLists = true,
                     )
                 )
                 identsToInsert.add(EntryIdentifierEntity("slug", kind.systemListSlug, id))

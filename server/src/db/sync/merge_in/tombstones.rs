@@ -537,7 +537,7 @@ impl SyncRepo<'_> {
         let protected_spec: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM collection_specs
              WHERE collection_id = ?
-               AND (mode = 'dynamic' OR collection_role IN ('system', 'feed', 'tag'))",
+               AND (rule_json IS NOT NULL OR collection_role IN ('system', 'feed', 'tag'))",
         )
         .bind(key)
         .fetch_optional(&mut *conn)
