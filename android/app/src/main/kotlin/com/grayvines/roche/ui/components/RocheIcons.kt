@@ -834,6 +834,26 @@ fun MoreDotsIcon(
     }
 }
 
+/** Six-dot grip handle (`⋮⋮`) indicating a row can be dragged to reorder. */
+@Composable
+fun DragHandleIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val r = this.size.minDimension * 0.075f
+        val xs = listOf(this.size.width * 0.34f, this.size.width * 0.66f)
+        val ys =
+            listOf(this.size.height * 0.24f, this.size.height * 0.50f, this.size.height * 0.76f)
+        for (y in ys) {
+            for (x in xs) {
+                drawCircle(color = tint, radius = r, center = Offset(x, y))
+            }
+        }
+    }
+}
+
 /** Downward chevron (`⌄`) icon for collapsing fullscreen overlays and players. */
 @Composable
 fun ChevronDownIcon(

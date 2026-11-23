@@ -1032,7 +1032,7 @@ private fun InboxEntryTextColumn(
             }
         EntrySourceMetadataRow(
             entry = entry,
-            trailingMetaText = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
+            trailingMetaText = "· ${entry.formattedPublishedLabel}",
             trailingMetaFontSize = 11.sp,
             trailingBadge = trailingBadge,
             trailingBadgeColor = trailingBadgeColor,

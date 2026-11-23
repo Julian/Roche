@@ -985,8 +985,7 @@ private fun HomeInboxPreviewRow(
             )
             EntrySourceMetadataRow(
                 entry = entry,
-                trailingMetaText =
-                    "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
+                trailingMetaText = "· ${entry.formattedPublishedLabel}",
                 showOfflineIndicator = true,
                 showStarDot = entry.isFavorite,
             )

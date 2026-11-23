@@ -2,8 +2,11 @@
 
 package com.grayvines.roche.ui
 
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -39,17 +42,23 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.catalog.CatalogListSummary
@@ -60,10 +69,10 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.extractCleanDomain
 import com.grayvines.roche.ui.components.CatalogCoverThumbnail
-import com.grayvines.roche.ui.components.DismissIcon
 import com.grayvines.roche.ui.components.EntrySourceMetadataRow
 import com.grayvines.roche.ui.components.EntryThumbnailPreview
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.MoreDotsIcon
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheMetaPill
@@ -1030,51 +1039,125 @@ private fun UpNextQueueListContent(
     onAction: (MainAction) -> Unit,
     listState: LazyListState,
 ) {
-    val colors = LocalRocheColors.current
     if (queueEntries.isEmpty()) {
-        Box(
-            modifier =
-                Modifier.fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(32.dp)
-                    .testTag("queue_empty_state"),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                text =
-                    "Your Queue is empty. Long-press any article, paper, video, or podcast episode in Inbox to add it to your Queue.",
-                color = colors.textMuted,
-                fontSize = 13.sp,
-            )
-        }
+        UpNextQueueEmptyState()
         return
     }
-    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-        val isCompactWidth = maxWidth < COMPACT_ROW_BREAKPOINT
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.fillMaxSize().testTag("queue_list"),
-            contentPadding = PaddingValues(bottom = 96.dp),
-        ) {
-            itemsIndexed(items = queueEntries, key = { _, item -> item.id }) { index, entry ->
-                QueueEntryRowItem(
-                    entry = entry,
-                    queuePosition = index + 1,
-                    canMoveUp = index > 0,
-                    isCompactWidth = isCompactWidth,
-                    isPlayingAudio = entry.id == activeAudioEntryId,
-                    isQueuedNextAudio = entry.id == nextQueuedAudioId,
-                    onOpen = { onAction(MainAction.OpenReader(entry.id)) },
-                    onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
-                    onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
-                    onMoveToTop = { onAction(MainAction.MoveQueueItemToTop(entry.id)) },
-                    onMoveUp = { onAction(MainAction.MoveQueueItemUp(entry.id)) },
-                    onRemoveFromQueue = { onAction(MainAction.RemoveFromQueue(entry.id)) },
-                    onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
-                )
-                HorizontalDivider(color = colors.border, thickness = 1.dp)
-            }
+    val dragState =
+        rememberQueueDragReorderState(
+            listState = listState,
+            entries = queueEntries,
+            onCommitReorder = { orderedIds -> onAction(MainAction.ReorderQueue(orderedIds)) },
+        )
+    val displayEntries = dragState.resolveDisplayEntries(queueEntries)
+    val currentIds = remember(displayEntries) { displayEntries.map { it.id } }
+    val canReorder = displayEntries.size > 1
+    val isAudioActuallyPlaying = LocalIsAudioActuallyPlaying.current ?: false
+
+    LazyColumn(
+        state = listState,
+        userScrollEnabled = dragState.draggedEntryId == null,
+        modifier = Modifier.fillMaxSize().testTag("queue_list"),
+        contentPadding = PaddingValues(bottom = 96.dp),
+    ) {
+        itemsIndexed(items = displayEntries, key = { _, item -> item.id }) { index, entry ->
+            val isDragging = dragState.draggedEntryId == entry.id
+            UpNextDraggableQueueSlot(
+                entry = entry,
+                index = index,
+                currentIds = currentIds,
+                canReorder = canReorder,
+                isDragging = isDragging,
+                dragState = dragState,
+                isPlayingAudio = entry.id == activeAudioEntryId,
+                isAudioActuallyPlaying = isAudioActuallyPlaying,
+                isQueuedNextAudio = activeAudioEntryId != null && entry.id == nextQueuedAudioId,
+                onAction = onAction,
+                modifier =
+                    Modifier.fillMaxWidth()
+                        .animateItem(
+                            placementSpec =
+                                if (isDragging) {
+                                    null
+                                } else {
+                                    spring<IntOffset>(stiffness = Spring.StiffnessMediumLow)
+                                }
+                        ),
+            )
         }
+    }
+}
+
+@Composable
+private fun UpNextQueueEmptyState() {
+    val colors = LocalRocheColors.current
+    Box(
+        modifier =
+            Modifier.fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(32.dp)
+                .testTag("queue_empty_state"),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text =
+                "Your Queue is empty. Long-press any article, paper, video, or podcast episode in Inbox to add it to your Queue.",
+            color = colors.textMuted,
+            fontSize = 13.sp,
+        )
+    }
+}
+
+@Composable
+private fun UpNextDraggableQueueSlot(
+    entry: InboxEntry,
+    index: Int,
+    currentIds: List<String>,
+    canReorder: Boolean,
+    isDragging: Boolean,
+    dragState: QueueDragReorderState,
+    isPlayingAudio: Boolean,
+    isAudioActuallyPlaying: Boolean,
+    isQueuedNextAudio: Boolean,
+    onAction: (MainAction) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    Column(
+        modifier =
+            modifier.zIndex(if (isDragging) 1f else 0f).graphicsLayer {
+                if (isDragging) {
+                    translationY = dragState.dragOffsetY
+                    shadowElevation = QUEUE_DRAG_ELEVATION_DP.dp.toPx()
+                }
+            }
+    ) {
+        QueueEntryRowItem(
+            entry = entry,
+            queuePosition = index + 1,
+            totalCount = currentIds.size,
+            canReorder = canReorder,
+            canMoveUp = index > 0,
+            canMoveDown = index < currentIds.lastIndex,
+            isDragging = isDragging,
+            dragState = dragState,
+            isPlayingAudio = isPlayingAudio,
+            isAudioActuallyPlaying = isAudioActuallyPlaying,
+            isQueuedNextAudio = isQueuedNextAudio,
+            onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+            onOpenContextSheet = { onAction(MainAction.OpenContextSheet(entry.id)) },
+            onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
+            onMoveToTop = { onAction(MainAction.MoveQueueItemToTop(entry.id)) },
+            onMoveUp = {
+                onAction(MainAction.ReorderQueue(moveItemInList(currentIds, index, index - 1)))
+            },
+            onMoveDown = {
+                onAction(MainAction.ReorderQueue(moveItemInList(currentIds, index, index + 1)))
+            },
+            onRemoveFromQueue = { onAction(MainAction.RemoveFromQueue(entry.id)) },
+            onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+        )
+        HorizontalDivider(color = colors.border, thickness = 1.dp)
     }
 }
 
@@ -1134,15 +1217,23 @@ private fun ListeningHistoryRowItem(
     val colors = LocalRocheColors.current
     val headlineFamily = currentHeadlineFontFamily()
     val starTint = if (entry.isFavorite) colors.accentEcru else colors.textMuted
+    val isAudioActuallyPlaying = LocalIsAudioActuallyPlaying.current ?: false
     val historyLabel = entry.formattedListeningHistoryLabel ?: "Played"
     val rowBg =
         if (isPlaying) colors.accentBlue.copy(alpha = ROW_HIGHLIGHT_ALPHA) else colors.background
     val starDesc = if (entry.isFavorite) "Unstar ${entry.title}" else "Star ${entry.title}"
+    val playingBadge =
+        if (isPlaying) {
+            if (isAudioActuallyPlaying) "▶ PLAYING" else "⏸ PAUSED"
+        } else {
+            null
+        }
 
     Row(
         modifier =
             Modifier.fillMaxWidth()
                 .background(rowBg)
+                .drawLeftAccentBar(if (isPlaying) colors.accentBlue else null)
                 .combinedClickable(
                     onClick = { onAction(MainAction.PlayAudioEntry(entry.id)) },
                     onLongClick = { onAction(MainAction.OpenContextSheet(entry.id)) },
@@ -1166,6 +1257,7 @@ private fun ListeningHistoryRowItem(
             entry = entry,
             headlineFamily = headlineFamily,
             historyLabel = historyLabel,
+            playingBadge = playingBadge,
             modifier = Modifier.weight(1f),
         )
         if (!inQueue) {
@@ -1183,6 +1275,7 @@ private fun ListeningHistoryMetaColumn(
     entry: InboxEntry,
     headlineFamily: FontFamily,
     historyLabel: String,
+    playingBadge: String?,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
@@ -1204,77 +1297,133 @@ private fun ListeningHistoryMetaColumn(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        Text(
-            text = historyLabel,
-            color = colors.accentVerdigris,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.testTag("history_timestamp_${entry.id}"),
-        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = historyLabel,
+                color = colors.accentVerdigris,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier =
+                    Modifier.weight(1f, fill = false).testTag("history_timestamp_${entry.id}"),
+            )
+            if (playingBadge != null) {
+                Text(
+                    text = playingBadge,
+                    color = colors.accentBlue,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                )
+            }
+        }
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
-@Suppress("LongParameterList")
 private fun QueueEntryRowItem(
     entry: InboxEntry,
     queuePosition: Int,
+    totalCount: Int,
+    canReorder: Boolean,
     canMoveUp: Boolean,
-    isCompactWidth: Boolean,
+    canMoveDown: Boolean,
+    isDragging: Boolean,
+    dragState: QueueDragReorderState,
     isPlayingAudio: Boolean,
+    isAudioActuallyPlaying: Boolean,
     isQueuedNextAudio: Boolean,
     onOpen: () -> Unit,
-    onLongPress: () -> Unit,
+    onOpenContextSheet: () -> Unit,
     onToggleStar: () -> Unit,
     onMoveToTop: () -> Unit,
     onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit,
     onRemoveFromQueue: () -> Unit,
     onToggleArchive: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val (rowBackground, leftAccentColor) =
-        resolveQueueRowColors(colors, isPlayingAudio, isQueuedNextAudio)
+    val (baseBg, leftAccentColor) = resolveQueueRowColors(colors, isPlayingAudio, isQueuedNextAudio)
+    val statusBadge =
+        resolveQueueRowStatusBadge(isPlayingAudio, isAudioActuallyPlaying, isQueuedNextAudio)
+    val rowStateDesc =
+        buildQueueRowStateDescription(
+            queuePosition,
+            totalCount,
+            isPlayingAudio,
+            isAudioActuallyPlaying,
+            isQueuedNextAudio,
+            entry.isFavorite,
+        )
+    val a11yActions =
+        buildQueueRowA11yActions(canMoveUp, canMoveDown, onMoveUp, onMoveDown, onMoveToTop)
 
     Row(
         modifier =
             Modifier.fillMaxWidth()
-                .background(rowBackground)
-                .drawLeftAccentBar(leftAccentColor)
-                .combinedClickable(onClick = onOpen, onLongClick = onLongPress)
-                .semantics { role = Role.Button }
-                .padding(
-                    start = if (isCompactWidth) 12.dp else 10.dp,
-                    end = if (isCompactWidth) 6.dp else 12.dp,
-                    top = 11.dp,
-                    bottom = 11.dp,
-                )
+                .background(if (isDragging) colors.surfaceElevated else baseBg)
+                .drawLeftAccentBar(if (isDragging) colors.accentBlue else leftAccentColor)
+                .clickable(onClick = onOpen)
+                .queueLongPressDrag(enabled = canReorder, entryId = entry.id, dragState = dragState)
+                .semantics {
+                    role = Role.Button
+                    stateDescription = rowStateDesc
+                    if (a11yActions.isNotEmpty()) customActions = a11yActions
+                }
+                .padding(start = 12.dp, end = 4.dp, top = 11.dp, bottom = 11.dp)
                 .testTag("queue_row_${entry.id}"),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        QueueRowLeadingSlot(
-            entry = entry,
-            queuePosition = queuePosition,
-            isCompactWidth = isCompactWidth,
-            onToggleStar = onToggleStar,
+        QueueRowLeadingSlot(entry = entry, queuePosition = queuePosition)
+        QueueEntryTextColumn(entry, statusBadge, Modifier.weight(1f))
+        QueueRowTrailingControls(
+            entry,
+            canReorder,
+            canMoveUp,
+            isDragging,
+            dragState,
+            onMoveToTop,
+            onToggleStar,
+            onToggleArchive,
+            onOpenContextSheet,
+            onRemoveFromQueue,
         )
-        QueueEntryTextColumn(
-            entry = entry,
-            showCompactStarDot = isCompactWidth && entry.isFavorite,
-            modifier = Modifier.weight(1f),
+    }
+}
+
+private fun buildQueueRowA11yActions(
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit,
+    onMoveToTop: () -> Unit,
+): List<CustomAccessibilityAction> = buildList {
+    if (canMoveUp) {
+        add(
+            CustomAccessibilityAction("Move up in queue") {
+                onMoveUp()
+                true
+            }
         )
-        QueueRowTrailingSlot(
-            entry = entry,
-            canMoveUp = canMoveUp,
-            isCompactWidth = isCompactWidth,
-            onMoveToTop = onMoveToTop,
-            onMoveUp = onMoveUp,
-            onToggleStar = onToggleStar,
-            onToggleArchive = onToggleArchive,
-            onRemoveFromQueue = onRemoveFromQueue,
+        add(
+            CustomAccessibilityAction("Move to top of queue") {
+                onMoveToTop()
+                true
+            }
+        )
+    }
+    if (canMoveDown) {
+        add(
+            CustomAccessibilityAction("Move down in queue") {
+                onMoveDown()
+                true
+            }
         )
     }
 }
@@ -1295,78 +1444,35 @@ private fun resolveQueueRowColors(
 private fun QueueRowLeadingSlot(
     entry: InboxEntry,
     queuePosition: Int,
-    isCompactWidth: Boolean,
-    onToggleStar: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    if (isCompactWidth) {
-        Text(
-            text = "$queuePosition",
-            color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-            textAlign = TextAlign.End,
-            modifier = Modifier.width(18.dp),
-        )
-    } else {
-        val starTint = if (entry.isFavorite) colors.accentEcru else colors.textMuted
-        RocheIconActionButton(
-            contentDescription =
-                if (entry.isFavorite) "Unstar ${entry.title}" else "Star ${entry.title}",
-            onClick = onToggleStar,
-            outlined = false,
-            modifier = Modifier.testTag("queue_star_btn_${entry.id}"),
-        ) {
-            StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 17.dp)
-        }
-    }
+    Text(
+        text = "$queuePosition",
+        color = colors.textMuted,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 11.sp,
+        textAlign = TextAlign.End,
+        modifier = Modifier.width(18.dp),
+    )
     if (entry.hasThumbnailSource()) {
         EntryThumbnailPreview(entry = entry, modifier = Modifier.padding(top = 2.dp))
     }
 }
 
 @Composable
-@Suppress("LongParameterList")
-private fun QueueRowTrailingSlot(
-    entry: InboxEntry,
-    canMoveUp: Boolean,
-    isCompactWidth: Boolean,
-    onMoveToTop: () -> Unit,
-    onMoveUp: () -> Unit,
-    onToggleStar: () -> Unit,
-    onToggleArchive: () -> Unit,
-    onRemoveFromQueue: () -> Unit,
-) {
-    if (isCompactWidth) {
-        QueueCompactOverflowMenu(
-            entry = entry,
-            canMoveUp = canMoveUp,
-            onMoveToTop = onMoveToTop,
-            onMoveUp = onMoveUp,
-            onToggleStar = onToggleStar,
-            onToggleArchive = onToggleArchive,
-            onRemoveFromQueue = onRemoveFromQueue,
-        )
-    } else {
-        QueueEntryTrailingActions(
-            entry = entry,
-            canMoveUp = canMoveUp,
-            onMoveToTop = onMoveToTop,
-            onMoveUp = onMoveUp,
-            onRemoveFromQueue = onRemoveFromQueue,
-            onToggleArchive = onToggleArchive,
-        )
-    }
-}
-
-@Composable
 private fun QueueEntryTextColumn(
     entry: InboxEntry,
-    showCompactStarDot: Boolean,
+    statusBadge: QueueRowStatusBadge?,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
     val headlineFamily = currentHeadlineFontFamily()
+    val badgeColor =
+        when (statusBadge?.tone) {
+            QueueRowBadgeTone.ACTIVE_AUDIO -> colors.accentBlue
+            QueueRowBadgeTone.UP_NEXT_AUDIO -> colors.accentVerdigris
+            null -> null
+        }
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(
             text = entry.title,
@@ -1382,21 +1488,60 @@ private fun QueueEntryTextColumn(
             entry = entry,
             trailingMetaText = "· ${entry.readEstimateLabel}",
             trailingMetaFontSize = 11.sp,
+            trailingBadge = statusBadge?.label,
+            trailingBadgeColor = badgeColor,
             showOfflineIndicator = true,
-            showStarDot = showCompactStarDot,
+            showStarDot = entry.isFavorite,
         )
     }
 }
 
 @Composable
 @Suppress("LongParameterList")
-private fun QueueCompactOverflowMenu(
+private fun QueueRowTrailingControls(
+    entry: InboxEntry,
+    canReorder: Boolean,
+    canMoveUp: Boolean,
+    isDragging: Boolean,
+    dragState: QueueDragReorderState,
+    onMoveToTop: () -> Unit,
+    onToggleStar: () -> Unit,
+    onToggleArchive: () -> Unit,
+    onOpenContextSheet: () -> Unit,
+    onRemoveFromQueue: () -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(0.dp),
+    ) {
+        if (canReorder) {
+            QueueDragGripHandle(
+                entryId = entry.id,
+                isDragging = isDragging,
+                dragState = dragState,
+            )
+        }
+        QueueRowOverflowMenu(
+            entry = entry,
+            canMoveUp = canMoveUp,
+            onMoveToTop = onMoveToTop,
+            onToggleStar = onToggleStar,
+            onToggleArchive = onToggleArchive,
+            onOpenContextSheet = onOpenContextSheet,
+            onRemoveFromQueue = onRemoveFromQueue,
+        )
+    }
+}
+
+@Composable
+@Suppress("LongParameterList")
+private fun QueueRowOverflowMenu(
     entry: InboxEntry,
     canMoveUp: Boolean,
     onMoveToTop: () -> Unit,
-    onMoveUp: () -> Unit,
     onToggleStar: () -> Unit,
     onToggleArchive: () -> Unit,
+    onOpenContextSheet: () -> Unit,
     onRemoveFromQueue: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -1409,26 +1554,21 @@ private fun QueueCompactOverflowMenu(
             outlined = false,
             modifier = Modifier.testTag("queue_more_btn_${entry.id}"),
         ) {
-            Text(
-                text = "⋯",
-                color = colors.textSecondary,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Medium,
-            )
+            MoreDotsIcon(tint = colors.textSecondary, size = 16.dp)
         }
         DropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
             containerColor = colors.surfaceElevated,
         ) {
-            QueueCompactOverflowMenuItems(
+            QueueOverflowMenuItems(
                 entry = entry,
                 canMoveUp = canMoveUp,
                 onDismiss = { expanded = false },
                 onMoveToTop = onMoveToTop,
-                onMoveUp = onMoveUp,
                 onToggleStar = onToggleStar,
                 onToggleArchive = onToggleArchive,
+                onOpenContextSheet = onOpenContextSheet,
                 onRemoveFromQueue = onRemoveFromQueue,
             )
         }
@@ -1437,14 +1577,14 @@ private fun QueueCompactOverflowMenu(
 
 @Composable
 @Suppress("LongParameterList")
-private fun QueueCompactOverflowMenuItems(
+private fun QueueOverflowMenuItems(
     entry: InboxEntry,
     canMoveUp: Boolean,
     onDismiss: () -> Unit,
     onMoveToTop: () -> Unit,
-    onMoveUp: () -> Unit,
     onToggleStar: () -> Unit,
     onToggleArchive: () -> Unit,
+    onOpenContextSheet: () -> Unit,
     onRemoveFromQueue: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -1452,10 +1592,6 @@ private fun QueueCompactOverflowMenuItems(
         QueueOverflowOption("Move to Top", colors.textPrimary, "queue_move_top_item_${entry.id}") {
             onDismiss()
             onMoveToTop()
-        }
-        QueueOverflowOption("Move Up", colors.textPrimary, "queue_up_item_${entry.id}") {
-            onDismiss()
-            onMoveUp()
         }
     }
     QueueOverflowOption(if (entry.isFavorite) "Remove Star" else "Star", colors.textPrimary) {
@@ -1466,8 +1602,12 @@ private fun QueueCompactOverflowMenuItems(
         onDismiss()
         onToggleArchive()
     }
+    QueueOverflowOption("Details & Tags…", colors.textPrimary) {
+        onDismiss()
+        onOpenContextSheet()
+    }
     QueueOverflowOption(
-        "Remove from Up Next",
+        "Remove from Queue",
         colors.accentIndianRed,
         "queue_remove_item_${entry.id}",
     ) {
@@ -1490,68 +1630,6 @@ private fun QueueOverflowOption(
     )
 }
 
-@Composable
-@Suppress("LongParameterList")
-private fun QueueEntryTrailingActions(
-    entry: InboxEntry,
-    canMoveUp: Boolean,
-    onMoveToTop: () -> Unit,
-    onMoveUp: () -> Unit,
-    onRemoveFromQueue: () -> Unit,
-    onToggleArchive: () -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        if (canMoveUp) {
-            QueueReorderIconButtons(entry = entry, onMoveToTop = onMoveToTop, onMoveUp = onMoveUp)
-        }
-        RocheIconActionButton(
-            contentDescription = "Remove ${entry.title} from Queue",
-            onClick = onRemoveFromQueue,
-            outlined = false,
-            modifier = Modifier.testTag("queue_remove_btn_${entry.id}"),
-        ) {
-            Text("✕", color = colors.textMuted, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
-        }
-        RocheIconActionButton(
-            contentDescription =
-                if (entry.isDismissed) "Mark ${entry.title} new" else "Dismiss ${entry.title}",
-            onClick = onToggleArchive,
-            outlined = false,
-            modifier = Modifier.testTag("queue_archive_btn_${entry.id}"),
-        ) {
-            DismissIcon(tint = colors.textMuted, isDismissed = entry.isDismissed, size = 17.dp)
-        }
-    }
-}
-
-@Composable
-private fun QueueReorderIconButtons(
-    entry: InboxEntry,
-    onMoveToTop: () -> Unit,
-    onMoveUp: () -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    RocheIconActionButton(
-        contentDescription = "Move ${entry.title} to top of Queue",
-        onClick = onMoveToTop,
-        outlined = false,
-        modifier = Modifier.testTag("queue_top_btn_${entry.id}"),
-    ) {
-        Text("⇈", color = colors.textSecondary, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
-    }
-    RocheIconActionButton(
-        contentDescription = "Move up ${entry.title}",
-        onClick = onMoveUp,
-        outlined = false,
-        modifier = Modifier.testTag("queue_up_btn_${entry.id}"),
-    ) {
-        Text("↑", color = colors.textSecondary, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
-    }
-}
-
 private const val ROW_HIGHLIGHT_ALPHA = 0.12f
 private const val QUEUE_NEXT_ALPHA = 0.11f
+private const val QUEUE_DRAG_ELEVATION_DP = 8

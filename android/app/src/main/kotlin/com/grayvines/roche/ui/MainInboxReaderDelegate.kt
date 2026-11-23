@@ -122,6 +122,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                 queueDelegate.removeFromQueue(action.entryId, showBanner = true)
             is MainAction.MoveQueueItemUp -> queueDelegate.moveUp(action.entryId)
             is MainAction.MoveQueueItemToTop -> queueDelegate.moveToTop(action.entryId)
+            is MainAction.ReorderQueue -> queueDelegate.reorder(action.orderedEntryIds)
         }
     }
 
@@ -684,6 +685,32 @@ internal class MainQueueActionsDelegate(private val host: InboxReaderHost) {
         }
         host.playbackOrchestrator.syncActivePlayerQueueState(host.playerController)
         host.showStatusMessage("Moved to top of Queue")
+    }
+
+    suspend fun reorder(orderedVisibleIds: List<String>) {
+        host.settingsRepository.update { current ->
+            val next = applyVisibleQueueReorder(current.queueItemIds, orderedVisibleIds)
+            if (next == current.queueItemIds) current else current.copy(queueItemIds = next)
+        }
+        host.playbackOrchestrator.syncActivePlayerQueueState(host.playerController)
+    }
+}
+
+internal fun applyVisibleQueueReorder(
+    currentQueueIds: List<String>,
+    orderedVisibleIds: List<String>,
+): List<String> {
+    val currentSet = currentQueueIds.toHashSet()
+    val validReordered = orderedVisibleIds.distinct().filter { it in currentSet }
+    if (validReordered.size <= 1) return currentQueueIds
+    val reorderedSet = validReordered.toHashSet()
+    val iterator = validReordered.iterator()
+    return currentQueueIds.map { existingId ->
+        if (existingId in reorderedSet && iterator.hasNext()) {
+            iterator.next()
+        } else {
+            existingId
+        }
     }
 }
 

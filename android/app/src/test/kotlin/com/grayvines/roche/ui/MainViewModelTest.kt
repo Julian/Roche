@@ -876,6 +876,17 @@ class MainViewModelTest {
                 }
             assertEquals(listOf("ep-1", "art-mid"), reordered.queueEntries.map { it.id })
 
+            viewModel.dispatch(MainAction.ReorderQueue(listOf("art-mid", "ep-1")))
+            val dragReordered =
+                viewModel.uiState.first {
+                    it.queueEntries.map { e -> e.id } == listOf("art-mid", "ep-1")
+                }
+            assertEquals(listOf("art-mid", "ep-1"), dragReordered.queueEntries.map { it.id })
+            viewModel.dispatch(MainAction.ReorderQueue(listOf("ep-1", "art-mid")))
+            viewModel.uiState.first {
+                it.queueEntries.map { e -> e.id } == listOf("ep-1", "art-mid")
+            }
+
             viewModel.dispatch(
                 MainAction.SetPlaybackSpeed(speed = 2.75f, applyToCurrentPodcast = true)
             )

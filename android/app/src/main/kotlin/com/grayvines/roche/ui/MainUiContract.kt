@@ -465,6 +465,8 @@ sealed interface MainAction {
 
     data class MoveQueueItemToTop(val entryId: String) : QueueFeedAudioMutation
 
+    data class ReorderQueue(val orderedEntryIds: List<String>) : QueueFeedAudioMutation
+
     data class ToggleArchive(
         val entry: InboxEntry,
         val liveReadProgress: Double? = null,
