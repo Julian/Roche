@@ -22,9 +22,12 @@ internal fun parsePreprocessedHtmlBody(rawHtml: String, baseUrl: String? = null)
     doc.outputSettings().prettyPrint(false)
     val body = doc.body()
     body.select(STRIPPED_MEDIA_QUERY).remove()
-    removeFootnoteBacklinks(body)
+    liftSemanticStylesAndClasses(body)
+    synthesizeFootnoteIds(body, baseUrl)
+    val knownIds = collectLocalAnchorIds(body)
     transformInlineImages(body, baseUrl)
-    sanitizeAnchorLinks(body, baseUrl)
+    removeOrphanBacklinks(body, baseUrl, knownIds)
+    sanitizeAnchorLinks(body, baseUrl, knownIds)
     unwrapLineNumberTables(body)
     transformDetailsElements(body)
     return body
@@ -36,19 +39,52 @@ internal data class NormalizedInlineContent(
     val maxLineLength: Int = 0,
 )
 
-internal fun prepareInlineHtmlForCompose(htmlFragment: String, baseUrl: String? = null): String {
-    if (!containsCustomInlineTags(htmlFragment)) return htmlFragment
+internal fun prepareInlineHtmlForCompose(
+    htmlFragment: String,
+    baseUrl: String? = null,
+    markBackgroundHex: String? = null,
+): String {
+    val hasMark = markBackgroundHex != null && htmlFragment.contains("<mark", ignoreCase = true)
+    if (!hasMark && !containsCustomInlineTags(htmlFragment)) return htmlFragment
     val doc = Jsoup.parseBodyFragment(htmlFragment, baseUrl.orEmpty())
     doc.outputSettings().prettyPrint(false)
     val body = doc.body()
     sanitizeAnchorLinks(body, baseUrl)
     normalizeComposeInlineTags(body)
+    if (markBackgroundHex != null) {
+        rewriteMarkTags(body, markBackgroundHex)
+    }
     return body.html()
+}
+
+internal fun applyMarkBackgroundHex(html: String, markBackgroundHex: String): String {
+    if (!html.contains("<mark", ignoreCase = true)) return html
+    val doc = Jsoup.parseBodyFragment(html)
+    doc.outputSettings().prettyPrint(false)
+    rewriteMarkTags(doc.body(), markBackgroundHex)
+    return doc.body().html()
+}
+
+private fun rewriteMarkTags(root: Element, markBackgroundHex: String) {
+    for (mark in root.select("mark").toList()) {
+        mark.tagName("span")
+        mark.attr("style", "background-color:$markBackgroundHex")
+    }
 }
 
 internal fun normalizeComposeInlineTags(root: Element) {
     root.select("code, kbd, samp").forEach { it.tagName(TAG_TT) }
-    root.select("var").forEach { it.tagName(TAG_EM) }
+    root.select("var, dfn").forEach { it.tagName(TAG_EM) }
+    root.select("ins").forEach { it.tagName(TAG_U) }
+    for (quote in root.select("q").toList()) {
+        if (hasVisibleDomText(quote)) {
+            quote.prependText("“")
+            quote.appendText("”")
+            quote.unwrap()
+        } else {
+            quote.remove()
+        }
+    }
 }
 
 private fun containsCustomInlineTags(html: String): Boolean =
@@ -56,18 +92,164 @@ private fun containsCustomInlineTags(html: String): Boolean =
         html.contains("<code", ignoreCase = true) ||
         html.contains("<kbd", ignoreCase = true) ||
         html.contains("<samp", ignoreCase = true) ||
-        html.contains("<var", ignoreCase = true)
+        html.contains("<var", ignoreCase = true) ||
+        html.contains("<dfn", ignoreCase = true) ||
+        html.contains("<ins", ignoreCase = true) ||
+        html.contains("<q", ignoreCase = true)
 
-internal fun sanitizeAnchorLinks(root: Element, baseUrl: String?) {
+internal fun sanitizeAnchorLinks(
+    root: Element,
+    baseUrl: String?,
+    knownIds: Map<String, String> = emptyMap(),
+) {
     for (anchor in root.select("a").toList()) {
-        val safeHref = resolveSafeAnchorHref(anchor.attr("href"), baseUrl)
-        if (safeHref != null) {
-            anchor.attr("href", safeHref)
-        } else {
+        val rawHref = anchor.attr("href")
+        val localTarget = resolveLocalAnchorTarget(rawHref, baseUrl, knownIds)
+        if (localTarget != null) {
+            anchor.attr("href", "#$localTarget")
+        } else if (isSamePageFragmentHref(rawHref, baseUrl)) {
             anchor.unwrap()
+        } else {
+            val safeHref = resolveSafeAnchorHref(rawHref, baseUrl)
+            if (safeHref != null) {
+                anchor.attr("href", safeHref)
+            } else {
+                anchor.unwrap()
+            }
         }
     }
 }
+
+internal fun extractSamePageFragment(rawHref: String, baseUrl: String?): String? {
+    val trimmed = rawHref.trim()
+    val result =
+        when {
+            trimmed.isEmpty() -> null
+            trimmed.startsWith("#") -> trimmed.substring(1).trim()
+            else -> extractResolvedSamePageFrag(trimmed, baseUrl)
+        }
+    return result?.takeIf { it.isNotEmpty() }
+}
+
+private fun extractResolvedSamePageFrag(trimmedHref: String, baseUrl: String?): String? {
+    val cleanBase = baseUrl?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    val resolved = runCatching {
+        URI(cleanBase).resolve(trimmedHref).toString()
+    }
+        .getOrElse { trimmedHref }
+    val hashIdx = resolved.indexOf('#')
+    if (hashIdx <= 0) return null
+    val baseWithoutFrag = cleanBase.substringBefore('#').trimEnd('/')
+    val hrefWithoutFrag = resolved.substring(0, hashIdx).trimEnd('/')
+    return if (
+        baseWithoutFrag.isNotEmpty() && hrefWithoutFrag.equals(baseWithoutFrag, ignoreCase = true)
+    ) {
+        resolved.substring(hashIdx + 1).trim()
+    } else {
+        null
+    }
+}
+
+internal fun isSamePageFragmentHref(rawHref: String, baseUrl: String?): Boolean =
+    extractSamePageFragment(rawHref, baseUrl) != null
+
+internal fun collectLocalAnchorIds(root: Element): Map<String, String> {
+    val known = LinkedHashMap<String, String>()
+    for (el in root.select("[id]")) {
+        val id = el.attr("id").trim()
+        if (id.isNotEmpty()) {
+            known.putIfAbsent(id, id)
+            known.putIfAbsent(id.removePrefix(PROSE_ID_PREFIX_STR), id)
+        }
+    }
+    return known
+}
+
+internal fun resolveLocalAnchorTarget(
+    rawHref: String,
+    baseUrl: String?,
+    knownIds: Map<String, String>,
+): String? {
+    if (knownIds.isEmpty()) return null
+    val frag = extractSamePageFragment(rawHref, baseUrl) ?: return null
+    return knownIds[frag] ?: knownIds[frag.removePrefix(PROSE_ID_PREFIX_STR)]
+}
+
+internal fun synthesizeFootnoteIds(root: Element, baseUrl: String?) {
+    val existingIds = collectLocalAnchorIds(root).toMutableMap()
+    val anchors = root.select("a").toList()
+    val referencedFrags = HashSet<String>()
+    for (anchor in anchors) {
+        extractSamePageFragment(anchor.attr("href"), baseUrl)
+            ?.removePrefix(PROSE_ID_PREFIX_STR)
+            ?.takeIf { it.isNotEmpty() }
+            ?.let(referencedFrags::add)
+    }
+    if (referencedFrags.isEmpty()) return
+    for (anchor in anchors) {
+        assignSyntheticFootnoteId(anchor, baseUrl, referencedFrags, existingIds)
+    }
+}
+
+private fun assignSyntheticFootnoteId(
+    anchor: Element,
+    baseUrl: String?,
+    referencedFrags: Set<String>,
+    existingIds: MutableMap<String, String>,
+) {
+    val rawFrag = extractSamePageFragment(anchor.attr("href"), baseUrl) ?: return
+    val normFrag = rawFrag.removePrefix(PROSE_ID_PREFIX_STR)
+    val recip =
+        reciprocalFootnoteIds(normFrag).firstOrNull { candidate ->
+            candidate in referencedFrags && candidate !in existingIds
+        } ?: return
+    val synthId = "$PROSE_ID_PREFIX_STR$recip"
+    val hostLi = anchor.parents().firstOrNull { it.normalName() == "li" }
+    val targetEl =
+        if (isFootnoteBacklink(anchor) && hostLi != null && hostLi.attr("id").isBlank()) {
+            hostLi
+        } else if (anchor.attr("id").isBlank()) {
+            anchor
+        } else {
+            null
+        }
+    if (targetEl != null) {
+        targetEl.attr("id", synthId)
+        existingIds[synthId] = synthId
+        existingIds[recip] = synthId
+    }
+}
+
+internal fun reciprocalFootnoteIds(rawFrag: String): List<String> {
+    val frag = rawFrag.removePrefix(PROSE_ID_PREFIX_STR)
+    val linkCandidate = "$frag$FOOTNOTE_LINK_SUFFIX"
+    return when {
+        frag.endsWith(FOOTNOTE_LINK_SUFFIX) -> listOf(frag.removeSuffix(FOOTNOTE_LINK_SUFFIX))
+        frag.startsWith("footnote_") -> listOf("identifier_${frag.removePrefix("footnote_")}")
+        frag.startsWith("identifier_") -> listOf("footnote_${frag.removePrefix("identifier_")}")
+        frag.startsWith("fnref") -> listOf("fn${frag.removePrefix("fnref")}")
+        frag.startsWith("fn") -> listOf("fnref${frag.removePrefix("fn")}", linkCandidate)
+        frag.startsWith("footnote-anchor-") ->
+            listOf("footnote-${frag.removePrefix("footnote-anchor-")}")
+        frag.startsWith("footnote-ref-") -> listOf("footnote-${frag.removePrefix("footnote-ref-")}")
+        frag.startsWith("footnote-") ->
+            listOf(
+                "footnote-anchor-${frag.removePrefix("footnote-")}",
+                "footnote-ref-${frag.removePrefix("footnote-")}",
+                linkCandidate,
+            )
+        else -> reciprocalWikiOrNoteIds(frag, linkCandidate)
+    }
+}
+
+private fun reciprocalWikiOrNoteIds(frag: String, linkCandidate: String): List<String> =
+    when {
+        frag.startsWith("cite_note-") -> listOf("cite_ref-${frag.removePrefix("cite_note-")}")
+        frag.startsWith("cite_ref-") -> listOf("cite_note-${frag.removePrefix("cite_ref-")}")
+        frag.startsWith("noteref-") -> listOf("note-${frag.removePrefix("noteref-")}")
+        frag.startsWith("note-") -> listOf("noteref-${frag.removePrefix("note-")}", linkCandidate)
+        else -> listOf(linkCandidate)
+    }
 
 internal fun resolveSafeAnchorHref(rawHref: String, baseUrl: String?): String? {
     val trimmed = rawHref.trim()
@@ -205,7 +387,8 @@ internal fun ensureStrongHtml(html: String): String =
         "<strong>$html</strong>"
     }
 
-internal fun isFootnoteBackarrowAlt(alt: String?): Boolean = alt == "↩" || alt == "↩︎"
+internal fun isFootnoteBackarrowAlt(alt: String?): Boolean =
+    stripVariationChars(alt.orEmpty()).trim() == "↩"
 
 internal fun parseHtmlPixelDimension(raw: String): Int? {
     val trimmed = raw.trim()
@@ -248,12 +431,31 @@ internal fun validateArticleImgElement(img: Element, baseUrl: String?): Validate
     }
 }
 
-internal fun removeFootnoteBacklinks(root: Element) {
+internal fun isFootnoteBackarrowSrc(src: String): Boolean {
+    val lower = src.lowercase(Locale.US)
+    return lower.endsWith("/21a9.png") || lower.endsWith("/21a9.svg")
+}
+
+internal fun removeOrphanBacklinks(
+    root: Element,
+    baseUrl: String? = null,
+    knownIds: Map<String, String> = emptyMap(),
+) {
     for (anchor in root.select("a").toList()) {
-        if (anchor.attr("href").trim().startsWith("#") && isFootnoteBacklink(anchor)) {
+        val href = anchor.attr("href")
+        if (!isFootnoteBacklink(anchor)) continue
+        if (resolveLocalAnchorTarget(href, baseUrl, knownIds) != null) {
+            normalizeBacklinkArrowText(anchor)
+        } else if (isSamePageFragmentHref(href, baseUrl)) {
             stripLeadingVariationChars(anchor.nextSibling())
             anchor.remove()
         }
+    }
+}
+
+private fun normalizeBacklinkArrowText(anchor: Element) {
+    if (anchor.select(TAG_IMG).isEmpty() && stripVariationChars(anchor.text()).trim() == "↩") {
+        anchor.text(FOOTNOTE_BACKARROW_TEXT)
     }
 }
 
@@ -261,8 +463,14 @@ internal fun isFootnoteBacklink(anchor: Element): Boolean {
     val imgs = anchor.select(TAG_IMG)
     val cleanText = stripVariationChars(anchor.text()).trim()
     val hasOnlyArrowImgs =
-        imgs.isNotEmpty() && imgs.all { isFootnoteBackarrowAlt(it.attr("alt").trim()) }
-    return cleanText.isEmpty() && hasOnlyArrowImgs || imgs.isEmpty() && cleanText == "↩"
+        imgs.isNotEmpty() &&
+            imgs.all {
+                isFootnoteBackarrowAlt(it.attr("alt").trim()) ||
+                    isFootnoteBackarrowSrc(it.attr("src").trim())
+            }
+    val isBacklinkText =
+        cleanText in FOOTNOTE_BACKLINK_TEXTS || cleanText.equals("[return]", ignoreCase = true)
+    return cleanText.isEmpty() && hasOnlyArrowImgs || imgs.isEmpty() && isBacklinkText
 }
 
 internal fun stripLeadingVariationChars(node: Node?) {
@@ -282,9 +490,9 @@ internal fun transformInlineImages(root: Element, baseUrl: String?) {
         val classAttr = img.attr("class").lowercase(Locale.US)
         val alt = img.attr("alt").ifBlank { img.attr("title") }.trim()
         when {
-            isFootnoteBackarrowAlt(alt) -> {
+            isFootnoteBackarrowAlt(alt) || isFootnoteBackarrowSrc(src) -> {
                 stripLeadingVariationChars(img.nextSibling())
-                removeNodeAndEmptyAnchor(img)
+                img.replaceWith(TextNode(FOOTNOTE_BACKARROW_TEXT))
             }
             isInlineLatexSource(src, classAttr) -> {
                 replaceLatexImageNode(img, alt)
@@ -816,6 +1024,11 @@ private const val TAG_BR = "br"
 private const val TAG_EM = "em"
 private const val TAG_STRONG = "strong"
 private const val TAG_TT = "tt"
+private const val TAG_U = "u"
+private const val PROSE_ID_PREFIX_STR = "prose-"
+private const val FOOTNOTE_LINK_SUFFIX = "-link"
+private const val FOOTNOTE_BACKARROW_TEXT = "↩\uFE0E"
+private val FOOTNOTE_BACKLINK_TEXTS = setOf("↩", "⤴", "↑", "↵")
 
 private const val BR_HTML = "<br>"
 private const val DOUBLE_BR_HTML = "<br><br>"

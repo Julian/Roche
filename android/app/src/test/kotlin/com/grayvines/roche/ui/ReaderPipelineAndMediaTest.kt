@@ -1,8 +1,14 @@
 package com.grayvines.roche.ui
 
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.dp
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import com.grayvines.roche.core.PDF_MAGIC_BYTES
+import com.grayvines.roche.data.feeds.LocalFeedPoller
+import com.grayvines.roche.data.feeds.extractWebPageSnapshot
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.HttpTransport
 import com.grayvines.roche.data.remote.PublicWebFetcher
@@ -27,9 +33,12 @@ import com.grayvines.roche.model.extractAllImageUrlsFromHtml
 import com.grayvines.roche.model.extractFirstImageUrlFromHtml
 import com.grayvines.roche.reader.ArticleBlock
 import com.grayvines.roche.reader.ArticleBlockCache
+import com.grayvines.roche.reader.applyMarkBackgroundHex
 import com.grayvines.roche.reader.hasVisibleHtmlText
 import com.grayvines.roche.reader.parseHtmlArticleBlocks
 import com.grayvines.roche.reader.parseHtmlArticleDocument
+import com.grayvines.roche.reader.prepareInlineHtmlForCompose
+import com.grayvines.roche.reader.sanitizeRocheHtml
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
@@ -444,6 +453,197 @@ internal class ReaderPipelineAndMediaTest {
                 isAwaitingBody = false,
             ),
         )
+    }
+
+    @Test
+    fun `semantic HTML normalizer preserves byline italics, inline styles, and rich tags`() {
+        val articleUrl = "https://proofsandprompts.com/2026/11/22/a-mathematical-community/"
+        val rssXml =
+            """<?xml version="1.0" encoding="UTF-8"?>""" +
+                """<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">""" +
+                "<channel><title>Proofs and Prompts</title><item>" +
+                "<title>A mathematical community?</title><link>$articleUrl</link>" +
+                "<content:encoded><![CDATA[" +
+                """<p class="author-line wp-block-paragraph"><a href="https://www.jm-kantor.fr/">Jean-Michel Kantor</a>, Emeritus from IMJ</p>""" +
+                """<p class="pp-in-reply-to"><strong>In reply to</strong> <a href="https://proofsandprompts.com/slow/">Slow Maths</a></p>""" +
+                """<p><span style="font-style: italic">Slanted</span> <span style="font-weight: 700">Heavy</span> """ +
+                """<span style="text-decoration: line-through">Old</span> <span style="text-decoration: underline">New</span> """ +
+                """<span style="display: none">Secret</span></p>""" +
+                """<div class="author-line"><p style="font-style: normal">Explicitly upright</p></div>""" +
+                """<figure><img src="https://proofsandprompts.com/fig.png" alt="Diagram"><figcaption>Caption</figcaption></figure>""" +
+                "<hr><p><del>gone</del> <ins>added</ins> <mark>key</mark> <kbd>Esc</kbd> <dfn>def</dfn></p>" +
+                "<details><summary>More</summary><p>Inside</p></details>" +
+                """<ol><li id="fn-1">Note <script>alert(1)</script><a href="javascript:alert(2)">bad</a></li></ol>""" +
+                "]]></content:encoded></item></channel></rss>"
+
+        val parsed =
+            LocalFeedPoller.parseFeedXml(rssXml, "https://proofsandprompts.com/feed/", "rss")
+        val cleaned = parsed.items.single().contentHtml.orEmpty()
+
+        assertTrue(
+            """<p><em><a href="https://www.jm-kantor.fr/">Jean-Michel Kantor</a>, Emeritus from IMJ</em></p>""" in
+                cleaned
+        )
+        assertTrue("<p><small><strong>In reply to</strong>" in cleaned)
+        assertTrue("<em>Slanted</em>" in cleaned && "<strong>Heavy</strong>" in cleaned)
+        assertTrue("<s>Old</s>" in cleaned && "<u>New</u>" in cleaned)
+        assertFalse("Secret" in cleaned)
+        assertTrue("<p>Explicitly upright</p>" in cleaned)
+        assertTrue("<figure>" in cleaned && "<figcaption>Caption</figcaption>" in cleaned)
+        assertTrue(
+            "<hr>" in cleaned && "<del>gone</del>" in cleaned && "<ins>added</ins>" in cleaned
+        )
+        assertTrue(
+            "<mark>key</mark>" in cleaned &&
+                "<kbd>Esc</kbd>" in cleaned &&
+                "<dfn>def</dfn>" in cleaned
+        )
+        assertTrue("<details>" in cleaned && "<summary>More</summary>" in cleaned)
+        assertTrue("""id="prose-fn-1"""" in cleaned)
+        assertFalse("alert(1)" in cleaned || "javascript:" in cleaned)
+
+        val reCleaned = sanitizeRocheHtml(cleaned, articleUrl)
+        assertFalse("<em><em>" in reCleaned || "prose-prose-" in reCleaned)
+    }
+
+    @Test
+    fun `extractWebPageSnapshot lifts stylesheet rules and selects entry-content over sidebar comments`() {
+        val articleUrl = "https://proofsandprompts.com/2026/11/22/a-mathematical-community/"
+        val pageHtml =
+            "<!DOCTYPE html><html><head>" +
+                "<title>A mathematical community? — Proofs and Prompts</title>" +
+                "<style>.custom-dek { font-style: italic; }</style>" +
+                "</head><body>" +
+                """<aside class="sidebar"><article class="wp-block-latest-comments__comment">""" +
+                "<p>Sidebar comment that should not win over entry-content.</p>" +
+                "</article></aside>" +
+                """<main><div class="entry-content wp-block-post-content">""" +
+                """<p class="custom-dek">Custom stylesheet dek line.</p>""" +
+                "<p>Main article body paragraph.</p>" +
+                """<div class="sharedaddy">Share on X</div>""" +
+                "</div></main></body></html>"
+
+        val snapshot = extractWebPageSnapshot(pageHtml, articleUrl)
+        val snapHtml = snapshot.contentHtml.orEmpty()
+
+        assertTrue("<p><em>Custom stylesheet dek line.</em></p>" in snapHtml)
+        assertTrue("Main article body paragraph." in snapHtml)
+        assertFalse("Sidebar comment" in snapHtml)
+        assertFalse("Share on X" in snapHtml)
+    }
+
+    @Test
+    fun `reader AST strips duplicate h1, preserves paired footnote arrows, and renders ins q dfn mark`() =
+        runTest {
+            val baseUrl = "https://proofsandprompts.com/2026/11/22/a-mathematical-community/"
+            val html =
+                "<h1>A mathematical community?</h1>" +
+                    """<p class="author-line"><a href="https://www.jm-kantor.fr/">Jean-Michel Kantor</a></p>""" +
+                    "<p>She said <q>hello</q> with <ins>added</ins>, <dfn>lemma</dfn>, <mark>key</mark>, " +
+                    """and note<sup><a id="prose-fn-1-link" href="$baseUrl#prose-fn-1">1</a></sup>.</p>""" +
+                    "<h2>1. Section</h2>" +
+                    """<ol><li id="prose-fn-1">Footnote text """ +
+                    """<a href="$baseUrl#prose-fn-1-link"><img src="https://s.w.org/images/core/emoji/17.0.2/72x72/21a9.png" alt="↩">︎</a></li></ol>"""
+
+            val doc =
+                parseHtmlArticleDocument(
+                    rawHtml = html,
+                    baseUrl = baseUrl,
+                    articleTitle = "A mathematical community?",
+                )
+            assertEquals(listOf("1. Section"), doc.outlineHeadings)
+            assertEquals(listOf(2), doc.orderedHeadingBlockIndices)
+            assertEquals(1, doc.anchorBlockIndices["prose-fn-1-link"])
+            assertEquals(3, doc.anchorBlockIndices["prose-fn-1"])
+
+            val byline = doc.blocks[0] as ArticleBlock.Paragraph
+            assertTrue(
+                """<em><a href="https://www.jm-kantor.fr/">Jean-Michel Kantor</a></em>""" in
+                    byline.html
+            )
+
+            val bodyPara = doc.blocks[1] as ArticleBlock.Paragraph
+            assertTrue("“hello”" in bodyPara.html && "<u>added</u>" in bodyPara.html)
+            assertTrue("<em>lemma</em>" in bodyPara.html && "<mark>key</mark>" in bodyPara.html)
+            assertTrue(
+                """<sup><a id="prose-fn-1-link" href="#prose-fn-1">1</a></sup>""" in bodyPara.html
+            )
+
+            val footnotes = doc.blocks[3] as ArticleBlock.ListBlock
+            assertEquals(
+                listOf("""Footnote text <a href="#prose-fn-1-link">↩︎</a>"""),
+                footnotes.itemsHtml,
+            )
+
+            val cache = ArticleBlockCache(maxEntries = 4)
+            val stripped =
+                cache.getOrParse(html, baseUrl, articleTitle = "A mathematical community?")
+            val kept = cache.getOrParse(html, baseUrl, articleTitle = "Different Title")
+            assertEquals(listOf("1. Section"), stripped.outlineHeadings)
+            assertEquals(listOf("A mathematical community?", "1. Section"), kept.outlineHeadings)
+        }
+
+    @Test
+    fun `legacy stored footnotes without id attributes still pair into live bidirectional Android jumps`() {
+        val baseUrl = "https://proofsandprompts.com/2026/11/22/a-mathematical-community/"
+        val legacyHtml =
+            """<p>See note<sup><a href="$baseUrl#3f6c1a52-8d4e">1</a></sup>.</p>""" +
+                "<p>Middle paragraph.</p>" +
+                """<ol><li>Source <a href="$baseUrl#3f6c1a52-8d4e-link">""" +
+                """<img src="https://s.w.org/images/core/emoji/17.0.2/72x72/21a9.png" alt="↩">︎</a></li></ol>"""
+
+        val doc = parseHtmlArticleDocument(rawHtml = legacyHtml, baseUrl = baseUrl)
+        val bodyPara = doc.blocks[0] as ArticleBlock.Paragraph
+        val footnotes = doc.blocks[2] as ArticleBlock.ListBlock
+
+        assertEquals(0, doc.anchorBlockIndices["prose-3f6c1a52-8d4e-link"])
+        assertEquals(2, doc.anchorBlockIndices["prose-3f6c1a52-8d4e"])
+        assertTrue(
+            """<a href="#prose-3f6c1a52-8d4e" id="prose-3f6c1a52-8d4e-link">1</a>""" in
+                bodyPara.html
+        )
+        assertEquals(
+            listOf("""Source <a href="#prose-3f6c1a52-8d4e-link">↩︎</a>"""),
+            footnotes.itemsHtml,
+        )
+    }
+
+    @Test
+    fun `mark highlight tags and nested italic inversion preserve typographic contrast`() {
+        assertEquals(
+            """<span style="background-color:#3D3424">key</span>""",
+            applyMarkBackgroundHex("<mark>key</mark>", "#3D3424"),
+        )
+        assertEquals(
+            """<u>ins</u> “q” <em>def</em> <span style="background-color:#E8D8B8">hi</span>""",
+            prepareInlineHtmlForCompose(
+                "<ins>ins</ins> <q>q</q> <dfn>def</dfn> <mark>hi</mark>",
+                markBackgroundHex = "#E8D8B8",
+            ),
+        )
+
+        val nestedItalic = buildAnnotatedString {
+            append("Read On Proof now")
+            addStyle(SpanStyle(fontStyle = FontStyle.Italic), 5, 13)
+        }
+        val inverted =
+            applyRichInlineSpanStyles(
+                base = nestedItalic,
+                codeBackground = Color.DarkGray,
+                invertItalics = true,
+            )
+        assertTrue(
+            inverted.spanStyles.any {
+                it.start == 5 && it.end == 13 && it.item.fontStyle == FontStyle.Normal
+            }
+        )
+        val nonInverted =
+            applyRichInlineSpanStyles(
+                base = nestedItalic,
+                codeBackground = Color.DarkGray,
+                invertItalics = false,
+            )
+        assertFalse(nonInverted.spanStyles.any { it.item.fontStyle == FontStyle.Normal })
     }
 
     private fun sampleEntry(url: String): InboxEntry =

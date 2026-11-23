@@ -290,6 +290,7 @@ private fun RenderImageCaption(
             codeBackground = colors.surfaceElevated,
             baseUrl = baseUrl,
             onOpenUrl = onOpenUrl,
+            invertItalics = true,
         )
     Text(
         text = annotated,

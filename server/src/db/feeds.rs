@@ -1360,6 +1360,7 @@ impl<'a> FeedRepo<'a> {
             && clean_duration.is_none()
             && item.thumbnail_url.is_none()
             && item.creators.is_empty()
+            && item.content_html.as_deref().is_none_or(|h| h.trim().is_empty())
         {
             return Ok(());
         }
@@ -1373,38 +1374,17 @@ impl<'a> FeedRepo<'a> {
             None
         };
 
-        let mut entry_hlc_bumped = false;
         let mut changed = false;
-
-        let entry_hlc = tx.next_hlc().await?;
-        let entry_res = sqlx::query(
-            "UPDATE entries
-             SET thumbnail_url = COALESCE(thumbnail_url, ?),
-                 creators_json = CASE WHEN creators_json = '[]' AND ? IS NOT NULL THEN ? ELSE creators_json END,
-                 kind = CASE WHEN ? IS NOT NULL AND kind = 'article' THEN 'podcast_episode' ELSE kind END,
-                 updated_at = ?,
-                 hlc = ?
-             WHERE id = ?
-               AND ((thumbnail_url IS NULL AND ? IS NOT NULL)
-                    OR (creators_json = '[]' AND ? IS NOT NULL)
-                    OR (kind = 'article' AND ? IS NOT NULL))",
+        let entry_hlc_bumped = Self::backfill_poll_entry_metadata_in_tx(
+            tx,
+            existing_id,
+            thumb_ref,
+            creators_ref,
+            podcast_audio_ref,
+            now,
         )
-        .bind(thumb_ref)
-        .bind(creators_ref)
-        .bind(creators_ref)
-        .bind(podcast_audio_ref)
-        .bind(now)
-        .bind(&entry_hlc)
-        .bind(existing_id)
-        .bind(thumb_ref)
-        .bind(creators_ref)
-        .bind(podcast_audio_ref)
-        .execute(tx.conn())
         .await?;
-        if entry_res.rows_affected() > 0 {
-            entry_hlc_bumped = true;
-            changed = true;
-        }
+        changed |= entry_hlc_bumped;
 
         if podcast_audio_ref.is_some() {
             let ct_res = sqlx::query!(
@@ -1432,6 +1412,23 @@ impl<'a> FeedRepo<'a> {
             changed |= enclosure_updated;
         }
 
+        if let Some(incoming_html) = item.content_html.as_deref().filter(|h| !h.trim().is_empty()) {
+            let resolved_ct =
+                if parent_feed_type == Some(FeedType::Podcast) && item.audio_url.is_some() {
+                    ContentType::Audio
+                } else {
+                    item.content_type
+                };
+            let html_updated = Self::backfill_poll_html_content_in_tx(
+                tx.conn(),
+                existing_id,
+                incoming_html,
+                resolved_ct,
+            )
+            .await?;
+            changed |= html_updated;
+        }
+
         if changed && !entry_hlc_bumped {
             let backfill_hlc = tx.next_hlc().await?;
             sqlx::query("UPDATE entries SET updated_at = ?, hlc = ? WHERE id = ?")
@@ -1453,6 +1450,72 @@ impl<'a> FeedRepo<'a> {
             .await?;
         }
         Ok(())
+    }
+
+    async fn backfill_poll_entry_metadata_in_tx(
+        tx: &mut WriteTx<'_>,
+        existing_id: &str,
+        thumb_ref: Option<&str>,
+        creators_ref: Option<&str>,
+        podcast_audio_ref: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        let entry_hlc = tx.next_hlc().await?;
+        let entry_res = sqlx::query(
+            "UPDATE entries
+             SET thumbnail_url = COALESCE(thumbnail_url, ?),
+                 creators_json = CASE WHEN creators_json = '[]' AND ? IS NOT NULL THEN ? ELSE creators_json END,
+                 kind = CASE WHEN ? IS NOT NULL AND kind = 'article' THEN 'podcast_episode' ELSE kind END,
+                 updated_at = ?,
+                 hlc = ?
+             WHERE id = ?
+               AND ((thumbnail_url IS NULL AND ? IS NOT NULL)
+                    OR (creators_json = '[]' AND ? IS NOT NULL)
+                    OR (kind = 'article' AND ? IS NOT NULL))",
+        )
+        .bind(thumb_ref)
+        .bind(creators_ref)
+        .bind(creators_ref)
+        .bind(podcast_audio_ref)
+        .bind(now)
+        .bind(&entry_hlc)
+        .bind(existing_id)
+        .bind(thumb_ref)
+        .bind(creators_ref)
+        .bind(podcast_audio_ref)
+        .execute(tx.conn())
+        .await?;
+        Ok(entry_res.rows_affected() > 0)
+    }
+
+    async fn backfill_poll_html_content_in_tx(
+        conn: &mut SqliteConnection,
+        existing_id: &str,
+        incoming_html: &str,
+        resolved_ct: ContentType,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        let existing_html: Option<String> =
+            sqlx::query_scalar("SELECT content_html FROM entry_content WHERE entry_id = ?")
+                .bind(existing_id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .flatten();
+        let merged_html =
+            roche_core::crdt::pick_richer_text(existing_html.as_deref(), Some(incoming_html));
+        if merged_html == existing_html.as_deref() {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO entry_content (entry_id, content_html, content_type)
+             VALUES (?, ?, ?)
+             ON CONFLICT(entry_id) DO UPDATE SET content_html = excluded.content_html",
+        )
+        .bind(existing_id)
+        .bind(merged_html)
+        .bind(resolved_ct)
+        .execute(conn)
+        .await?;
+        Ok(true)
     }
 
     async fn backfill_poll_audio_enclosure_in_tx(

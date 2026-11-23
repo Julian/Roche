@@ -20,6 +20,9 @@ import com.grayvines.roche.data.local.enrichEntryMetadataIfPresent
 import com.grayvines.roche.data.remote.PublicWebFetcher
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.inferContentType
+import com.grayvines.roche.reader.parseStylesheetRules
+import com.grayvines.roche.reader.sanitizeRocheHtml
+import com.grayvines.roche.reader.selectArticleContainer
 import java.net.URI
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
@@ -282,14 +285,10 @@ internal fun extractWebPageSnapshot(rawHtml: String, pageUrl: String): Extracted
             ?.absUrl(ATTR_CONTENT)
             ?.trim()
             ?.takeIf { isHttpOrHttpsUrl(it) }
-    doc.select("script, style, noscript, nav, header, footer, aside, form, iframe").remove()
-    val container =
-        doc.selectFirst("article")
-            ?: doc.selectFirst("main")
-            ?: doc.selectFirst("[role=main]")
-            ?: doc.body()
+    val cssRules = parseStylesheetRules(doc)
+    val container = selectArticleContainer(doc)
     val bodyHtml =
-        sanitizeFeedHtml(container.html(), pageUrl)
+        sanitizeRocheHtml(container.html(), pageUrl, cssRules)
             .takeIf { it.isNotBlank() }
             ?.take(MAX_SQLITE_HTML_CHARS)
     return ExtractedWebPageSnapshot(

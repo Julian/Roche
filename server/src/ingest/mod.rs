@@ -940,4 +940,73 @@ mod tests {
         assert!(pod_text.audio_url.is_none());
         assert!(pod_text.duration.is_none());
     }
+
+    #[tokio::test]
+    async fn test_repoll_upgrades_existing_item_html_when_richer_without_clobbering_full_text() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://proofsandprompts.com/feed/").unwrap();
+        let feed = db.feeds().create(FeedType::Rss, &feed_url, None, None).await.unwrap();
+
+        let legacy_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+        <channel>
+            <title>Proofs and Prompts</title>
+            <link>https://proofsandprompts.com</link>
+            <item>
+                <title>A mathematical community?</title>
+                <link>https://proofsandprompts.com/2026/11/22/a-mathematical-community/</link>
+                <content:encoded><![CDATA[<p><a href="https://www.jm-kantor.fr/">Jean-Michel Kantor</a>, Emeritus</p><p>Body text.</p>]]></content:encoded>
+            </item>
+        </channel>
+        </rss>"#;
+        let first_batch = FeedIngester::parse_feed_content(FeedType::Rss, legacy_xml).unwrap();
+        let inserted = db.feeds().record_poll_batch(&feed.id, &first_batch).await.unwrap();
+        assert_eq!(inserted.len(), 1);
+        let item_id = &inserted[0].0;
+        let initial = db.items().get(item_id).await.unwrap().unwrap();
+        assert!(!initial.content_html.as_deref().unwrap().contains("<em>"));
+
+        // Re-polling with semantic `author-line` class upgrades stored HTML via pick_richer_text.
+        let semantic_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+        <channel>
+            <title>Proofs and Prompts</title>
+            <link>https://proofsandprompts.com</link>
+            <item>
+                <title>A mathematical community?</title>
+                <link>https://proofsandprompts.com/2026/11/22/a-mathematical-community/</link>
+                <content:encoded><![CDATA[<p class="author-line wp-block-paragraph"><a href="https://www.jm-kantor.fr/">Jean-Michel Kantor</a>, Emeritus</p><p>Body text.</p>]]></content:encoded>
+            </item>
+        </channel>
+        </rss>"#;
+        let second_batch = FeedIngester::parse_feed_content(FeedType::Rss, semantic_xml).unwrap();
+        let reinserted = db.feeds().record_poll_batch(&feed.id, &second_batch).await.unwrap();
+        assert!(reinserted.is_empty());
+        let upgraded = db.items().get(item_id).await.unwrap().unwrap();
+        assert!(
+            upgraded
+                .content_html
+                .as_deref()
+                .unwrap()
+                .contains("<p><em><a href=\"https://www.jm-kantor.fr/\"")
+        );
+
+        // A shorter teaser on a later poll must NOT clobber the richer stored HTML.
+        let teaser_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0">
+        <channel>
+            <title>Proofs and Prompts</title>
+            <link>https://proofsandprompts.com</link>
+            <item>
+                <title>A mathematical community?</title>
+                <link>https://proofsandprompts.com/2026/11/22/a-mathematical-community/</link>
+                <description>Short teaser.</description>
+            </item>
+        </channel>
+        </rss>"#;
+        let third_batch = FeedIngester::parse_feed_content(FeedType::Rss, teaser_xml).unwrap();
+        let _ = db.feeds().record_poll_batch(&feed.id, &third_batch).await.unwrap();
+        let preserved = db.items().get(item_id).await.unwrap().unwrap();
+        assert_eq!(preserved.content_html, upgraded.content_html);
+    }
 }

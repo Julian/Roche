@@ -1,5 +1,6 @@
 pub mod html;
 pub mod http;
+pub mod semantic_html;
 
 pub use html::{HtmlSanitizer, MAX_SUMMARY_CHARS};
 pub use http::SafeHttpClient;

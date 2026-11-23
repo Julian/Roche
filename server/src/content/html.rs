@@ -1,9 +1,12 @@
-use std::{borrow::Cow, collections::HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use quick_xml::{Reader, events::Event};
 use url::Url;
 
-use super::xml_util;
+use super::{semantic_html, xml_util};
 use crate::util::{
     media_urls::{extract_youtube_channel_id, is_youtube_host, youtube_feed_url_for_channel_id},
     url_guard::{sanitize_public_http_href, validate_public_url},
@@ -30,12 +33,18 @@ impl HtmlSanitizer {
 
     #[must_use]
     pub fn clean_with_base(html: &str, base_url: Option<&Url>) -> String {
+        let prepared = semantic_html::preprocess_semantic_html(html, &HashMap::new(), false);
+        Self::sanitize_prepared_html(&prepared, base_url)
+    }
+
+    fn sanitize_prepared_html(html: &str, base_url: Option<&Url>) -> String {
         let valid_base = base_url.filter(|base| validate_public_url(base).is_ok()).cloned();
         let filter_base = valid_base.clone();
 
         let mut builder = ammonia::Builder::default();
         builder.url_schemes(HashSet::from(["http", "https", "mailto"]));
         builder.add_clean_content_tags(["head", "title", "noscript", "template", "svg", "math"]);
+        builder.add_generic_attributes(["id"]);
         builder.set_tag_attribute_value("img", "referrerpolicy", "no-referrer");
         builder.set_tag_attribute_value("img", "loading", "lazy");
         builder.set_tag_attribute_value("img", "decoding", "async");
@@ -43,6 +52,9 @@ impl HtmlSanitizer {
             builder.url_relative(ammonia::UrlRelative::RewriteWithBase(base));
         }
         builder.attribute_filter(move |element, attribute, value| {
+            if attribute.eq_ignore_ascii_case("id") {
+                return semantic_html::normalize_prose_id(value);
+            }
             Self::filter_sanitized_url_attr(element, attribute, value, filter_base.as_ref())
         });
         builder.clean(html).to_string()
@@ -257,7 +269,9 @@ impl HtmlSanitizer {
 
         let (title, author, meta_desc, meta_image) =
             Self::parse_title_and_meta(&normalized_meta_html, base_url);
-        let content_html = Self::clean_with_base(raw_html, base_url);
+        let css_rules = semantic_html::parse_stylesheet_typographic_rules(raw_html);
+        let prepared_body = semantic_html::preprocess_semantic_html(raw_html, &css_rules, true);
+        let content_html = Self::sanitize_prepared_html(&prepared_body, base_url);
         let thumbnail_url =
             meta_image.or_else(|| Self::extract_first_image_url_with_base(raw_html, base_url));
         let summary = meta_desc
@@ -886,5 +900,64 @@ mod tests {
         );
         assert!(!cleaned_priv.contains("secret.png"));
         assert!(!cleaned_priv.contains("logout"));
+    }
+
+    #[test]
+    fn test_clean_and_extract_snapshot_preserve_byline_italics_inline_styles_and_idempotency() {
+        let base = Url::parse("https://proofsandprompts.com/2026/11/22/a-mathematical-community/")
+            .unwrap();
+        let rss_html = r#"
+            <p class="author-line wp-block-paragraph"><a href="https://www.jm-kantor.fr/">Jean-Michel Kantor</a>, Emeritus from IMJ</p>
+            <p class="pp-in-reply-to wp-block-paragraph"><strong>In reply to</strong> <a href="https://proofsandprompts.com/2026/11/03/slow-maths/">Slow Maths</a></p>
+            <p>Inline <span style="font-style: italic">italics</span>, <span style="font-weight: 700">bold</span>, <span style="text-decoration: underline">under</span>, <span style="text-decoration: line-through">strike</span><span style="display:none">hidden</span>.</p>
+            <ol><li id="fn-1">Footnote text</li></ol>
+        "#;
+        let clean1 = HtmlSanitizer::clean_with_base(rss_html, Some(&base));
+        assert!(clean1.contains(
+            "<p><em><a href=\"https://www.jm-kantor.fr/\" rel=\"noopener noreferrer\">Jean-Michel Kantor</a>, Emeritus from IMJ</em></p>"
+        ));
+        assert!(clean1.contains("<p><small><strong>In reply to</strong>"));
+        assert!(clean1.contains("<em>italics</em>"));
+        assert!(clean1.contains("<strong>bold</strong>"));
+        assert!(clean1.contains("<u>under</u>"));
+        assert!(clean1.contains("<s>strike</s>"));
+        assert!(!clean1.contains("hidden"));
+        assert!(clean1.contains("id=\"prose-fn-1\""));
+
+        // Running clean_with_base a second time (as Web reader does) must be strictly idempotent.
+        let clean2 = HtmlSanitizer::clean_with_base(&clean1, Some(&base));
+        assert_eq!(clean1, clean2);
+
+        // Full webpage extraction lifts site <style> rules, picks .entry-content over sidebar <article> comments,
+        // and strips Jetpack share widgets and chrome.
+        let full_page = r#"<!DOCTYPE html>
+        <html>
+          <head>
+            <title>A mathematical community? – Proofs and Prompts</title>
+            <style>.custom-dek { font-style: italic; } .author-line { font-style: italic; }</style>
+          </head>
+          <body>
+            <header><nav><a href="/">Home</a></nav></header>
+            <main>
+              <div class="entry-content wp-block-post-content">
+                <p class="author-line wp-block-paragraph"><a href="https://www.jm-kantor.fr/">Jean-Michel Kantor</a>, Emeritus</p>
+                <p class="custom-dek">A reply to Isabelle Gallagher.</p>
+                <p>Body text.</p>
+                <div class="sharedaddy"><h3>Share this:</h3><a href="/share">Mastodon</a></div>
+              </div>
+              <aside>
+                <ul class="wp-block-latest-comments">
+                  <li class="wp-block-latest-comments__comment"><article><p>Sidebar comment noise</p></article></li>
+                </ul>
+              </aside>
+            </main>
+          </body>
+        </html>"#;
+        let snap = HtmlSanitizer::extract_snapshot_with_base(full_page, Some(&base));
+        assert!(snap.content_html.contains("<em><a href=\"https://www.jm-kantor.fr/\""));
+        assert!(snap.content_html.contains("<p><em>A reply to Isabelle Gallagher.</em></p>"));
+        assert!(snap.content_html.contains("<p>Body text.</p>"));
+        assert!(!snap.content_html.contains("Sidebar comment noise"));
+        assert!(!snap.content_html.contains("Share this:"));
     }
 }

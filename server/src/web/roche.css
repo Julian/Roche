@@ -3019,6 +3019,137 @@ article.reader-article {
   margin: 0 0 1.1em;
 }
 
+.reader-prose p:empty {
+  display: none;
+}
+
+.reader-prose ul,
+.reader-prose ol {
+  margin: 0.9em 0 1.15em;
+  padding-left: 1.6rem;
+}
+
+.reader-prose li {
+  margin-bottom: 0.42em;
+}
+
+.reader-prose li > p {
+  margin: 0 0 0.55em;
+}
+
+.reader-prose li > p:last-child {
+  margin-bottom: 0;
+}
+
+.reader-prose li > ul,
+.reader-prose li > ol {
+  margin: 0.4em 0;
+}
+
+.reader-prose dl {
+  margin: 1rem 0 1.25rem;
+}
+
+.reader-prose dt {
+  font-weight: 600;
+  color: var(--ink);
+  margin-top: 0.85em;
+}
+
+.reader-prose dd {
+  margin: 0.2em 0 0.65em 1.4rem;
+}
+
+.reader-prose sup,
+.reader-prose sub {
+  font-size: 0.74em;
+  line-height: 0;
+  position: relative;
+  vertical-align: baseline;
+}
+
+.reader-prose sup {
+  top: -0.45em;
+}
+
+.reader-prose sub {
+  bottom: -0.25em;
+}
+
+.reader-prose [id] {
+  scroll-margin-top: 76px;
+}
+
+.reader-prose sup a,
+.reader-prose a[href^="#prose-"] {
+  text-decoration: none;
+  padding: 0 0.1em;
+}
+
+.reader-prose sup a:hover,
+.reader-prose a[href^="#prose-"]:hover {
+  text-decoration: underline;
+}
+
+.reader-prose small {
+  font-size: 0.88em;
+  color: var(--ink-soft);
+}
+
+.reader-prose mark {
+  background: var(--badge-bg);
+  color: var(--ink);
+  padding: 0.05em 0.25em;
+  border-radius: 2px;
+  border-bottom: 1.5px solid var(--accent);
+}
+
+.reader-prose del,
+.reader-prose s {
+  color: var(--ink-soft);
+}
+
+.reader-prose ins {
+  text-decoration: underline;
+  text-decoration-color: var(--tier-A);
+  text-underline-offset: 0.16em;
+}
+
+.reader-prose kbd {
+  font-family: var(--mono);
+  font-size: 0.82em;
+  background: var(--paper-deep);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 0.08em 0.32em;
+}
+
+.reader-prose abbr[title] {
+  text-decoration: underline dotted var(--control-border);
+  text-underline-offset: 0.16em;
+  cursor: help;
+}
+
+.reader-prose details {
+  border: 1px solid var(--rule);
+  background: var(--paper-deep);
+  padding: 0.6rem 0.9rem;
+  margin: 1.1rem 0;
+  border-radius: 2px;
+}
+
+.reader-prose details > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.reader-prose details[open] > summary {
+  margin-bottom: 0.65rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--rule);
+}
+
 .reader-prose h1,
 .reader-prose h2,
 .reader-prose h3 {
@@ -3098,6 +3229,28 @@ article.reader-article {
   border-left: 2.5px solid var(--accent);
   color: var(--ink-soft);
   font-style: italic;
+}
+
+.reader-prose blockquote > p:last-child {
+  margin-bottom: 0;
+}
+
+.reader-prose blockquote em,
+.reader-prose blockquote i,
+.reader-prose blockquote cite,
+.reader-prose blockquote dfn,
+.reader-prose figcaption em,
+.reader-prose figcaption i {
+  font-style: normal;
+}
+
+.reader-prose blockquote > cite,
+.reader-prose blockquote > footer {
+  display: block;
+  margin-top: 0.55rem;
+  font-style: normal;
+  font-size: 0.88em;
+  color: var(--ink-faint);
 }
 
 .reader-prose pre {
@@ -3270,6 +3423,19 @@ article.reader-article {
   border: 1px solid var(--rule);
   padding: 0.35rem 0.55rem;
   text-align: left;
+}
+
+.reader-prose th {
+  background: var(--paper-deep);
+  font-weight: 600;
+}
+
+.reader-prose table caption {
+  font-size: 0.88em;
+  font-style: italic;
+  color: var(--ink-soft);
+  text-align: left;
+  margin-bottom: 0.4rem;
 }
 
 .reader-rail-actions {

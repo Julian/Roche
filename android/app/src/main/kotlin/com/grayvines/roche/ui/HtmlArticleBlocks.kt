@@ -34,6 +34,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -70,15 +71,30 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.reader.ArticleBlock
+import com.grayvines.roche.reader.applyMarkBackgroundHex
 import com.grayvines.roche.reader.prepareInlineHtmlForCompose
 import com.grayvines.roche.reader.resolveSafeAnchorHref
 import com.grayvines.roche.reader.stripInlineHtmlToPlainText
 import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
+import java.util.Locale
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+internal val LocalReaderAnchorNavigator = staticCompositionLocalOf<((String) -> Unit)?> { null }
+
+internal fun readerMarkHighlightColor(isDark: Boolean): Color =
+    if (isDark) Color(0xFF3D3424) else Color(0xFFE8D8B8)
+
+private fun Color.toHexRgbString(): String {
+    val r = (red * 255f).toInt().coerceIn(0, 255)
+    val g = (green * 255f).toInt().coerceIn(0, 255)
+    val b = (blue * 255f).toInt().coerceIn(0, 255)
+    return "#%02X%02X%02X".format(Locale.US, r, g, b)
+}
+
+@Suppress("LongParameterList")
 internal fun htmlToComposeAnnotatedString(
     html: String,
     linkStyles: TextLinkStyles,
@@ -86,8 +102,24 @@ internal fun htmlToComposeAnnotatedString(
     baseUrl: String? = null,
     linkInteractionListener: LinkInteractionListener? = null,
     isPreNormalized: Boolean = false,
+    markBackground: Color = Color.Unspecified,
+    invertItalics: Boolean = false,
 ): AnnotatedString {
-    val prepared = if (isPreNormalized) html else prepareInlineHtmlForCompose(html, baseUrl)
+    val markHex = markBackground.takeIf { it != Color.Unspecified }?.toHexRgbString()
+    val prepared =
+        if (isPreNormalized) {
+            if (markHex != null && html.contains("<mark", ignoreCase = true)) {
+                applyMarkBackgroundHex(html, markHex)
+            } else {
+                html
+            }
+        } else {
+            prepareInlineHtmlForCompose(
+                htmlFragment = html,
+                baseUrl = baseUrl,
+                markBackgroundHex = markHex,
+            )
+        }
     val base =
         AnnotatedString.fromHtml(
             htmlString = prepared,
@@ -96,12 +128,14 @@ internal fun htmlToComposeAnnotatedString(
         )
     val needsCustomSpans =
         base.spanStyles.any {
-            it.item.fontFamily == FontFamily.Monospace || isSubOrSuperscript(it.item)
+            it.item.fontFamily == FontFamily.Monospace ||
+                isSubOrSuperscript(it.item) ||
+                invertItalics && it.item.fontStyle == FontStyle.Italic
         }
     return if (!needsCustomSpans) {
         base
     } else {
-        applyRichInlineSpanStyles(base, codeBackground)
+        applyRichInlineSpanStyles(base, codeBackground, invertItalics)
     }
 }
 
@@ -113,8 +147,11 @@ internal fun rememberRichHtmlText(
     baseUrl: String? = null,
     onOpenUrl: ((String) -> Unit)? = null,
     isPreNormalized: Boolean = true,
+    invertItalics: Boolean = false,
 ): AnnotatedString {
+    val markBackground = readerMarkHighlightColor(LocalRocheColors.current.isDark)
     val uriHandler = LocalUriHandler.current
+    val currentAnchorNavigator by rememberUpdatedState(LocalReaderAnchorNavigator.current)
     val currentOnOpenUrl by rememberUpdatedState(onOpenUrl)
     val currentUriHandler by rememberUpdatedState(uriHandler)
     val linkListener =
@@ -124,11 +161,21 @@ internal fun rememberRichHtmlText(
                     link = link,
                     baseUrl = baseUrl,
                     onOpenUrl = currentOnOpenUrl,
+                    onJumpToAnchor = currentAnchorNavigator,
                     fallbackOpenUri = { url -> currentUriHandler.openUri(url) },
                 )
             }
         }
-    return remember(html, linkStyles, codeBackground, baseUrl, linkListener, isPreNormalized) {
+    return remember(
+        html,
+        linkStyles,
+        codeBackground,
+        markBackground,
+        baseUrl,
+        linkListener,
+        isPreNormalized,
+        invertItalics,
+    ) {
         htmlToComposeAnnotatedString(
             html = html,
             linkStyles = linkStyles,
@@ -136,6 +183,8 @@ internal fun rememberRichHtmlText(
             baseUrl = baseUrl,
             linkInteractionListener = linkListener,
             isPreNormalized = isPreNormalized,
+            markBackground = markBackground,
+            invertItalics = invertItalics,
         )
     }
 }
@@ -144,9 +193,17 @@ private fun handleRichHtmlLinkClick(
     link: LinkAnnotation,
     baseUrl: String?,
     onOpenUrl: ((String) -> Unit)?,
+    onJumpToAnchor: ((String) -> Unit)?,
     fallbackOpenUri: (String) -> Unit,
 ) {
     val rawUrl = (link as? LinkAnnotation.Url)?.url ?: return
+    if (rawUrl.startsWith("#")) {
+        val anchorId = rawUrl.removePrefix("#").trim()
+        if (anchorId.isNotEmpty()) {
+            onJumpToAnchor?.invoke(anchorId)
+        }
+        return
+    }
     val safeUrl = resolveSafeAnchorHref(rawUrl, baseUrl) ?: return
     if (onOpenUrl != null) {
         runCatching { onOpenUrl(safeUrl) }
@@ -159,9 +216,10 @@ private fun isSubOrSuperscript(style: SpanStyle): Boolean =
     style.baselineShift == BaselineShift.Superscript ||
         style.baselineShift == BaselineShift.Subscript
 
-private fun applyRichInlineSpanStyles(
+internal fun applyRichInlineSpanStyles(
     base: AnnotatedString,
     codeBackground: Color,
+    invertItalics: Boolean = false,
 ): AnnotatedString = buildAnnotatedString {
     append(base)
     for (span in base.spanStyles) {
@@ -178,6 +236,9 @@ private fun applyRichInlineSpanStyles(
         }
         if (isSubOrSuperscript(span.item)) {
             addStyle(SpanStyle(fontSize = SUB_SUPER_FONT_EM.em), span.start, span.end)
+        }
+        if (invertItalics && span.item.fontStyle == FontStyle.Italic) {
+            addStyle(SpanStyle(fontStyle = FontStyle.Normal), span.start, span.end)
         }
     }
 }
@@ -495,6 +556,7 @@ internal fun RenderBlockquoteBlock(
             codeBackground = colors.surfaceElevated,
             baseUrl = baseUrl,
             onOpenUrl = onOpenUrl,
+            invertItalics = true,
         )
     val attributionAnnotated =
         block.attributionHtml

@@ -2,6 +2,7 @@
 
 package com.grayvines.roche.reader
 
+import java.util.Locale
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -49,6 +50,7 @@ internal data class ParsedArticleDocument(
     val blocks: List<ArticleBlock>,
     val outlineHeadings: List<String>,
     val orderedHeadingBlockIndices: List<Int>,
+    val anchorBlockIndices: Map<String, Int> = emptyMap(),
 )
 
 internal fun extractInboxSnippet(rawSummary: String): String =
@@ -61,8 +63,16 @@ internal fun extractInboxSnippet(rawSummary: String): String =
 internal fun parseHtmlArticleDocument(
     rawHtml: String,
     baseUrl: String? = null,
+    articleTitle: String? = null,
 ): ParsedArticleDocument {
-    val blocks = parseHtmlArticleBlocks(rawHtml = rawHtml, baseUrl = baseUrl)
+    val anchorBlockIndices = LinkedHashMap<String, Int>()
+    val blocks =
+        parseHtmlArticleBlocksInternal(
+            rawHtml = rawHtml,
+            baseUrl = baseUrl,
+            articleTitle = articleTitle,
+            anchorBlockIndices = anchorBlockIndices,
+        )
     val outlineHeadings = extractPlainTextHeadings(blocks)
     val orderedHeadingIndices =
         mapBlockHeadingIndices(blocks).entries.sortedBy { it.value }.map { it.key }
@@ -70,46 +80,149 @@ internal fun parseHtmlArticleDocument(
         blocks = blocks,
         outlineHeadings = outlineHeadings,
         orderedHeadingBlockIndices = orderedHeadingIndices,
+        anchorBlockIndices = anchorBlockIndices,
     )
 }
 
 internal fun parseHtmlArticleBlocks(
     rawHtml: String,
     baseUrl: String? = null,
+    articleTitle: String? = null,
+): List<ArticleBlock> =
+    parseHtmlArticleBlocksInternal(
+        rawHtml = rawHtml,
+        baseUrl = baseUrl,
+        articleTitle = articleTitle,
+        anchorBlockIndices = null,
+    )
+
+private fun parseHtmlArticleBlocksInternal(
+    rawHtml: String,
+    baseUrl: String?,
+    articleTitle: String?,
+    anchorBlockIndices: MutableMap<String, Int>?,
 ): List<ArticleBlock> {
     if (rawHtml.isBlank()) return emptyList()
     val body = parsePreprocessedHtmlBody(rawHtml, baseUrl)
     val blocks = mutableListOf<ArticleBlock>()
-    walkDomContainer(body, baseUrl, blocks)
+    walkDomContainer(body, baseUrl, blocks, anchorBlockIndices)
+    val removedLeading = stripDuplicateLeadingHeading(blocks, articleTitle)
+    if (removedLeading && anchorBlockIndices != null) {
+        shiftAnchorBlockIndices(anchorBlockIndices)
+    }
     return blocks
 }
+
+private fun stripDuplicateLeadingHeading(
+    blocks: MutableList<ArticleBlock>,
+    articleTitle: String?,
+): Boolean {
+    val expected = normalizeTitleForComparison(articleTitle)
+    val first = blocks.firstOrNull() as? ArticleBlock.Heading
+    val matches =
+        expected.isNotEmpty() &&
+            first != null &&
+            first.level == MIN_HEADING &&
+            normalizeTitleForComparison(resolveHeadingPlainText(first)) == expected
+    if (matches) {
+        blocks.removeAt(0)
+    }
+    return matches
+}
+
+private fun shiftAnchorBlockIndices(anchorBlockIndices: MutableMap<String, Int>) {
+    val shifted = LinkedHashMap<String, Int>(anchorBlockIndices.size)
+    for ((key, idx) in anchorBlockIndices) {
+        if (idx > 0) {
+            shifted[key] = idx - 1
+        }
+    }
+    anchorBlockIndices.clear()
+    anchorBlockIndices.putAll(shifted)
+}
+
+private fun registerAnchorId(
+    rawId: String,
+    blockIndex: Int,
+    anchorBlockIndices: MutableMap<String, Int>?,
+) {
+    if (anchorBlockIndices == null) return
+    val id = rawId.trim()
+    if (id.isNotEmpty()) {
+        anchorBlockIndices.putIfAbsent(id, blockIndex)
+        anchorBlockIndices.putIfAbsent(id.removePrefix("prose-"), blockIndex)
+    }
+}
+
+private fun registerElementAnchors(
+    element: Element,
+    blockIndex: Int,
+    anchorBlockIndices: MutableMap<String, Int>?,
+) {
+    if (anchorBlockIndices == null) return
+    registerAnchorId(element.attr("id"), blockIndex, anchorBlockIndices)
+    for (desc in element.select("[id]")) {
+        registerAnchorId(desc.attr("id"), blockIndex, anchorBlockIndices)
+    }
+}
+
+private fun registerNodeAnchors(
+    nodes: List<Node>,
+    blockIndex: Int,
+    anchorBlockIndices: MutableMap<String, Int>?,
+) {
+    if (anchorBlockIndices == null) return
+    for (node in nodes) {
+        if (node is Element) {
+            registerElementAnchors(node, blockIndex, anchorBlockIndices)
+        }
+    }
+}
+
+private fun normalizeTitleForComparison(raw: String?): String =
+    raw.orEmpty()
+        .replace('\u00A0', ' ')
+        .trim()
+        .split(TITLE_WHITESPACE_REGEX)
+        .filter { it.isNotEmpty() }
+        .joinToString(" ")
+        .lowercase(Locale.US)
 
 internal fun walkDomContainer(
     container: Element,
     baseUrl: String?,
     out: MutableList<ArticleBlock>,
+    anchorBlockIndices: MutableMap<String, Int>? = null,
 ) {
     val inlineNodes = mutableListOf<Node>()
     for (node in container.childNodes()) {
         if (node is Element && isBlockLevelTag(node.normalName())) {
+            val inlineStart = out.size
             flushInlineNodes(
                 nodes = inlineNodes,
                 baseUrl = baseUrl,
                 out = out,
                 splitDoubleBrIntoParagraphs = true,
             )
+            if (out.size > inlineStart) {
+                registerNodeAnchors(inlineNodes, inlineStart, anchorBlockIndices)
+            }
             inlineNodes.clear()
-            appendBlockElement(node, baseUrl, out)
+            appendBlockElement(node, baseUrl, out, anchorBlockIndices)
         } else {
             inlineNodes.add(node)
         }
     }
+    val tailStart = out.size
     flushInlineNodes(
         nodes = inlineNodes,
         baseUrl = baseUrl,
         out = out,
         splitDoubleBrIntoParagraphs = true,
     )
+    if (out.size > tailStart) {
+        registerNodeAnchors(inlineNodes, tailStart, anchorBlockIndices)
+    }
 }
 
 private fun isBlockLevelTag(tag: String): Boolean = tag in BLOCK_LEVEL_TAGS
@@ -118,33 +231,82 @@ private fun appendBlockElement(
     element: Element,
     baseUrl: String?,
     out: MutableList<ArticleBlock>,
+    anchorBlockIndices: MutableMap<String, Int>? = null,
 ) {
+    val startIdx = out.size
+    val isLeafBlock = dispatchBlockElement(element, baseUrl, out, anchorBlockIndices)
+    if (out.size > startIdx) {
+        if (isLeafBlock) {
+            registerElementAnchors(element, startIdx, anchorBlockIndices)
+        } else {
+            registerAnchorId(element.attr("id"), startIdx, anchorBlockIndices)
+        }
+    }
+}
+
+private fun dispatchBlockElement(
+    element: Element,
+    baseUrl: String?,
+    out: MutableList<ArticleBlock>,
+    anchorBlockIndices: MutableMap<String, Int>?,
+): Boolean =
     when (val tag = element.normalName()) {
-        "pre" -> appendPreBlock(element, out)
+        "pre" -> {
+            appendPreBlock(element, out)
+            true
+        }
         "h1",
         "h2",
         "h3",
         "h4",
         "h5",
-        "h6" -> parseHeadingElement(element, tag)?.let { out.add(it) }
-        TAG_BLOCKQUOTE -> appendQuoteBlocks(element, baseUrl, out)
+        "h6" -> {
+            parseHeadingElement(element, tag)?.let { out.add(it) }
+            true
+        }
+        TAG_BLOCKQUOTE -> {
+            appendQuoteBlocks(element, baseUrl, out)
+            true
+        }
         "ul",
-        "ol" -> appendListBlocks(element, ordered = tag == "ol", baseUrl = baseUrl, out = out)
-        "dl" -> appendDefinitionListBlocks(element, baseUrl, out)
-        "dt" -> appendStandaloneTermBlock(element, out)
-        "hr" -> out.add(ArticleBlock.HorizontalRule)
-        TAG_FIGURE -> parseFigureElement(element, baseUrl, out)
-        "p" ->
+        "ol" -> {
+            appendListBlocks(element, ordered = tag == "ol", baseUrl = baseUrl, out = out)
+            true
+        }
+        "dl" -> {
+            appendDefinitionListBlocks(element, baseUrl, out)
+            true
+        }
+        "dt" -> {
+            appendStandaloneTermBlock(element, out)
+            true
+        }
+        "hr" -> {
+            out.add(ArticleBlock.HorizontalRule)
+            true
+        }
+        TAG_FIGURE -> {
+            parseFigureElement(element, baseUrl, out)
+            true
+        }
+        "p" -> {
             flushInlineNodes(
                 nodes = element.childNodes(),
                 baseUrl = baseUrl,
                 out = out,
                 splitDoubleBrIntoParagraphs = false,
             )
-        TAG_TABLE -> appendTableBlocks(element, out)
-        else -> walkDomContainer(element, baseUrl, out)
+            true
+        }
+        TAG_TABLE -> {
+            appendTableBlocks(element, out)
+            true
+        }
+        else -> {
+            walkDomContainer(element, baseUrl, out, anchorBlockIndices)
+            false
+        }
     }
-}
 
 private fun appendPreBlock(element: Element, out: MutableList<ArticleBlock>) {
     extractPreCodeText(element)
@@ -805,6 +967,7 @@ private const val TAG_FIGCAPTION = "figcaption"
 private const val TAG_IMG = "img"
 private const val TAG_DIV = "div"
 private const val TAG_TABLE = "table"
+private val TITLE_WHITESPACE_REGEX = Regex("""\s+""")
 private const val EMBEDDED_QUOTE_BLOCKS_QUERY = "pre, img, figure, table"
 private const val COMPOSITE_FIGURE_QUERY = "blockquote, pre, table"
 private val COMPOSITE_CAPTION_BREAK_TAGS =

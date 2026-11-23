@@ -35,6 +35,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -93,6 +94,7 @@ import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
@@ -103,34 +105,43 @@ internal data class ParsedArticleBlocksState(
     val isParsing: Boolean,
     val outlineHeadings: List<String> = emptyList(),
     val orderedHeadingBlockIndices: List<Int> = emptyList(),
+    val anchorBlockIndices: Map<String, Int> = emptyMap(),
 )
 
 @Composable
 internal fun rememberParsedArticleBlocks(
     htmlBody: String?,
     baseUrl: String?,
+    articleTitle: String? = null,
 ): ParsedArticleBlocksState {
     val cache = LocalArticleBlockCache.current
     val cleanHtml = htmlBody?.takeIf { it.isNotBlank() }
     val initialState =
-        remember(cache, cleanHtml, baseUrl) {
+        remember(cache, cleanHtml, baseUrl, articleTitle) {
             resolveInitialParsedBlocks(
                 cache = cache,
                 cleanHtml = cleanHtml,
                 baseUrl = baseUrl,
+                articleTitle = articleTitle,
             )
         }
     val state by
-        produceState(initialValue = initialState, cache, cleanHtml, baseUrl) {
+        produceState(initialValue = initialState, cache, cleanHtml, baseUrl, articleTitle) {
             value = initialState
             if (initialState.isParsing && cleanHtml != null) {
-                val parsed = cache.getOrParse(cleanHtml = cleanHtml, baseUrl = baseUrl)
+                val parsed =
+                    cache.getOrParse(
+                        cleanHtml = cleanHtml,
+                        baseUrl = baseUrl,
+                        articleTitle = articleTitle,
+                    )
                 value =
                     ParsedArticleBlocksState(
                         blocks = parsed.blocks,
                         isParsing = false,
                         outlineHeadings = parsed.outlineHeadings,
                         orderedHeadingBlockIndices = parsed.orderedHeadingBlockIndices,
+                        anchorBlockIndices = parsed.anchorBlockIndices,
                     )
             }
         }
@@ -141,15 +152,17 @@ private fun resolveInitialParsedBlocks(
     cache: ArticleBlockCache,
     cleanHtml: String?,
     baseUrl: String?,
+    articleTitle: String?,
 ): ParsedArticleBlocksState {
     if (cleanHtml == null) return ParsedArticleBlocksState(emptyList(), isParsing = false)
-    val cached = cache.lookupFast(cleanHtml, baseUrl)
+    val cached = cache.lookupFast(cleanHtml, baseUrl, articleTitle)
     return if (cached != null) {
         ParsedArticleBlocksState(
             blocks = cached.blocks,
             isParsing = false,
             outlineHeadings = cached.outlineHeadings,
             orderedHeadingBlockIndices = cached.orderedHeadingBlockIndices,
+            anchorBlockIndices = cached.anchorBlockIndices,
         )
     } else {
         ParsedArticleBlocksState(emptyList(), isParsing = true)
@@ -213,6 +226,7 @@ private data class ReaderArticleCallbacks(
     val onToggleOfflineAudio: () -> Unit,
     val onShare: () -> Unit,
     val onOpenExternalUrl: (String) -> Unit,
+    val onJumpToAnchor: (String) -> Unit,
     val onZoomPdfPage: (Int) -> Unit,
     val onZoomInlineImage: (ImageBitmap, ArticleBlock.ImageBlock) -> Unit,
 )
@@ -233,7 +247,11 @@ private fun rememberReaderContentBundle(
     isDownloadingOffline: Boolean,
 ): ReaderContentBundle {
     val parsedState =
-        rememberParsedArticleBlocks(htmlBody = resolveReaderHtmlBody(entry), baseUrl = entry.url)
+        rememberParsedArticleBlocks(
+            htmlBody = resolveReaderHtmlBody(entry),
+            baseUrl = entry.url,
+            articleTitle = entry.title,
+        )
     val pdfSession =
         rememberCachedPdfSession(
             entryId = entry.id,
@@ -331,6 +349,7 @@ private fun buildReaderArticleCallbacks(
     entry: InboxEntry,
     listState: LazyListState,
     content: ReaderContentBundle,
+    coroutineScope: CoroutineScope,
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
@@ -354,6 +373,9 @@ private fun buildReaderArticleCallbacks(
         onToggleOfflineAudio = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
         onShare = { onShareEntry(entry) },
         onOpenExternalUrl = onOpenExternalUrl,
+        onJumpToAnchor = { anchorId ->
+            jumpToReaderAnchor(anchorId, content, listState, coroutineScope)
+        },
         onZoomPdfPage = { pageIdx ->
             content.pdfSession?.let { onOpenLightbox(ReaderLightboxTarget.PdfPage(it, pageIdx)) }
         },
@@ -389,11 +411,13 @@ private fun ReaderViewScaffold(
     onOpenLightbox: (ReaderLightboxTarget) -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val coroutineScope = rememberCoroutineScope()
     val callbacks =
         buildReaderArticleCallbacks(
             entry = entry,
             listState = listState,
             content = content,
+            coroutineScope = coroutineScope,
             onAction = onAction,
             onShareEntry = onShareEntry,
             onOpenExternalUrl = onOpenExternalUrl,
@@ -442,6 +466,22 @@ private fun ReaderViewScaffold(
                     onOpenLightbox(ReaderLightboxTarget.PdfPage(pdfSession, pageIdx))
                 },
             )
+        }
+    }
+}
+
+private fun jumpToReaderAnchor(
+    anchorId: String,
+    content: ReaderContentBundle,
+    listState: LazyListState,
+    coroutineScope: CoroutineScope,
+) {
+    val blockIdx =
+        content.parsedState.anchorBlockIndices[anchorId]
+            ?: content.parsedState.anchorBlockIndices[anchorId.removePrefix("prose-")]
+    if (blockIdx != null) {
+        coroutineScope.launch {
+            listState.animateScrollToItem(content.metrics.sectionBlockOffset + blockIdx)
         }
     }
 }
@@ -1154,53 +1194,54 @@ private fun ReaderArticleBody(
     val hasPdfPages = pdfSession != null && pdfSession.pageCount > 0
     val showUncachedPdfCard = !hasPdfPages && isPdfLikeEntry(entry) && !isLocalPdf
 
-    BoxWithConstraints(modifier = modifier.fillMaxSize()) {
-        val horizontalPadding =
-            resolveReaderHorizontalPadding(maxWidth = maxWidth, isPdf = hasPdfPages)
-        val proseModifier =
-            if (hasPdfPages && maxWidth < 500.dp) Modifier.padding(horizontal = 10.dp) else Modifier
+    CompositionLocalProvider(LocalReaderAnchorNavigator provides callbacks.onJumpToAnchor) {
+        BoxWithConstraints(modifier = modifier.fillMaxSize()) {
+            val horizontalPadding =
+                resolveReaderHorizontalPadding(maxWidth = maxWidth, isPdf = hasPdfPages)
+            val proseModifier = resolveReaderProseModifier(hasPdfPages, maxWidth)
 
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.fillMaxSize().testTag("reader_article_list"),
-            contentPadding = PaddingValues(horizontal = horizontalPadding, vertical = 18.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            readerPreBodyItems(
-                entry = entry,
-                isLocalPdf = isLocalPdf,
-                showUncachedPdfCard = showUncachedPdfCard,
-                isDownloadingOffline = isDownloadingOffline,
-                playerStateFlow = playerStateFlow,
-                dividerColor = colors.border,
-                proseModifier = proseModifier,
-                callbacks = callbacks,
-            )
-            readerArticleBodyContentItems(
-                entry = entry,
-                parsedState = parsedState,
-                hasPdfPages = hasPdfPages,
-                isHydrating = isHydrating,
-                showUncachedPdfCard = showUncachedPdfCard,
-                plainParagraphs = plainParagraphs,
-                proseModifier = proseModifier,
-                mutedColor = colors.textMuted,
-                linkStyles = linkStyles,
-                callbacks = callbacks,
-            )
-            readerPdfPageItems(
-                pdfSession = pdfSession,
-                entry = entry,
-                isLocalPdf = isLocalPdf,
-                proseModifier = proseModifier,
-                callbacks = callbacks,
-            )
-            readerFooterItem(
-                entry = entry,
-                isLocalPdf = isLocalPdf,
-                proseModifier = proseModifier,
-                callbacks = callbacks,
-            )
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize().testTag("reader_article_list"),
+                contentPadding = PaddingValues(horizontal = horizontalPadding, vertical = 18.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                readerPreBodyItems(
+                    entry = entry,
+                    isLocalPdf = isLocalPdf,
+                    showUncachedPdfCard = showUncachedPdfCard,
+                    isDownloadingOffline = isDownloadingOffline,
+                    playerStateFlow = playerStateFlow,
+                    dividerColor = colors.border,
+                    proseModifier = proseModifier,
+                    callbacks = callbacks,
+                )
+                readerArticleBodyContentItems(
+                    entry = entry,
+                    parsedState = parsedState,
+                    hasPdfPages = hasPdfPages,
+                    isHydrating = isHydrating,
+                    showUncachedPdfCard = showUncachedPdfCard,
+                    plainParagraphs = plainParagraphs,
+                    proseModifier = proseModifier,
+                    mutedColor = colors.textMuted,
+                    linkStyles = linkStyles,
+                    callbacks = callbacks,
+                )
+                readerPdfPageItems(
+                    pdfSession = pdfSession,
+                    entry = entry,
+                    isLocalPdf = isLocalPdf,
+                    proseModifier = proseModifier,
+                    callbacks = callbacks,
+                )
+                readerFooterItem(
+                    entry = entry,
+                    isLocalPdf = isLocalPdf,
+                    proseModifier = proseModifier,
+                    callbacks = callbacks,
+                )
+            }
         }
     }
 }
@@ -1301,6 +1342,9 @@ private fun ReaderAudioBarSlot(
         modifier = modifier,
     )
 }
+
+private fun resolveReaderProseModifier(hasPdfPages: Boolean, maxWidth: Dp): Modifier =
+    if (hasPdfPages && maxWidth < 500.dp) Modifier.padding(horizontal = 10.dp) else Modifier
 
 internal fun resolveReaderHorizontalPadding(maxWidth: Dp, isPdf: Boolean): Dp =
     if (isPdf) {
@@ -1652,7 +1696,12 @@ internal fun ReaderBodyContent(
     onOpenExternalUrl: (String) -> Unit = {},
 ) {
     val htmlBody = resolveReaderHtmlBody(entry)
-    val parsedState = rememberParsedArticleBlocks(htmlBody = htmlBody, baseUrl = entry.url)
+    val parsedState =
+        rememberParsedArticleBlocks(
+            htmlBody = htmlBody,
+            baseUrl = entry.url,
+            articleTitle = entry.title,
+        )
     var activeImageTarget by
         remember(entry.id) { mutableStateOf<ReaderLightboxTarget.InlineImage?>(null) }
     SelectionContainer {

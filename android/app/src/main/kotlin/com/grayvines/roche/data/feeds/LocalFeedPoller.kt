@@ -38,6 +38,7 @@ import com.grayvines.roche.data.remote.HttpStatusException
 import com.grayvines.roche.data.remote.ProblemDetailsException
 import com.grayvines.roche.data.remote.PublicWebFetcher
 import com.grayvines.roche.model.ItemStatus
+import com.grayvines.roche.reader.sanitizeRocheHtml
 import java.net.URI
 import java.time.Instant
 import java.time.ZonedDateTime
@@ -49,7 +50,6 @@ import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import org.jsoup.parser.Parser
-import org.jsoup.safety.Safelist
 
 internal data class ParsedFeedCandidateItem(
     val title: String,
@@ -951,7 +951,7 @@ internal fun extractEnclosureImage(item: Element, baseUrl: String): String? =
         ?.let { resolveRelativeUrl(baseUrl, it.attr(ATTR_URL).trim()) }
 
 internal fun sanitizeFeedHtml(rawHtml: String, baseUrl: String): String =
-    Jsoup.clean(rawHtml, baseUrl.trim(), Safelist.relaxed()).trim()
+    sanitizeRocheHtml(rawHtml, baseUrl)
 
 internal fun extractFirstImgUrl(html: String, baseUrl: String): String? =
     IMG_TAG_REGEX.findAll(html)
