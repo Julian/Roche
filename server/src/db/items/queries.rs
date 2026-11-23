@@ -6,7 +6,8 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 
 use super::{
     IS_FEED_INBOX_ITEM_SQL, IS_LIVE_ITEM_SQL, Item, ItemContentProjection, ItemFilter, ItemPage,
-    ItemRepo, item_select_query_builder,
+    ItemRepo, STARRED_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID, item_select_query_builder,
+    push_item_select_projection,
 };
 use crate::db::{InboxState, ItemSortField, ItemStatus, ItemStatusFilter, SortOrder};
 
@@ -114,7 +115,45 @@ impl ItemRepo<'_> {
         } else {
             ItemContentProjection::List
         };
-        let mut qb = item_select_query_builder(proj);
+        // Two-phase paginate-then-hydrate CTE: filter, sort, and LIMIT to at most `per_page + 1`
+        // IDs first using only the joins needed by the active predicates, then hydrate correlated
+        // subqueries (`fs_primary`, `entry_media`, `tag_names`, `json_each`, `entry_content`) only
+        // for the returned page rows instead of every matching row in the inbox.
+        let needs_ec = filter.inbox_only != Some(true)
+            || filter.content_type.is_some()
+            || filter.has_audio.is_some();
+        let needs_wtr = filter.inbox_only != Some(true)
+            && matches!(
+                filter.status,
+                Some(
+                    ItemStatusFilter::Unread
+                        | ItemStatusFilter::Dismissed
+                        | ItemStatusFilter::Archived
+                )
+            );
+        let needs_fav = filter.is_favorite.is_some();
+
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "WITH page_ids(id, ord) AS MATERIALIZED (
+                 SELECT page_inner.id, ROW_NUMBER() OVER () AS ord
+                 FROM (
+                     SELECT i.id
+                     FROM entries i
+                     LEFT JOIN entry_state es ON es.entry_id = i.id",
+        );
+        if needs_ec {
+            qb.push(" LEFT JOIN entry_content ec ON ec.entry_id = i.id");
+        }
+        if needs_wtr {
+            qb.push(" LEFT JOIN collection_entries ce_wtr ON ce_wtr.collection_id = ")
+                .push_bind(WANT_TO_READ_COLLECTION_ID)
+                .push(" AND ce_wtr.entry_id = i.id");
+        }
+        if needs_fav {
+            qb.push(" LEFT JOIN collection_entries ce_fav ON ce_fav.collection_id = ")
+                .push_bind(STARRED_COLLECTION_ID)
+                .push(" AND ce_fav.entry_id = i.id");
+        }
         if let Some(fts_match) = &fts_query {
             qb.push(
                 " LEFT JOIN (SELECT rowid AS fts_rowid, bm25(entries_fts, 0.0, 10.0, 5.0, 2.0, 1.0) AS fts_rank FROM entries_fts WHERE entries_fts MATCH ",
@@ -269,7 +308,11 @@ impl ItemRepo<'_> {
         qb.push(" LIMIT ")
             .push_bind(i64::try_from(fetch_limit).unwrap_or(51))
             .push(" OFFSET ")
-            .push_bind(i64::try_from(offset).unwrap_or(0));
+            .push_bind(i64::try_from(offset).unwrap_or(0))
+            .push(") page_inner) ");
+
+        push_item_select_projection(&mut qb, proj, "FROM page_ids p JOIN entries i ON i.id = p.id");
+        qb.push(" ORDER BY p.ord ASC");
 
         let mut items = qb.build_query_as::<Item>().fetch_all(self.pool).await?;
         let has_more = items.len() > per_page;

@@ -26,6 +26,8 @@ const PAIR_RATE_LIMIT_MAX_FAILURES: usize = 4;
 const PAIR_PRE_DB_MAX_ATTEMPTS: usize = 12;
 const MAX_TRACKED_PAIRING_IPS: usize = 4_096;
 const MAX_TAILSCALE_WEB_TOKENS_PER_USER: i64 = 3;
+const WEB_SESSION_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_TRACKED_WEB_SESSION_TOUCHES: usize = 1_024;
 pub const WEB_SESSION_TTL_DAYS: i64 = 30;
 pub const WEB_SESSION_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 
@@ -288,12 +290,48 @@ impl AuthService<'_> {
         raw_session_token: &str,
     ) -> Result<String, AppError> {
         let token_hash = TokenManager::hash_token(raw_session_token);
-        self.service
-            .db
-            .auth()
-            .validate_web_session_id(&token_hash)
-            .await?
-            .ok_or_else(|| AppError::token_invalid("Invalid or expired web session"))
+        let Some((session_id, db_needs_touch)) =
+            self.service.db.auth().lookup_valid_web_session_id(&token_hash).await?
+        else {
+            return Err(AppError::token_invalid("Invalid or expired web session"));
+        };
+
+        if db_needs_touch {
+            let now = Instant::now();
+            let should_spawn = {
+                let mut map = self
+                    .service
+                    .web_session_last_touch
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let recently_queued = map
+                    .get(&session_id)
+                    .is_some_and(|last| now.duration_since(*last) < WEB_SESSION_TOUCH_INTERVAL);
+                if recently_queued {
+                    false
+                } else {
+                    if map.len() >= MAX_TRACKED_WEB_SESSION_TOUCHES
+                        && !map.contains_key(&session_id)
+                    {
+                        map.retain(|_, ts| now.duration_since(*ts) < WEB_SESSION_TOUCH_INTERVAL);
+                        if map.len() >= MAX_TRACKED_WEB_SESSION_TOUCHES {
+                            map.clear();
+                        }
+                    }
+                    map.insert(session_id.clone(), now);
+                    true
+                }
+            };
+            if should_spawn {
+                let db = self.service.db.clone();
+                let sid = session_id.clone();
+                self.service.spawn_background(async move {
+                    let _ = db.auth().touch_web_session_last_used(&sid).await;
+                });
+            }
+        }
+
+        Ok(session_id)
     }
 
     pub async fn verify_sync_peer_binding(

@@ -47,6 +47,13 @@ pub struct SafeHttpClient {
     client: reqwest::Client,
 }
 
+/// Result of a conditional HTTP GET (`If-None-Match` / `If-Modified-Since`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalTextResponse {
+    NotModified,
+    Modified { text: String, etag: Option<String>, last_modified: Option<String> },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FetchValidation {
     Raw,
@@ -96,6 +103,53 @@ impl SafeHttpClient {
     pub async fn fetch_text(&self, url: &Url, max_bytes: usize) -> Result<String> {
         let bytes = self.fetch_bytes(url, max_bytes).await?;
         Ok(Self::decode_xml_or_text_bytes(&bytes))
+    }
+
+    pub async fn fetch_text_conditional(
+        &self,
+        url: &Url,
+        max_bytes: usize,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<ConditionalTextResponse> {
+        validate_public_url(url)?;
+        let mut req = self.client.get(url.clone());
+        let mut sent_conditional = false;
+        for (header_name, raw_val) in [
+            (reqwest::header::IF_NONE_MATCH, etag),
+            (reqwest::header::IF_MODIFIED_SINCE, last_modified),
+        ] {
+            if let Some(clean) = raw_val.map(str::trim).filter(|s| !s.is_empty())
+                && let Ok(val) = reqwest::header::HeaderValue::from_str(clean)
+            {
+                req = req.header(header_name, val);
+                sent_conditional = true;
+            }
+        }
+        let response = req.send().await?;
+        if sent_conditional && response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(ConditionalTextResponse::NotModified);
+        }
+        let resp_etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty() && s.len() <= 256);
+        let resp_last_modified = response
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty() && s.len() <= 256);
+        let bytes =
+            Self::read_validated_response_bytes(url, response, max_bytes, FetchValidation::Raw)
+                .await?;
+        Ok(ConditionalTextResponse::Modified {
+            text: Self::decode_xml_or_text_bytes(&bytes),
+            etag: resp_etag,
+            last_modified: resp_last_modified,
+        })
     }
 
     #[must_use]
@@ -164,7 +218,16 @@ impl SafeHttpClient {
         validation: FetchValidation,
     ) -> Result<Vec<u8>> {
         validate_public_url(url)?;
-        let mut response = self.client.get(url.clone()).send().await?;
+        let response = self.client.get(url.clone()).send().await?;
+        Self::read_validated_response_bytes(url, response, max_bytes, validation).await
+    }
+
+    async fn read_validated_response_bytes(
+        url: &Url,
+        mut response: reqwest::Response,
+        max_bytes: usize,
+        validation: FetchValidation,
+    ) -> Result<Vec<u8>> {
         let response_status = response.status();
         if !response_status.is_success() {
             anyhow::bail!("Upstream server returned HTTP {response_status}");

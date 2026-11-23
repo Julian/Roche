@@ -7,14 +7,15 @@ use std::{
 };
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::{
     content::{
-        HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient, classify_url, is_valid_pdf_bytes,
-        resolve_pdf_url,
+        ConditionalTextResponse, HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient, classify_url,
+        is_valid_pdf_bytes, resolve_pdf_url,
     },
     db::{Db, Feed, FeedRepo, PollBatch, PollItemCandidate},
     domain::{ContentType, FeedType, MediaType},
@@ -38,8 +39,34 @@ pub enum PollError {
     Database(#[from] sqlx::Error),
 }
 
+/// Optional HTTP conditional-GET validators for scheduled feed polling.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FeedFetchValidators<'a> {
+    pub etag: Option<&'a str>,
+    pub last_modified: Option<&'a str>,
+}
+
+/// Outcome of a conditional feed fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalFeedFetch {
+    NotModified,
+    Modified { body: String, etag: Option<String>, last_modified: Option<String> },
+}
+
 pub trait FeedFetcher: Send + Sync + 'static {
     fn fetch_feed(&self, url: &Url) -> impl Future<Output = Result<String>> + Send;
+
+    fn fetch_feed_conditional(
+        &self,
+        url: &Url,
+        _validators: FeedFetchValidators<'_>,
+    ) -> impl Future<Output = Result<ConditionalFeedFetch>> + Send {
+        let fut = self.fetch_feed(url);
+        async move {
+            let body = fut.await?;
+            Ok(ConditionalFeedFetch::Modified { body, etag: None, last_modified: None })
+        }
+    }
 
     fn fetch_html(&self, _url: &Url) -> impl Future<Output = Result<Option<String>>> + Send {
         std::future::ready(Ok(None))
@@ -54,6 +81,11 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 trait BoxedFeedFetcher: Send + Sync + 'static {
     fn fetch_feed<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<String>>;
+    fn fetch_feed_conditional<'a>(
+        &'a self,
+        url: &'a Url,
+        validators: FeedFetchValidators<'a>,
+    ) -> BoxFuture<'a, Result<ConditionalFeedFetch>>;
     fn fetch_html<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<Option<String>>>;
     fn fetch_pdf<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<Option<Vec<u8>>>>;
 }
@@ -61,6 +93,14 @@ trait BoxedFeedFetcher: Send + Sync + 'static {
 impl<T: FeedFetcher> BoxedFeedFetcher for T {
     fn fetch_feed<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<String>> {
         Box::pin(FeedFetcher::fetch_feed(self, url))
+    }
+
+    fn fetch_feed_conditional<'a>(
+        &'a self,
+        url: &'a Url,
+        validators: FeedFetchValidators<'a>,
+    ) -> BoxFuture<'a, Result<ConditionalFeedFetch>> {
+        Box::pin(FeedFetcher::fetch_feed_conditional(self, url, validators))
     }
 
     fn fetch_html<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<Option<String>>> {
@@ -94,6 +134,14 @@ impl FeedFetcher for DynFeedFetcher {
         self.0.fetch_feed(url).await
     }
 
+    async fn fetch_feed_conditional(
+        &self,
+        url: &Url,
+        validators: FeedFetchValidators<'_>,
+    ) -> Result<ConditionalFeedFetch> {
+        self.0.fetch_feed_conditional(url, validators).await
+    }
+
     async fn fetch_html(&self, url: &Url) -> Result<Option<String>> {
         self.0.fetch_html(url).await
     }
@@ -119,12 +167,86 @@ impl FeedFetcher for HttpFeedFetcher {
         self.client.fetch_text(url, MAX_FEED_BYTES).await
     }
 
+    async fn fetch_feed_conditional(
+        &self,
+        url: &Url,
+        validators: FeedFetchValidators<'_>,
+    ) -> Result<ConditionalFeedFetch> {
+        match self
+            .client
+            .fetch_text_conditional(url, MAX_FEED_BYTES, validators.etag, validators.last_modified)
+            .await?
+        {
+            ConditionalTextResponse::NotModified => Ok(ConditionalFeedFetch::NotModified),
+            ConditionalTextResponse::Modified { text, etag, last_modified } => {
+                Ok(ConditionalFeedFetch::Modified { body: text, etag, last_modified })
+            }
+        }
+    }
+
     async fn fetch_html(&self, url: &Url) -> Result<Option<String>> {
         self.client.fetch_html_text(url, MAX_HTML_BYTES).await.map(Some)
     }
 
     async fn fetch_pdf(&self, url: &Url) -> Result<Option<Vec<u8>>> {
         self.client.fetch_pdf_bytes(url, MAX_PDF_BYTES).await.map(Some)
+    }
+}
+
+const MAX_CONDITIONAL_CACHE_ENTRIES: usize = 2_048;
+
+#[derive(Debug, Clone)]
+struct CachedFeedPoll {
+    feed_url: String,
+    feed_type: FeedType,
+    feed_created_at: chrono::DateTime<chrono::Utc>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    body_sha256: [u8; 32],
+    parsed_entries: usize,
+    feed_title: Option<String>,
+}
+
+/// Bounded in-memory cache of per-feed `ETag`, `Last-Modified`, and last persisted body SHA-256
+/// used by scheduled background polling to skip redundant XML/HTML sanitization and SQLite write
+/// loops when upstream feeds have not changed.
+#[derive(Debug, Clone, Default)]
+pub struct FeedConditionalCache {
+    entries: Arc<Mutex<HashMap<String, CachedFeedPoll>>>,
+}
+
+impl FeedConditionalCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get_matching(&self, feed: &Feed) -> Option<CachedFeedPoll> {
+        // Never short-circuit unpolled feeds (new, re-subscribed after delete, or URL-edited)
+        // or feeds recovering from an error.
+        if feed.last_polled.is_none()
+            || feed.consecutive_failures > 0
+            || feed.last_error.as_deref().is_some_and(|e| !e.trim().is_empty())
+        {
+            return None;
+        }
+        let guard = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .get(&feed.id)
+            .filter(|c| {
+                c.feed_url == feed.url.as_str()
+                    && c.feed_type == feed.feed_type
+                    && c.feed_created_at == feed.created_at
+            })
+            .cloned()
+    }
+
+    fn record(&self, feed_id: &str, entry: CachedFeedPoll) {
+        let mut guard = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.len() >= MAX_CONDITIONAL_CACHE_ENTRIES && !guard.contains_key(feed_id) {
+            guard.clear();
+        }
+        guard.insert(feed_id.to_owned(), entry);
     }
 }
 
@@ -215,6 +337,7 @@ pub struct PollOutcome {
     pub inserted: Vec<(String, PollItemCandidate)>,
     pub feed_title: Option<String>,
     pub parsed_entries: usize,
+    pub unchanged: bool,
 }
 
 pub struct FeedIngester;
@@ -237,8 +360,29 @@ impl FeedIngester {
         context_label: &str,
         record_db_errors: bool,
     ) -> std::result::Result<PollOutcome, PollError> {
+        Self::poll_xml_and_record_outcome_with_cache(
+            db,
+            fetcher,
+            feed,
+            context_label,
+            record_db_errors,
+            None,
+        )
+        .await
+    }
+
+    pub async fn poll_xml_and_record_outcome_with_cache<F: FeedFetcher>(
+        db: &Db,
+        fetcher: &F,
+        feed: &Feed,
+        context_label: &str,
+        record_db_errors: bool,
+        conditional_cache: Option<&FeedConditionalCache>,
+    ) -> std::result::Result<PollOutcome, PollError> {
         let feed_repo = db.feeds();
-        match Self::poll_returning_inserted(&feed_repo, feed, fetcher).await {
+        match Self::poll_returning_inserted_with_cache(&feed_repo, feed, fetcher, conditional_cache)
+            .await
+        {
             Ok(outcome) => {
                 let feed_title =
                     outcome.feed_title.as_deref().or(feed.title.as_deref()).unwrap_or("<untitled>");
@@ -432,12 +576,113 @@ impl FeedIngester {
         }
     }
 
+    #[cfg(test)]
     async fn poll_returning_inserted<F: FeedFetcher>(
         repo: &FeedRepo<'_>,
         feed: &Feed,
         fetcher: &F,
     ) -> std::result::Result<PollOutcome, PollError> {
-        let content = fetcher.fetch_feed(&feed.url).await.map_err(PollError::Upstream)?;
+        Self::poll_returning_inserted_with_cache(repo, feed, fetcher, None).await
+    }
+
+    async fn fetch_feed_for_poll<F: FeedFetcher>(
+        feed: &Feed,
+        fetcher: &F,
+        cached: Option<&CachedFeedPoll>,
+        use_conditional_headers: bool,
+    ) -> std::result::Result<ConditionalFeedFetch, PollError> {
+        if let Some(prev) = cached {
+            fetcher
+                .fetch_feed_conditional(
+                    &feed.url,
+                    FeedFetchValidators {
+                        etag: prev.etag.as_deref(),
+                        last_modified: prev.last_modified.as_deref(),
+                    },
+                )
+                .await
+                .map_err(PollError::Upstream)
+        } else if use_conditional_headers {
+            let res = fetcher
+                .fetch_feed_conditional(&feed.url, FeedFetchValidators::default())
+                .await
+                .map_err(PollError::Upstream)?;
+            if matches!(res, ConditionalFeedFetch::NotModified) {
+                return Err(PollError::Upstream(anyhow::anyhow!(
+                    "Upstream server returned HTTP 304 Not Modified to an unconditional request"
+                )));
+            }
+            Ok(res)
+        } else {
+            let body = fetcher.fetch_feed(&feed.url).await.map_err(PollError::Upstream)?;
+            Ok(ConditionalFeedFetch::Modified { body, etag: None, last_modified: None })
+        }
+    }
+
+    async fn poll_returning_inserted_with_cache<F: FeedFetcher>(
+        repo: &FeedRepo<'_>,
+        feed: &Feed,
+        fetcher: &F,
+        conditional_cache: Option<&FeedConditionalCache>,
+    ) -> std::result::Result<PollOutcome, PollError> {
+        let cached = conditional_cache.and_then(|c| c.get_matching(feed));
+        let (content, resp_etag, resp_last_modified) = match Self::fetch_feed_for_poll(
+            feed,
+            fetcher,
+            cached.as_ref(),
+            conditional_cache.is_some(),
+        )
+        .await?
+        {
+            ConditionalFeedFetch::NotModified => {
+                let Some(prev) = cached else {
+                    return Err(PollError::Upstream(anyhow::anyhow!(
+                        "Upstream server returned HTTP 304 Not Modified to an unconditional request"
+                    )));
+                };
+                repo.record_unchanged_poll(&feed.id).await?;
+                return Ok(PollOutcome {
+                    inserted: Vec::new(),
+                    feed_title: prev.feed_title,
+                    parsed_entries: prev.parsed_entries,
+                    unchanged: true,
+                });
+            }
+            ConditionalFeedFetch::Modified { body, etag, last_modified } => {
+                (body, etag, last_modified)
+            }
+        };
+
+        let body_sha256: Option<[u8; 32]> = conditional_cache.map(|_| {
+            let digest = Sha256::digest(content.as_bytes());
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&digest);
+            out
+        });
+
+        if let (Some(cache), Some(prev), Some(hash)) =
+            (conditional_cache, cached.as_ref(), body_sha256)
+            && hash == prev.body_sha256
+        {
+            repo.record_unchanged_poll(&feed.id).await?;
+            if resp_etag.is_some() || resp_last_modified.is_some() {
+                cache.record(
+                    &feed.id,
+                    CachedFeedPoll {
+                        etag: resp_etag.or_else(|| prev.etag.clone()),
+                        last_modified: resp_last_modified.or_else(|| prev.last_modified.clone()),
+                        ..prev.clone()
+                    },
+                );
+            }
+            return Ok(PollOutcome {
+                inserted: Vec::new(),
+                feed_title: prev.feed_title.clone(),
+                parsed_entries: prev.parsed_entries,
+                unchanged: true,
+            });
+        }
+
         let feed_type = feed.feed_type;
         let batch =
             tokio::task::spawn_blocking(move || Self::parse_feed_content(feed_type, &content))
@@ -448,7 +693,24 @@ impl FeedIngester {
         let parsed_entries = batch.items.len();
         let feed_title = batch.title.clone().filter(|t| !t.trim().is_empty());
         let inserted = repo.record_poll_batch(&feed.id, &batch).await?;
-        Ok(PollOutcome { inserted, feed_title, parsed_entries })
+
+        if let (Some(cache), Some(hash)) = (conditional_cache, body_sha256) {
+            cache.record(
+                &feed.id,
+                CachedFeedPoll {
+                    feed_url: feed.url.as_str().to_owned(),
+                    feed_type: feed.feed_type,
+                    feed_created_at: feed.created_at,
+                    etag: resp_etag,
+                    last_modified: resp_last_modified,
+                    body_sha256: hash,
+                    parsed_entries,
+                    feed_title: feed_title.clone(),
+                },
+            );
+        }
+
+        Ok(PollOutcome { inserted, feed_title, parsed_entries, unchanged: false })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -473,12 +735,21 @@ impl FeedIngester {
                             (content_type == ContentType::Audio).then(|| url.as_str().to_owned())
                         });
                         let duration = audio_url.is_some().then_some(item.duration).flatten();
-                        let clean_desc =
-                            HtmlSanitizer::clean_with_base(&item.description, Some(&url));
+                        let clean_desc = if item.description.trim().is_empty() {
+                            String::new()
+                        } else {
+                            HtmlSanitizer::clean_with_base(&item.description, Some(&url))
+                        };
                         let content_html = item
                             .content_html
                             .as_deref()
-                            .map(|raw| HtmlSanitizer::clean_with_base(raw, Some(&url)))
+                            .map(|raw| {
+                                if raw == item.description {
+                                    clean_desc.clone()
+                                } else {
+                                    HtmlSanitizer::clean_with_base(raw, Some(&url))
+                                }
+                            })
                             .filter(|h| !h.trim().is_empty())
                             .or_else(|| Some(clean_desc.clone()));
                         let thumbnail_url = item
@@ -1008,5 +1279,160 @@ mod tests {
         let _ = db.feeds().record_poll_batch(&feed.id, &third_batch).await.unwrap();
         let preserved = db.items().get(item_id).await.unwrap().unwrap();
         assert_eq!(preserved.content_html, upgraded.content_html);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)]
+    async fn test_conditional_cache_handles_304_not_modified_and_identical_body_short_circuit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ConditionalMockFetcher {
+            xml: String,
+            etag: String,
+            calls: AtomicUsize,
+            not_modified_hits: AtomicUsize,
+            send_304: std::sync::atomic::AtomicBool,
+        }
+
+        impl FeedFetcher for ConditionalMockFetcher {
+            fn fetch_feed(&self, _url: &Url) -> impl Future<Output = Result<String>> + Send {
+                std::future::ready(Ok(self.xml.clone()))
+            }
+
+            fn fetch_feed_conditional(
+                &self,
+                _url: &Url,
+                validators: FeedFetchValidators<'_>,
+            ) -> impl Future<Output = Result<ConditionalFeedFetch>> + Send {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.send_304.load(Ordering::SeqCst)
+                    && validators.etag == Some(self.etag.as_str())
+                {
+                    self.not_modified_hits.fetch_add(1, Ordering::SeqCst);
+                    return std::future::ready(Ok(ConditionalFeedFetch::NotModified));
+                }
+                std::future::ready(Ok(ConditionalFeedFetch::Modified {
+                    body: self.xml.clone(),
+                    etag: Some(self.etag.clone()),
+                    last_modified: Some("Mon, 23 Nov 2026 12:00:00 GMT".to_owned()),
+                }))
+            }
+        }
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://cond.example.com/feed.xml").unwrap();
+        let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Cond"), None).await.unwrap();
+        let cache = FeedConditionalCache::new();
+        let fetcher = ConditionalMockFetcher {
+            xml: r#"<?xml version="1.0" encoding="UTF-8"?>
+                <rss version="2.0"><channel><title>Cond</title>
+                <item><title>Post 1</title><link>https://cond.example.com/1</link><description>Hello</description></item>
+                </channel></rss>"#
+                .to_owned(),
+            etag: "\"v1\"".to_owned(),
+            calls: AtomicUsize::new(0),
+            not_modified_hits: AtomicUsize::new(0),
+            send_304: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        // 1. Initial poll ingests item and populates cache.
+        let out1 = FeedIngester::poll_xml_and_record_outcome_with_cache(
+            &db,
+            &fetcher,
+            &feed,
+            "scheduled",
+            false,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out1.inserted.len(), 1);
+        assert_eq!(out1.parsed_entries, 1);
+        assert!(!out1.unchanged);
+
+        let polled_feed = db.feeds().get(&feed.id).await.unwrap().unwrap();
+        assert!(polled_feed.last_polled.is_some());
+
+        // 2. Identical 200 OK body short-circuits via SHA-256 without re-inserting.
+        let out2 = FeedIngester::poll_xml_and_record_outcome_with_cache(
+            &db,
+            &fetcher,
+            &polled_feed,
+            "scheduled",
+            false,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        assert!(out2.inserted.is_empty());
+        assert_eq!(out2.parsed_entries, 1);
+        assert!(out2.unchanged);
+
+        // 3. Server honoring If-None-Match returns 304 Not Modified and still refreshes last_polled.
+        fetcher.send_304.store(true, Ordering::SeqCst);
+        let out3 = FeedIngester::poll_xml_and_record_outcome_with_cache(
+            &db,
+            &fetcher,
+            &polled_feed,
+            "scheduled",
+            false,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        assert!(out3.inserted.is_empty());
+        assert_eq!(out3.parsed_entries, 1);
+        assert!(out3.unchanged);
+        assert_eq!(fetcher.not_modified_hits.load(Ordering::SeqCst), 1);
+
+        // 4. Deleting and re-subscribing to the same URL produces the same deterministic feed ID
+        //    with `last_polled = None`; stale cache entries must be bypassed so items re-ingest.
+        assert!(db.feeds().delete(&feed.id).await.unwrap());
+        let resubscribed =
+            db.feeds().create(FeedType::Rss, &feed_url, Some("Cond"), None).await.unwrap();
+        assert_eq!(resubscribed.id, feed.id);
+        assert!(resubscribed.last_polled.is_none());
+        let out4 = FeedIngester::poll_xml_and_record_outcome_with_cache(
+            &db,
+            &fetcher,
+            &resubscribed,
+            "scheduled",
+            false,
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out4.inserted.len(), 1);
+        assert!(!out4.unchanged);
+
+        // 5. An unexpected 304 Not Modified to an unconditional request (empty cache) fails as an
+        //    upstream error instead of being treated as a healthy poll.
+        struct Always304Fetcher;
+        impl FeedFetcher for Always304Fetcher {
+            fn fetch_feed(&self, _url: &Url) -> impl Future<Output = Result<String>> + Send {
+                std::future::ready(Err(anyhow::anyhow!("unexpected fetch_feed")))
+            }
+
+            fn fetch_feed_conditional(
+                &self,
+                _url: &Url,
+                _validators: FeedFetchValidators<'_>,
+            ) -> impl Future<Output = Result<ConditionalFeedFetch>> + Send {
+                std::future::ready(Ok(ConditionalFeedFetch::NotModified))
+            }
+        }
+        let fresh_cache = FeedConditionalCache::new();
+        let err = FeedIngester::poll_xml_and_record_outcome_with_cache(
+            &db,
+            &Always304Fetcher,
+            &resubscribed,
+            "scheduled",
+            false,
+            Some(&fresh_cache),
+        )
+        .await
+        .err()
+        .expect("unexpected 304 on unconditional poll must fail");
+        assert!(matches!(err, PollError::Upstream(_)));
     }
 }

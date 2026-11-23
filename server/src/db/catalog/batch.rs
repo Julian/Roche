@@ -93,7 +93,7 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<CatalogBatchResult> {
         validate_batch_limits(batch)?;
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let mut ref_map: HashMap<String, String> =
             HashMap::with_capacity(batch.entries.len() + batch.collections.len());
 

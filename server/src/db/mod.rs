@@ -91,14 +91,16 @@ pub(crate) fn serialize_creators_json(creators: &[String]) -> Option<String> {
     serde_json::to_string(&cleaned).ok()
 }
 
-pub(crate) use tx::{ReadTx, WriteTx};
+pub(crate) use tx::{ReadTx, WriteLock, WriteTx};
 
 /// Begins a SQLite write transaction using `BEGIN IMMEDIATE` wrapped in [`WriteTx`] so WAL-mode
-/// writers acquire the RESERVED lock up-front and share a single causal [`HlcClock`].
-pub(crate) async fn begin_write(
-    pool: &SqlitePool,
-) -> std::result::Result<WriteTx<'_>, sqlx::Error> {
-    WriteTx::begin(pool).await
+/// writers serialize cleanly on `write_lock` before borrowing a pool connection and share a single
+/// causal [`HlcClock`].
+pub(crate) async fn begin_write<'a>(
+    pool: &'a SqlitePool,
+    write_lock: &WriteLock,
+) -> std::result::Result<WriteTx<'a>, sqlx::Error> {
+    WriteTx::begin(pool, write_lock).await
 }
 
 /// Begins a SQLite read-snapshot transaction (`BEGIN DEFERRED`) wrapped in [`ReadTx`] so multiple
@@ -110,12 +112,13 @@ pub(crate) async fn begin_read(pool: &SqlitePool) -> std::result::Result<ReadTx<
 #[derive(Debug, Clone)]
 pub struct Db {
     pool: SqlitePool,
+    write_lock: WriteLock,
 }
 
 impl Db {
     #[cfg(test)]
     pub(crate) async fn begin_write(&self) -> std::result::Result<WriteTx<'_>, sqlx::Error> {
-        begin_write(&self.pool).await
+        begin_write(&self.pool, &self.write_lock).await
     }
 
     pub(crate) async fn begin_read(&self) -> std::result::Result<ReadTx<'_>, sqlx::Error> {
@@ -125,6 +128,8 @@ impl Db {
     /// Connects to the SQLite database at `database_path` and runs all embedded migrations.
     pub async fn connect(database_path: impl AsRef<Path>) -> Result<Self> {
         let path = database_path.as_ref();
+        let is_in_memory =
+            path.to_str().is_some_and(|s| s.contains(":memory:") || s.contains("mode=memory"));
         let file_path_for_perms = match path.to_str() {
             Some(":memory:") => None,
             Some(s) if s.starts_with("sqlite:") => None,
@@ -145,15 +150,28 @@ impl Db {
             }
         };
 
-        let connect_options = base_options
+        let mut connect_options = base_options
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(Duration::from_secs(30));
 
-        let pool =
-            SqlitePoolOptions::new().max_connections(5).connect_with(connect_options).await?;
+        if !is_in_memory {
+            // Note: `cache_size = -16000` is per SQLite connection (up to 16 connections = 256 MiB
+            // worst-case page cache), while `mmap_size` is shared across connections in OS page cache.
+            connect_options = connect_options
+                .pragma("cache_size", "-16000")
+                .pragma("temp_store", "MEMORY")
+                .pragma("mmap_size", "268435456")
+                .pragma("wal_autocheckpoint", "4000");
+        }
+
+        let max_conns = if is_in_memory { 5 } else { 16 };
+        let pool = SqlitePoolOptions::new()
+            .max_connections(max_conns)
+            .connect_with(connect_options)
+            .await?;
 
         prepare_pre_v010_schema_if_needed(&pool).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
@@ -162,9 +180,9 @@ impl Db {
             tighten_sqlite_sidecar_permissions(file_path).await;
         }
 
-        let db = Self { pool };
+        let db = Self { pool, write_lock: WriteLock::new() };
         db.run_startup_maintenance().await;
-        verify_and_heal_fts_index(&db.pool).await?;
+        verify_and_heal_fts_index_with_lock(&db.pool, &db.write_lock).await?;
 
         Ok(db)
     }
@@ -189,7 +207,7 @@ impl Db {
     }
 
     async fn decouple_rss_audio_entries(&self) -> Result<()> {
-        let mut tx = begin_write(&self.pool).await?;
+        let mut tx = begin_write(&self.pool, &self.write_lock).await?;
         let now = crate::util::clock::now_utc();
         let rows: Vec<(String, EntryKind, ContentType, Option<String>)> = sqlx::query_as(
             "SELECT e.id, e.kind, ec.content_type, e.url
@@ -240,7 +258,7 @@ impl Db {
     }
 
     async fn repair_implicit_podcast_misclassifications(&self) -> Result<()> {
-        let mut tx = begin_write(&self.pool).await?;
+        let mut tx = begin_write(&self.pool, &self.write_lock).await?;
         let now = crate::util::clock::now_utc();
         let deleted_media_entry_ids =
             Self::delete_bogus_webpage_audio_enclosures_in_tx(&mut tx).await?;
@@ -436,7 +454,7 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut tx = begin_write(&self.pool).await?;
+        let mut tx = begin_write(&self.pool, &self.write_lock).await?;
         for row in entry_urls {
             let entry_id = row.id;
             let raw_url = row.url;
@@ -559,37 +577,37 @@ impl Db {
 
     #[must_use]
     pub const fn feeds(&self) -> FeedRepo<'_> {
-        FeedRepo::new(&self.pool)
+        FeedRepo::new(&self.pool, &self.write_lock)
     }
 
     #[must_use]
     pub const fn items(&self) -> ItemRepo<'_> {
-        ItemRepo::new(&self.pool)
+        ItemRepo::new(&self.pool, &self.write_lock)
     }
 
     #[must_use]
     pub const fn tags(&self) -> TagRepo<'_> {
-        TagRepo::new(&self.pool)
+        TagRepo::new(&self.pool, &self.write_lock)
     }
 
     #[must_use]
     pub const fn catalog(&self) -> CatalogRepo<'_> {
-        CatalogRepo::new(&self.pool)
+        CatalogRepo::new(&self.pool, &self.write_lock)
     }
 
     #[must_use]
     pub const fn media(&self) -> MediaRepo<'_> {
-        MediaRepo::new(&self.pool)
+        MediaRepo::new(&self.pool, &self.write_lock)
     }
 
     #[must_use]
     pub const fn auth(&self) -> AuthRepo<'_> {
-        AuthRepo::new(&self.pool)
+        AuthRepo::new(&self.pool, &self.write_lock)
     }
 
     #[must_use]
     pub const fn sync(&self) -> SyncRepo<'_> {
-        SyncRepo::new(&self.pool)
+        SyncRepo::new(&self.pool, &self.write_lock)
     }
 }
 
@@ -626,7 +644,8 @@ pub(crate) async fn prepare_pre_v010_schema_if_needed(pool: &SqlitePool) -> Resu
         return Ok(());
     }
 
-    let mut tx = begin_write(pool).await?;
+    let startup_lock = WriteLock::new();
+    let mut tx = begin_write(pool, &startup_lock).await?;
     for (_, mut group) in groups {
         if group.len() < 2 {
             continue;
@@ -672,7 +691,16 @@ pub(crate) async fn verify_foreign_key_integrity(pool: &SqlitePool) -> Result<()
 ///
 /// Rebuilds automatically if implicit `rowid` compaction (e.g. from an external SQLite `VACUUM`
 /// or dump/restore) or b-tree corruption desynchronized it.
+#[cfg(test)]
 pub async fn verify_and_heal_fts_index(pool: &SqlitePool) -> Result<bool> {
+    let lock = WriteLock::new();
+    verify_and_heal_fts_index_with_lock(pool, &lock).await
+}
+
+async fn verify_and_heal_fts_index_with_lock(
+    pool: &SqlitePool,
+    write_lock: &WriteLock,
+) -> Result<bool> {
     let btree_ok = sqlx::query("INSERT INTO entries_fts(entries_fts) VALUES('integrity-check')")
         .execute(pool)
         .await
@@ -702,7 +730,7 @@ pub async fn verify_and_heal_fts_index(pool: &SqlitePool) -> Result<bool> {
     tracing::warn!(
         "entries_fts integrity/rowid check failed (likely after external VACUUM); rebuilding FTS5 index"
     );
-    let mut tx = begin_write(pool).await?;
+    let mut tx = begin_write(pool, write_lock).await?;
     sqlx::query!("DELETE FROM entries_fts").execute(tx.conn()).await?;
     sqlx::query!(
         "INSERT INTO entries_fts (rowid, entry_id, title, creators, summary, content_html)
@@ -1838,5 +1866,47 @@ mod tests {
             Some("https://cdn.substack.example.com/p.mp3")
         );
         assert_eq!(emitted.content.as_ref().unwrap().duration, Some(1800));
+    }
+
+    #[tokio::test]
+    async fn test_write_lock_prevents_concurrent_writers_from_starving_readers() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-write-gate-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let db_path = temp_dir.join("roche.db");
+
+        let db = Db::connect(&db_path).await.unwrap();
+        let feed_url = Url::parse("https://gate.example.com/rss.xml").unwrap();
+        let _feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Gate"), None).await.unwrap();
+
+        // Hold an active write transaction and queue 8 more concurrent writers behind it
+        // (more than the old 5-connection pool). Because `WriteTx::begin` serializes on
+        // `write_lock` before checking out a pool connection, concurrent readers still succeed
+        // immediately without blocking behind the writer queue.
+        let active_tx = db.begin_write().await.unwrap();
+        let mut writer_tasks = Vec::new();
+        for _ in 0..8 {
+            let db_clone = db.clone();
+            writer_tasks.push(tokio::spawn(async move {
+                let tx = db_clone.begin_write().await.unwrap();
+                tx.commit().await.unwrap();
+            }));
+        }
+        tokio::task::yield_now().await;
+
+        let read_res = tokio::time::timeout(Duration::from_secs(2), db.feeds().list())
+            .await
+            .expect("concurrent read must not starve while writers are queued")
+            .unwrap();
+        assert_eq!(read_res.len(), 1);
+
+        active_tx.commit().await.unwrap();
+        for task in writer_tasks {
+            task.await.unwrap();
+        }
+
+        db.pool().close().await;
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

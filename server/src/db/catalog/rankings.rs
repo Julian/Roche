@@ -26,7 +26,7 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<ComparisonRecord> {
         let now = now_utc();
         let event_ts = ts.unwrap_or(now);
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         let mut resolved_ordering: Vec<Vec<String>> = Vec::with_capacity(ordering.len());
         for group in ordering {
@@ -63,7 +63,7 @@ impl CatalogRepo<'_> {
             return Ok(false);
         }
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let res = sqlx::query("DELETE FROM comparisons WHERE id = ?")
             .bind(trimmed)
             .execute(tx.conn())

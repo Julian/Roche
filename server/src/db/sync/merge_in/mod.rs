@@ -258,7 +258,7 @@ impl SyncRepo<'_> {
             req.weight.map(|w| bound_peer_weight(req.network_tier, Some(w)))
         };
 
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         Self::ensure_server_peer_in_tx(tx.conn(), now).await?;
         if !peer_id.is_empty() && peer_id != SERVER_PEER_ID {

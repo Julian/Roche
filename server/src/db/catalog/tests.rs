@@ -764,7 +764,7 @@ async fn test_local_consumption_log_clears_stale_tombstone() {
         event_ts.timestamp_millis(),
         ConsumptionStatus::Consumed.as_str(),
     );
-    let mut tx = crate::db::begin_write(db.pool()).await.unwrap();
+    let mut tx = db.begin_write().await.unwrap();
     crate::db::SyncRepo::record_tombstone(
         &mut tx,
         crate::db::ActivityEntityType::ConsumptionLog,

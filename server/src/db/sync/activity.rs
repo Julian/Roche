@@ -195,7 +195,7 @@ impl SyncRepo<'_> {
 
     pub async fn prune_activity_older_than_days(&self, days: i64) -> Result<u64> {
         let cutoff = Self::now_utc() - chrono::Duration::days(days.max(0));
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let pruned_max_seq: Option<i64> = sqlx::query_scalar(
             "SELECT MAX(sync_seq) FROM sync_tombstones
              WHERE strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(recorded_at, deleted_at))

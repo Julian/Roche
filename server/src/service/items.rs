@@ -59,6 +59,10 @@ impl<'a> ItemService<'a> {
         Ok(self.service.db.items().existing_ids(ids).await?)
     }
 
+    pub async fn count_unread(&self) -> Result<i64, AppError> {
+        Ok(self.service.db.items().count_unread().await?)
+    }
+
     pub async fn save(
         &self,
         url: &Url,

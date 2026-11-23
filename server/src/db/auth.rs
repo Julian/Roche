@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use super::WriteLock;
 use crate::util::{clock::now_utc, hash::sha256_hex};
 
 const MAX_PAIRING_ATTEMPTS: i64 = 25;
@@ -17,19 +18,20 @@ pub struct DeviceToken {
 
 pub struct AuthRepo<'a> {
     pub(crate) pool: &'a SqlitePool,
+    pub(crate) write_lock: &'a WriteLock,
 }
 
 impl<'a> AuthRepo<'a> {
     #[must_use]
-    pub const fn new(pool: &'a SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: &'a SqlitePool, write_lock: &'a WriteLock) -> Self {
+        Self { pool, write_lock }
     }
 
     pub async fn save_pairing_code(&self, code: &str, expires_at: DateTime<Utc>) -> Result<()> {
         let now = now_utc();
         let normalized = code.trim().to_ascii_lowercase();
         let code_hash = sha256_hex(&normalized);
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         sqlx::query!("DELETE FROM pairing_codes").execute(tx.conn()).await?;
 
         sqlx::query!(
@@ -61,7 +63,7 @@ impl<'a> AuthRepo<'a> {
         let now = now_utc();
         let normalized = code.trim().to_ascii_lowercase();
         let code_hash = sha256_hex(&normalized);
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         sqlx::query!(
             "DELETE FROM pairing_codes WHERE datetime(expires_at) <= datetime(?)",
@@ -103,6 +105,7 @@ impl<'a> AuthRepo<'a> {
         token_hash: &str,
     ) -> Result<()> {
         let now = now_utc();
+        let _write_guard = self.write_lock.acquire().await?;
         sqlx::query!(
             "INSERT INTO device_tokens (id, device_name, token, created_at) VALUES (?, ?, ?, ?)",
             id,
@@ -136,6 +139,7 @@ impl<'a> AuthRepo<'a> {
 
         if should_update {
             let now = now_utc();
+            let _write_guard = self.write_lock.acquire().await?;
             sqlx::query("UPDATE device_tokens SET last_used_at = ? WHERE id = ?")
                 .bind(now)
                 .bind(&id)
@@ -150,7 +154,7 @@ impl<'a> AuthRepo<'a> {
     /// Returns `Ok(false)` if this token is bound to a different `peer_id` or another token
     /// already owns `peer_id`.
     pub async fn bind_or_verify_peer_id(&self, token_id: &str, peer_id: &str) -> Result<bool> {
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let current: Option<Option<String>> =
             sqlx::query_scalar("SELECT bound_peer_id FROM device_tokens WHERE id = ?")
                 .bind(token_id)
@@ -204,6 +208,7 @@ impl<'a> AuthRepo<'a> {
     }
 
     pub async fn revoke_device(&self, id: &str) -> Result<bool> {
+        let _write_guard = self.write_lock.acquire().await?;
         let res =
             sqlx::query!("DELETE FROM device_tokens WHERE id = ?", id).execute(self.pool).await?;
         Ok(res.rows_affected() > 0)
@@ -217,6 +222,7 @@ impl<'a> AuthRepo<'a> {
         expires_at: DateTime<Utc>,
     ) -> Result<()> {
         let now = now_utc();
+        let _write_guard = self.write_lock.acquire().await?;
         sqlx::query(
             "INSERT INTO web_sessions (id, token_hash, label, created_at, expires_at)
              VALUES (?, ?, ?, ?, ?)",
@@ -231,7 +237,12 @@ impl<'a> AuthRepo<'a> {
         Ok(())
     }
 
-    pub async fn validate_web_session_id(&self, token_hash: &str) -> Result<Option<String>> {
+    /// Read-only web session lookup returning `(session_id, should_touch_last_used)` so
+    /// authenticated `GET` page navigations never block on SQLite's write lock.
+    pub async fn lookup_valid_web_session_id(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(String, bool)>> {
         let now = now_utc();
         let row: Option<(String, bool)> = sqlx::query_as(
             "SELECT id,
@@ -243,23 +254,23 @@ impl<'a> AuthRepo<'a> {
         .bind(now)
         .fetch_optional(self.pool)
         .await?;
+        Ok(row)
+    }
 
-        let Some((id, should_update)) = row else {
-            return Ok(None);
-        };
-
-        if should_update {
-            sqlx::query("UPDATE web_sessions SET last_used_at = ? WHERE id = ?")
-                .bind(now)
-                .bind(&id)
-                .execute(self.pool)
-                .await?;
-        }
-
-        Ok(Some(id))
+    /// Updates `web_sessions.last_used_at` for an active session under the serialized write lock.
+    pub async fn touch_web_session_last_used(&self, id: &str) -> Result<()> {
+        let now = now_utc();
+        let _write_guard = self.write_lock.acquire().await?;
+        sqlx::query("UPDATE web_sessions SET last_used_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn revoke_web_session_by_token_hash(&self, token_hash: &str) -> Result<bool> {
+        let _write_guard = self.write_lock.acquire().await?;
         let res = sqlx::query("DELETE FROM web_sessions WHERE token_hash = ?")
             .bind(token_hash)
             .execute(self.pool)
@@ -269,6 +280,7 @@ impl<'a> AuthRepo<'a> {
 
     pub async fn prune_expired_web_sessions(&self) -> Result<u64> {
         let now = now_utc();
+        let _write_guard = self.write_lock.acquire().await?;
         let res = sqlx::query("DELETE FROM web_sessions WHERE datetime(expires_at) <= datetime(?)")
             .bind(now)
             .execute(self.pool)
@@ -284,6 +296,7 @@ impl<'a> AuthRepo<'a> {
         keep_most_recent: i64,
     ) -> Result<u64> {
         let keep = keep_most_recent.max(1);
+        let _write_guard = self.write_lock.acquire().await?;
         let res = sqlx::query(
             "DELETE FROM web_sessions
              WHERE label = ?

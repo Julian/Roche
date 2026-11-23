@@ -190,7 +190,7 @@ impl ItemRepo<'_> {
             .and_then(|a| serde_json::to_string(&[a]).ok())
             .unwrap_or_else(|| "[]".to_owned());
 
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         Self::insert_created_item_rows_in_tx(
             &mut tx,
             &id,
@@ -309,7 +309,7 @@ impl ItemRepo<'_> {
         let now = now_utc();
         let clean_duration = input.duration.filter(|&d| d > 0);
         let entry_kind = EntryKind::for_feed_item(None, input.content_type);
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         SyncRepo::clear_tombstone(
             tx.conn(),
@@ -549,7 +549,7 @@ impl ItemRepo<'_> {
         progress_source: Option<ProgressSource>,
     ) -> Result<bool> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let found = Self::update_in_tx(
             &mut tx,
             id,
@@ -578,7 +578,7 @@ impl ItemRepo<'_> {
         notes: Option<&str>,
     ) -> CatalogResult<Option<(bool, ConsumptionLogView)>> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         let has_feed = sqlx::query_scalar::<_, i64>(
             "SELECT 1 FROM collection_entries ce
@@ -617,8 +617,9 @@ impl ItemRepo<'_> {
         .await?;
         tx.commit().await?;
 
-        let logged =
-            CatalogRepo::new(self.pool).load_consumption_log_view(&log_id, &canon_id).await?;
+        let logged = CatalogRepo::new(self.pool, self.write_lock)
+            .load_consumption_log_view(&log_id, &canon_id)
+            .await?;
         Ok(Some((has_feed, logged)))
     }
 
@@ -628,7 +629,7 @@ impl ItemRepo<'_> {
     /// to `Want to Read`.
     pub async fn unfinish_reader_item(&self, id: &str) -> CatalogResult<bool> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         let has_feed = sqlx::query_scalar::<_, i64>(
             "SELECT 1 FROM collection_entries ce
@@ -675,7 +676,7 @@ impl ItemRepo<'_> {
     /// returning `Ok(Some(new_is_favorite))` or `Ok(None)` if not found.
     pub async fn toggle_star(&self, id: &str) -> Result<Option<bool>> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let mut qb = QueryBuilder::<Sqlite>::new(
             "SELECT EXISTS (
                  SELECT 1 FROM collection_entries ce_fav
@@ -725,7 +726,7 @@ impl ItemRepo<'_> {
     /// items are removed from `Want to Read`.
     pub async fn dismiss(&self, id: &str) -> Result<bool> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let deleted_logs = CatalogRepo::delete_consumed_logs_for_entry_in_tx(&mut tx, id, now)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -974,7 +975,7 @@ impl ItemRepo<'_> {
 
     pub async fn unarchive(&self, id: &str) -> Result<bool> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let deleted_logs = CatalogRepo::delete_consumed_logs_for_entry_in_tx(&mut tx, id, now)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1192,7 +1193,7 @@ impl ItemRepo<'_> {
 
     pub(crate) async fn delete_returning_outcome(&self, id: &str) -> Result<ItemDeleteOutcome> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         let mut key_qb = QueryBuilder::<Sqlite>::new(
             "SELECT i.url,
@@ -1313,7 +1314,7 @@ impl ItemRepo<'_> {
         }
 
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         let live: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM entries e
@@ -1386,7 +1387,7 @@ impl ItemRepo<'_> {
         }
 
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         if Self::backfill_entry_fields_in_tx(&mut tx, id, &backfill, now).await? {
             SyncRepo::record_activity(
                 tx.conn(),

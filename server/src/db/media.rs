@@ -5,7 +5,8 @@ use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use super::{
-    ActivityAction, ActivityEntityType, MediaType, SyncRepo, sync::deterministic_enclosure_media_id,
+    ActivityAction, ActivityEntityType, MediaType, SyncRepo, WriteLock,
+    sync::deterministic_enclosure_media_id,
 };
 use crate::util::clock::now_utc;
 
@@ -22,6 +23,7 @@ pub struct Media {
 
 pub struct MediaRepo<'a> {
     pub(crate) pool: &'a SqlitePool,
+    pub(crate) write_lock: &'a WriteLock,
 }
 
 pub struct NewMediaSpec<'a> {
@@ -33,8 +35,8 @@ pub struct NewMediaSpec<'a> {
 
 impl<'a> MediaRepo<'a> {
     #[must_use]
-    pub const fn new(pool: &'a SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: &'a SqlitePool, write_lock: &'a WriteLock) -> Self {
+        Self { pool, write_lock }
     }
 
     async fn insert_media_row_in_tx(
@@ -119,7 +121,7 @@ impl<'a> MediaRepo<'a> {
             return Ok(Vec::new());
         }
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let mut out = Vec::with_capacity(specs.len());
 
         for spec in specs {
@@ -199,7 +201,7 @@ impl<'a> MediaRepo<'a> {
         duration: Option<i64>,
     ) -> Result<Media> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let media = Self::insert_media_row_in_tx(
             tx.conn(),
             item_id,
@@ -306,7 +308,7 @@ impl<'a> MediaRepo<'a> {
 
     pub async fn delete(&self, id: &str) -> Result<()> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         Self::delete_local_in_tx(tx.conn(), id, now).await?;
         tx.commit().await?;
         Ok(())
@@ -320,7 +322,7 @@ impl<'a> MediaRepo<'a> {
             return Ok(media_list);
         }
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         for media in &media_list {
             Self::delete_local_in_tx(tx.conn(), &media.id, now).await?;
         }

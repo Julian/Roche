@@ -15,7 +15,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -165,6 +165,7 @@ pub struct RocheService {
     ep_cache: EpScoreCache,
     pairing_limiter: Arc<PairingRateLimiter>,
     tailscale_web_sessions: Arc<Mutex<HashMap<String, String>>>,
+    web_session_last_touch: Arc<Mutex<HashMap<String, Instant>>>,
     artist_enricher: Arc<ArtistEnricher>,
     node_identity: Option<crate::tailscale::NodeIdentity>,
 }
@@ -190,6 +191,7 @@ impl RocheService {
             ep_cache: EpScoreCache::new(),
             pairing_limiter: Arc::new(PairingRateLimiter::default()),
             tailscale_web_sessions: Arc::new(Mutex::new(HashMap::new())),
+            web_session_last_touch: Arc::new(Mutex::new(HashMap::new())),
             artist_enricher: Arc::new(ArtistEnricher::default_for_runtime()),
             node_identity: None,
         }

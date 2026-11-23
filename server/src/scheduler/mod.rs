@@ -12,8 +12,8 @@ use crate::{
         SERVER_PEER_ID, compute_throughput_weight, should_peer_poll_feed, update_throughput_ewma,
     },
     ingest::{
-        FeedFetcher, FeedIngester, FeedPollGuard, FeedPollLocks, HttpFeedFetcher,
-        MAX_CONCURRENT_POLLS, MediaIngestContext,
+        FeedConditionalCache, FeedFetcher, FeedIngester, FeedPollGuard, FeedPollLocks,
+        HttpFeedFetcher, MAX_CONCURRENT_POLLS, MediaIngestContext,
     },
     media::{MediaStore, ytdlp::YtDlpWorker},
     util::clock::now_utc,
@@ -78,6 +78,7 @@ pub struct PollScheduler<F = HttpFeedFetcher> {
     download_semaphore: Arc<Semaphore>,
     semaphore: Arc<Semaphore>,
     feed_poll_locks: FeedPollLocks,
+    conditional_cache: FeedConditionalCache,
     throughput_ewma: ThroughputEwma,
     tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
 }
@@ -93,6 +94,7 @@ impl<F: FeedFetcher> PollScheduler<F> {
             download_semaphore: Arc::new(Semaphore::new(2)),
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_POLLS)),
             feed_poll_locks: FeedPollLocks::new(),
+            conditional_cache: FeedConditionalCache::new(),
             throughput_ewma: ThroughputEwma::new(),
             tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
         }
@@ -231,6 +233,7 @@ impl<F: FeedFetcher> PollScheduler<F> {
         let ytdlp_worker = self.ytdlp_worker.clone();
         let download_semaphore = Arc::clone(&self.download_semaphore);
         let semaphore = Arc::clone(&self.semaphore);
+        let conditional_cache = self.conditional_cache.clone();
         let throughput_ewma = self.throughput_ewma.clone();
 
         tasks.spawn(async move {
@@ -240,18 +243,21 @@ impl<F: FeedFetcher> PollScheduler<F> {
                     return;
                 };
                 let started_at = Instant::now();
-                let res = FeedIngester::poll_xml_and_record_outcome(
+                let res = FeedIngester::poll_xml_and_record_outcome_with_cache(
                     &db,
                     fetcher.as_ref(),
                     &feed,
                     "scheduled",
                     false,
+                    Some(&conditional_cache),
                 )
                 .await;
                 (res, started_at.elapsed().as_secs_f64())
             };
 
-            if let Ok(ref outcome) = poll_res {
+            if let Ok(ref outcome) = poll_res
+                && !outcome.unchanged
+            {
                 let sample_weight =
                     compute_throughput_weight(1, outcome.parsed_entries, elapsed_secs);
                 let _ = throughput_ewma.record_sample(sample_weight);

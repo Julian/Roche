@@ -59,6 +59,7 @@ impl SyncRepo<'_> {
 
     pub async fn prune_stale_peer_nodes(&self, older_than_days: i64) -> Result<u64> {
         let cutoff = Self::now_utc() - chrono::Duration::days(older_than_days.max(1));
+        let _write_guard = self.write_lock.acquire().await?;
         let res = sqlx::query(
             "DELETE FROM peer_nodes
              WHERE peer_id != ?
@@ -81,6 +82,7 @@ impl SyncRepo<'_> {
         now: DateTime<Utc>,
     ) -> Result<()> {
         let clamped_weight = bound_peer_weight(network_tier, Some(weight));
+        let _write_guard = self.write_lock.acquire().await?;
         sqlx::query!(
             "INSERT INTO peer_nodes (peer_id, device_name, network_tier, weight, last_seen_at)
              VALUES (?, ?, ?, ?, ?)

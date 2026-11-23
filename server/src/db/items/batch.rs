@@ -107,7 +107,7 @@ impl ItemRepo<'_> {
         }
 
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let state_hlc = tx.next_hlc().await?;
         let mut archived_ids = Vec::with_capacity(candidate_ids.len());
 
@@ -206,7 +206,7 @@ impl ItemRepo<'_> {
         }
 
         let count = u64::try_from(normalized.len()).unwrap_or(0);
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         for (id, excerpt, thumb) in normalized {
             sqlx::query!(
                 "INSERT INTO entry_content (entry_id, content_html, content_type)
@@ -291,7 +291,7 @@ impl ItemRepo<'_> {
         }
 
         let count = u64::try_from(updates.len()).unwrap_or(0);
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         for (id, thumb) in updates {
             let entry_hlc = tx.next_hlc().await?;
             sqlx::query("UPDATE entries SET thumbnail_url = ?, hlc = ? WHERE id = ?")

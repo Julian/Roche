@@ -15,3 +15,29 @@ nursery = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+# Keep debug builds snappy for local development without slowing down incremental compiles
+# of the workspace crates themselves: optimize SQLite, HTML/XML parsing, and compression.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 2
+
+[profile.dev.package.sqlx-sqlite]
+opt-level = 2
+
+[profile.dev.package.ammonia]
+opt-level = 2
+
+[profile.dev.package.html5ever]
+opt-level = 2
+
+[profile.dev.package.quick-xml]
+opt-level = 2
+
+[profile.dev.package.brotli]
+opt-level = 2
+
+[profile.dev.package.zstd-sys]
+opt-level = 2
+
+[profile.dev.package.flate2]
+opt-level = 2

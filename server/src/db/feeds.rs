@@ -6,7 +6,7 @@ use url::Url;
 
 use super::{
     ActivityAction, ActivityEntityType, CatalogRepo, ContentType, EntryKind, FeedType, InboxState,
-    ItemRepo, MediaRepo, SyncRepo, WriteTx,
+    ItemRepo, MediaRepo, SyncRepo, WriteLock, WriteTx,
     entries_core::{self, EntryInsertParams},
     sync::{
         MAX_CONSECUTIVE_FAILURES, SERVER_PEER_ID, canonicalize_sync_url, deterministic_feed_id,
@@ -79,7 +79,38 @@ JOIN entries e ON e.id = fs.collection_id ",
 }
 
 const FEED_SELECT_BY_ID_SQL: &str = feed_select_sql!("WHERE fs.collection_id = ?");
-const FEED_SELECT_ALL_SQL: &str = feed_select_sql!("ORDER BY e.created_at DESC");
+const FEED_SELECT_ALL_SQL: &str = "SELECT fs.collection_id AS id,
+       fs.source_type AS feed_type,
+       fs.feed_url AS url,
+       fs.feed_title AS title,
+       e.summary AS description,
+       fs.language,
+       fs.poll_interval,
+       fs.last_polled_at AS last_polled,
+       fs.last_polled_by,
+       fs.last_error,
+       fs.last_error_by,
+       fs.consecutive_failures,
+       fs.is_active,
+       e.created_at,
+       COALESCE(uc.unread_count, 0) AS unread_count
+FROM feed_sources fs
+JOIN entries e ON e.id = fs.collection_id
+LEFT JOIN (
+    SELECT ce.collection_id, COUNT(*) AS unread_count
+    FROM entry_state es
+    JOIN entries ie ON ie.id = es.entry_id
+    JOIN collection_entries ce ON ce.entry_id = es.entry_id
+    JOIN feed_sources fs_u ON fs_u.collection_id = ce.collection_id
+    WHERE es.inbox_state = 'unread'
+      AND ie.merged_into_id IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM consumption_log cl_f
+          WHERE cl_f.entry_id = ie.id AND cl_f.status = 'consumed'
+      )
+    GROUP BY ce.collection_id
+) uc ON uc.collection_id = fs.collection_id
+ORDER BY e.created_at DESC";
 const FEED_SELECT_ACTIVE_POLL_SQL: &str = "SELECT fs.collection_id AS id,
        fs.source_type AS feed_type,
        fs.feed_url AS url,
@@ -236,14 +267,26 @@ struct ExistingFeedPollMeta {
     language: Option<String>,
 }
 
+#[derive(sqlx::FromRow)]
+struct ExistingPollItemSnapshot {
+    inbox_state: Option<InboxState>,
+    already_linked: bool,
+    has_thumb: bool,
+    has_creators: bool,
+    kind: EntryKind,
+    content_type: Option<ContentType>,
+    content_trimmed_bytes: Option<i64>,
+}
+
 pub struct FeedRepo<'a> {
     pub(crate) pool: &'a SqlitePool,
+    pub(crate) write_lock: &'a WriteLock,
 }
 
 impl<'a> FeedRepo<'a> {
     #[must_use]
-    pub const fn new(pool: &'a SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: &'a SqlitePool, write_lock: &'a WriteLock) -> Self {
+        Self { pool, write_lock }
     }
 
     #[cfg(test)]
@@ -384,7 +427,7 @@ impl<'a> FeedRepo<'a> {
         let id = deterministic_feed_id(url_str);
         let nat_key = feed_natural_key(url_str);
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, &nat_key).await?;
         SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, &id).await?;
@@ -567,7 +610,7 @@ impl<'a> FeedRepo<'a> {
         default_interval: i64,
     ) -> Result<Vec<Feed>> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let mut imported = Vec::new();
 
         for outline in outlines {
@@ -682,6 +725,12 @@ impl<'a> FeedRepo<'a> {
         Ok(raw.map(Feed::try_from).transpose()?)
     }
 
+    pub async fn count(&self) -> Result<usize> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed_sources").fetch_one(self.pool).await?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
     pub async fn list(&self) -> Result<Vec<Feed>> {
         let mut conn = self.pool.acquire().await?;
         Self::list_in_tx(&mut conn).await
@@ -712,7 +761,7 @@ impl<'a> FeedRepo<'a> {
         }
 
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         let existing_feed: Option<(String, FeedType, Option<String>)> = sqlx::query_as(
             "SELECT feed_url, source_type, feed_title FROM feed_sources WHERE collection_id = ?",
@@ -1096,7 +1145,7 @@ impl<'a> FeedRepo<'a> {
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let deleted_url: Option<String> =
             sqlx::query_scalar!("SELECT feed_url FROM feed_sources WHERE collection_id = ?", id,)
                 .fetch_optional(tx.conn())
@@ -1143,6 +1192,40 @@ impl<'a> FeedRepo<'a> {
         Ok(rows.into_iter().map(Feed::try_from).collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Fast-path poll timestamp & health update for unchanged feeds (`304 Not Modified` or
+    /// identical body hash) without touching `entries_fts`, `sync_clock.last_hlc`, or item rows
+    /// (`feed_sources_sync_seq_au` still bumps `sync_seq` so poll metadata propagates to peers).
+    pub async fn record_unchanged_poll(
+        &self,
+        feed_id: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        self.record_unchanged_poll_by_peer(feed_id, SERVER_PEER_ID).await
+    }
+
+    pub async fn record_unchanged_poll_by_peer(
+        &self,
+        feed_id: &str,
+        peer_id: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
+        sqlx::query(
+            "UPDATE feed_sources
+             SET last_polled_at = ?,
+                 last_polled_by = ?,
+                 last_error = NULL,
+                 last_error_by = NULL,
+                 consecutive_failures = 0
+             WHERE collection_id = ?",
+        )
+        .bind(now)
+        .bind(peer_id)
+        .bind(feed_id)
+        .execute(tx.conn())
+        .await?;
+        tx.commit().await
+    }
+
     pub async fn record_poll_batch(
         &self,
         feed_id: &str,
@@ -1164,7 +1247,7 @@ impl<'a> FeedRepo<'a> {
         let new_desc = batch.description.as_deref().filter(|s| !s.is_empty());
         let new_lang = batch.language.as_deref().filter(|s| !s.is_empty());
 
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         let existing_meta: Option<ExistingFeedPollMeta> = sqlx::query_as(
             "SELECT fs.feed_url, fs.source_type, fs.feed_title, e.summary, fs.language
@@ -1214,22 +1297,26 @@ impl<'a> FeedRepo<'a> {
         .execute(tx.conn())
         .await?;
 
-        let entry_hlc_opt = if entry_meta_changed { Some(tx.next_hlc().await?) } else { None };
-        sqlx::query(
-            "UPDATE entries
-             SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
-                 summary = COALESCE(summary, ?),
-                 updated_at = ?,
-                 hlc = COALESCE(?, hlc)
-             WHERE id = ?",
-        )
-        .bind(feed_id)
-        .bind(new_desc)
-        .bind(now)
-        .bind(entry_hlc_opt.as_deref())
-        .bind(feed_id)
-        .execute(tx.conn())
-        .await?;
+        // Only update the feed's `entries` row when title or summary actually filled in,
+        // avoiding firing `entries_fts_au` (FTS5 delete+reinsert) on every routine poll.
+        if entry_meta_changed {
+            let entry_hlc = tx.next_hlc().await?;
+            sqlx::query(
+                "UPDATE entries
+                 SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
+                     summary = COALESCE(summary, ?),
+                     updated_at = ?,
+                     hlc = ?
+                 WHERE id = ?",
+            )
+            .bind(feed_id)
+            .bind(new_desc)
+            .bind(now)
+            .bind(&entry_hlc)
+            .bind(feed_id)
+            .execute(tx.conn())
+            .await?;
+        }
 
         if metadata_updated {
             SyncRepo::record_activity(
@@ -1242,20 +1329,33 @@ impl<'a> FeedRepo<'a> {
             .await?;
         }
 
+        let has_item_tombstones = if batch.items.is_empty() {
+            false
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM sync_tombstones WHERE entity_type = 'item' LIMIT 1",
+            )
+            .fetch_optional(tx.conn())
+            .await?
+            .is_some()
+        };
+
         let mut inserted = Vec::new();
         for item in &batch.items {
             let item_url_str = item.url.as_str();
             let item_thumb = item.thumbnail_url.as_deref();
             let item_content_html = item.content_html.as_deref();
-            let natural_key = item_natural_key(feed_url.as_deref(), item_url_str);
-            let tombstoned: Option<i64> = sqlx::query_scalar!(
-                "SELECT 1 AS \"found!: i64\" FROM sync_tombstones WHERE entity_type = 'item' AND natural_key = ? LIMIT 1",
-                natural_key,
-            )
-            .fetch_optional(tx.conn())
-            .await?;
-            if tombstoned.is_some() {
-                continue;
+            if has_item_tombstones {
+                let natural_key = item_natural_key(feed_url.as_deref(), item_url_str);
+                let tombstoned: Option<i64> = sqlx::query_scalar!(
+                    "SELECT 1 AS \"found!: i64\" FROM sync_tombstones WHERE entity_type = 'item' AND natural_key = ? LIMIT 1",
+                    natural_key,
+                )
+                .fetch_optional(tx.conn())
+                .await?;
+                if tombstoned.is_some() {
+                    continue;
+                }
             }
 
             let det_id = deterministic_item_id(feed_url.as_deref(), item_url_str);
@@ -1266,25 +1366,43 @@ impl<'a> FeedRepo<'a> {
             if let Some(existing_id) =
                 resolve_dedup_entry_id(tx.conn(), &det_id, &canon_url, arxiv_id.as_deref()).await?
             {
-                let existing_state: Option<InboxState> = sqlx::query_scalar!(
-                    "SELECT inbox_state AS \"inbox_state: InboxState\" FROM entry_state WHERE entry_id = ? LIMIT 1",
-                    existing_id,
-                )
-                .fetch_optional(tx.conn())
-                .await?;
-
-                let ce_hlc = tx.next_hlc().await?;
-                sqlx::query(
-                    "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at, hlc)
-                     VALUES (?, ?, ?, ?)",
+                let snapshot: Option<ExistingPollItemSnapshot> = sqlx::query_as(
+                    "SELECT es.inbox_state AS inbox_state,
+                            EXISTS (
+                                SELECT 1 FROM collection_entries ce
+                                WHERE ce.collection_id = ? AND ce.entry_id = e.id
+                            ) AS already_linked,
+                            (e.thumbnail_url IS NOT NULL) AS has_thumb,
+                            (e.creators_json != '[]') AS has_creators,
+                            e.kind AS kind,
+                            ec.content_type AS content_type,
+                            length(CAST(trim(ec.content_html, ' ' || char(9, 10, 11, 12, 13, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)) AS BLOB)) AS content_trimmed_bytes
+                     FROM entries e
+                     LEFT JOIN entry_state es ON es.entry_id = e.id
+                     LEFT JOIN entry_content ec ON ec.entry_id = e.id
+                     WHERE e.id = ?",
                 )
                 .bind(feed_id)
                 .bind(&existing_id)
-                .bind(now)
-                .bind(&ce_hlc)
-                .execute(tx.conn())
+                .fetch_optional(tx.conn())
                 .await?;
 
+                let already_linked = snapshot.as_ref().is_some_and(|s| s.already_linked);
+                if !already_linked {
+                    let ce_hlc = tx.next_hlc().await?;
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at, hlc)
+                         VALUES (?, ?, ?, ?)",
+                    )
+                    .bind(feed_id)
+                    .bind(&existing_id)
+                    .bind(now)
+                    .bind(&ce_hlc)
+                    .execute(tx.conn())
+                    .await?;
+                }
+
+                let existing_state = snapshot.as_ref().and_then(|s| s.inbox_state);
                 if existing_state.is_none() {
                     let clean_summary =
                         Some(item.summary.as_str()).filter(|s| !s.trim().is_empty());
@@ -1364,6 +1482,7 @@ impl<'a> FeedRepo<'a> {
                         item,
                         clean_duration,
                         now,
+                        None,
                     )
                     .await?;
 
@@ -1384,6 +1503,7 @@ impl<'a> FeedRepo<'a> {
                         item,
                         clean_duration,
                         now,
+                        snapshot.as_ref(),
                     )
                     .await?;
                 }
@@ -1474,6 +1594,7 @@ impl<'a> FeedRepo<'a> {
         Ok(inserted)
     }
 
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn backfill_existing_poll_item_in_tx(
         tx: &mut WriteTx<'_>,
         existing_id: &str,
@@ -1481,6 +1602,7 @@ impl<'a> FeedRepo<'a> {
         item: &PollItemCandidate,
         clean_duration: Option<i64>,
         now: DateTime<Utc>,
+        snapshot: Option<&ExistingPollItemSnapshot>,
     ) -> std::result::Result<(), sqlx::Error> {
         if item.audio_url.is_none()
             && clean_duration.is_none()
@@ -1501,18 +1623,29 @@ impl<'a> FeedRepo<'a> {
         };
 
         let mut changed = false;
-        let entry_hlc_bumped = Self::backfill_poll_entry_metadata_in_tx(
-            tx,
-            existing_id,
-            thumb_ref,
-            creators_ref,
-            podcast_audio_ref,
-            now,
-        )
-        .await?;
+        let needs_entry_meta_backfill = snapshot.is_none_or(|s| {
+            (thumb_ref.is_some() && !s.has_thumb)
+                || (creators_ref.is_some() && !s.has_creators)
+                || (podcast_audio_ref.is_some() && s.kind == EntryKind::Article)
+        });
+        let entry_hlc_bumped = if needs_entry_meta_backfill {
+            Self::backfill_poll_entry_metadata_in_tx(
+                tx,
+                existing_id,
+                thumb_ref,
+                creators_ref,
+                podcast_audio_ref,
+                now,
+            )
+            .await?
+        } else {
+            false
+        };
         changed |= entry_hlc_bumped;
 
-        if podcast_audio_ref.is_some() {
+        if podcast_audio_ref.is_some()
+            && snapshot.is_none_or(|s| s.content_type != Some(ContentType::Audio))
+        {
             let ct_res = sqlx::query!(
                 "UPDATE entry_content
                  SET content_type = 'audio'
@@ -1539,20 +1672,27 @@ impl<'a> FeedRepo<'a> {
         }
 
         if let Some(incoming_html) = item.content_html.as_deref().filter(|h| !h.trim().is_empty()) {
-            let resolved_ct =
-                if parent_feed_type == Some(FeedType::Podcast) && item.audio_url.is_some() {
-                    ContentType::Audio
-                } else {
-                    item.content_type
-                };
-            let html_updated = Self::backfill_poll_html_content_in_tx(
-                tx.conn(),
-                existing_id,
-                incoming_html,
-                resolved_ct,
-            )
-            .await?;
-            changed |= html_updated;
+            let incoming_trimmed_len =
+                i64::try_from(incoming_html.trim().len()).unwrap_or(i64::MAX);
+            let skip_html_fetch = snapshot.is_some_and(|s| {
+                s.content_trimmed_bytes.is_some_and(|b| b > 0 && incoming_trimmed_len <= b)
+            });
+            if !skip_html_fetch {
+                let resolved_ct =
+                    if parent_feed_type == Some(FeedType::Podcast) && item.audio_url.is_some() {
+                        ContentType::Audio
+                    } else {
+                        item.content_type
+                    };
+                let html_updated = Self::backfill_poll_html_content_in_tx(
+                    tx.conn(),
+                    existing_id,
+                    incoming_html,
+                    resolved_ct,
+                )
+                .await?;
+                changed |= html_updated;
+            }
         }
 
         if changed && !entry_hlc_bumped {
@@ -1687,7 +1827,7 @@ impl<'a> FeedRepo<'a> {
 
     pub async fn mark_error_by_peer(&self, id: &str, error: &str, peer_id: &str) -> Result<()> {
         let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         sqlx::query(
             "UPDATE feed_sources
              SET last_error = ?,
@@ -2276,5 +2416,57 @@ mod tests {
         .unwrap();
         assert!(tomb_keys.contains(&super::feed_natural_key(case_upper.as_str())));
         assert!(tomb_keys.contains(&upper_feed.id));
+    }
+
+    #[tokio::test]
+    async fn test_poll_html_backfill_treats_unicode_whitespace_only_content_as_empty() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://nbsp.example.com/rss.xml").unwrap();
+        let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("NBSP"), None).await.unwrap();
+        let post_url = Url::parse("https://nbsp.example.com/p/1").unwrap();
+
+        // 5 NBSP codepoints = 10 UTF-8 bytes, but `str::trim().len() == 0`.
+        let ws_batch = PollBatch {
+            title: Some("NBSP".to_owned()),
+            description: None,
+            language: None,
+            items: vec![PollItemCandidate {
+                title: "Post".to_owned(),
+                url: post_url.clone(),
+                creators: Vec::new(),
+                published_at: None,
+                summary: String::new(),
+                content_html: Some("\u{00A0}\u{00A0}\u{00A0}\u{00A0}\u{00A0}".to_owned()),
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Article,
+            }],
+        };
+        let inserted = db.feeds().record_poll_batch(&feed.id, &ws_batch).await.unwrap();
+        let item_id = inserted[0].0.clone();
+
+        // 9-byte incoming HTML is shorter in raw bytes (9 < 10) yet richer than blank Unicode whitespace.
+        let richer_batch = PollBatch {
+            title: Some("NBSP".to_owned()),
+            description: None,
+            language: None,
+            items: vec![PollItemCandidate {
+                title: "Post".to_owned(),
+                url: post_url,
+                creators: Vec::new(),
+                published_at: None,
+                summary: String::new(),
+                content_html: Some("<p>hi</p>".to_owned()),
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Article,
+            }],
+        };
+        let reinserted = db.feeds().record_poll_batch(&feed.id, &richer_batch).await.unwrap();
+        assert!(reinserted.is_empty());
+        let item = db.items().get(&item_id).await.unwrap().unwrap();
+        assert_eq!(item.content_html.as_deref(), Some("<p>hi</p>"));
     }
 }

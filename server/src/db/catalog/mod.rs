@@ -1,5 +1,7 @@
 use sqlx::SqlitePool;
 
+use super::WriteLock;
+
 mod batch;
 mod collections;
 mod consumption;
@@ -37,11 +39,12 @@ pub use roche_core::{
 #[derive(Clone, Copy)]
 pub struct CatalogRepo<'a> {
     pool: &'a SqlitePool,
+    write_lock: &'a WriteLock,
 }
 
 impl<'a> CatalogRepo<'a> {
     #[must_use]
-    pub const fn new(pool: &'a SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: &'a SqlitePool, write_lock: &'a WriteLock) -> Self {
+        Self { pool, write_lock }
     }
 }

@@ -48,14 +48,17 @@ pub use roche_core::{
 };
 use sqlx::SqlitePool;
 
+use super::WriteLock;
+
 pub struct SyncRepo<'a> {
     pub(crate) pool: &'a SqlitePool,
+    pub(crate) write_lock: &'a WriteLock,
 }
 
 impl<'a> SyncRepo<'a> {
     #[must_use]
-    pub const fn new(pool: &'a SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: &'a SqlitePool, write_lock: &'a WriteLock) -> Self {
+        Self { pool, write_lock }
     }
 
     /// Returns the current UTC timestamp truncated to milliseconds (`YYYY-MM-DDTHH:MM:SS.sss+00:00`).

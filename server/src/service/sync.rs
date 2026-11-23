@@ -64,7 +64,7 @@ pub struct SyncService<'a> {
 
 impl SyncService<'_> {
     pub async fn status(&self) -> Result<SyncStatus, AppError> {
-        let feeds = self.service.db.feeds().list().await?;
+        let feeds_count = self.service.db.feeds().count().await?;
         let unread_items_count = self.service.db.items().count_unread().await?;
         let archived_items_count =
             self.service.db.items().count_by_status(ItemStatus::Archived).await?;
@@ -73,7 +73,7 @@ impl SyncService<'_> {
         let active_refresh_count = self.service.active_refresh_count();
         Ok(SyncStatus {
             status: "ok",
-            feeds_count: feeds.len(),
+            feeds_count,
             unread_items_count,
             archived_items_count,
             latest_activity_id,

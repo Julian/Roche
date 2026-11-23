@@ -172,10 +172,42 @@ async fn test_web_static_login_csrf_and_logout_revocation() {
     assert_eq!(css_resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
     assert_eq!(css_resp.headers().get(header::X_FRAME_OPTIONS).unwrap(), "SAMEORIGIN");
     assert_eq!(css_resp.headers().get(header::REFERRER_POLICY).unwrap(), "same-origin");
+    let css_etag = css_resp.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
+    assert!(css_etag.starts_with("W/\""), "expected weak ETag under compression, got {css_etag}");
+    assert_eq!(css_resp.headers().get(header::VARY).unwrap(), "Accept-Encoding");
     let css_body =
         String::from_utf8(to_bytes(css_resp.into_body(), 128 * 1024).await.unwrap().to_vec())
             .unwrap();
     assert!(css_body.contains("#fbf7ed"));
+
+    // Both exact weak ETag and stripped strong form must match per RFC 9110 §8.8.3.2 weak comparison,
+    // and 304 must retain `Vary: Accept-Encoding` per RFC 9110 §15.4.5.
+    for inm in [css_etag.as_str(), css_etag.trim_start_matches("W/")] {
+        let css_304 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/static/roche.css")
+                    .header(header::IF_NONE_MATCH, inm)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(css_304.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(css_304.headers().get(header::VARY).unwrap(), "Accept-Encoding");
+    }
+
+    let css_versioned = app
+        .clone()
+        .oneshot(Request::builder().uri(super::css_href()).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(css_versioned.status(), StatusCode::OK);
+    assert_eq!(
+        css_versioned.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
 
     let js_resp = app
         .clone()

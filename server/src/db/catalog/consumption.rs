@@ -73,7 +73,7 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<ConsumptionLogView> {
         let now = now_utc();
         let event_ts = ts.unwrap_or(now);
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let (log_id, canon_id) =
             Self::log_consumption_in_tx(&mut tx, entry_id, status, notes, event_ts, now).await?;
         tx.commit().await?;
@@ -100,7 +100,7 @@ impl CatalogRepo<'_> {
 
         let now = now_utc();
         let event_ts = ts.unwrap_or(now);
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let entry_id = Self::upsert_entry_in_tx(&mut tx, input, kind, title, now).await?;
         let (log_id, canon_id) =
             Self::log_consumption_in_tx(&mut tx, &entry_id, status, notes, event_ts, now).await?;
@@ -693,7 +693,7 @@ impl CatalogRepo<'_> {
         ts: Option<DateTime<Utc>>,
     ) -> CatalogResult<ConsumptionLogView> {
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let existing: Option<ConsumptionLogRow> = sqlx::query_as(
             "SELECT id, entry_id, ts, status, notes, created_at
              FROM consumption_log WHERE id = ?",
@@ -746,7 +746,7 @@ impl CatalogRepo<'_> {
     /// Deletes a single diary log by ID, recording a sync tombstone and delete activity event.
     pub async fn delete_consumption_log(&self, log_id: &str) -> CatalogResult<bool> {
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let res = sqlx::query("DELETE FROM consumption_log WHERE id = ?")
             .bind(log_id)
             .execute(tx.conn())

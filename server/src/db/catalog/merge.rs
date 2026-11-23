@@ -29,7 +29,7 @@ impl CatalogRepo<'_> {
         canonical_id: &str,
     ) -> CatalogResult<CatalogEntry> {
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let dup_resolved = Self::follow_merged_id_in_tx(tx.conn(), duplicate_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Duplicate entry '{duplicate_id}'")))?;

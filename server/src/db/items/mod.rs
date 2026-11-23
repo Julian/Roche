@@ -16,7 +16,7 @@ pub use fts::SearchTerm;
 
 use super::{
     ContentType, EntryKind, EntryTriageState, InboxState, ItemSortField, ItemStatus,
-    ItemStatusFilter, STARRED_COLLECTION_ID, SortOrder, WANT_TO_READ_COLLECTION_ID,
+    ItemStatusFilter, STARRED_COLLECTION_ID, SortOrder, WANT_TO_READ_COLLECTION_ID, WriteLock,
 };
 
 /// Canonical SQL predicate defining the read-only `Item` projection boundary over unified `entries`.
@@ -66,7 +66,12 @@ pub(super) enum ItemContentProjection {
     MetadataOnly,
 }
 
-pub(super) fn item_select_query_builder(proj: ItemContentProjection) -> QueryBuilder<Sqlite> {
+#[allow(clippy::too_many_lines)]
+pub(super) fn push_item_select_projection(
+    qb: &mut QueryBuilder<Sqlite>,
+    proj: ItemContentProjection,
+    from_clause: &str,
+) {
     let content_html_expr = match proj {
         ItemContentProjection::Full => "ec.content_html",
         ItemContentProjection::List => {
@@ -75,7 +80,7 @@ pub(super) fn item_select_query_builder(proj: ItemContentProjection) -> QueryBui
         ItemContentProjection::MetadataOnly => "NULL",
     };
 
-    let mut qb = QueryBuilder::<Sqlite>::new(
+    qb.push(
         "SELECT i.id,
        i.kind AS entry_kind,
        fs_primary.collection_id AS feed_id,
@@ -87,8 +92,9 @@ pub(super) fn item_select_query_builder(proj: ItemContentProjection) -> QueryBui
        i.published_at,
        i.created_at,
        i.summary, ",
-    );
-    qb.push(content_html_expr).push(
+    )
+    .push(content_html_expr)
+    .push(
         " AS content_html,
        i.thumbnail_url,
        (SELECT m.remote_url
@@ -141,7 +147,11 @@ pub(super) fn item_select_query_builder(proj: ItemContentProjection) -> QueryBui
                ORDER BY e_t.title ASC
            )
        ), '[]') AS tag_names
-FROM entries i
+",
+    )
+    .push(from_clause)
+    .push(
+        "
 LEFT JOIN entry_state es ON es.entry_id = i.id
 LEFT JOIN entry_content ec ON ec.entry_id = i.id
 LEFT JOIN feed_sources fs_primary ON fs_primary.collection_id = (
@@ -153,11 +163,16 @@ LEFT JOIN feed_sources fs_primary ON fs_primary.collection_id = (
     LIMIT 1
 )
 LEFT JOIN collection_entries ce_wtr ON ce_wtr.collection_id = ",
-    );
-    qb.push_bind(WANT_TO_READ_COLLECTION_ID)
-        .push(" AND ce_wtr.entry_id = i.id LEFT JOIN collection_entries ce_fav ON ce_fav.collection_id = ")
-        .push_bind(STARRED_COLLECTION_ID)
-        .push(" AND ce_fav.entry_id = i.id");
+    )
+    .push_bind(WANT_TO_READ_COLLECTION_ID)
+    .push(" AND ce_wtr.entry_id = i.id LEFT JOIN collection_entries ce_fav ON ce_fav.collection_id = ")
+    .push_bind(STARRED_COLLECTION_ID)
+    .push(" AND ce_fav.entry_id = i.id");
+}
+
+pub(super) fn item_select_query_builder(proj: ItemContentProjection) -> QueryBuilder<Sqlite> {
+    let mut qb = QueryBuilder::<Sqlite>::new("");
+    push_item_select_projection(&mut qb, proj, "FROM entries i");
     qb
 }
 
@@ -307,11 +322,12 @@ pub struct ItemFilter {
 
 pub struct ItemRepo<'a> {
     pub(crate) pool: &'a SqlitePool,
+    pub(crate) write_lock: &'a WriteLock,
 }
 
 impl<'a> ItemRepo<'a> {
     #[must_use]
-    pub const fn new(pool: &'a SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: &'a SqlitePool, write_lock: &'a WriteLock) -> Self {
+        Self { pool, write_lock }
     }
 }

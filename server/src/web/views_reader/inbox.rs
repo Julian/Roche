@@ -119,26 +119,22 @@ pub(in crate::web) async fn inbox_get(
         ..ItemFilter::default()
     };
 
-    let sync = service.sync();
     let tags_svc = service.tags();
-    let (page_res, feeds, sync_res, labels, all_tags) = tokio::join!(
-        service.items().query().with_filter(filter).list_page(),
+    let items_svc = service.items();
+    let (page_res, feeds, unread_res, tag_pairs) = tokio::join!(
+        items_svc.query().with_filter(filter).list_page(),
         load_sorted_active_feeds(&service),
-        sync.status(),
-        load_inbox_filter_labels(&service, clean_feed, clean_tag),
-        tags_svc.list(),
+        items_svc.count_unread(),
+        tags_svc.list_id_name_pairs(),
     );
     let page = page_res.web_err(&session)?;
-    let total_unread = sync_res.map_or_else(
-        |_| feeds.iter().map(|f| f.unread_count).sum::<i64>(),
-        |s| s.unread_items_count,
-    );
-    let (feed_label, tag_label) = labels;
-    let tag_id_by_lower_name: HashMap<String, String> = all_tags
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| (t.name.to_ascii_lowercase(), t.id))
-        .collect();
+    let total_unread =
+        unread_res.unwrap_or_else(|_| feeds.iter().map(|f| f.unread_count).sum::<i64>());
+    let tag_pairs = tag_pairs.unwrap_or_default();
+    let (feed_label, tag_label) =
+        resolve_inbox_filter_labels(&service, &feeds, &tag_pairs, clean_feed, clean_tag).await;
+    let tag_id_by_lower_name: HashMap<String, String> =
+        tag_pairs.into_iter().map(|(id, name)| (name.to_ascii_lowercase(), id)).collect();
     let selected_feed_unread =
         clean_feed.and_then(|fid| feeds.iter().find(|f| f.id == fid)).map(|f| f.unread_count);
 
@@ -232,24 +228,44 @@ async fn load_sorted_active_feeds(service: &RocheService) -> Vec<Feed> {
     feeds
 }
 
-async fn load_inbox_filter_labels(
+async fn resolve_inbox_filter_labels(
     service: &RocheService,
+    active_feeds: &[Feed],
+    tag_pairs: &[(String, String)],
     clean_feed: Option<&str>,
     clean_tag: Option<&str>,
 ) -> (Option<String>, Option<String>) {
     let feed_label = match clean_feed {
-        Some(fid) => service
-            .feeds()
-            .get(fid)
-            .await
-            .ok()
-            .and_then(|f| f.title.filter(|t| !t.is_empty()).or_else(|| Some(f.url.to_string())))
-            .or_else(|| Some(fid.to_owned())),
+        Some(fid) => {
+            if let Some(f) = active_feeds.iter().find(|f| f.id == fid) {
+                Some(
+                    f.title
+                        .as_deref()
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or(f.url.as_str())
+                        .to_owned(),
+                )
+            } else {
+                service
+                    .feeds()
+                    .get(fid)
+                    .await
+                    .ok()
+                    .and_then(|f| {
+                        f.title.filter(|t| !t.is_empty()).or_else(|| Some(f.url.to_string()))
+                    })
+                    .or_else(|| Some(fid.to_owned()))
+            }
+        }
         None => None,
     };
     let tag_label = match clean_tag {
         Some(tid) => {
-            service.tags().get(tid).await.ok().map(|t| t.name).or_else(|| Some(tid.to_owned()))
+            if let Some((_, name)) = tag_pairs.iter().find(|(id, _)| id == tid) {
+                Some(name.clone())
+            } else {
+                service.tags().get(tid).await.ok().map(|t| t.name).or_else(|| Some(tid.to_owned()))
+            }
         }
         None => None,
     };
@@ -839,7 +855,7 @@ fn render_single_inbox_row(
         let _ = writeln!(
             out,
             "<a class=\"inbox-thumb-link\" href=\"{}\" tabindex=\"-1\" aria-hidden=\"true\">\
-               <img class=\"inbox-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">\
+               <img class=\"inbox-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" decoding=\"async\" fetchpriority=\"low\" referrerpolicy=\"no-referrer\">\
              </a>",
             esc(&reader_href),
             esc(thumb),

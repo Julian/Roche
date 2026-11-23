@@ -178,7 +178,7 @@ impl CatalogRepo<'_> {
             .map_err(|e| CatalogError::InvalidInput(e.to_string()))?;
         let clean_color = validated_color.as_ref().map(HexColor::as_str);
 
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let existing = sqlx::query_scalar!(
             r#"SELECT collection_id as "collection_id!" FROM collection_specs WHERE slug = ?"#,
             &derived_slug,
@@ -287,7 +287,7 @@ impl CatalogRepo<'_> {
         }
 
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let raw = Self::ensure_want_collection_in_tx(&mut tx, trimmed, now).await?;
         tx.commit().await?;
         Ok(raw)
@@ -418,7 +418,7 @@ impl CatalogRepo<'_> {
         position: Option<f64>,
     ) -> CatalogResult<()> {
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let col = Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, false).await?;
         if let Some(reason) = col.immutable_reason() {
             return Err(CatalogError::ImmutableCollection { title: col.title, reason });
@@ -446,7 +446,7 @@ impl CatalogRepo<'_> {
         entry_id: &str,
     ) -> CatalogResult<bool> {
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let col = Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, false).await?;
         if let Some(reason) = col.immutable_reason() {
             return Err(CatalogError::ImmutableCollection { title: col.title, reason });
@@ -512,7 +512,7 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<(CollectionSummary, CatalogEntry)> {
         let clean_notes = notes.map(str::trim).filter(|s| !s.is_empty());
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         let resolved_existing = if try_resolve_existing {
             Self::resolve_entry_raw_in_tx(tx.conn(), &input.title, input.kind, None).await.ok()

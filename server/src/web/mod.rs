@@ -9,25 +9,74 @@ mod views_rank;
 mod views_reader;
 mod views_search;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+};
 
 use axum::{
     Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Request},
-    http::{HeaderName, HeaderValue, StatusCode, header},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, Request, rejection::QueryRejection},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use serde::Deserialize;
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::{service::RocheService, util::http_security::is_forwarded_https};
+use crate::{
+    service::RocheService,
+    util::{hash::sha256_hex, http_security::is_forwarded_https},
+};
 
 const ROCHE_CSS: &str = include_str!("roche.css");
 const ROCHE_JS: &str = include_str!("roche.js");
 const MAX_WEB_FORM_BODY_BYTES: usize = 128 * 1024;
 const MAX_WEB_OPML_BODY_BYTES: usize = 4 * 1024 * 1024;
 const OPML_UPLOAD_PATH: &str = "/web/feeds/opml";
+
+struct StaticAssetMeta {
+    version: String,
+    etag: HeaderValue,
+    href: String,
+}
+
+fn build_asset_meta(path: &str, body: &str) -> StaticAssetMeta {
+    let digest = sha256_hex(body);
+    let version = digest[..12].to_owned();
+    // Weak ETag per RFC 9110 §8.8.3.3 because `CompressionLayer` may serve gzip/br/zstd or
+    // identity representations for the same underlying asset.
+    let etag_raw = format!("W/\"{version}\"");
+    let etag = HeaderValue::from_str(&etag_raw)
+        .unwrap_or_else(|_| HeaderValue::from_static("W/\"roche\""));
+    let href = format!("{path}?v={version}");
+    StaticAssetMeta { version, etag, href }
+}
+
+fn css_asset_meta() -> &'static StaticAssetMeta {
+    static META: OnceLock<StaticAssetMeta> = OnceLock::new();
+    META.get_or_init(|| build_asset_meta("/static/roche.css", ROCHE_CSS))
+}
+
+fn js_asset_meta() -> &'static StaticAssetMeta {
+    static META: OnceLock<StaticAssetMeta> = OnceLock::new();
+    META.get_or_init(|| build_asset_meta("/static/roche.js", ROCHE_JS))
+}
+
+fn css_href() -> &'static str {
+    &css_asset_meta().href
+}
+
+fn js_href() -> &'static str {
+    &js_asset_meta().href
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StaticAssetQuery {
+    #[serde(default)]
+    v: Option<String>,
+}
 
 pub fn router(service: Arc<RocheService>) -> Router<Arc<RocheService>> {
     let static_routes = Router::new()
@@ -123,29 +172,79 @@ pub fn router(service: Arc<RocheService>) -> Router<Arc<RocheService>> {
         .route_layer(middleware::from_fn(attach_web_security_headers))
 }
 
-async fn serve_css() -> Response {
+fn strip_weak_etag_prefix(tag: &str) -> &str {
+    tag.strip_prefix("W/").unwrap_or(tag)
+}
+
+fn if_none_match_matches(headers: &HeaderMap, etag: &HeaderValue) -> bool {
+    let Ok(expected) = etag.to_str() else {
+        return false;
+    };
+    let expected_opaque = strip_weak_etag_prefix(expected);
+    headers.get_all(header::IF_NONE_MATCH).iter().filter_map(|v| v.to_str().ok()).any(|raw| {
+        raw.split(',').any(|candidate| {
+            let trimmed = candidate.trim();
+            trimmed == "*" || strip_weak_etag_prefix(trimmed) == expected_opaque
+        })
+    })
+}
+
+fn serve_static_asset(
+    headers: &HeaderMap,
+    query: Option<&StaticAssetQuery>,
+    meta: &'static StaticAssetMeta,
+    content_type: &'static str,
+    body: &'static str,
+) -> Response {
+    let cache_control = if query.and_then(|q| q.v.as_deref()) == Some(meta.version.as_str()) {
+        HeaderValue::from_static("public, max-age=31536000, immutable")
+    } else {
+        HeaderValue::from_static("public, max-age=3600")
+    };
+    let vary = HeaderValue::from_static("Accept-Encoding");
+    if if_none_match_matches(headers, &meta.etag) {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, meta.etag.clone()),
+                (header::CACHE_CONTROL, cache_control),
+                (header::VARY, vary),
+            ],
+        )
+            .into_response();
+    }
     (
         [
-            (header::CONTENT_TYPE, HeaderValue::from_static("text/css; charset=utf-8")),
-            (header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600")),
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (header::ETAG, meta.etag.clone()),
+            (header::CACHE_CONTROL, cache_control),
+            (header::VARY, vary),
         ],
-        ROCHE_CSS,
+        body,
     )
         .into_response()
 }
 
-async fn serve_js() -> Response {
-    (
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/javascript; charset=utf-8"),
-            ),
-            (header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600")),
-        ],
+async fn serve_css(
+    headers: HeaderMap,
+    query: Result<Query<StaticAssetQuery>, QueryRejection>,
+) -> Response {
+    let q = query.ok().map(|Query(q)| q);
+    serve_static_asset(&headers, q.as_ref(), css_asset_meta(), "text/css; charset=utf-8", ROCHE_CSS)
+}
+
+async fn serve_js(
+    headers: HeaderMap,
+    query: Result<Query<StaticAssetQuery>, QueryRejection>,
+) -> Response {
+    let q = query.ok().map(|Query(q)| q);
+    serve_static_asset(
+        &headers,
+        q.as_ref(),
+        js_asset_meta(),
+        "application/javascript; charset=utf-8",
         ROCHE_JS,
     )
-        .into_response()
 }
 
 const WEB_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; media-src 'self' https: http:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'";

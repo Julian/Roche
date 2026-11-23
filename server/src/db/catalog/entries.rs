@@ -331,7 +331,7 @@ impl CatalogRepo<'_> {
         }
 
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let entry_id = Self::upsert_entry_in_tx(&mut tx, input, kind, title, now).await?;
         tx.commit().await?;
 

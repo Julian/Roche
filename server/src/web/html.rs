@@ -329,7 +329,7 @@ pub(super) fn render_feed_favicon_with_class(
     if let Some(h) = public_favicon_host {
         let _ = write!(
             out,
-            "<img src=\"https://icons.duckduckgo.com/ip3/{}.ico\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
+            "<img src=\"https://icons.duckduckgo.com/ip3/{}.ico\" alt=\"\" loading=\"lazy\" decoding=\"async\" fetchpriority=\"low\" referrerpolicy=\"no-referrer\">",
             esc(&h),
         );
     }
@@ -591,11 +591,12 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
            <meta charset=\"utf-8\">\n\
            <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
            <title>{title}</title>\n\
-           <link rel=\"stylesheet\" href=\"/static/roche.css\">\n\
+           <link rel=\"stylesheet\" href=\"{css_href}\">\n\
          </head>\n\
          <body data-csrf=\"{csrf}\">\n\
          <a class=\"skip-link\" href=\"#roche-main\">Skip to content</a>\n",
         title = esc(&page_title),
+        css_href = super::css_href(),
         csrf = esc(shell.csrf_token),
     );
 
@@ -650,7 +651,7 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
     );
     render_quick_log_dialog(&mut out, shell.csrf_token, shell.active.default_path());
     render_shortcuts_dialog(&mut out);
-    out.push_str("<script src=\"/static/roche.js\" defer></script>\n</body>\n</html>\n");
+    let _ = writeln!(out, "<script src=\"{}\" defer></script>\n</body>\n</html>", super::js_href());
 
     Html(out)
 }
@@ -851,7 +852,7 @@ pub(super) fn render_login_page(args: &LoginPageArgs<'_>) -> Html<String> {
            <meta charset=\"utf-8\">\n\
            <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
            <title>Sign in — Roche</title>\n\
-           <link rel=\"stylesheet\" href=\"/static/roche.css\">\n\
+           <link rel=\"stylesheet\" href=\"{css_href}\">\n\
          </head>\n\
          <body>\n\
          <header class=\"masthead\">\n\
@@ -860,6 +861,7 @@ pub(super) fn render_login_page(args: &LoginPageArgs<'_>) -> Html<String> {
          <main>\n\
          <div class=\"login-box\">\n\
            <h2>{heading}</h2>\n",
+        css_href = super::css_href(),
     );
 
     if let Some(err) = trimmed_err {
@@ -933,8 +935,10 @@ pub(super) fn render_login_page(args: &LoginPageArgs<'_>) -> Html<String> {
         );
     }
 
-    out.push_str(
-        "</div>\n</main>\n<script src=\"/static/roche.js\" defer></script>\n</body>\n</html>\n",
+    let _ = writeln!(
+        out,
+        "</div>\n</main>\n<script src=\"{}\" defer></script>\n</body>\n</html>",
+        super::js_href(),
     );
     Html(out)
 }
@@ -972,9 +976,10 @@ pub(super) fn render_error_page(
             Html(format!(
                 "<!doctype html><html lang=\"en\"{theme_attr}><head><meta charset=\"utf-8\">\
                  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-                 <title>{}</title><link rel=\"stylesheet\" href=\"/static/roche.css\"></head>\
+                 <title>{}</title><link rel=\"stylesheet\" href=\"{}\"></head>\
                  <body><main>{}</main></body></html>",
                 esc(heading),
+                super::css_href(),
                 unauthed_body
             ))
         },

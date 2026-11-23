@@ -5,7 +5,7 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use super::{
     ActivityAction, ActivityEntityType, EntryKind, HexColor, SyncRepo, WANT_TO_READ_COLLECTION_ID,
-    WriteTx,
+    WriteLock, WriteTx,
     entries_core::{self, EntryInsertParams},
     sync::{deterministic_tag_id, tag_natural_key},
 };
@@ -90,19 +90,20 @@ pub struct ItemTag {
 
 pub struct TagRepo<'a> {
     pub(crate) pool: &'a SqlitePool,
+    pub(crate) write_lock: &'a WriteLock,
 }
 
 impl<'a> TagRepo<'a> {
     #[must_use]
-    pub const fn new(pool: &'a SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: &'a SqlitePool, write_lock: &'a WriteLock) -> Self {
+        Self { pool, write_lock }
     }
 
     pub async fn create(&self, name: &str, color: Option<&HexColor>) -> Result<Tag> {
         let id = deterministic_tag_id(name);
         let nat_key = tag_natural_key(name);
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Tag, &nat_key).await?;
 
@@ -147,6 +148,20 @@ impl<'a> TagRepo<'a> {
         Self::list_in_tx(&mut conn).await
     }
 
+    /// Lightweight `(id, name)` tag listing without per-tag correlated unread counts,
+    /// used by Inbox UI rendering to resolve clickable tag filter links.
+    pub async fn list_id_name_pairs(&self) -> Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT e.id, e.title
+             FROM entries e
+             JOIN collection_specs cs ON cs.collection_id = e.id
+             WHERE cs.collection_role = 'tag' AND e.merged_into_id IS NULL
+             ORDER BY e.title",
+        )
+        .fetch_all(self.pool)
+        .await?)
+    }
+
     pub(crate) async fn list_in_tx(conn: &mut SqliteConnection) -> Result<Vec<Tag>> {
         Ok(sqlx::query_as::<_, Tag>(TAG_SELECT_ALL_SQL)
             .bind(WANT_TO_READ_COLLECTION_ID)
@@ -165,7 +180,7 @@ impl<'a> TagRepo<'a> {
         }
 
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
         let exists = sqlx::query_scalar!(
             "SELECT 1 AS \"found!: i64\" FROM collection_specs WHERE collection_id = ? AND collection_role = 'tag'",
@@ -250,7 +265,7 @@ impl<'a> TagRepo<'a> {
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let exists = sqlx::query_scalar!(
             "SELECT 1 AS \"found!: i64\" FROM collection_specs WHERE collection_id = ? AND collection_role = 'tag'",
             id,
@@ -439,7 +454,7 @@ impl<'a> TagRepo<'a> {
 
     pub async fn add_to_item(&self, item_id: &str, tag_id: &str) -> Result<()> {
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         Self::attach_in_tx(&mut tx, item_id, tag_id, now).await?;
         tx.commit().await?;
         Ok(())
@@ -447,7 +462,7 @@ impl<'a> TagRepo<'a> {
 
     pub async fn add_named_to_item(&self, item_id: &str, name: &str) -> Result<Tag> {
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let tag = Self::get_or_create_and_attach_in_tx(&mut tx, item_id, name, now).await?;
         tx.commit().await?;
         Ok(tag)
@@ -455,7 +470,7 @@ impl<'a> TagRepo<'a> {
 
     pub async fn remove_from_item(&self, item_id: &str, tag_id: &str) -> Result<bool> {
         let now = crate::util::clock::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
         let res = sqlx::query!(
             "DELETE FROM collection_entries
              WHERE collection_id = ?

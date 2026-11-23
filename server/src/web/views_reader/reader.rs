@@ -83,10 +83,28 @@ pub(in crate::web) async fn reader_get(
             || n.eq_ignore_ascii_case("Dismissed")
     });
 
+    let hardened_prose_html = if let Some(raw_html) =
+        detail.item.content_html.as_deref().filter(|s| !s.trim().is_empty()).map(ToOwned::to_owned)
+    {
+        let item_url = detail.item.url.clone();
+        let item_title = detail.item.title.clone();
+        let rendered = tokio::task::spawn_blocking(move || {
+            let cleaned = HtmlSanitizer::clean_with_base(&raw_html, Some(&item_url));
+            harden_reader_prose_html_with_context(&cleaned, Some(&item_url), Some(&item_title))
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Reader HTML render task failed: {e}")))
+        .web_err(&session)?;
+        Some(rendered)
+    } else {
+        None
+    };
+
     let mut body = String::with_capacity(14_336);
     render_reader_article(
         &mut body,
         &detail,
+        hardened_prose_html.as_deref(),
         triage_state,
         suppress_auto_finish,
         can_rank,
@@ -159,6 +177,7 @@ fn back_label_for_return_to(return_to: &str) -> &'static str {
 fn render_reader_article(
     out: &mut String,
     detail: &ItemDetail,
+    hardened_prose_html: Option<&str>,
     triage_state: EntryTriageState,
     suppress_auto_finish: bool,
     can_rank: bool,
@@ -205,6 +224,7 @@ fn render_reader_article(
     render_reader_media_and_prose(
         out,
         detail,
+        hardened_prose_html,
         &id_enc,
         &reader_path,
         return_to,
@@ -444,6 +464,7 @@ fn render_reader_mobile_tools(
 fn render_reader_media_and_prose(
     out: &mut String,
     detail: &ItemDetail,
+    hardened_prose_html: Option<&str>,
     id_enc: &str,
     reader_path: &str,
     return_to: &str,
@@ -507,13 +528,8 @@ fn render_reader_media_and_prose(
     }
 
     out.push_str("<div class=\"reader-prose\">\n");
-    if let Some(raw_html) = item.content_html.as_deref().filter(|s| !s.trim().is_empty()) {
-        let cleaned = HtmlSanitizer::clean_with_base(raw_html, Some(&item.url));
-        out.push_str(&harden_reader_prose_html_with_context(
-            &cleaned,
-            Some(&item.url),
-            Some(&item.title),
-        ));
+    if let Some(prose_html) = hardened_prose_html {
+        out.push_str(prose_html);
     } else if let Some(summary) = item.summary.as_deref().filter(|s| !s.trim().is_empty()) {
         for para in summary.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
             let _ = writeln!(out, "<p>{}</p>", esc(para));
