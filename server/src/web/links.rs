@@ -23,6 +23,7 @@ pub(super) enum WebLinkIcon {
     Paper,
     Game,
     Rss,
+    Discussion,
     External,
 }
 
@@ -37,6 +38,7 @@ impl WebLinkIcon {
             "arxiv" => Self::Paper,
             "igdb" => Self::Game,
             "feed_url" => Self::Rss,
+            "hacker_news" | "lobsters" | "reddit" | "discussion" => Self::Discussion,
             _ => Self::External,
         }
     }
@@ -64,6 +66,9 @@ impl WebLinkIcon {
             }
             Self::Rss => {
                 "<svg class=\"icon\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 11a9 9 0 0 1 9 9\"/><path d=\"M4 4a16 16 0 0 1 16 16\"/><circle cx=\"5\" cy=\"19\" r=\"1\"/></svg>"
+            }
+            Self::Discussion => {
+                "<svg class=\"icon\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z\"/></svg>"
             }
             Self::External => {
                 "<svg class=\"icon\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M15 3h6v6\"/><path d=\"M10 14 21 3\"/><path d=\"M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6\"/></svg>"
@@ -236,6 +241,40 @@ pub(super) fn collect_web_external_links(
             _ => (ident.label(), WebLinkIcon::for_scheme(&scheme)),
         };
         links.push(WebExternalLink { label: label.to_owned(), href: safe_href.to_owned(), icon });
+    }
+
+    if !is_music_kind(entry.kind)
+        && let Some(arr) = entry.metadata.get("discussions").and_then(serde_json::Value::as_array)
+    {
+        for raw in arr {
+            let Ok(disc) =
+                serde_json::from_value::<roche_core::boards::DiscussionLink>(raw.clone())
+            else {
+                continue;
+            };
+            let Some(safe_href) = sanitize_non_local_href(&disc.url) else {
+                continue;
+            };
+            if !seen_urls.insert(canonicalize_sync_url(safe_href)) {
+                continue;
+            }
+            let label = disc.label.as_deref().map(str::trim).filter(|s| !s.is_empty()).map_or_else(
+                || {
+                    let src = disc.source.trim();
+                    if src.is_empty() {
+                        "Discussion".to_owned()
+                    } else {
+                        roche_core::external_links::external_identifier_label(src).to_owned()
+                    }
+                },
+                ToOwned::to_owned,
+            );
+            links.push(WebExternalLink {
+                label,
+                href: safe_href.to_owned(),
+                icon: WebLinkIcon::Discussion,
+            });
+        }
     }
 
     if source_label.is_none()

@@ -34,6 +34,8 @@ internal const val SCHEME_QOBUZ = "qobuz"
 internal const val SCHEME_AMAZON_MUSIC = "amazon_music"
 internal const val SCHEME_BANDCAMP = "bandcamp"
 internal const val SCHEME_YOUTUBE = "youtube"
+internal const val SCHEME_HACKER_NEWS = "hacker_news"
+internal const val HACKER_NEWS_ITEM_URL_PREFIX = "https://news.ycombinator.com/item?id="
 
 internal const val YT_MUSIC_ORIGIN = "https://music.youtube.com"
 internal const val YT_MUSIC_BROWSE_PREFIX = "MPREb"
@@ -107,6 +109,7 @@ private val ARXIV_HOSTS: Set<String> =
 private val TMDB_HOSTS: Set<String> = setOf("themoviedb.org", "www.themoviedb.org")
 private val OPENLIBRARY_HOSTS: Set<String> = setOf("openlibrary.org", "www.openlibrary.org")
 private val MUSICBRAINZ_HOSTS: Set<String> = setOf("musicbrainz.org", "www.musicbrainz.org")
+private val HACKER_NEWS_HOSTS: Set<String> = setOf("news.ycombinator.com")
 
 private val BRANDED_ALLOWED_HOSTS: Map<String, Set<String>> =
     mapOf(
@@ -145,6 +148,7 @@ private val BRANDED_ALLOWED_HOSTS: Map<String, Set<String>> =
         "imdb" to setOf("imdb.com", "www.imdb.com", "m.imdb.com"),
         "doi" to setOf("doi.org", "dx.doi.org"),
         "rym" to setOf("rateyourmusic.com", "www.rateyourmusic.com"),
+        SCHEME_HACKER_NEWS to HACKER_NEWS_HOSTS,
     )
 
 private val DISALLOWED_URI_SCHEME_PREFIXES: List<String> =
@@ -202,6 +206,7 @@ internal fun normalizeIdentifierValueRaw(
         "imdb" -> normalizeImdbIdentifier(trimmed)
         SCHEME_WIKIPEDIA -> normalizeWikipediaIdentifier(trimmed)
         SCHEME_ARXIV -> extractArxivIdentifier(trimmed) ?: trimmed
+        SCHEME_HACKER_NEWS -> extractHackerNewsItemId(trimmed) ?: trimmed
         else -> trimmed
     }
 }
@@ -361,6 +366,16 @@ internal fun extractArxivIdentifier(urlOrId: String): String? {
     return cleaned.takeIf(::isValidArxivId)
 }
 
+private val ARXIV_VERSION_SUFFIX_REGEX = Regex("""v\d+$""", RegexOption.IGNORE_CASE)
+
+internal fun canonicalArxivAbstractUrl(url: String): String? {
+    val trimmed = url.trim()
+    if (!isHttpOrHttpsUrl(trimmed) || !isValidArxivHttpUrl(trimmed)) return null
+    val arxivId = extractArxivIdentifier(trimmed) ?: return null
+    val versionless = arxivId.replace(ARXIV_VERSION_SUFFIX_REGEX, "").ifEmpty { arxivId }
+    return if (isValidArxivId(versionless)) "https://arxiv.org/abs/$versionless" else null
+}
+
 private fun isValidArxivHttpUrl(raw: String): Boolean {
     val uri = parseLenientUri(raw) ?: return false
     val host = uri.host?.lowercase()
@@ -492,6 +507,7 @@ internal fun externalIdentifierUrl(
         SCHEME_YOUTUBE -> resolveYoutubeExternalUrl(clean, http)
         "imdb" -> resolveImdbExternalUrl(clean, http)
         "doi" -> resolveDoiExternalUrl(clean, http)
+        SCHEME_HACKER_NEWS -> resolveHackerNewsExternalUrl(clean, http)
         SCHEME_BANDCAMP,
         "rym" ->
             http?.let { candidate ->
@@ -567,6 +583,51 @@ private fun resolveYoutubeExternalUrl(clean: String, http: String?): String? =
         isYoutubeChannelId(clean) -> "https://www.youtube.com/channel/${encodeQueryValue(clean)}"
         isSafeBareIdentifier(clean) -> "https://www.youtube.com/watch?v=${encodeQueryValue(clean)}"
         else -> null
+    }
+
+private const val MAX_HN_ITEM_ID_LEN = 20
+
+private fun isValidHackerNewsItemId(candidate: String): Boolean =
+    candidate.isNotEmpty() &&
+        candidate.length <= MAX_HN_ITEM_ID_LEN &&
+        candidate[0] != '0' &&
+        candidate.all { it in '0'..'9' }
+
+internal fun extractHackerNewsItemId(raw: String): String? {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return null
+    if (isValidHackerNewsItemId(trimmed)) return trimmed
+    val uri = parseLenientUri(trimmed) ?: return null
+    val scheme = uri.scheme?.lowercase(Locale.ROOT)
+    val host = uri.host?.trim()?.trimEnd('.')?.lowercase(Locale.ROOT)
+    val path = uri.rawPath.orEmpty().trimEnd('/')
+    val validScheme = scheme == SCHEME_HTTP || scheme == SCHEME_HTTPS
+    val validHostAndPath = validScheme && host in HACKER_NEWS_HOSTS && path == "/item"
+    if (!validHostAndPath) return null
+    return extractQueryParam(uri.rawQuery, "id")?.takeIf(::isValidHackerNewsItemId)
+}
+
+private fun resolveHackerNewsExternalUrl(clean: String, http: String?): String? {
+    if (isValidHackerNewsItemId(clean)) {
+        return "$HACKER_NEWS_ITEM_URL_PREFIX$clean"
+    }
+    val validHttps =
+        http?.let { validatedBrandedHttpsUrl(it) { host -> host in HACKER_NEWS_HOSTS } }
+            ?: return null
+    val itemId = extractHackerNewsItemId(validHttps) ?: return null
+    return "$HACKER_NEWS_ITEM_URL_PREFIX$itemId"
+}
+
+internal fun externalIdentifierLabel(scheme: String): String =
+    when (normalizeIdentifierScheme(scheme)) {
+        SCHEME_HACKER_NEWS -> "Hacker News"
+        SCHEME_ARXIV -> "arXiv"
+        SCHEME_WIKIPEDIA -> "Wikipedia"
+        SCHEME_YOUTUBE -> "YouTube"
+        SCHEME_SPOTIFY -> "Spotify"
+        "url" -> "Web"
+        SCHEME_FEED_URL -> "Feed"
+        else -> scheme.trim().ifEmpty { "Discussion" }
     }
 
 private fun resolveDoiExternalUrl(clean: String, http: String?): String? {

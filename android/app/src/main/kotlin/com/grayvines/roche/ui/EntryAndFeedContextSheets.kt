@@ -115,9 +115,9 @@ fun EntryContextBottomSheet(
                     onAction(MainAction.CloseContextSheet)
                     onShareEntry(entry)
                 },
-                onOpenExternalUrl = {
+                onOpenExternalUrl = { url ->
                     onAction(MainAction.CloseContextSheet)
-                    onOpenExternalUrl(entry.url)
+                    onOpenExternalUrl(url)
                 },
             )
             Spacer(modifier = Modifier.height(16.dp))
@@ -226,7 +226,7 @@ private fun ContextSheetActionsList(
     isDownloadingOffline: Boolean,
     onAction: (MainAction) -> Unit,
     onShare: () -> Unit,
-    onOpenExternalUrl: () -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val isPlayableAudio = entry.isPlayableAudio
@@ -245,22 +245,14 @@ private fun ContextSheetActionsList(
             accentVerdigris = colors.accentVerdigris,
             onAction = onAction,
         )
-    val secondaryGroup = buildList {
-        if (entry.feedId != null) {
-            add(
-                ContextActionSpec(
-                    label = "Filter Inbox by ${entry.feedTitle}",
-                    onClick = { onAction(MainAction.FilterByFeed(entry.feedId)) },
-                )
-            )
-        }
-        if (!isLocalPdf) {
-            add(ContextActionSpec(label = "Share…", onClick = onShare))
-        }
-        if (!isLocalPdf && entry.url.isNotBlank()) {
-            add(ContextActionSpec(label = "Open Original URL ↗", onClick = onOpenExternalUrl))
-        }
-    }
+    val secondaryGroup =
+        buildEntrySecondaryActions(
+            entry = entry,
+            isLocalPdf = isLocalPdf,
+            onAction = onAction,
+            onShare = onShare,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         ContextActionCardGroup(primaryGroup)
@@ -285,6 +277,42 @@ private fun ContextSheetActionsList(
                 confirmDeleteEntry = false
                 onAction(MainAction.DeleteEntry(entry.id))
             },
+        )
+    }
+}
+
+private fun buildEntrySecondaryActions(
+    entry: InboxEntry,
+    isLocalPdf: Boolean,
+    onAction: (MainAction) -> Unit,
+    onShare: () -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+): List<ContextActionSpec> = buildList {
+    if (entry.feedId != null) {
+        add(
+            ContextActionSpec(
+                label = "Filter Inbox by ${entry.feedTitle}",
+                onClick = { onAction(MainAction.FilterByFeed(entry.feedId)) },
+            )
+        )
+    }
+    if (!isLocalPdf) {
+        add(ContextActionSpec(label = "Share…", onClick = onShare))
+    }
+    if (!isLocalPdf && entry.url.isNotBlank()) {
+        add(
+            ContextActionSpec(
+                label = "Open Original URL ↗",
+                onClick = { onOpenExternalUrl(entry.url) },
+            )
+        )
+    }
+    visibleExternalDiscussions(entry).forEach { link ->
+        add(
+            ContextActionSpec(
+                label = "Open ${link.displayLabel} Discussion ↗",
+                onClick = { onOpenExternalUrl(link.url) },
+            )
         )
     }
 }

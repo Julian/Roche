@@ -4,7 +4,7 @@ pub mod cli;
 pub mod config;
 mod content;
 pub mod db;
-pub use roche_core::{domain, feeds, ranking};
+pub use roche_core::{boards, domain, feeds, ranking};
 mod ingest;
 mod media;
 mod scheduler;

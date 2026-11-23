@@ -2,12 +2,16 @@ package com.grayvines.roche.data.sync
 
 import com.grayvines.roche.core.FLAG_LOCAL_HLC
 import com.grayvines.roche.core.runSuspendCatching
+import com.grayvines.roche.data.boards.BoardAdapterRegistry
+import com.grayvines.roche.data.boards.LocalBoardPoller
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.feeds.LocalFeedPoller
+import com.grayvines.roche.data.local.BoardEntity
 import com.grayvines.roche.data.local.DbWriteLock
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.LocalSyncFlagEntity
 import com.grayvines.roche.data.local.RocheDao
+import com.grayvines.roche.data.local.pruneExpiredBoardStatesInDao
 import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.remote.PeerNodeDto
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
@@ -109,7 +113,11 @@ internal class PeerSyncCoordinator(
                 sinceSeqOverride = sinceSeqOverride,
             ) ?: return null
 
-        val pollOutcome =
+        writeLock.withLock {
+            dao.executeInTransaction { pruneExpiredBoardStatesInDao(dao) }
+        }
+
+        val feedPollOutcome =
             if (networkTier != NetworkTier.OFFLINE) {
                 pollCooperativeFeedsOnDevice(
                     dao = dao,
@@ -121,8 +129,23 @@ internal class PeerSyncCoordinator(
             } else {
                 null
             }
-        if (pollOutcome != null && pollOutcome.attemptedFeedsCount > 0) {
-            runPostPollPeerSync(initialCycle.settings, pollOutcome.measuredWeight)
+        val boardPollOutcome =
+            if (networkTier != NetworkTier.OFFLINE) {
+                pollCooperativeBoardsOnDevice(
+                    dao = dao,
+                    publicWebFetcher = publicWebFetcher,
+                    localPeerId = initialCycle.settings.peerId,
+                    activePeers = initialCycle.latestPeers,
+                    writeLock = writeLock,
+                )
+            } else {
+                null
+            }
+        val attemptedFeeds = feedPollOutcome?.attemptedFeedsCount ?: 0
+        val attemptedBoards = boardPollOutcome?.attemptedFeedsCount ?: 0
+        if (attemptedFeeds > 0 || attemptedBoards > 0) {
+            val measuredWeight = boardPollOutcome?.measuredWeight ?: feedPollOutcome?.measuredWeight
+            runPostPollPeerSync(initialCycle.settings, measuredWeight)
         }
         return dao.countItems()
     }
@@ -483,6 +506,7 @@ internal class PeerSyncCoordinator(
             sentGeneratorHlcById = tracked.sentGeneratorHlcById.filterKeys { it in keptGenIds },
             sentLogHlcById = tracked.sentLogHlcById.filterKeys { it in keptLogIds },
             sentComparisonHlcById = tracked.sentComparisonHlcById.filterKeys { it in keptCompIds },
+            sentBoardSnapshotHlcById = emptyMap(),
             byteOverflowEntryIds = droppedEntryIds + tracked.byteOverflowEntryIds,
         )
     }
@@ -500,11 +524,13 @@ internal class PeerSyncCoordinator(
         }
         val error = primary.exceptionOrNull()
         val payloadProblem = (error as? ProblemDetailsException)?.takeIf(::isPayloadTooLargeProblem)
+        val hasStrippablePayload =
+            request.entries.isNotEmpty() || request.boards.any { !it.snapshotItems.isNullOrEmpty() }
         return when {
             error == null -> {
                 primary.getOrNull()?.let { SyncRoundCallResult(response = it) }
             }
-            payloadProblem != null && request.entries.isNotEmpty() -> {
+            payloadProblem != null && hasStrippablePayload -> {
                 val strippedRequest = stripEntriesFor413Retry(request)
                 serverApi
                     .syncPeer(
@@ -548,6 +574,7 @@ internal fun stripEntriesFor413Retry(request: PeerSyncRequestDto): PeerSyncReque
                 comp.scopeCollectionId !in droppedEntryIds &&
                     comp.ordering.flatten().none { it in droppedEntryIds }
             },
+        boards = request.boards.map { it.copy(snapshotItems = null) },
     )
 }
 
@@ -672,6 +699,113 @@ internal suspend fun pollCooperativeSlice(
                         publicWebFetcher = publicWebFetcher,
                         feed = feed,
                         localPeerId = localPeerId,
+                        clock = clock,
+                        writeLock = writeLock,
+                    )
+                val elapsedSeconds =
+                    (System.nanoTime() - startedNanos).toDouble() / NANOS_PER_SECOND
+                outcome.getOrNull()?.let { itemsProcessed ->
+                    FeedPollSample(
+                        itemsProcessed = itemsProcessed,
+                        elapsedSeconds = elapsedSeconds,
+                    )
+                }
+            }
+        }
+        .awaitAll()
+        .filterNotNull()
+}
+
+@Suppress("LongParameterList")
+internal suspend fun pollCooperativeBoardsOnDevice(
+    dao: RocheDao,
+    publicWebFetcher: PublicWebFetcher,
+    localPeerId: String,
+    activePeers: List<PeerNodeDto>,
+    adapterRegistry: BoardAdapterRegistry = BoardAdapterRegistry.default(publicWebFetcher),
+    nowInstant: Instant? = null,
+    clock: () -> Instant = { Instant.now().truncatedTo(ChronoUnit.SECONDS) },
+    writeLock: DbWriteLock = DbWriteLock(),
+): CooperativePollOutcome {
+    val effectiveClock: () -> Instant = nowInstant?.let { fixed -> { fixed } } ?: clock
+    val attemptedIds = mutableSetOf<String>()
+    var currentPeers = activePeers
+    var polledBoardsCount = 0
+    var ewmaWeight = loadInitialThroughputWeight(dao, localPeerId, activePeers)
+    var measuredWeight: Double? = null
+
+    var keepPolling = true
+    while (keepPolling) {
+        val sliceNow = effectiveClock()
+        val slice =
+            dao.getActiveBoards()
+                .filter {
+                    it.id !in attemptedIds &&
+                        shouldPeerPollBoard(localPeerId, currentPeers, it, sliceNow.epochSecond)
+                }
+                .take(COOPERATIVE_POLL_SLICE_SIZE)
+        if (slice.isEmpty()) {
+            keepPolling = false
+        } else {
+            slice.forEach { attemptedIds.add(it.id) }
+            val succeededSamples =
+                pollCooperativeBoardSlice(
+                    dao = dao,
+                    publicWebFetcher = publicWebFetcher,
+                    adapterRegistry = adapterRegistry,
+                    slice = slice,
+                    localPeerId = localPeerId,
+                    clock = effectiveClock,
+                    writeLock = writeLock,
+                )
+            if (succeededSamples.isNotEmpty()) {
+                polledBoardsCount += succeededSamples.size
+                ewmaWeight = foldThroughputSamplesIntoEwma(ewmaWeight, succeededSamples)
+                measuredWeight = ewmaWeight
+                currentPeers = currentPeers.map { peer ->
+                    if (peer.peerId == localPeerId) peer.copy(weight = ewmaWeight) else peer
+                }
+            }
+        }
+    }
+    if (measuredWeight != null) {
+        writeLock.withLock {
+            dao.upsertLocalSyncFlag(
+                LocalSyncFlagEntity(
+                    flagKey = FLAG_LOCAL_THROUGHPUT_WEIGHT,
+                    flagValue = measuredWeight.toString(),
+                )
+            )
+        }
+    }
+    return CooperativePollOutcome(
+        polledFeedsCount = polledBoardsCount,
+        attemptedFeedsCount = attemptedIds.size,
+        measuredWeight = measuredWeight,
+    )
+}
+
+@Suppress("LongParameterList")
+internal suspend fun pollCooperativeBoardSlice(
+    dao: RocheDao,
+    publicWebFetcher: PublicWebFetcher,
+    adapterRegistry: BoardAdapterRegistry,
+    slice: List<BoardEntity>,
+    localPeerId: String,
+    clock: () -> Instant = { Instant.now().truncatedTo(ChronoUnit.SECONDS) },
+    writeLock: DbWriteLock = DbWriteLock(),
+): List<FeedPollSample> = coroutineScope {
+    slice
+        .map { board ->
+            async {
+                val startedNanos = System.nanoTime()
+                val outcome =
+                    LocalBoardPoller.pollBoard(
+                        dao = dao,
+                        publicWebFetcher = publicWebFetcher,
+                        board = board,
+                        localPeerId = localPeerId,
+                        adapterRegistry = adapterRegistry,
                         clock = clock,
                         writeLock = writeLock,
                     )

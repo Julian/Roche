@@ -17,6 +17,9 @@ internal val REVISION_TRACKED_TABLES: List<String> =
         "entry_state",
         "entry_content",
         "feed_sources",
+        "boards",
+        "board_items",
+        "board_item_states",
     )
 
 /**
@@ -56,7 +59,7 @@ internal fun setupTableRevisions(connection: SQLiteConnection) {
 
 internal fun installTableRevisionTriggers(connection: SQLiteConnection) {
     if (hasTableRevisionSetup(connection)) return
-    for (table in REVISION_TRACKED_TABLES) {
+    for (table in existingTrackedTables(connection)) {
         connection.execSQL(
             "INSERT OR IGNORE INTO `table_revisions` (`tableName`, `revision`) " +
                 "VALUES ('$table', 0)"
@@ -77,6 +80,16 @@ internal fun installTableRevisionTriggers(connection: SQLiteConnection) {
                 "AFTER DELETE ON `$table` BEGIN $bumpSql; END"
         )
     }
+}
+
+private fun existingTrackedTables(connection: SQLiteConnection): List<String> {
+    val present = HashSet<String>()
+    connection.prepare("SELECT `name` FROM `sqlite_master` WHERE `type` = 'table'").use { stmt ->
+        while (stmt.step()) {
+            present.add(stmt.getText(0))
+        }
+    }
+    return REVISION_TRACKED_TABLES.filter { it in present }
 }
 
 private fun hasTableRevisionSetup(connection: SQLiteConnection): Boolean {

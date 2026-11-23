@@ -116,7 +116,7 @@ async fn ensure_auto_finished_in_tx(
     }
 }
 
-pub(super) async fn set_collection_flag_membership_in_tx(
+pub async fn set_collection_flag_membership_in_tx(
     tx: &mut WriteTx<'_>,
     collection_id: &str,
     entry_id: &str,
@@ -152,7 +152,7 @@ pub(super) async fn set_collection_flag_membership_in_tx(
     Ok(())
 }
 
-pub(super) async fn set_favorite_membership_in_tx(
+pub async fn set_favorite_membership_in_tx(
     tx: &mut WriteTx<'_>,
     entry_id: &str,
     is_favorite: bool,
@@ -230,6 +230,7 @@ impl ItemRepo<'_> {
             thumbnail_media_id: None,
             duration: None,
             tag_names: TagNames::default(),
+            discussions: Vec::new(),
         })
     }
 
@@ -628,6 +629,22 @@ impl ItemRepo<'_> {
     /// `Unread` / `progress = 0.0` / `read_at = NULL`, and re-attaches saved non-feed items
     /// to `Want to Read`.
     pub async fn unfinish_reader_item(&self, id: &str) -> CatalogResult<bool> {
+        self.unfinish_reader_item_with_options(id, true).await
+    }
+
+    /// Atomically undoes reader completion in a single SQLite write transaction:
+    /// deletes `consumed` diary logs (recording sync tombstones) and resets `progress = 0.0` /
+    /// `read_at = NULL`.
+    ///
+    /// When `requeue_non_feed` is `true`, non-feed items are re-attached to `Want to Read`.
+    /// When `requeue_non_feed` is `false` (for example, unfinishing a promoted Board story),
+    /// non-feed items keep `inbox_state = 'none'` and preserve their existing `Want to Read`
+    /// membership without being forcibly added to the Queue.
+    pub async fn unfinish_reader_item_with_options(
+        &self,
+        id: &str,
+        requeue_non_feed: bool,
+    ) -> CatalogResult<bool> {
         let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
 
@@ -641,10 +658,12 @@ impl ItemRepo<'_> {
         .await?
         .is_some();
 
+        let status_patch =
+            if has_feed || requeue_non_feed { Some(ItemStatus::Unread) } else { None };
         let found = Self::update_in_tx(
             &mut tx,
             id,
-            Some(ItemStatus::Unread),
+            status_patch,
             None,
             Some(0.0),
             ReadAtPatch::MarkUnread,
@@ -658,7 +677,7 @@ impl ItemRepo<'_> {
         }
 
         let _ = CatalogRepo::delete_consumed_logs_for_entry_in_tx(&mut tx, id, now).await?;
-        if !has_feed {
+        if !has_feed && requeue_non_feed {
             set_collection_flag_membership_in_tx(
                 &mut tx,
                 WANT_TO_READ_COLLECTION_ID,

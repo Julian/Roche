@@ -108,7 +108,14 @@ pub(in crate::web) async fn inbox_get(
         status: Some(status_filter),
         feed_id: clean_feed.map(ToOwned::to_owned),
         tag_id: clean_tag.map(ToOwned::to_owned),
-        inbox_only: Some(true),
+        inbox_only: if clean_tag.is_some()
+            && status_filter == ItemStatusFilter::All
+            && clean_feed.is_none()
+        {
+            None
+        } else {
+            Some(true)
+        },
         content_type: parsed_kind.content_type,
         has_audio: parsed_kind.has_audio,
         podcast_only: parsed_kind.podcast_only,
@@ -966,7 +973,7 @@ fn render_inbox_row_controls(
 
     if item.in_want_to_read {
         let queue_btn = format!(
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-quiet is-in-queue\" title=\"Remove from Queue\" aria-label=\"Remove {} from Queue\">&#10003; In Queue</button>",
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-quiet is-in-queue\" title=\"Remove from Queue\" aria-label=\"In Queue — remove {} from Queue\">&#10003; In Queue</button>",
             esc(&item.title),
         );
         render_triage_form(

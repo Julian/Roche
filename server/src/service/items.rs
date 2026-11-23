@@ -250,7 +250,18 @@ impl<'a> ItemService<'a> {
     /// Atomically unfinishes a reader item (deleting `consumed` logs, resetting progress/status,
     /// and restoring non-feed items to `Want to Read`).
     pub async fn unfinish_reader_item(&self, id: &str) -> Result<(), AppError> {
-        if !self.service.db.items().unfinish_reader_item(id).await? {
+        self.unfinish_reader_item_with_options(id, true).await
+    }
+
+    /// Atomically unfinishes a reader item with explicit control over whether non-feed items are
+    /// re-added to `Want to Read` (`requeue_non_feed = false` preserves Queue state for promoted
+    /// board stories).
+    pub async fn unfinish_reader_item_with_options(
+        &self,
+        id: &str,
+        requeue_non_feed: bool,
+    ) -> Result<(), AppError> {
+        if !self.service.db.items().unfinish_reader_item_with_options(id, requeue_non_feed).await? {
             return Err(AppError::not_found("Item not found"));
         }
         Ok(())

@@ -8,12 +8,13 @@ use tokio::sync::Semaphore;
 
 use crate::{
     db::{
-        DEFAULT_ONLINE_PEER_WEIGHT, Db, Feed, MAX_PEER_WEIGHT, MIN_PEER_WEIGHT, NetworkTier,
+        Board, DEFAULT_ONLINE_PEER_WEIGHT, Db, Feed, MAX_PEER_WEIGHT, MIN_PEER_WEIGHT, NetworkTier,
         SERVER_PEER_ID, compute_throughput_weight, should_peer_poll_feed, update_throughput_ewma,
     },
     ingest::{
-        FeedConditionalCache, FeedFetcher, FeedIngester, FeedPollGuard, FeedPollLocks,
-        HttpFeedFetcher, MAX_CONCURRENT_POLLS, MediaIngestContext,
+        BoardIngester, FeedConditionalCache, FeedFetcher, FeedIngester, FeedPollGuard,
+        FeedPollLocks, HttpFeedFetcher, MAX_CONCURRENT_POLLS, MediaIngestContext,
+        board_poll_lock_key,
     },
     media::{MediaStore, ytdlp::YtDlpWorker},
     util::clock::now_utc,
@@ -209,7 +210,20 @@ impl<F: FeedFetcher> PollScheduler<F> {
             due_feeds.push((feed, poll_guard));
         }
 
-        if due_feeds.is_empty() {
+        let boards = self.db.boards().get_active_for_cooperative_polling().await?;
+        let mut due_boards = Vec::new();
+        for board in boards {
+            if !should_peer_poll_feed(SERVER_PEER_ID, &active_peers, &board, now) {
+                continue;
+            }
+            let lock_key = board_poll_lock_key(&board.id);
+            let Some(poll_guard) = self.feed_poll_locks.try_acquire(&lock_key) else {
+                continue;
+            };
+            due_boards.push((board, poll_guard));
+        }
+
+        if due_feeds.is_empty() && due_boards.is_empty() {
             return Ok(());
         }
 
@@ -217,8 +231,50 @@ impl<F: FeedFetcher> PollScheduler<F> {
         for (feed, poll_guard) in due_feeds {
             self.spawn_feed_poll_task(&mut tasks, feed, poll_guard);
         }
+        for (board, poll_guard) in due_boards {
+            self.spawn_board_poll_task(&mut tasks, board, poll_guard);
+        }
 
         Ok(())
+    }
+
+    fn spawn_board_poll_task(
+        &self,
+        tasks: &mut tokio::task::JoinSet<()>,
+        board: Board,
+        poll_guard: FeedPollGuard,
+    ) {
+        let db = self.db.clone();
+        let fetcher = Arc::clone(&self.fetcher);
+        let semaphore = Arc::clone(&self.semaphore);
+        let throughput_ewma = self.throughput_ewma.clone();
+
+        tasks.spawn(async move {
+            let (poll_res, elapsed_secs) = {
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    drop(poll_guard);
+                    return;
+                };
+                let started_at = Instant::now();
+                let res = BoardIngester::poll_and_record(
+                    &db,
+                    fetcher.as_ref(),
+                    &board,
+                    "scheduled",
+                    false,
+                )
+                .await;
+                (res, started_at.elapsed().as_secs_f64())
+            };
+
+            if let Ok(outcome) = poll_res {
+                let sample_weight = compute_throughput_weight(1, outcome.item_count, elapsed_secs);
+                let _ = throughput_ewma.record_sample(sample_weight);
+            }
+
+            // Board polling NEVER invokes media ingestion (`yt-dlp` / PDF downloads).
+            drop(poll_guard);
+        });
     }
 
     fn spawn_feed_poll_task(
@@ -694,5 +750,107 @@ mod tests {
         assert!(res.unwrap().is_ok());
         drop(tx);
         assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_polls_due_boards_via_hrw_without_media_downloads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use roche_core::boards::{BoardSourceSpec, HackerNewsSection};
+
+        struct BoardAndFeedFetcher {
+            board_list_calls: Arc<AtomicUsize>,
+            pdf_calls: Arc<AtomicUsize>,
+        }
+
+        impl FeedFetcher for BoardAndFeedFetcher {
+            fn fetch_feed(&self, url: &Url) -> impl std::future::Future<Output = Result<String>> {
+                let s = url.as_str().to_owned();
+                let list_calls = Arc::clone(&self.board_list_calls);
+                async move {
+                    if s == HackerNewsSection::Top.api_stories_url() {
+                        list_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok("[5001, 5002]".to_owned())
+                    } else if s.ends_with("/item/5001.json") {
+                        Ok(r#"{"id":5001,"type":"story","title":"Attention Paper","url":"https://arxiv.org/abs/2401.00001","by":"alice","score":420,"descendants":99,"time":1732300000}"#.to_owned())
+                    } else if s.ends_with("/item/5002.json") {
+                        Ok(r#"{"id":5002,"type":"story","title":"Systems Talk","url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","by":"bob","score":120,"descendants":31,"time":1732300100}"#.to_owned())
+                    } else if s == "https://example.com/rss-feed.xml" {
+                        Ok(r#"<?xml version="1.0" encoding="UTF-8"?>
+                        <rss version="2.0"><channel><title>Regular Feed</title>
+                            <item><title>Feed Entry</title><link>https://example.com/post-1</link><description>Hi</description></item>
+                        </channel></rss>"#
+                            .to_owned())
+                    } else {
+                        Err(anyhow::anyhow!("unexpected url: {s}"))
+                    }
+                }
+            }
+
+            fn fetch_pdf(
+                &self,
+                _url: &Url,
+            ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> {
+                self.pdf_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(Some(b"%PDF-1.5\n%%EOF".to_vec())))
+            }
+        }
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let top_spec = BoardSourceSpec::for_hacker_news(HackerNewsSection::Top);
+        let active_board = db.boards().create(&top_spec, None, None, 30).await.unwrap();
+        let ask_spec = BoardSourceSpec::for_hacker_news(HackerNewsSection::Ask);
+        let archived_board = db.boards().create(&ask_spec, None, None, 30).await.unwrap();
+        db.boards().archive(&archived_board.id).await.unwrap();
+
+        let feed_url = Url::parse("https://example.com/rss-feed.xml").unwrap();
+        db.feeds().create(FeedType::Rss, &feed_url, None, None).await.unwrap();
+
+        let board_list_calls = Arc::new(AtomicUsize::new(0));
+        let pdf_calls = Arc::new(AtomicUsize::new(0));
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-board-sched-{}", uuid::Uuid::new_v4()));
+        let store = MediaStore::new(&temp_dir);
+        let ytdlp = YtDlpWorker::new(crate::config::MediaConfig::default(), store.clone());
+
+        let scheduler = PollScheduler::with_arc_fetcher(
+            db.clone(),
+            Arc::new(BoardAndFeedFetcher {
+                board_list_calls: Arc::clone(&board_list_calls),
+                pdf_calls: Arc::clone(&pdf_calls),
+            }),
+        )
+        .with_media(store, ytdlp, Arc::new(Semaphore::new(2)));
+
+        scheduler.check_and_poll().await.unwrap();
+        scheduler.shutdown_tasks(Duration::from_secs(2)).await;
+
+        assert_eq!(board_list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            pdf_calls.load(Ordering::SeqCst),
+            0,
+            "board polling must NEVER download PDFs or invoke media ingestion"
+        );
+
+        let polled = db.boards().get(&active_board.id).await.unwrap().unwrap();
+        assert!(polled.last_polled_at.is_some());
+        assert!(polled.snapshot_fetched_at.is_some());
+        assert_eq!(polled.item_count, 2);
+
+        let still_archived = db.boards().get(&archived_board.id).await.unwrap().unwrap();
+        assert!(still_archived.last_polled_at.is_none());
+        assert_eq!(still_archived.item_count, 0);
+
+        // Entries table must contain only the RSS feed entry, never unpromoted board items.
+        let all_items = db.items().list(None, None, None).await.unwrap();
+        assert_eq!(all_items.len(), 1);
+        assert_eq!(all_items[0].title, "Feed Entry");
+
+        // Second tick immediately after polling must skip the board (not due yet under HRW).
+        scheduler.check_and_poll().await.unwrap();
+        scheduler.shutdown_tasks(Duration::from_secs(2)).await;
+        assert_eq!(board_list_calls.load(Ordering::SeqCst), 1);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

@@ -36,55 +36,52 @@ fun BottomTabIcon(
     Canvas(modifier = modifier.size(size)) {
         val strokeWidth = this.size.minDimension * STROKE_FRACTION
         val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
-        when (tab) {
-            AppTab.INBOX -> {
-                drawInboxTabIcon(
-                    path = pathA,
-                    tint = tint,
-                    stroke = stroke,
-                    strokeWidth = strokeWidth,
-                )
-            }
-            AppTab.QUEUE -> {
-                drawQueueTabIcon(
-                    path = pathA,
-                    tint = tint,
-                    stroke = stroke,
-                    strokeWidth = strokeWidth,
-                )
-            }
-            AppTab.STARRED -> {
-                populateStarPath(path = pathA, width = this.size.width, height = this.size.height)
-                drawPath(path = pathA, color = tint, style = stroke)
-            }
-            AppTab.HOME -> {
-                drawHomeTabIcon(housePath = pathA, doorPath = pathB, tint = tint, stroke = stroke)
-            }
-            AppTab.FEEDS -> {
-                drawFeedsTabIcon(tint = tint, stroke = stroke)
-            }
-            AppTab.LISTS -> {
-                drawListsTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
-            }
-            AppTab.DIARY -> {
-                drawDiaryTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
-            }
-            AppTab.OFFLINE -> {
-                drawArrowTray(
-                    trayPath = pathA,
-                    chevronPath = pathB,
-                    tint = tint,
-                    stroke = stroke,
-                    strokeWidth = strokeWidth,
-                    arrowTipY = ARROW_BOTTOM_Y,
-                    chevronWingY = OFFLINE_CHEVRON_WING_Y,
-                )
-            }
-            AppTab.SETTINGS -> {
-                drawSettingsCogIcon(path = pathA, tint = tint, stroke = stroke)
-            }
-        }
+        drawBottomTabGlyph(
+            tab = tab,
+            pathA = pathA,
+            pathB = pathB,
+            tint = tint,
+            stroke = stroke,
+            strokeWidth = strokeWidth,
+        )
     }
+}
+
+@Suppress("LongParameterList")
+private fun DrawScope.drawBottomTabGlyph(
+    tab: AppTab,
+    pathA: Path,
+    pathB: Path,
+    tint: Color,
+    stroke: Stroke,
+    strokeWidth: Float,
+) {
+    when (tab) {
+        AppTab.INBOX -> drawInboxTabIcon(pathA, tint, stroke, strokeWidth)
+        AppTab.QUEUE -> drawQueueTabIcon(pathA, tint, stroke, strokeWidth)
+        AppTab.STARRED -> drawStarTabIcon(pathA, tint, stroke)
+        AppTab.HOME -> drawHomeTabIcon(pathA, pathB, tint, stroke)
+        AppTab.FEEDS -> drawFeedsTabIcon(tint, stroke)
+        AppTab.BOARDS -> drawBoardsTabIcon(pathA, tint, stroke, strokeWidth)
+        AppTab.LISTS -> drawListsTabIcon(tint, stroke, strokeWidth)
+        AppTab.DIARY -> drawDiaryTabIcon(tint, stroke, strokeWidth)
+        AppTab.OFFLINE ->
+            drawArrowTray(
+                trayPath = pathA,
+                chevronPath = pathB,
+                tint = tint,
+                stroke = stroke,
+                strokeWidth = strokeWidth,
+                arrowTipY = ARROW_BOTTOM_Y,
+                chevronWingY = OFFLINE_CHEVRON_WING_Y,
+            )
+        AppTab.SETTINGS -> drawSettingsCogIcon(pathA, tint, stroke)
+    }
+}
+
+private fun DrawScope.drawStarTabIcon(path: Path, tint: Color, stroke: Stroke) {
+    populateStarPath(path = path, width = size.width, height = size.height)
+    drawPath(path = path, color = tint, style = stroke)
 }
 
 private fun DrawScope.drawInboxTabIcon(
@@ -181,6 +178,82 @@ private fun DrawScope.drawHomeTabIcon(
     doorPath.lineTo(w * 0.59f, h * 0.58f)
     doorPath.lineTo(w * 0.59f, h * 0.84f)
     drawPath(path = doorPath, color = tint, style = stroke)
+}
+
+private fun DrawScope.drawBoardsTabIcon(
+    flapPath: Path,
+    tint: Color,
+    stroke: Stroke,
+    strokeWidth: Float,
+) {
+    val w = size.width
+    val h = size.height
+    drawRoundRect(
+        color = tint,
+        topLeft = Offset(w * 0.14f, h * 0.16f),
+        size = Size(w * 0.58f, h * 0.68f),
+        cornerRadius = CornerRadius(w * CORNER_FRACTION, w * CORNER_FRACTION),
+        style = stroke,
+    )
+    flapPath.rewind()
+    flapPath.moveTo(w * 0.72f, h * 0.34f)
+    flapPath.lineTo(w * 0.86f, h * 0.34f)
+    flapPath.lineTo(w * 0.86f, h * 0.76f)
+    flapPath.lineTo(w * 0.78f, h * 0.84f)
+    flapPath.lineTo(w * 0.72f, h * 0.84f)
+    drawPath(path = flapPath, color = tint, style = stroke)
+    drawRoundRect(
+        color = tint,
+        topLeft = Offset(w * 0.26f, h * 0.28f),
+        size = Size(w * 0.34f, h * 0.17f),
+        cornerRadius = CornerRadius(w * 0.04f, w * 0.04f),
+        style = stroke,
+    )
+    drawLine(
+        color = tint,
+        start = Offset(w * 0.26f, h * 0.58f),
+        end = Offset(w * 0.60f, h * 0.58f),
+        strokeWidth = strokeWidth,
+        cap = StrokeCap.Round,
+    )
+    drawLine(
+        color = tint,
+        start = Offset(w * 0.26f, h * 0.71f),
+        end = Offset(w * 0.50f, h * 0.71f),
+        strokeWidth = strokeWidth,
+        cap = StrokeCap.Round,
+    )
+}
+
+/** Crisp speech-bubble icon for external discussion / Hacker News comment links. */
+@Composable
+fun CommentBubbleIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 15.dp,
+) {
+    val bubblePath = remember { Path() }
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val w = this.size.width
+        val h = this.size.height
+        bubblePath.rewind()
+        bubblePath.moveTo(w * 0.22f, h * 0.18f)
+        bubblePath.lineTo(w * 0.78f, h * 0.18f)
+        bubblePath.quadraticTo(w * 0.86f, h * 0.18f, w * 0.86f, h * 0.26f)
+        bubblePath.lineTo(w * 0.86f, h * 0.62f)
+        bubblePath.quadraticTo(w * 0.86f, h * 0.70f, w * 0.78f, h * 0.70f)
+        bubblePath.lineTo(w * 0.44f, h * 0.70f)
+        bubblePath.lineTo(w * 0.24f, h * 0.85f)
+        bubblePath.lineTo(w * 0.24f, h * 0.70f)
+        bubblePath.lineTo(w * 0.22f, h * 0.70f)
+        bubblePath.quadraticTo(w * 0.14f, h * 0.70f, w * 0.14f, h * 0.62f)
+        bubblePath.lineTo(w * 0.14f, h * 0.26f)
+        bubblePath.quadraticTo(w * 0.14f, h * 0.18f, w * 0.22f, h * 0.18f)
+        bubblePath.close()
+        drawPath(path = bubblePath, color = tint, style = stroke)
+    }
 }
 
 private fun DrawScope.drawListsTabIcon(tint: Color, stroke: Stroke, strokeWidth: Float) {

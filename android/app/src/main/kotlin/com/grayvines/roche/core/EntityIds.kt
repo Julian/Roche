@@ -3,6 +3,7 @@ package com.grayvines.roche.core
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.UUID
 
 private const val DIGEST_ALGORITHM_SHA256 = "SHA-256"
@@ -50,6 +51,7 @@ internal const val TOMBSTONE_ENTITY_COLLECTION_ENTRY = "collection_entry"
 internal const val TOMBSTONE_ENTITY_COLLECTION_GENERATOR = "collection_generator"
 internal const val TOMBSTONE_ENTITY_CONSUMPTION_LOG = "consumption_log"
 internal const val TOMBSTONE_ENTITY_COMPARISON = "comparison"
+internal const val TOMBSTONE_TYPE_BOARD = "board"
 
 internal const val MAX_CONSECUTIVE_FAILURES = 20
 
@@ -100,11 +102,17 @@ internal fun itemNaturalKey(feedUrl: String?, itemUrl: String): String {
 
 internal fun tagNaturalKey(name: String): String = name.trim().lowercase()
 
+internal fun boardNaturalKey(adapterType: String, sourceKey: String): String =
+    "${adapterType.trim().lowercase(Locale.ROOT)}\u0000${sourceKey.trim().lowercase(Locale.ROOT)}"
+
 internal fun collectionEntryNaturalKey(collectionId: String, entryId: String): String =
     "${collectionId.trim()}\u0000${entryId.trim()}"
 
 internal fun deterministicFeedId(url: String): String =
     deterministicEntityUuid("feed", feedNaturalKey(url))
+
+internal fun deterministicBoardId(adapterType: String, sourceKey: String): String =
+    deterministicEntityUuid("board", boardNaturalKey(adapterType, sourceKey))
 
 internal fun deterministicItemId(feedUrl: String?, itemUrl: String): String =
     deterministicEntityUuid("item", itemNaturalKey(feedUrl, itemUrl))

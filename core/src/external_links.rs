@@ -1,4 +1,5 @@
 use crate::{
+    boards::{hacker_news::HN_WEB_HOST, is_valid_hn_item_id},
     domain::EntryKind,
     identity_norm::{
         extract_spotify_web_entity_and_id, is_wikipedia_host, normalize_identifier_scheme,
@@ -9,9 +10,10 @@ use crate::{
     url_guard::sanitize_public_http_href,
 };
 
-pub const EXTERNAL_ID_DISPLAY_ORDER: [&str; 22] = [
+pub const EXTERNAL_ID_DISPLAY_ORDER: [&str; 23] = [
     "wikipedia",
     "arxiv",
+    "hacker_news",
     "musicbrainz_release",
     "musicbrainz_recording",
     "musicbrainz_artist",
@@ -46,6 +48,7 @@ pub fn external_identifier_label(scheme: &str) -> &str {
         "discogs" => "Discogs",
         "wikipedia" => "Wikipedia",
         "arxiv" => "arXiv",
+        "hacker_news" => "Hacker News",
         "musicbrainz_release" | "musicbrainz_artist" | "musicbrainz_recording" | "musicbrainz" => {
             "MusicBrainz"
         }
@@ -297,6 +300,32 @@ fn format_doi_external_url(v: &str) -> Option<String> {
     is_safe_bare_identifier(clean).then(|| format!("https://doi.org/{clean}"))
 }
 
+fn format_hacker_news_external_url(v: &str) -> Option<String> {
+    if is_valid_hn_item_id(v) {
+        return Some(format!("https://news.ycombinator.com/item?id={v}"));
+    }
+    if is_http_url(v) {
+        let parsed = url::Url::parse(v).ok()?;
+        if parsed.scheme() != "https"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return None;
+        }
+        let host = parsed.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+        if host != HN_WEB_HOST || parsed.path().trim_end_matches('/') != "/item" {
+            return None;
+        }
+        let id = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "id")
+            .map(|(_, val)| val.trim().to_owned())
+            .filter(|val| is_valid_hn_item_id(val))?;
+        return Some(format!("https://news.ycombinator.com/item?id={id}"));
+    }
+    None
+}
+
 fn prefixed_external_url(scheme: &str, v: &str, kind: Option<EntryKind>) -> Option<String> {
     let prefix = match scheme {
         "tmdb_movie" => "https://www.themoviedb.org/movie/",
@@ -365,6 +394,7 @@ pub fn external_identifier_url_for_kind(
             }
         }
         "doi" => format_doi_external_url(v),
+        "hacker_news" => format_hacker_news_external_url(v),
         "bandcamp" => validated_branded_https_url(v, |host| {
             host == "bandcamp.com" || host.ends_with(".bandcamp.com")
         }),

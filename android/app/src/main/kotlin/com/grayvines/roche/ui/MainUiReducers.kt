@@ -12,6 +12,7 @@ internal fun reduceUiAction(
         is MainAction.OverlayUi -> reduceOverlayUiAction(state, action)
         is MainAction.PlayerChromeUi -> reducePlayerChromeUiAction(state, action)
         is MainAction.CatalogUi -> reduceCatalogUiAction(state, action)
+        is MainAction.BoardUi -> reduceBoardUiAction(state, action)
     }
 
 private fun reduceNavigationUiAction(
@@ -19,29 +20,13 @@ private fun reduceNavigationUiAction(
     action: MainAction.NavigationUi,
 ): TransientUiState =
     when (action) {
-        is MainAction.SelectTab ->
-            state
-                .clearSearch()
-                .copy(
-                    activeTab = action.tab,
-                    selectedCatalogCollectionId =
-                        if (action.tab == AppTab.LISTS && state.activeTab == AppTab.LISTS) {
-                            null
-                        } else {
-                            state.selectedCatalogCollectionId
-                        },
-                    selectedReaderEntryId = null,
-                    readerContent = null,
-                    catalogDetailStack = emptyList(),
-                    selectedFeedId = null,
-                    selectedTag = null,
-                    scopeOriginTab = null,
-                )
+        is MainAction.SelectTab -> reduceSelectTab(state, action.tab)
         MainAction.ResetSettingsToHub -> state
         is MainAction.SelectFilter -> state.copy(activeFilter = action.filter)
         is MainAction.FilterByTag ->
             state
                 .clearSearch()
+                .clearBoardOverlayState()
                 .copy(
                     activeTab = AppTab.INBOX,
                     selectedTag = action.tagName,
@@ -54,6 +39,7 @@ private fun reduceNavigationUiAction(
         is MainAction.FilterByFeed ->
             state
                 .clearSearch()
+                .clearBoardOverlayState()
                 .copy(
                     activeTab = AppTab.INBOX,
                     selectedFeedId = action.feedId,
@@ -65,17 +51,47 @@ private fun reduceNavigationUiAction(
                     feedContextSheetId = null,
                 )
         MainAction.NavigateBackFromScope ->
-            state.copy(
-                activeTab = state.scopeOriginTab ?: AppTab.HOME,
-                selectedFeedId = null,
-                selectedTag = null,
-                scopeOriginTab = null,
-                selectedReaderEntryId = null,
-                readerContent = null,
-                contextSheetEntryId = null,
-                feedContextSheetId = null,
-            )
+            state
+                .clearBoardOverlayState()
+                .copy(
+                    activeTab = state.scopeOriginTab ?: AppTab.HOME,
+                    selectedFeedId = null,
+                    selectedTag = null,
+                    scopeOriginTab = null,
+                    selectedReaderEntryId = null,
+                    readerContent = null,
+                    contextSheetEntryId = null,
+                    feedContextSheetId = null,
+                )
     }
+
+private fun reduceSelectTab(state: TransientUiState, tab: AppTab): TransientUiState =
+    state
+        .clearSearch()
+        .clearBoardOverlayState()
+        .copy(
+            activeTab = tab,
+            selectedCatalogCollectionId =
+                if (tab == AppTab.LISTS && state.activeTab == AppTab.LISTS) {
+                    null
+                } else {
+                    state.selectedCatalogCollectionId
+                },
+            selectedReaderEntryId = null,
+            readerContent = null,
+            catalogDetailStack = emptyList(),
+            selectedFeedId = null,
+            selectedTag = null,
+            scopeOriginTab = null,
+        )
+
+private fun TransientUiState.clearBoardOverlayState(): TransientUiState =
+    copy(
+        selectedBoardReaderBoardId = null,
+        selectedBoardReaderExternalId = null,
+        boardReaderState = null,
+        boardContextSheetTarget = null,
+    )
 
 internal fun resolveNextScopeOriginTab(state: TransientUiState, hasNewScope: Boolean): AppTab? =
     when {
@@ -97,6 +113,9 @@ private fun reduceOverlayUiAction(
                 feedContextSheetId = null,
                 catalogDetailStack = emptyList(),
                 isAddSheetOpen = false,
+                isAddBoardSheetOpen = false,
+                editBoardSheetId = null,
+                boardContextSheetTarget = null,
             )
         MainAction.CloseSearch -> state.clearSearch()
         is MainAction.OpenReader -> reduceOpenReader(state, action)
@@ -131,6 +150,9 @@ private fun reduceOpenReader(
     state.copy(
         selectedReaderEntryId = action.entryId,
         readerContent = state.readerContent?.takeIf { it.itemId == action.entryId },
+        selectedBoardReaderBoardId = null,
+        selectedBoardReaderExternalId = null,
+        boardReaderState = null,
         hydratingEntryIds = state.hydratingEntryIds + action.entryId,
         contextSheetEntryId = null,
         catalogDetailStack = emptyList(),
@@ -243,6 +265,7 @@ private fun reduceOpenCompanionSection(
         }
     return state
         .clearSearch()
+        .clearBoardOverlayState()
         .copy(
             activeTab = targetTab,
             companionSubTab = action.subTab,

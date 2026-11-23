@@ -5,6 +5,11 @@ import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.SyncStatusState
 import com.grayvines.roche.data.WorkspaceSearchResult
+import com.grayvines.roche.data.boards.BoardAdapterType
+import com.grayvines.roche.data.boards.BoardItemView
+import com.grayvines.roche.data.boards.BoardOrderMode
+import com.grayvines.roche.data.boards.BoardSummary
+import com.grayvines.roche.data.boards.DEFAULT_BOARD_POLL_INTERVAL_MINUTES
 import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
@@ -115,6 +120,11 @@ sealed interface UndoActionKind {
     ) : UndoActionKind
 
     data class RestoreOfflineCache(val entryId: String) : UndoActionKind
+
+    data class RestoreBoardDismiss(
+        val boardId: String,
+        val externalId: String,
+    ) : UndoActionKind
 }
 
 data class UndoActionEvent(
@@ -129,6 +139,7 @@ data class UndoActionEvent(
                 is UndoActionKind.RestoreCollectionEntry -> kind.entryId
                 is UndoActionKind.RestoreQueueItem -> kind.entryId
                 is UndoActionKind.RestoreOfflineCache -> kind.entryId
+                is UndoActionKind.RestoreBoardDismiss -> kind.externalId
             }
 }
 
@@ -170,6 +181,20 @@ data class MainUiState(
     val readableEntryIds: Set<String> = entryById.keys,
     val feeds: List<FeedItem> = emptyList(),
     val tags: List<TagItem> = emptyList(),
+    val boards: List<BoardSummary> = emptyList(),
+    val boardItemsByBoardId: Map<String, List<BoardItemView>> = emptyMap(),
+    val selectedBoardId: String? = null,
+    val boardStreamFilter: BoardStreamFilter = BoardStreamFilter.ACTIVE,
+    val boardFilterQuery: String = "",
+    val isAddBoardSheetOpen: Boolean = false,
+    val editBoardSheetId: String? = null,
+    val boardContextSheetTarget: BoardStoryContextTarget? = null,
+    val creatingBoardKeys: Set<String> = emptySet(),
+    val refreshingBoardIds: Set<String> = emptySet(),
+    val boardPaginationByBoardId: Map<String, BoardPaginationState> = emptyMap(),
+    val selectedBoardReaderBoardId: String? = null,
+    val selectedBoardReaderExternalId: String? = null,
+    val boardReaderState: BoardReaderUiState? = null,
     val activePeers: List<PeerNodeDto> = emptyList(),
     val localNetworkTier: NetworkTier = NetworkTier.WIFI,
     val settings: Settings = Settings(),
@@ -232,6 +257,15 @@ data class MainUiState(
     val contextSheetFeed: FeedItem?
         get() = feeds.firstOrNull { it.id == feedContextSheetId }
 
+    val activeBoard: BoardSummary?
+        get() = boards.firstOrNull { it.id == selectedBoardId } ?: boards.firstOrNull()
+
+    val activeBoardId: String?
+        get() = activeBoard?.id
+
+    val editBoardSheetBoard: BoardSummary?
+        get() = editBoardSheetId?.let { id -> boards.firstOrNull { it.id == id } }
+
     val selectedFeedTitle: String?
         get() = feeds.firstOrNull { it.id == selectedFeedId }?.title
 
@@ -243,6 +277,9 @@ data class MainUiState(
             contextSheetEntryId != null ||
                 feedContextSheetId != null ||
                 isAddSheetOpen ||
+                isAddBoardSheetOpen ||
+                editBoardSheetId != null ||
+                boardContextSheetTarget != null ||
                 drawNoteDialog != null ||
                 rankSession != null ||
                 catalogDetailEntryId != null ||
@@ -336,6 +373,8 @@ sealed interface MainAction {
 
     sealed interface CatalogUi : Ui
 
+    sealed interface BoardUi : Ui
+
     sealed interface Mutation : MainAction
 
     sealed interface InboxReaderMutation : Mutation
@@ -357,6 +396,8 @@ sealed interface MainAction {
     sealed interface SettingsServerAction : SyncFeedMutation
 
     sealed interface CatalogMutation : Mutation
+
+    sealed interface BoardMutation : Mutation
 
     data class SelectTab(val tab: AppTab) : NavigationUi
 
@@ -705,6 +746,114 @@ sealed interface MainAction {
     ) : SettingsServerAction
 
     data object DiscoverServer : SettingsServerAction
+
+    data class SelectBoard(val boardId: String) : BoardUi
+
+    data class SelectBoardStreamFilter(val filter: BoardStreamFilter) : BoardUi
+
+    data class UpdateBoardFilterQuery(val query: String) : BoardUi
+
+    data object OpenAddBoardSheet : BoardUi
+
+    data object CloseAddBoardSheet : BoardUi
+
+    data class OpenEditBoardSheet(val boardId: String) : BoardUi
+
+    data object CloseEditBoardSheet : BoardUi
+
+    data class OpenBoardStoryContextSheet(
+        val boardId: String,
+        val externalId: String,
+        val item: BoardItemView,
+    ) : BoardUi
+
+    data object CloseBoardStoryContextSheet : BoardUi
+
+    data class OpenBoardReader(
+        val boardId: String,
+        val externalId: String,
+        val item: BoardItemView? = null,
+    ) : BoardUi
+
+    data object CloseBoardReader : BoardUi
+
+    data class CreateBoard(
+        val adapterType: BoardAdapterType = BoardAdapterType.HACKER_NEWS,
+        val sectionOrUrl: String,
+        val title: String? = null,
+        val pollInterval: Int = DEFAULT_BOARD_POLL_INTERVAL_MINUTES,
+    ) : BoardMutation
+
+    data class UpdateBoard(
+        val boardId: String,
+        val title: String? = null,
+        val pollInterval: Int? = null,
+        val isActive: Boolean? = null,
+        val orderMode: BoardOrderMode? = null,
+    ) : BoardMutation
+
+    data class DeleteBoard(val boardId: String) : BoardMutation
+
+    data class RefreshBoard(val boardId: String) : BoardMutation
+
+    data object RefreshAllBoards : BoardMutation
+
+    data class LoadMoreBoardItems(val boardId: String) : BoardMutation
+
+    data class DismissBoardItem(
+        val boardId: String,
+        val externalId: String,
+        val title: String,
+        val closeReaderIfOpen: Boolean = false,
+    ) : BoardMutation
+
+    data class UndismissBoardItem(
+        val boardId: String,
+        val externalId: String,
+    ) : BoardMutation
+
+    data class ToggleBoardItemStar(
+        val boardId: String,
+        val externalId: String,
+        val item: BoardItemView? = null,
+        val extractedHtml: String? = null,
+    ) : BoardMutation
+
+    data class ToggleBoardItemQueue(
+        val boardId: String,
+        val externalId: String,
+        val item: BoardItemView? = null,
+        val extractedHtml: String? = null,
+    ) : BoardMutation
+
+    data class FinishBoardItem(
+        val boardId: String,
+        val externalId: String,
+        val item: BoardItemView? = null,
+        val extractedHtml: String? = null,
+        val silent: Boolean = false,
+    ) : BoardMutation
+
+    data class UnfinishBoardItem(
+        val boardId: String,
+        val externalId: String,
+        val entryId: String,
+    ) : BoardMutation
+
+    data class PromoteBoardItemToList(
+        val boardId: String,
+        val externalId: String,
+        val listId: String,
+        val listTitle: String,
+        val item: BoardItemView? = null,
+        val extractedHtml: String? = null,
+    ) : BoardMutation
+
+    data class RetryLoadBoardReader(
+        val boardId: String,
+        val externalId: String,
+        val item: BoardItemView? = null,
+    ) : BoardMutation
 }
 
 internal data class TransientUiState(
@@ -735,6 +884,18 @@ internal data class TransientUiState(
     val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
+    val selectedBoardId: String? = null,
+    val boardStreamFilter: BoardStreamFilter = BoardStreamFilter.ACTIVE,
+    val boardFilterQuery: String = "",
+    val isAddBoardSheetOpen: Boolean = false,
+    val editBoardSheetId: String? = null,
+    val boardContextSheetTarget: BoardStoryContextTarget? = null,
+    val creatingBoardKeys: Set<String> = emptySet(),
+    val refreshingBoardIds: Set<String> = emptySet(),
+    val boardPaginationByBoardId: Map<String, BoardPaginationState> = emptyMap(),
+    val selectedBoardReaderBoardId: String? = null,
+    val selectedBoardReaderExternalId: String? = null,
+    val boardReaderState: BoardReaderUiState? = null,
     val catalogDetailStack: List<String> = emptyList(),
     val isQuickLogSheetOpen: Boolean = false,
     val quickLogDefaultWant: Boolean = false,
@@ -773,6 +934,10 @@ internal data class SavedNavigationUiState(
     val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
+    val selectedBoardId: String? = null,
+    val boardStreamFilter: BoardStreamFilter = BoardStreamFilter.ACTIVE,
+    val selectedBoardReaderBoardId: String? = null,
+    val selectedBoardReaderExternalId: String? = null,
 )
 
 internal fun TransientUiState.toSavedNavigationUiState(): SavedNavigationUiState =
@@ -789,6 +954,10 @@ internal fun TransientUiState.toSavedNavigationUiState(): SavedNavigationUiState
         queueSubTab = queueSubTab,
         selectedCatalogCollectionId = selectedCatalogCollectionId,
         selectedWantCollectionId = selectedWantCollectionId,
+        selectedBoardId = selectedBoardId,
+        boardStreamFilter = boardStreamFilter,
+        selectedBoardReaderBoardId = selectedBoardReaderBoardId,
+        selectedBoardReaderExternalId = selectedBoardReaderExternalId,
     )
 
 internal fun SavedNavigationUiState.toInitialTransientUiState(
@@ -808,6 +977,20 @@ internal fun SavedNavigationUiState.toInitialTransientUiState(
         queueSubTab = queueSubTab,
         selectedCatalogCollectionId = selectedCatalogCollectionId,
         selectedWantCollectionId = selectedWantCollectionId,
+        selectedBoardId = selectedBoardId,
+        boardStreamFilter = boardStreamFilter,
+        selectedBoardReaderBoardId = selectedBoardReaderBoardId,
+        selectedBoardReaderExternalId = selectedBoardReaderExternalId,
+        boardReaderState =
+            if (selectedBoardReaderBoardId != null && selectedBoardReaderExternalId != null) {
+                BoardReaderUiState(
+                    boardId = selectedBoardReaderBoardId,
+                    externalId = selectedBoardReaderExternalId,
+                    isLoading = true,
+                )
+            } else {
+                null
+            },
         localNetworkTier = localNetworkTier,
     )
 
@@ -921,6 +1104,21 @@ internal fun assembleMainUiState(
         readableEntryIds = inboxDerived.entryProjections.readableEntryIds,
         feeds = snapshot.feeds,
         tags = snapshot.tags,
+        boards = snapshot.boards,
+        boardItemsByBoardId = snapshot.boardItems,
+        selectedBoardId = local.selectedBoardId,
+        boardStreamFilter = local.boardStreamFilter,
+        boardFilterQuery = local.boardFilterQuery,
+        isAddBoardSheetOpen = local.isAddBoardSheetOpen,
+        editBoardSheetId = local.editBoardSheetId,
+        boardContextSheetTarget = local.boardContextSheetTarget,
+        creatingBoardKeys = local.creatingBoardKeys,
+        refreshingBoardIds = local.refreshingBoardIds,
+        boardPaginationByBoardId =
+            reconcileBoardPaginationMap(local.boardPaginationByBoardId, snapshot),
+        selectedBoardReaderBoardId = local.selectedBoardReaderBoardId,
+        selectedBoardReaderExternalId = local.selectedBoardReaderExternalId,
+        boardReaderState = local.boardReaderState,
         activePeers = snapshot.activePeers,
         localNetworkTier = local.localNetworkTier,
         settings = settings.redactedForUi(),

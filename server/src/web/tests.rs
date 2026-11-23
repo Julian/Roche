@@ -176,7 +176,7 @@ async fn test_web_static_login_csrf_and_logout_revocation() {
     assert!(css_etag.starts_with("W/\""), "expected weak ETag under compression, got {css_etag}");
     assert_eq!(css_resp.headers().get(header::VARY).unwrap(), "Accept-Encoding");
     let css_body =
-        String::from_utf8(to_bytes(css_resp.into_body(), 128 * 1024).await.unwrap().to_vec())
+        String::from_utf8(to_bytes(css_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
             .unwrap();
     assert!(css_body.contains("#fbf7ed"));
 
@@ -225,7 +225,7 @@ async fn test_web_static_login_csrf_and_logout_revocation() {
     assert_eq!(unauth.headers().get(header::LOCATION).unwrap(), "/login");
 
     let (cookie, csrf) = login_browser(&db, &app).await;
-    for path in ["/inbox", "/lists/starred", "/feeds", "/lists", "/diary", "/queue"] {
+    for path in ["/inbox", "/boards", "/lists/starred", "/feeds", "/lists", "/diary", "/queue"] {
         let resp = get_authed(&app, path, &cookie).await;
         assert_eq!(resp.status(), StatusCode::OK, "expected 200 OK on {path}");
     }
@@ -4396,4 +4396,511 @@ async fn test_web_feeds_editable_url_form_and_post_edit_validation() {
     let untitled_after = db.feeds().get(&untitled_feed.id).await.unwrap().unwrap();
     assert_eq!(untitled_after.url.as_str(), "https://untitled-new.example.com/rss.xml");
     assert!(untitled_after.title.is_none());
+}
+
+#[derive(Clone)]
+struct MockBoardWebFetcher;
+
+impl FeedFetcher for MockBoardWebFetcher {
+    #[allow(clippy::too_many_lines)]
+    fn fetch_feed(
+        &self,
+        url: &Url,
+    ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send {
+        let s = url.as_str().to_owned();
+        async move {
+            if s == roche_core::boards::HackerNewsSection::Top.api_stories_url() {
+                let ids: Vec<u64> = (1001..=1035).collect();
+                return Ok(serde_json::to_string(&ids).unwrap());
+            }
+            if let Some(id_part) = s
+                .strip_prefix("https://hacker-news.firebaseio.com/v0/item/")
+                .and_then(|r| r.strip_suffix(".json"))
+                && let Ok(id_num) = id_part.parse::<u64>()
+            {
+                let payload = match id_num {
+                    1001 => serde_json::json!({
+                        "id": 1001,
+                        "type": "story",
+                        "title": "Systems Architecture Deep Dive",
+                        "url": "https://systems.example/essay",
+                        "by": "ada",
+                        "score": 312,
+                        "descendants": 42,
+                        "time": 1_760_000_000_i64
+                    }),
+                    1002 => serde_json::json!({
+                        "id": 1002,
+                        "type": "story",
+                        "title": "Ask HN: Favorite systems books?",
+                        "text": "<p>What books shaped your engineering taste?</p>",
+                        "by": "grace",
+                        "score": 145,
+                        "descendants": 18,
+                        "time": 1_760_000_100_i64
+                    }),
+                    1003 => serde_json::json!({
+                        "id": 1003,
+                        "type": "story",
+                        "title": "Unextractable GitHub Repo",
+                        "url": "https://github.com/example/unextractable-repo",
+                        "by": "linus",
+                        "score": 205,
+                        "descendants": 27,
+                        "time": 1_760_000_200_i64
+                    }),
+                    1005 => serde_json::json!({
+                        "id": 1005,
+                        "type": "story",
+                        "title": "Ask HN: Who is hiring?",
+                        "by": "whoishiring",
+                        "score": 410,
+                        "descendants": 99,
+                        "time": 1_760_000_250_i64
+                    }),
+                    1006 => serde_json::json!({
+                        "id": 1006,
+                        "type": "story",
+                        "title": "Foundations of Raft (PDF)",
+                        "url": "https://papers.example/raft.pdf",
+                        "by": "diego",
+                        "score": 188,
+                        "descendants": 14,
+                        "time": 1_760_000_260_i64
+                    }),
+                    1007 => serde_json::json!({
+                        "id": 1007,
+                        "type": "story",
+                        "title": "Systems Talk Keynote",
+                        "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                        "by": "speaker",
+                        "score": 170,
+                        "descendants": 33,
+                        "time": 1_760_000_270_i64
+                    }),
+                    1008 => serde_json::json!({
+                        "id": 1008,
+                        "type": "story",
+                        "title": "Transient Flaky Host Essay",
+                        "url": "https://timeout.example/flaky",
+                        "by": "ops",
+                        "score": 160,
+                        "descendants": 11,
+                        "time": 1_760_000_280_i64
+                    }),
+                    1034 => serde_json::json!({
+                        "id": 1034,
+                        "type": "story",
+                        "title": "Ranked Story #1034 DeepNeedleBeyondPageOne",
+                        "url": "https://stories.example/post-1034",
+                        "by": "builder",
+                        "score": 66,
+                        "descendants": 34,
+                        "time": 1_760_001_034_i64
+                    }),
+                    n => serde_json::json!({
+                        "id": n,
+                        "type": "story",
+                        "title": format!("Ranked Story #{n}"),
+                        "url": format!("https://stories.example/post-{n}"),
+                        "by": "builder",
+                        "score": 1100 - n,
+                        "descendants": n - 1000,
+                        "time": 1_760_000_000_i64 + i64::try_from(n).unwrap()
+                    }),
+                };
+                return Ok(payload.to_string());
+            }
+            Err(anyhow::anyhow!("unexpected mock board url: {s}"))
+        }
+    }
+
+    fn fetch_html(
+        &self,
+        url: &Url,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<String>>> + Send {
+        let res = if url.as_str() == "https://systems.example/essay" {
+            Ok(Some(
+                "<html><head><title>Systems Architecture Deep Dive</title></head>\
+                 <body><article><h1>Systems Architecture Deep Dive</h1>\
+                 <p>Clean editorial body paragraph from board extraction.</p></article></body></html>"
+                    .to_owned(),
+            ))
+        } else if url.as_str() == "https://timeout.example/flaky" {
+            Err(anyhow::anyhow!("upstream timeout"))
+        } else {
+            Ok(None)
+        };
+        std::future::ready(res)
+    }
+
+    fn fetch_pdf(
+        &self,
+        _url: &Url,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<Vec<u8>>>> + Send {
+        std::future::ready(Ok(None))
+    }
+}
+
+async fn post_form_json(
+    app: &Router,
+    uri: &str,
+    cookie: &str,
+    csrf: &str,
+    fields: &[(&str, &str)],
+) -> (StatusCode, serde_json::Value) {
+    let body = encode_form(fields);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::COOKIE, cookie)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::ACCEPT, "application/json")
+                .header("x-roche-ajax", "1")
+                .header("x-roche-csrf", csrf)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+    let val = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, val)
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_web_boards_onboarding_lifecycle_backfill_promote_reader_and_isolation() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let svc = RocheService::new(db.clone(), MockBoardWebFetcher, Config::default());
+    let app = ApiRoutes::router_with_service(svc);
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    // 1. Masthead nav contains Boards after Inbox & empty /boards renders quick-add onboarding
+    let empty_html = read_body_html(get_authed(&app, "/boards", &cookie).await).await;
+    let inbox_pos = empty_html.find("href=\"/inbox\"").unwrap();
+    let boards_pos = empty_html.find("href=\"/boards\"").unwrap();
+    let starred_pos = empty_html.find("href=\"/starred\"").unwrap();
+    assert!(inbox_pos < boards_pos && boards_pos < starred_pos);
+    assert!(empty_html.contains("Hacker News (Front Page)"));
+    assert!(empty_html.contains("HN Best"));
+    assert!(empty_html.contains("Ask HN"));
+    assert!(empty_html.contains("Show HN"));
+
+    // 2. Create Hacker News Front Page board via Web form (auto-polls 35 stories)
+    let create_resp = post_form(
+        &app,
+        "/web/boards/create",
+        &cookie,
+        &[("_csrf", &csrf), ("adapter_type", "hacker_news"), ("section", "top")],
+    )
+    .await;
+    assert_eq!(create_resp.status(), StatusCode::SEE_OTHER);
+    let board_loc =
+        create_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
+    assert!(board_loc.starts_with("/boards/"), "unexpected redirect: {board_loc}");
+    let board_id = board_loc.strip_prefix("/boards/").unwrap().to_owned();
+
+    // 3. Board view renders top 30 ranked stories with comments links, points, Ask HN badge & Load More
+    let board_html = read_body_html(get_authed(&app, &board_loc, &cookie).await).await;
+    assert!(board_html.contains("Systems Architecture Deep Dive"));
+    assert!(board_html.contains("systems.example"));
+    assert!(board_html.contains("312 pts"));
+    assert!(board_html.contains("42 comments"));
+    assert!(board_html.contains("https://news.ycombinator.com/item?id=1001"));
+    assert!(
+        board_html.contains("Open 42 comments on Hacker News for Systems Architecture Deep Dive")
+    );
+    assert!(board_html.contains("Ask HN: Favorite systems books?"));
+    assert!(board_html.contains("What books shaped your engineering taste?"));
+    assert!(board_html.contains("Load more stories"));
+    assert!(board_html.contains("Ranked Story #1030"));
+    assert!(!board_html.contains("Ranked Story #1031"), "page 1 must display only top 30");
+    // De-duplicated toolbar badge: "Hacker News" board shows "Front Page" (not "Hacker News · Front Page")
+    assert!(board_html.contains("<span class=\"badge badge-kind\">Front Page</span>"));
+    assert!(!board_html.contains("Hacker News · Front Page"));
+    // External discussion links carry rel="noopener noreferrer" and #roche-board-list carries data-base-offset
+    assert!(board_html.contains("rel=\"noopener noreferrer\""));
+    assert!(board_html.contains("data-base-offset=\"0\""));
+
+    // 3b. Server-side ?q= searches across the full 90-item buffer (finds rank #34 past page 1!)
+    let query_html = read_body_html(
+        get_authed(&app, &format!("/boards/{board_id}?q=DeepNeedleBeyondPageOne"), &cookie).await,
+    )
+    .await;
+    assert!(query_html.contains("DeepNeedleBeyondPageOne"));
+    assert!(!query_html.contains("Systems Architecture Deep Dive"));
+
+    // 4. Isolation: unpromoted board stories MUST NOT appear in /inbox or /search
+    let inbox_html = read_body_html(get_authed(&app, "/inbox", &cookie).await).await;
+    assert!(!inbox_html.contains("Systems Architecture Deep Dive"));
+    let search_html = read_body_html(get_authed(&app, "/search?q=Systems", &cookie).await).await;
+    assert!(!search_html.contains("Systems Architecture Deep Dive"));
+
+    // 5. Instant dismiss + backfill JSON returns #31 (external_id 1031)
+    let (dismiss_status, dismiss_json) = post_form_json(
+        &app,
+        &format!("/web/boards/{board_id}/items/1004/dismiss"),
+        &cookie,
+        &csrf,
+        &[("_csrf", &csrf), ("backfill_offset", "29")],
+    )
+    .await;
+    assert_eq!(dismiss_status, StatusCode::OK);
+    assert_eq!(dismiss_json["ok"], true);
+    assert_eq!(dismiss_json["replacement_external_id"], "1031");
+    assert!(dismiss_json["replacement_html"].as_str().unwrap().contains("Ranked Story #1031"));
+    assert_eq!(dismiss_json["visible_count"], 34);
+    assert_eq!(dismiss_json["dismissed_count"], 1);
+
+    // 6. Dismissed view shows 1004 with Restore, and undismiss restores it cleanly
+    let dismissed_html = read_body_html(
+        get_authed(&app, &format!("/boards/{board_id}?view=dismissed"), &cookie).await,
+    )
+    .await;
+    assert!(dismissed_html.contains("Ranked Story #1004"));
+    assert!(dismissed_html.contains("Restore"));
+    assert!(!dismissed_html.contains("Systems Architecture Deep Dive"));
+
+    let (undo_status, undo_json) = post_form_json(
+        &app,
+        &format!("/web/boards/{board_id}/items/1004/undismiss"),
+        &cookie,
+        &csrf,
+        &[("_csrf", &csrf)],
+    )
+    .await;
+    assert_eq!(undo_status, StatusCode::OK);
+    assert_eq!(undo_json["visible_count"], 35);
+    assert_eq!(undo_json["dismissed_count"], 0);
+
+    // 7. Progressive Load More fragment returns buffered slice #31..#35
+    let load_more_resp =
+        get_authed(&app, &format!("/web/boards/{board_id}/items?page=2"), &cookie).await;
+    assert_eq!(load_more_resp.status(), StatusCode::OK);
+    let load_more_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(load_more_resp.into_body(), 256 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(load_more_json["count"], 5);
+    assert!(load_more_json["rows_html"].as_str().unwrap().contains("Ranked Story #1031"));
+    assert!(load_more_json["rows_html"].as_str().unwrap().contains("Ranked Story #1035"));
+
+    // 8. On-demand Board Reader: extracted article, Ask HN self-post, and graceful fallback card
+    let art_reader_html =
+        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1001"), &cookie).await)
+            .await;
+    assert!(art_reader_html.contains("data-board-reader=\"1\""));
+    assert!(art_reader_html.contains("data-has-readable-body=\"1\""));
+    assert!(art_reader_html.contains("Clean editorial body paragraph from board extraction."));
+    assert!(art_reader_html.contains("Original &#8599;"));
+    assert!(art_reader_html.contains("Hacker News (42 comments) &#8599;"));
+    // Opening Reader marks seen but still does NOT insert into entries / Inbox!
+    assert!(db.items().list(None, None, None).await.unwrap().is_empty());
+
+    let ask_reader_html =
+        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1002"), &cookie).await)
+            .await;
+    assert!(ask_reader_html.contains("data-has-readable-body=\"1\""));
+    assert!(ask_reader_html.contains("What books shaped your engineering taste?"));
+    assert!(!ask_reader_html.contains("Original &#8599;"));
+    assert!(ask_reader_html.contains("Hacker News (18 comments) &#8599;"));
+
+    let fallback_reader_html =
+        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1003"), &cookie).await)
+            .await;
+    assert!(fallback_reader_html.contains("board-reader-fallback"));
+    assert!(fallback_reader_html.contains("data-has-readable-body=\"0\""));
+    assert!(fallback_reader_html.contains("Open Original &#8599;"));
+    assert!(fallback_reader_html.contains("Open Hacker News Discussion (27 comments) &#8599;"));
+    assert!(fallback_reader_html.contains("Mark Finished"));
+    // Typography buttons are omitted when no readable prose body is present
+    assert!(!fallback_reader_html.contains("js-font-dec"));
+    assert!(!fallback_reader_html.contains("js-font-inc"));
+
+    // 8b. Tailored fallback cards: SelfPostEmpty, Pdf, Video, and FetchFailed
+    let empty_ask_html =
+        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1005"), &cookie).await)
+            .await;
+    assert!(empty_ask_html.contains("board-reader-fallback"));
+    assert!(empty_ask_html.contains("This Hacker News post has no body text"));
+    assert!(empty_ask_html.contains("Open Hacker News Discussion (99 comments) &#8599;"));
+    assert!(!empty_ask_html.contains("Open Original"));
+    assert!(!empty_ask_html.contains("Original &#8599;"));
+    assert!(!empty_ask_html.contains("js-font-dec"));
+
+    let pdf_fallback_html =
+        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1006"), &cookie).await)
+            .await;
+    assert!(pdf_fallback_html.contains("PDF document"));
+    assert!(pdf_fallback_html.contains("Open PDF &#8599;"));
+    assert!(!pdf_fallback_html.contains("js-font-dec"));
+
+    let video_fallback_html =
+        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1007"), &cookie).await)
+            .await;
+    assert!(video_fallback_html.contains("Video link"));
+    assert!(video_fallback_html.contains("Watch Video &#8599;"));
+
+    let fetch_fail_html =
+        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1008"), &cookie).await)
+            .await;
+    assert!(fetch_fail_html.contains("load article right now"));
+    assert!(fetch_fail_html.contains(">Retry</a>"));
+    assert!(fetch_fail_html.contains("Open Original &#8599;"));
+
+    // 9. Promote via Queue, Star, Finish -> dedups onto same canonical entry & persists HN link
+    let (q_status, q_json) = post_form_json(
+        &app,
+        &format!("/web/boards/{board_id}/items/1001/promote"),
+        &cookie,
+        &csrf,
+        &[("_csrf", &csrf), ("action", "queue")],
+    )
+    .await;
+    assert_eq!(q_status, StatusCode::OK);
+    let entry_id = q_json["entry_id"].as_str().unwrap().to_owned();
+    assert_eq!(q_json["in_want_to_read"], true);
+    assert_eq!(q_json["unqueue_action"], format!("/web/want/read/remove/{entry_id}"));
+
+    let (s_status, s_json) = post_form_json(
+        &app,
+        &format!("/web/boards/{board_id}/items/1001/promote"),
+        &cookie,
+        &csrf,
+        &[("_csrf", &csrf), ("action", "star")],
+    )
+    .await;
+    assert_eq!(s_status, StatusCode::OK);
+    assert_eq!(s_json["entry_id"], entry_id);
+    assert_eq!(s_json["is_favorite"], true);
+
+    let (f_status, f_json) = post_form_json(
+        &app,
+        &format!("/web/boards/{board_id}/items/1001/promote"),
+        &cookie,
+        &csrf,
+        &[("_csrf", &csrf), ("action", "finish")],
+    )
+    .await;
+    assert_eq!(f_status, StatusCode::OK);
+    assert_eq!(f_json["entry_id"], entry_id);
+    assert_eq!(f_json["is_finished"], true);
+
+    // Board row now shows seen styling + Finished indicator (and NO redundant byline star badge)
+    let board_after_promote = read_body_html(get_authed(&app, &board_loc, &cookie).await).await;
+    assert!(board_after_promote.contains("board-seen"));
+    assert!(board_after_promote.contains("&#10003; Finished"));
+    assert!(!board_after_promote.contains("js-board-star-badge"));
+
+    // Board Reader unfinish form carries hidden requeue=0 and unfinishing MUST NOT add to Queue!
+    let finished_board_reader =
+        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1001"), &cookie).await)
+            .await;
+    assert!(finished_board_reader.contains("name=\"requeue\" value=\"0\""));
+    let unfinish_resp = post_form(
+        &app,
+        &format!("/web/items/{entry_id}/unfinish"),
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("requeue", "0"),
+            ("return_to", &format!("/boards/{board_id}/read/1001")),
+        ],
+    )
+    .await;
+    assert_eq!(unfinish_resp.status(), StatusCode::SEE_OTHER);
+    let after_unfinish = db.items().get(&entry_id).await.unwrap().unwrap();
+    assert!(!after_unfinish.is_finished, "unfinish must clear finished state");
+    assert!(
+        !after_unfinish.in_want_to_read,
+        "unfinishing a board story with requeue=0 must NOT add it to Queue"
+    );
+    // Re-finish 1001 so subsequent catalog/Diary assertions stay intact
+    let (refin_status, _) = post_form_json(
+        &app,
+        &format!("/web/boards/{board_id}/items/1001/promote"),
+        &cookie,
+        &csrf,
+        &[("_csrf", &csrf), ("action", "finish")],
+    )
+    .await;
+    assert_eq!(refin_status, StatusCode::OK);
+
+    // Tagging promoted board story: clicking its tag pill (/inbox?status=all&tag={id}) shows it,
+    // while regular /inbox still excludes promoted board stories!
+    let tag_resp = post_form(
+        &app,
+        &format!("/web/items/{entry_id}/tags"),
+        &cookie,
+        &[("_csrf", &csrf), ("name", "systems-board-tag")],
+    )
+    .await;
+    assert_eq!(tag_resp.status(), StatusCode::SEE_OTHER);
+    let entry_tags = db.tags().list_id_name_pairs().await.unwrap();
+    let tag_id = &entry_tags.iter().find(|(_, name)| name == "systems-board-tag").unwrap().0;
+    let tagged_view_html =
+        read_body_html(get_authed(&app, &format!("/inbox?status=all&tag={tag_id}"), &cookie).await)
+            .await;
+    assert!(tagged_view_html.contains("Systems Architecture Deep Dive"));
+
+    // Regular /reader/{entry_id} and /entries/{entry_id} display persisted Hacker News discussion link!
+    let regular_reader_html =
+        read_body_html(get_authed(&app, &format!("/reader/{entry_id}"), &cookie).await).await;
+    assert!(regular_reader_html.contains("Original &#8599;"));
+    assert!(regular_reader_html.contains("Hacker News &#8599;"));
+    assert!(regular_reader_html.contains("https://news.ycombinator.com/item?id=1001"));
+
+    let entry_detail_html =
+        read_body_html(get_authed(&app, &format!("/entries/{entry_id}"), &cookie).await).await;
+    assert!(entry_detail_html.contains("Open Source"));
+    assert!(entry_detail_html.contains("Hacker News"));
+    assert!(entry_detail_html.contains("https://news.ycombinator.com/item?id=1001"));
+
+    // Promoted board item STILL stays out of Feed Inbox (inbox_state = 'none')!
+    let inbox_after = read_body_html(get_authed(&app, "/inbox", &cookie).await).await;
+    assert!(!inbox_after.contains("Systems Architecture Deep Dive"));
+
+    // 10. Settings edit, global masthead refresh (feeds + boards), pause, delete
+    let edit_resp = post_form(
+        &app,
+        &format!("/web/boards/{board_id}/edit"),
+        &cookie,
+        &[("_csrf", &csrf), ("title", "HN Frontpage"), ("poll_interval", "45")],
+    )
+    .await;
+    assert_eq!(edit_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(db.boards().get(&board_id).await.unwrap().unwrap().title, "HN Frontpage");
+
+    let refresh_all_resp = post_form(
+        &app,
+        "/web/feeds/refresh-all",
+        &cookie,
+        &[("_csrf", &csrf), ("return_to", &board_loc)],
+    )
+    .await;
+    assert_eq!(refresh_all_resp.status(), StatusCode::SEE_OTHER);
+    let flash_cookie = find_set_cookie(&refresh_all_resp, "roche_flash=n:").unwrap();
+    assert!(flash_cookie.contains("board"), "expected board refresh flash, got: {flash_cookie}");
+
+    let pause_resp = post_form(
+        &app,
+        &format!("/web/boards/{board_id}/toggle-active"),
+        &cookie,
+        &[("_csrf", &csrf), ("active", "false")],
+    )
+    .await;
+    assert_eq!(pause_resp.status(), StatusCode::SEE_OTHER);
+    assert!(!db.boards().get(&board_id).await.unwrap().unwrap().is_active);
+
+    let del_resp =
+        post_form(&app, &format!("/web/boards/{board_id}/delete"), &cookie, &[("_csrf", &csrf)])
+            .await;
+    assert_eq!(del_resp.status(), StatusCode::SEE_OTHER);
+    assert!(db.boards().get(&board_id).await.unwrap().is_none());
+    // Promoted entry preserved in Diary/Catalog!
+    assert!(db.catalog().get_entry_detail(&entry_id).await.unwrap().is_some());
 }

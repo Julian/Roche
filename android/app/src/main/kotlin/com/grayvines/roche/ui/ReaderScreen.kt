@@ -80,6 +80,7 @@ import com.grayvines.roche.reader.ArticleBlock
 import com.grayvines.roche.reader.ArticleBlockCache
 import com.grayvines.roche.reader.mapBlockHeadingIndices
 import com.grayvines.roche.reader.stripInlineHtmlToPlainText
+import com.grayvines.roche.ui.components.CommentBubbleIcon
 import com.grayvines.roche.ui.components.CompactStarAndArchiveButtons
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
@@ -1521,6 +1522,7 @@ private data class ReaderEndCardPresentation(
     val headingText: String,
     val dismissLabel: String?,
     val externalUrl: String?,
+    val discussions: List<com.grayvines.roche.core.DiscussionLink> = emptyList(),
 )
 
 private fun resolveReaderEndCardModel(
@@ -1548,6 +1550,7 @@ private fun resolveReaderEndCardModel(
         headingText = headingText,
         dismissLabel = dismissLabel,
         externalUrl = entry.url.takeIf { !isLocalPdf && it.isNotBlank() },
+        discussions = visibleExternalDiscussions(entry),
     )
 }
 
@@ -1640,6 +1643,13 @@ private fun ReaderEndCardActionsRow(
                 modifier = Modifier.testTag("reader_end_original_btn"),
             )
         }
+        presentation.discussions.forEachIndexed { idx, link ->
+            HeaderActionButton(
+                label = "${link.displayLabel} ↗",
+                onClick = { onOpenExternalUrl(link.url) },
+                modifier = Modifier.testTag("reader_end_discussion_btn_$idx"),
+            )
+        }
     }
 }
 
@@ -1711,6 +1721,51 @@ internal fun ReaderArticleHeader(
                     )
                 }
             }
+            visibleExternalDiscussions(entry).forEachIndexed { idx, link ->
+                ReaderDiscussionLinkPill(
+                    label = link.displayLabel,
+                    onClick = { onOpenExternalUrl(link.url) },
+                    modifier = Modifier.testTag("reader_byline_discussion_$idx"),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReaderDiscussionLinkPill(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(6.dp)
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            modifier
+                .minimumInteractiveComponentSize()
+                .clip(shape)
+                .clickable(onClick = onClick)
+                .semantics { role = Role.Button },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            modifier =
+                Modifier.clip(shape)
+                    .background(colors.surfaceElevated)
+                    .border(1.dp, colors.border, shape)
+                    .padding(horizontal = 7.dp, vertical = 3.dp),
+        ) {
+            CommentBubbleIcon(tint = colors.accentEcru, size = 12.dp)
+            Text(
+                text = "$label ↗",
+                color = colors.accentEcru,
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+            )
         }
     }
 }

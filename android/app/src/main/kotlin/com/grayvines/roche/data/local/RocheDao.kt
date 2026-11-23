@@ -59,6 +59,11 @@ private const val IS_FINISHED_EXPR =
     "EXISTS (SELECT 1 FROM consumption_log cl_fin " +
         "WHERE cl_fin.entryId = e.id AND LOWER(cl_fin.status) = 'consumed')"
 
+private const val HACKER_NEWS_ID_SUBQUERY =
+    "(SELECT ei_hn.value FROM entry_identifiers ei_hn " +
+        "WHERE ei_hn.entryId = e.id AND ei_hn.scheme = 'hacker_news' " +
+        "ORDER BY ei_hn.value ASC LIMIT 1)"
+
 private const val STATUS_EXPR =
     "CASE WHEN es.inboxState = 'dismissed' " +
         "OR (COALESCE(es.inboxState, 'none') = 'none' AND es.readAt IS NOT NULL AND NOT EXISTS (" +
@@ -116,7 +121,9 @@ private const val INBOX_SELECT_LIST_PREFIX =
         "ec.audioUrl AS audioUrl, " +
         "COALESCE(es.inboxState, 'none') AS inboxState, " +
         "e.kind AS entryKind, " +
-        "$IS_FINISHED_EXPR AS isFinished " +
+        "$IS_FINISHED_EXPR AS isFinished, " +
+        "e.metadataJson AS metadataJson, " +
+        "$HACKER_NEWS_ID_SUBQUERY AS hackerNewsId " +
         INBOX_FROM_WHERE
 
 private const val INBOX_SELECT_FULL_PREFIX =
@@ -145,7 +152,9 @@ private const val INBOX_SELECT_FULL_PREFIX =
         "ec.audioUrl AS audioUrl, " +
         "COALESCE(es.inboxState, 'none') AS inboxState, " +
         "e.kind AS entryKind, " +
-        "$IS_FINISHED_EXPR AS isFinished " +
+        "$IS_FINISHED_EXPR AS isFinished, " +
+        "e.metadataJson AS metadataJson, " +
+        "$HACKER_NEWS_ID_SUBQUERY AS hackerNewsId " +
         INBOX_FROM_WHERE
 
 private const val INBOX_SELECT_SEARCH_PREFIX =
@@ -174,7 +183,9 @@ private const val INBOX_SELECT_SEARCH_PREFIX =
         "ec.audioUrl AS audioUrl, " +
         "COALESCE(es.inboxState, 'none') AS inboxState, " +
         "e.kind AS entryKind, " +
-        "$IS_FINISHED_EXPR AS isFinished " +
+        "$IS_FINISHED_EXPR AS isFinished, " +
+        "e.metadataJson AS metadataJson, " +
+        "$HACKER_NEWS_ID_SUBQUERY AS hackerNewsId " +
         INBOX_FROM_WHERE
 
 private const val CATALOG_STAMP_SELECT =
@@ -191,7 +202,10 @@ private const val REPOSITORY_STAMP_SELECT =
     "$CATALOG_STAMP_SELECT, " +
         "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'entry_state'), 0) AS statesStamp, " +
         "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'entry_content'), 0) AS contentsStamp, " +
-        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'feed_sources'), 0) AS feedsStamp"
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'feed_sources'), 0) AS feedsStamp, " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'boards'), 0) AS boardsStamp, " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'board_items'), 0) AS boardItemsStamp, " +
+        "COALESCE((SELECT revision FROM table_revisions WHERE tableName = 'board_item_states'), 0) AS boardItemStatesStamp"
 
 private const val DEFAULT_FTS_SEARCH_LIMIT = 150
 private const val DEFAULT_FTS_TOKEN_ID_LIMIT = 600
@@ -1040,6 +1054,160 @@ interface RocheDao {
             ") THEN 1 ELSE 0 END"
     )
     suspend fun hasComparisonScopeRaw(entryId: String): Int
+
+    // --- Boards (`boards`, `board_items`, `board_item_states`) ---
+
+    @Query("SELECT * FROM boards ORDER BY title COLLATE NOCASE ASC, id ASC")
+    suspend fun getAllBoards(): List<BoardEntity>
+
+    @Query("SELECT * FROM boards WHERE isActive = 1 ORDER BY title COLLATE NOCASE ASC, id ASC")
+    suspend fun getActiveBoards(): List<BoardEntity>
+
+    @Query("SELECT * FROM boards WHERE isLocalDirty = 1 OR isSnapshotDirty = 1")
+    suspend fun getDirtyBoards(): List<BoardEntity>
+
+    @Query("SELECT * FROM boards WHERE id = :id LIMIT 1")
+    suspend fun getBoardById(id: String): BoardEntity?
+
+    @Query(
+        "SELECT * FROM boards " +
+            "WHERE LOWER(adapterType) = LOWER(:adapterType) " +
+            "AND LOWER(sourceKey) = LOWER(:sourceKey) LIMIT 1"
+    )
+    suspend fun getBoardBySourceKey(adapterType: String, sourceKey: String): BoardEntity?
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertBoardIgnore(board: BoardEntity): Long
+
+    @Update suspend fun updateBoard(board: BoardEntity)
+
+    @Transaction
+    suspend fun upsertBoard(board: BoardEntity) {
+        if (insertBoardIgnore(board) == -1L) {
+            updateBoard(board)
+        }
+    }
+
+    @Query("DELETE FROM boards WHERE id = :id") suspend fun deleteBoardById(id: String)
+
+    @Query(
+        "UPDATE boards SET isLocalDirty = 0 " +
+            "WHERE id = :id AND hlc = :expectedHlc " +
+            "AND snapshotHlc = :expectedSnapshotHlc " +
+            "AND COALESCE(lastPolledAt, '') = :expectedLastPolledAt"
+    )
+    suspend fun clearBoardDirtyIfSameHlc(
+        id: String,
+        expectedHlc: String,
+        expectedSnapshotHlc: String,
+        expectedLastPolledAt: String,
+    )
+
+    @Suppress("FunctionNameMaxLength")
+    @Query(
+        "UPDATE boards SET isSnapshotDirty = 0 " +
+            "WHERE id = :id AND snapshotHlc = :expectedSnapshotHlc"
+    )
+    suspend fun clearBoardSnapshotDirtyIfSameHlc(id: String, expectedSnapshotHlc: String)
+
+    @Query("SELECT * FROM board_items ORDER BY boardId ASC, rank ASC")
+    suspend fun getAllBoardItems(): List<BoardItemEntity>
+
+    @Query("SELECT * FROM board_items WHERE boardId = :boardId ORDER BY rank ASC")
+    suspend fun getBoardItemsForBoard(boardId: String): List<BoardItemEntity>
+
+    @Query("SELECT * FROM board_items WHERE boardId IN (:boardIds) ORDER BY boardId ASC, rank ASC")
+    suspend fun getBoardItemsByBoardIds(boardIds: List<String>): List<BoardItemEntity>
+
+    @Query(
+        "SELECT * FROM board_items WHERE boardId = :boardId AND externalId = :externalId LIMIT 1"
+    )
+    suspend fun getBoardItem(boardId: String, externalId: String): BoardItemEntity?
+
+    @Query("SELECT COUNT(*) FROM board_items WHERE boardId = :boardId")
+    suspend fun countBoardItems(boardId: String): Int
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertBoardItems(items: List<BoardItemEntity>)
+
+    @Query("DELETE FROM board_items WHERE boardId = :boardId")
+    suspend fun deleteBoardItemsForBoard(boardId: String)
+
+    @Transaction
+    suspend fun replaceBoardItemsInTx(
+        boardId: String,
+        items: List<BoardItemEntity>,
+        snapshotFetchedAt: String,
+    ) {
+        deleteBoardItemsForBoard(boardId)
+        if (items.isNotEmpty()) {
+            insertBoardItems(items)
+            val externalIds = items.map { it.externalId }.distinct()
+            for (chunk in externalIds.chunked(SQLITE_DELETE_CHUNK_SIZE)) {
+                touchBoardStatesInSnapshot(boardId, chunk, snapshotFetchedAt)
+            }
+        }
+    }
+
+    @Query("SELECT * FROM board_item_states")
+    suspend fun getAllBoardItemStates(): List<BoardItemStateEntity>
+
+    @Query("SELECT * FROM board_item_states WHERE isLocalDirty = 1")
+    suspend fun getDirtyBoardItemStates(): List<BoardItemStateEntity>
+
+    @Query("SELECT * FROM board_item_states WHERE boardId = :boardId")
+    suspend fun getBoardItemStatesForBoard(boardId: String): List<BoardItemStateEntity>
+
+    @Query(
+        "SELECT * FROM board_item_states " +
+            "WHERE boardId = :boardId AND externalId = :externalId LIMIT 1"
+    )
+    suspend fun getBoardItemState(boardId: String, externalId: String): BoardItemStateEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertBoardItemState(state: BoardItemStateEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertBoardItemStates(states: List<BoardItemStateEntity>)
+
+    @Query("DELETE FROM board_item_states WHERE boardId = :boardId AND externalId = :externalId")
+    suspend fun deleteBoardItemState(boardId: String, externalId: String)
+
+    @Suppress("FunctionNameMaxLength")
+    @Query(
+        "UPDATE board_item_states SET isLocalDirty = 0 " +
+            "WHERE boardId = :boardId AND externalId = :externalId AND hlc = :expectedHlc"
+    )
+    suspend fun clearBoardItemStateDirtyIfSameHlc(
+        boardId: String,
+        externalId: String,
+        expectedHlc: String,
+    )
+
+    @Query(
+        "UPDATE board_item_states " +
+            "SET lastSeenInSnapshotAt = CASE " +
+            "WHEN julianday(lastSeenInSnapshotAt) IS NULL " +
+            "OR julianday(lastSeenInSnapshotAt) < julianday(:fetchedAt) " +
+            "THEN :fetchedAt ELSE lastSeenInSnapshotAt END " +
+            "WHERE boardId = :boardId AND externalId IN (:externalIds)"
+    )
+    suspend fun touchBoardStatesInSnapshot(
+        boardId: String,
+        externalIds: List<String>,
+        fetchedAt: String,
+    )
+
+    @Query(
+        "DELETE FROM board_item_states " +
+            "WHERE julianday(lastSeenInSnapshotAt) < julianday(:cutoffIso) " +
+            "AND julianday(updatedAt) < julianday(:cutoffIso) " +
+            "AND NOT EXISTS (" +
+            "SELECT 1 FROM board_items bi " +
+            "WHERE bi.boardId = board_item_states.boardId " +
+            "AND bi.externalId = board_item_states.externalId)"
+    )
+    suspend fun pruneExpiredBoardItemStates(cutoffIso: String): Int
 
     @Transaction
     suspend fun executeInTransaction(block: suspend () -> Unit) {

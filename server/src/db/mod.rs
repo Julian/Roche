@@ -6,6 +6,7 @@ use sqlx::sqlite::{
 };
 
 mod auth;
+mod boards;
 mod catalog;
 pub(crate) mod entries_core;
 mod feeds;
@@ -17,6 +18,10 @@ pub(crate) mod tx;
 mod types;
 
 pub use auth::{AuthRepo, DeviceToken};
+pub use boards::{
+    Board, BoardItem, BoardItemState, BoardItemView, BoardItemsSlice, BoardPollBatch,
+    BoardPollCandidate, BoardPromoteAction, BoardPromoteContent, BoardPromoteOutcome, BoardRepo,
+};
 pub use catalog::{
     BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
     BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult, CatalogEntry,
@@ -39,16 +44,17 @@ pub use sync::{
     ABSOLUTE_MAX_BACKOFF_SECS, ActivityEntry, DEFAULT_MAX_BACKOFF_SECS, DEFAULT_ONLINE_PEER_WEIGHT,
     HlcClock, HlcTimestamp, MAX_CONSECUTIVE_FAILURES, MAX_PEER_WEIGHT, MIN_PEER_WEIGHT,
     NetworkTier, PeerSyncRequest, PeerSyncResponse, PreparedSyncEntry, SERVER_PEER_ID,
-    STARRED_COLLECTION_ID, SyncCollectionEntryRecord, SyncCollectionGeneratorRecord,
-    SyncCollectionSpec, SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryContent,
-    SyncEntryRecord, SyncEntryState, SyncFeedSource, SyncRepo, SyncTombstone,
-    THROUGHPUT_EWMA_ALPHA, UP_NEXT_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID, WANT_TO_READ_SLUG,
-    WANT_TO_READ_TITLE, canonical_ordering_json, canonicalize_sync_url,
-    collection_entry_natural_key, compute_throughput_weight, deterministic_comparison_id,
-    deterministic_consumption_log_id, deterministic_feed_id, deterministic_system_collection_id,
-    deterministic_title_entry_id, feed_phase_offset_secs, is_protected_system_collection_id,
-    next_phase_slot_at_or_after, next_scheduled_poll_epoch_secs, should_peer_poll_feed,
-    target_poll_interval_secs, update_throughput_ewma,
+    STARRED_COLLECTION_ID, SyncBoardItemRecord, SyncBoardItemStateRecord, SyncBoardRecord,
+    SyncCollectionEntryRecord, SyncCollectionGeneratorRecord, SyncCollectionSpec,
+    SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord,
+    SyncEntryState, SyncFeedSource, SyncRepo, SyncTombstone, THROUGHPUT_EWMA_ALPHA,
+    UP_NEXT_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID, WANT_TO_READ_SLUG, WANT_TO_READ_TITLE,
+    board_natural_key, canonical_ordering_json, canonicalize_sync_url,
+    collection_entry_natural_key, compute_throughput_weight, deterministic_board_id,
+    deterministic_comparison_id, deterministic_consumption_log_id, deterministic_feed_id,
+    deterministic_system_collection_id, deterministic_title_entry_id, feed_phase_offset_secs,
+    is_protected_system_collection_id, next_phase_slot_at_or_after, next_scheduled_poll_epoch_secs,
+    should_peer_poll_feed, target_poll_interval_secs, update_throughput_ewma,
 };
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{
@@ -578,6 +584,11 @@ impl Db {
     #[must_use]
     pub const fn feeds(&self) -> FeedRepo<'_> {
         FeedRepo::new(&self.pool, &self.write_lock)
+    }
+
+    #[must_use]
+    pub const fn boards(&self) -> BoardRepo<'_> {
+        BoardRepo::new(&self.pool, &self.write_lock)
     }
 
     #[must_use]
@@ -1312,7 +1323,7 @@ mod tests {
         pre_pool.close().await;
         drop(pre_pool);
 
-        // 2. Connect via Db::connect and verify (a) all 19 regular tables end with STRICT,
+        // 2. Connect via Db::connect and verify (a) all 22 regular tables end with STRICT,
         //    (b) wrong storage class is rejected, and (c) FK check + FTS + sequence work end-to-end.
         let db = Db::connect(&db_path).await.unwrap();
 
@@ -1327,7 +1338,7 @@ mod tests {
         .fetch_all(db.pool())
         .await
         .unwrap();
-        assert_eq!(regular_tables.len(), 19, "Expected all 19 regular tables in schema");
+        assert_eq!(regular_tables.len(), 22, "Expected all 22 regular tables in schema");
         for tbl in &regular_tables {
             let trimmed_ddl = tbl.sql.trim().trim_end_matches(';').trim_end();
             assert!(

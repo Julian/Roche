@@ -13,11 +13,12 @@ use axum::{
 use url::Url;
 
 use super::{
-    AddTagForm, FinishItemForm, ItemReturnForm, ProgressForm, ReaderQuery, render_audio_play_button,
+    AddTagForm, FinishItemForm, ItemReturnForm, ProgressForm, ReaderQuery, UnfinishItemForm,
+    render_audio_play_button,
 };
 use crate::{
     content::{HtmlSanitizer, semantic_html},
-    db::WANT_TO_READ_COLLECTION_ID,
+    db::{WANT_TO_READ_COLLECTION_ID, canonicalize_sync_url},
     domain::{
         ConsumptionStatus, ContentType, EntryKind, EntryTriageState, MediaType, ProgressSource,
     },
@@ -34,9 +35,9 @@ use crate::{
     },
 };
 
-const QUEUE_ADD_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 2.5h9v11l-4.5-3-4.5 3v-11Z\"/><path d=\"M8 5.2v3.6M6.2 7h3.6\"/></svg>";
-const QUEUE_CHECK_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 2.5h9v11l-4.5-3-4.5 3v-11Z\"/><path d=\"m6 6.8 1.5 1.5 2.6-2.6\"/></svg>";
-const TOP_ARROW_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M8 13V3.5\"/><path d=\"M4 7.5 8 3.5l4 4\"/></svg>";
+pub(in crate::web) const QUEUE_ADD_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 2.5h9v11l-4.5-3-4.5 3v-11Z\"/><path d=\"M8 5.2v3.6M6.2 7h3.6\"/></svg>";
+pub(in crate::web) const QUEUE_CHECK_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 2.5h9v11l-4.5-3-4.5 3v-11Z\"/><path d=\"m6 6.8 1.5 1.5 2.6-2.6\"/></svg>";
+pub(in crate::web) const TOP_ARROW_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M8 13V3.5\"/><path d=\"M4 7.5 8 3.5l4 4\"/></svg>";
 
 pub(in crate::web) async fn reader_get(
     State(service): State<Arc<RocheService>>,
@@ -65,7 +66,9 @@ pub(in crate::web) async fn reader_get(
     let default_back = if detail.item.in_want_to_read { "/queue" } else { "/inbox" };
     let return_to = safe_local_redirect(query.return_to.as_deref(), default_back);
 
-    let active_nav = if return_to.starts_with("/queue") || detail.item.in_want_to_read {
+    let active_nav = if return_to.starts_with("/boards") {
+        NavSection::Boards
+    } else if return_to.starts_with("/queue") || detail.item.in_want_to_read {
         NavSection::Queue
     } else if detail.item.feed_id.is_none() && detail.item.is_favorite {
         NavSection::Starred
@@ -160,6 +163,8 @@ fn estimate_reading_minutes(detail: &ItemDetail) -> Option<usize> {
 fn back_label_for_return_to(return_to: &str) -> &'static str {
     if return_to == "/" {
         "Back to Home"
+    } else if return_to.starts_with("/boards") {
+        "Back to Boards"
     } else if return_to.starts_with("/queue") {
         "Back to Queue"
     } else if return_to.starts_with("/search") {
@@ -307,7 +312,14 @@ fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail, return_to: &st
         );
         wrote_meta = true;
     }
-    if let Some(ext_href) = sanitize_non_local_href(item.url.as_str()) {
+    let orig_href = sanitize_non_local_href(item.url.as_str());
+    let orig_canon = orig_href.map(canonicalize_sync_url);
+    let orig_is_discussion = orig_canon.as_deref().is_some_and(|oc| {
+        item.discussions.iter().any(|d| {
+            sanitize_non_local_href(&d.url).is_some_and(|dh| canonicalize_sync_url(dh) == oc)
+        })
+    });
+    if !orig_is_discussion && let Some(ext_href) = orig_href {
         if wrote_meta {
             out.push_str(" &middot; ");
         }
@@ -316,6 +328,35 @@ fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail, return_to: &st
             "<a href=\"{}\" target=\"_blank\" rel=\"noopener\">Original &#8599;</a>",
             esc(ext_href)
         );
+        wrote_meta = true;
+    }
+    let mut seen_disc = HashSet::new();
+    for disc in &item.discussions {
+        let Some(disc_href) = sanitize_non_local_href(&disc.url) else {
+            continue;
+        };
+        if !seen_disc.insert(canonicalize_sync_url(disc_href)) {
+            continue;
+        }
+        if wrote_meta {
+            out.push_str(" &middot; ");
+        }
+        let label =
+            disc.label.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or_else(|| {
+                let src = disc.source.trim();
+                if src.is_empty() {
+                    "Discussion"
+                } else {
+                    roche_core::external_links::external_identifier_label(src)
+                }
+            });
+        let _ = write!(
+            out,
+            "<a class=\"reader-discussion-link js-reader-discussion-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\">{} &#8599;</a>",
+            esc(disc_href),
+            esc(label),
+        );
+        wrote_meta = true;
     }
     out.push_str("</span>\n</div>\n");
 }
@@ -393,22 +434,24 @@ fn render_reader_header(
     out.push_str("</div>\n<div class=\"reader-quick-tools\">\n");
     render_audio_play_button(out, item);
     if item.in_want_to_read {
-        render_inline_csrf_form(
+        render_inline_csrf_form_with_class(
             out,
             &format!("/web/want/read/remove/{id_enc}"),
             csrf,
+            Some("js-reader-queue-form"),
             &[("return_to", reader_path)],
             None,
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">In Queue &times;</button>",
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost is-in-queue js-reader-queue-btn\">In Queue &times;</button>",
         );
     } else {
-        render_inline_csrf_form(
+        render_inline_csrf_form_with_class(
             out,
             &format!("/web/entries/{id_enc}/list-add"),
             csrf,
+            Some("js-reader-queue-form"),
             &[("list_slug_or_id", WANT_TO_READ_COLLECTION_ID), ("return_to", reader_path)],
             None,
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">+ Queue</button>",
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost js-reader-queue-btn\">+ Queue</button>",
         );
     }
     out.push_str("</div>\n</div>\n");
@@ -432,8 +475,8 @@ fn render_reader_mobile_tools(
     }
     out.push_str(
         "<div class=\"reader-size-controls\">\n\
-           <button type=\"button\" class=\"btn btn-small btn-ghost js-font-dec\" aria-label=\"Decrease text size\">A&minus;</button>\n\
-           <button type=\"button\" class=\"btn btn-small btn-ghost js-font-inc\" aria-label=\"Increase text size\">A+</button>\n\
+           <button type=\"button\" class=\"btn btn-small btn-ghost js-font-dec\" title=\"Decrease text size\" aria-label=\"A&minus; Decrease text size\">A&minus;</button>\n\
+           <button type=\"button\" class=\"btn btn-small btn-ghost js-font-inc\" title=\"Increase text size\" aria-label=\"A+ Increase text size\">A+</button>\n\
          </div>\n\
          <details class=\"reader-mobile-drawer\">\n\
            <summary class=\"btn btn-small btn-ghost\">Contents &amp; Info</summary>\n\
@@ -734,8 +777,8 @@ fn render_reader_rail(
            <div class=\"reader-rail-group\">\n\
              <div class=\"reader-rail-title\">Typography</div>\n\
              <div class=\"reader-size-controls\">\n\
-               <button type=\"button\" class=\"btn btn-small btn-ghost js-font-dec\" aria-label=\"Decrease text size\">A&minus;</button>\n\
-               <button type=\"button\" class=\"btn btn-small btn-ghost js-font-inc\" aria-label=\"Increase text size\">A+</button>\n\
+               <button type=\"button\" class=\"btn btn-small btn-ghost js-font-dec\" title=\"Decrease text size\" aria-label=\"A&minus; Decrease text size\">A&minus;</button>\n\
+               <button type=\"button\" class=\"btn btn-small btn-ghost js-font-inc\" title=\"Increase text size\" aria-label=\"A+ Increase text size\">A+</button>\n\
              </div>\n\
            </div>\n\
            <div class=\"reader-rail-group\">\n\
@@ -944,9 +987,16 @@ pub(in crate::web) async fn post_item_unfinish(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
-    Form(form): Form<ItemReturnForm>,
+    Form(form): Form<UnfinishItemForm>,
 ) -> Result<Response, WebError> {
-    service.items().unfinish_reader_item(&id).await.web_err(&session)?;
+    let requeue_non_feed = !form.requeue.as_deref().map(str::trim).is_some_and(|v| {
+        v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no")
+    });
+    if requeue_non_feed {
+        service.items().unfinish_reader_item(&id).await.web_err(&session)?;
+    } else {
+        service.items().unfinish_reader_item_with_options(&id, false).await.web_err(&session)?;
+    }
     let fallback = format!("/reader/{}", urlencode(&id));
     let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
     Ok(redirect_with_flash(&dest, "notice", "Marked unfinished"))
@@ -959,16 +1009,24 @@ pub(in crate::web) async fn post_item_tag_add(
     Form(form): Form<AddTagForm>,
 ) -> Result<Response, WebError> {
     let _ = service.items().add_tag(&id, None, Some(&form.name)).await.web_err(&session)?;
-    Ok(redirect_see_other(&format!("/reader/{}", urlencode(&id))))
+    let fallback = format!("/reader/{}", urlencode(&id));
+    let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
+    Ok(redirect_see_other(&dest))
 }
 
 pub(in crate::web) async fn post_item_tag_remove(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path((id, tag_id)): Path<(String, String)>,
+    form: Result<Form<ItemReturnForm>, axum::extract::rejection::FormRejection>,
 ) -> Result<Response, WebError> {
     service.items().remove_tag(&id, &tag_id).await.web_err(&session)?;
-    Ok(redirect_see_other(&format!("/reader/{}", urlencode(&id))))
+    let fallback = format!("/reader/{}", urlencode(&id));
+    let dest = safe_local_redirect(
+        form.ok().as_ref().and_then(|Form(f)| f.return_to.as_deref()),
+        &fallback,
+    );
+    Ok(redirect_see_other(&dest))
 }
 
 /// Finds the byte index of the closing `>` of an HTML tag starting immediately after `<`,
@@ -1445,7 +1503,7 @@ fn harden_reader_prose_html(clean_html: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn harden_reader_prose_html_with_context(
+pub(in crate::web) fn harden_reader_prose_html_with_context(
     clean_html: &str,
     article_url: Option<&Url>,
     article_title: Option<&str>,

@@ -405,6 +405,15 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                 val msg = if (restored) "Restored local offline copy" else "Could not restore copy"
                 host.showStatusMessage(msg)
             }
+            is UndoActionKind.RestoreBoardDismiss -> {
+                host.repository.undismissBoardItem(kind.boardId, kind.externalId)
+                host.updateTransient { current ->
+                    patchBoardItemInTransient(current, kind.boardId, kind.externalId) {
+                        it.copy(dismissedAt = null)
+                    }
+                }
+                host.showStatusMessage("Restored story")
+            }
         }
     }
 

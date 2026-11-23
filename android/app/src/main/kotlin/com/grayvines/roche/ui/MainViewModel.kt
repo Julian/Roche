@@ -160,6 +160,7 @@ class MainViewModel(
     private val inboxReaderDelegate = MainInboxReaderDelegate(delegateHost)
     private val syncFeedDelegate = MainSyncFeedDelegate(delegateHost)
     private val catalogActionsDelegate = MainCatalogActionsDelegate(delegateHost)
+    private val boardsDelegate = MainBoardsDelegate(delegateHost, viewModelScope)
 
     init {
         savedStateHandle?.setSavedStateProvider(SAVED_NAV_STATE_KEY) {
@@ -238,6 +239,11 @@ class MainViewModel(
                     companionSubTab = local.companionSubTab,
                     selectedCatalogCollectionId = local.selectedCatalogCollectionId,
                     selectedWantCollectionId = local.selectedWantCollectionId,
+                    selectedBoardId = local.selectedBoardId,
+                    boardStreamFilter = local.boardStreamFilter,
+                    selectedBoardReaderBoardId = local.selectedBoardReaderBoardId,
+                    selectedBoardReaderExternalId = local.selectedBoardReaderExternalId,
+                    boardReaderState = local.boardReaderState,
                     isPlayerFullscreenOpen = local.isPlayerFullscreenOpen,
                     isPlayerSpeedSheetOpen = local.isPlayerSpeedSheetOpen,
                     activePlayerDrawerTab = local.activePlayerDrawerTab,
@@ -264,6 +270,7 @@ class MainViewModel(
     override fun onCleared() {
         searchFeature.cancelSearch()
         catalogRankFeature.cancelPendingResolve()
+        boardsDelegate.cancelBoardReaderLoad()
         playerController.clearUiErrorListener(uiErrorListener)
         if (ownsPlayerController) {
             playerController.releaseController()
@@ -321,7 +328,10 @@ class MainViewModel(
 
     private fun handleUiSideEffects(action: MainAction.Ui) {
         when (action) {
-            is MainAction.OpenReader -> launchReaderOpenSideEffects(action.entryId)
+            is MainAction.OpenReader -> openReaderAndCancelBoardLoad(action.entryId)
+            is MainAction.OpenBoardReader ->
+                boardsDelegate.loadBoardReader(action.boardId, action.externalId, action.item)
+            MainAction.CloseBoardReader -> boardsDelegate.cancelBoardReaderLoad()
             is MainAction.UpdateSearchQuery -> searchFeature.scheduleWorkspaceSearch(action.query)
             MainAction.ResetSettingsToHub -> settingsFeature.requestResetToHub()
             is MainAction.LaunchCollectionDraw ->
@@ -335,13 +345,23 @@ class MainViewModel(
                 )
             is MainAction.EnrichAndLaunchMusicDraw ->
                 catalogRankFeature.enrichAndLaunchMusicDraw(action.draw)
-            MainAction.CloseSearch,
+            MainAction.CloseSearch -> searchFeature.cancelSearch()
             is MainAction.SelectTab,
             is MainAction.FilterByTag,
             is MainAction.FilterByFeed,
-            is MainAction.OpenCompanionSection -> searchFeature.cancelSearch()
+            is MainAction.OpenCompanionSection -> cancelSearchAndBoardReader()
             else -> Unit
         }
+    }
+
+    private fun openReaderAndCancelBoardLoad(entryId: String) {
+        boardsDelegate.cancelBoardReaderLoad()
+        launchReaderOpenSideEffects(entryId)
+    }
+
+    private fun cancelSearchAndBoardReader() {
+        searchFeature.cancelSearch()
+        boardsDelegate.cancelBoardReaderLoad()
     }
 
     private fun launchReaderOpenSideEffects(entryId: String) {
@@ -351,13 +371,27 @@ class MainViewModel(
 
     private fun restoreNavigationSideEffects(restored: SavedNavigationUiState) {
         restored.selectedReaderEntryId?.let(readerFeature::hydrateEntryIfNeeded)
+        val restoredBoardId = restored.selectedBoardReaderBoardId
+        val restoredBoardExtId = restored.selectedBoardReaderExternalId
+        if (restoredBoardId != null && restoredBoardExtId != null) {
+            boardsDelegate.loadBoardReader(restoredBoardId, restoredBoardExtId, null)
+        }
         if (restored.isSearchOpen && restored.searchQuery.isNotBlank()) {
             searchFeature.scheduleWorkspaceSearch(restored.searchQuery)
         }
-        if (restored.selectedReaderEntryId != null || restored.selectedFeedId != null) {
+        if (hasRestoredSelection(restored)) {
             viewModelScope.launch { reconcileRestoredSelection(restored) }
         }
     }
+
+    private fun hasRestoredSelection(restored: SavedNavigationUiState): Boolean =
+        listOfNotNull(
+                restored.selectedReaderEntryId,
+                restored.selectedFeedId,
+                restored.selectedBoardId,
+                restored.selectedBoardReaderBoardId,
+            )
+            .isNotEmpty()
 
     private suspend fun reconcileRestoredSelection(restored: SavedNavigationUiState) {
         val snapshot = sharedSnapshotFlow.first()
@@ -370,9 +404,29 @@ class MainViewModel(
                 snapshot.feeds.none { it.id == targetFeedId } &&
                     snapshot.entries.none { it.feedId == targetFeedId }
             }
-        if (missingReaderId != null || missingFeedId != null) {
+        val missingBoardId =
+            restored.selectedBoardId?.takeIf { targetBoardId ->
+                snapshot.boards.none { it.id == targetBoardId }
+            }
+        val missingBoardReaderId =
+            restored.selectedBoardReaderBoardId?.takeIf { targetBoardId ->
+                snapshot.boards.none { it.id == targetBoardId }
+            }
+        val hasMissing =
+            listOfNotNull(missingReaderId, missingFeedId, missingBoardId, missingBoardReaderId)
+                .isNotEmpty()
+        if (hasMissing) {
+            if (missingBoardReaderId != null) {
+                boardsDelegate.cancelBoardReaderLoad()
+            }
             transientState.update { current ->
-                pruneMissingRestoredState(current, missingReaderId, missingFeedId)
+                pruneMissingRestoredState(
+                    current = current,
+                    missingReaderId = missingReaderId,
+                    missingFeedId = missingFeedId,
+                    missingBoardId = missingBoardId,
+                    missingBoardReaderId = missingBoardReaderId,
+                )
             }
         }
     }
@@ -437,6 +491,7 @@ class MainViewModel(
             is MainAction.InboxReaderMutation -> inboxReaderDelegate.execute(action)
             is MainAction.SyncFeedMutation -> syncFeedDelegate.execute(action)
             is MainAction.CatalogMutation -> catalogActionsDelegate.execute(action)
+            is MainAction.BoardMutation -> boardsDelegate.execute(action)
         }
     }
 
@@ -773,16 +828,44 @@ internal fun pruneMissingRestoredState(
     current: TransientUiState,
     missingReaderId: String?,
     missingFeedId: String?,
+    missingBoardId: String? = null,
+    missingBoardReaderId: String? = null,
+): TransientUiState {
+    val prunedFeed = pruneMissingReaderAndFeed(current, missingReaderId, missingFeedId)
+    return pruneMissingBoardSelection(prunedFeed, missingBoardId, missingBoardReaderId)
+}
+
+private fun pruneMissingReaderAndFeed(
+    current: TransientUiState,
+    missingReaderId: String?,
+    missingFeedId: String?,
 ): TransientUiState {
     val clearReader = missingReaderId != null && current.selectedReaderEntryId == missingReaderId
     val clearFeed = missingFeedId != null && current.selectedFeedId == missingFeedId
-    val nextOriginTab =
-        if (clearFeed && current.selectedTag == null) null else current.scopeOriginTab
     return current.copy(
         selectedReaderEntryId = if (clearReader) null else current.selectedReaderEntryId,
         readerContent = if (clearReader) null else current.readerContent,
         selectedFeedId = if (clearFeed) null else current.selectedFeedId,
-        scopeOriginTab = nextOriginTab,
+        scopeOriginTab =
+            if (clearFeed && current.selectedTag == null) null else current.scopeOriginTab,
+    )
+}
+
+private fun pruneMissingBoardSelection(
+    current: TransientUiState,
+    missingBoardId: String?,
+    missingBoardReaderId: String?,
+): TransientUiState {
+    val clearBoard = missingBoardId != null && current.selectedBoardId == missingBoardId
+    val clearBoardReader =
+        missingBoardReaderId != null && current.selectedBoardReaderBoardId == missingBoardReaderId
+    return current.copy(
+        selectedBoardId = if (clearBoard) null else current.selectedBoardId,
+        selectedBoardReaderBoardId =
+            if (clearBoardReader) null else current.selectedBoardReaderBoardId,
+        selectedBoardReaderExternalId =
+            if (clearBoardReader) null else current.selectedBoardReaderExternalId,
+        boardReaderState = if (clearBoardReader) null else current.boardReaderState,
     )
 }
 

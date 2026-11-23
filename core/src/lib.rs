@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod boards;
 pub mod classify;
 pub mod crdt;
 pub mod domain;

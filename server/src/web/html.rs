@@ -517,6 +517,7 @@ pub(super) fn render_diary_row_with_tier(
 pub(super) enum NavSection {
     Home,
     Inbox,
+    Boards,
     Starred,
     Feeds,
     Lists,
@@ -530,6 +531,7 @@ impl NavSection {
         match self {
             Self::Home | Self::None => "/",
             Self::Inbox => "/inbox",
+            Self::Boards => "/boards",
             Self::Starred => "/starred",
             Self::Feeds => "/feeds",
             Self::Lists => "/lists",
@@ -564,9 +566,10 @@ fn html_theme_attr(theme: Option<&'static str>) -> &'static str {
     }
 }
 
-const NAV_ITEMS: [(NavSection, &str, &str); 7] = [
+const NAV_ITEMS: [(NavSection, &str, &str); 8] = [
     (NavSection::Home, "/", "Home"),
     (NavSection::Inbox, "/inbox", "Inbox"),
+    (NavSection::Boards, "/boards", "Boards"),
     (NavSection::Starred, "/starred", "Starred"),
     (NavSection::Feeds, "/feeds", "Feeds"),
     (NavSection::Lists, "/lists", "Lists"),
@@ -748,20 +751,21 @@ fn render_shortcuts_dialog(out: &mut String) {
              <div class=\"shortcuts-group\">\n\
                <h3>Global</h3>\n\
                <dl class=\"shortcuts-list\">\n\
-                 <dt><kbd>/</kbd></dt><dd>Search (stream on Inbox, global elsewhere)</dd>\n\
+                 <dt><kbd>/</kbd></dt><dd>Search (stream on Inbox/Boards, global elsewhere)</dd>\n\
                  <dt><kbd>c</kbd></dt><dd>Open Quick Log &amp; Save URL</dd>\n\
                  <dt><kbd>?</kbd></dt><dd>Toggle this shortcut help</dd>\n\
                  <dt><kbd>Esc</kbd></dt><dd>Close modal, drawer, or search</dd>\n\
                </dl>\n\
              </div>\n\
              <div class=\"shortcuts-group\">\n\
-               <h3>Inbox &amp; Reader</h3>\n\
+               <h3>Inbox, Boards &amp; Reader</h3>\n\
                <dl class=\"shortcuts-list\">\n\
                  <dt><kbd>j</kbd><kbd>k</kbd></dt><dd>Next / previous item</dd>\n\
                  <dt><kbd>Enter</kbd><kbd>o</kbd></dt><dd>Open selected item</dd>\n\
-                 <dt><kbd>e</kbd></dt><dd>Dismiss / mark new</dd>\n\
+                 <dt><kbd>d</kbd></dt><dd>Open discussion / comments</dd>\n\
+                 <dt><kbd>e</kbd></dt><dd>Dismiss / restore</dd>\n\
                  <dt><kbd>s</kbd></dt><dd>Toggle star</dd>\n\
-                 <dt><kbd>q</kbd></dt><dd>Add to Queue</dd>\n\
+                 <dt><kbd>q</kbd></dt><dd>Toggle Queue</dd>\n\
                  <dt><kbd>[</kbd><kbd>]</kbd></dt><dd>Decrease / increase Reader text size</dd>\n\
                </dl>\n\
              </div>\n\
@@ -794,7 +798,7 @@ fn render_masthead(out: &mut String, shell: &PageShell<'_>) {
                <form id=\"roche-masthead-refresh\" class=\"inline-form\" method=\"post\" action=\"/web/feeds/refresh-all\">\n\
                  <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
                  <input type=\"hidden\" name=\"return_to\" value=\"{refresh_return}\">\n\
-                 <button type=\"submit\" class=\"util-btn\" title=\"Refresh all feeds\" aria-label=\"Refresh all feeds\">\n\
+                 <button type=\"submit\" class=\"util-btn\" title=\"Refresh all feeds and boards\" aria-label=\"Refresh all feeds and boards\">\n\
                    {REFRESH_SVG}\n\
                    <span class=\"util-label\">Refresh</span>\n\
                  </button>\n\

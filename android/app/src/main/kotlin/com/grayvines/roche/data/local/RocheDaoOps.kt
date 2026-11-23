@@ -863,38 +863,59 @@ internal suspend fun RocheDao.setItemStatusAndReadAt(
     status: String,
     readAt: String?,
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+    restoreToWantToRead: Boolean = true,
 ) {
     executeInTransaction {
         val nowIso = nowUtcIso()
         val existing = resolveOrInitEntryState(itemId, nowIso)
         if (existing != null) {
-            val hlc = nextLocalHlc(this, nodeId)
-            val isNonFeed = existing.inboxState.equals("none", ignoreCase = true)
-            val isArchived = status.equals("archived", ignoreCase = true)
-            val inboxState =
-                when {
-                    isNonFeed -> "none"
-                    isArchived -> "dismissed"
-                    else -> "unread"
-                }
-            val effectiveReadAt =
-                if (isNonFeed && isArchived) readAt ?: existing.readAt ?: nowIso else readAt
-            upsertEntryState(
-                existing.copy(
-                    inboxState = inboxState,
-                    readAt = effectiveReadAt,
-                    interactionUpdatedAt = nowIso,
-                    updatedAt = nowIso,
-                    hlc = hlc,
-                    isLocalDirty =
-                        getEntryById(itemId)?.url?.let(::isSyncableItemUrl) != false ||
-                            existing.isLocalDirty,
-                )
+            applyItemStatusAndReadAtInTx(
+                itemId = itemId,
+                existing = existing,
+                status = status,
+                readAt = readAt,
+                nowIso = nowIso,
+                nodeId = nodeId,
+                restoreToWantToRead = restoreToWantToRead,
             )
-            if (isNonFeed) {
-                syncNonFeedWantArchive(itemId, isArchived, nowIso, hlc, nodeId)
-            }
         }
+    }
+}
+
+@Suppress("LongParameterList")
+private suspend fun RocheDao.applyItemStatusAndReadAtInTx(
+    itemId: String,
+    existing: EntryStateEntity,
+    status: String,
+    readAt: String?,
+    nowIso: String,
+    nodeId: String,
+    restoreToWantToRead: Boolean,
+) {
+    val hlc = nextLocalHlc(this, nodeId)
+    val isNonFeed = existing.inboxState.equals("none", ignoreCase = true)
+    val isArchived = status.equals("archived", ignoreCase = true)
+    val inboxState =
+        when {
+            isNonFeed -> "none"
+            isArchived -> "dismissed"
+            else -> "unread"
+        }
+    val effectiveReadAt =
+        if (isNonFeed && isArchived) readAt ?: existing.readAt ?: nowIso else readAt
+    val isSyncable = getEntryById(itemId)?.url?.let(::isSyncableItemUrl) != false
+    upsertEntryState(
+        existing.copy(
+            inboxState = inboxState,
+            readAt = effectiveReadAt,
+            interactionUpdatedAt = nowIso,
+            updatedAt = nowIso,
+            hlc = hlc,
+            isLocalDirty = isSyncable || existing.isLocalDirty,
+        )
+    )
+    if (isNonFeed && (isArchived || restoreToWantToRead)) {
+        syncNonFeedWantArchive(itemId, isArchived, nowIso, hlc, nodeId)
     }
 }
 

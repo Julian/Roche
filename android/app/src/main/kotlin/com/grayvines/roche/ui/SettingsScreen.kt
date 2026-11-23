@@ -834,6 +834,7 @@ private fun resolveUnpinnedTabSubtitle(
     when (tab) {
         AppTab.HOME -> "Quick access to Home widgets"
         AppTab.INBOX -> "Chronological stream from subscribed feeds"
+        AppTab.BOARDS -> formatBoardsUnpinnedSubtitle(state)
         AppTab.DIARY -> "Chronological consumption log (${state.catalog.consumedCount} logged)"
         AppTab.QUEUE -> "${state.queueEntries.size} up next · ${state.catalog.wantItemCount} want"
         AppTab.OFFLINE -> "${state.offlineEntries.size} cached articles & episodes"
@@ -841,6 +842,18 @@ private fun resolveUnpinnedTabSubtitle(
         AppTab.LISTS -> "Ranked collections & custom lists"
         else -> "Open ${tab.label}"
     }
+
+internal fun formatBoardsUnpinnedSubtitle(state: MainUiState): String {
+    val totalCount = state.boards.size
+    val activeCount = state.boards.count { it.isActive }
+    return when {
+        totalCount == 0 -> "Live front pages & Hacker News"
+        activeCount == 0 && totalCount == 1 -> "1 paused board"
+        activeCount == 0 -> "$totalCount paused boards"
+        activeCount == 1 -> "1 active board"
+        else -> "$activeCount active boards"
+    }
+}
 
 internal fun formatPlaybackSpeedLabel(speed: Float): String =
     String.format(Locale.US, "%.2f", speed).trimEnd('0').trimEnd('.') + "x"

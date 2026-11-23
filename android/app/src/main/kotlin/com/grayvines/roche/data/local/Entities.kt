@@ -339,6 +339,105 @@ data class TableRevisionEntity(
     val revision: Long = 0L,
 )
 
+@Entity(
+    tableName = "boards",
+    indices =
+        [
+            Index(value = ["adapterType", "sourceKey"], unique = true),
+            Index(value = ["isActive"]),
+            Index(value = ["isLocalDirty"]),
+            Index(value = ["isSnapshotDirty"]),
+        ],
+)
+data class BoardEntity(
+    @PrimaryKey val id: String,
+    val adapterType: String,
+    val sourceKey: String,
+    val sourceUrl: String,
+    val sourceConfigJson: String = "{}",
+    val title: String,
+    val orderMode: String = "ranked",
+    val pollInterval: Int = 30,
+    val isActive: Boolean = true,
+    val lastPolledAt: String? = null,
+    val lastPolledBy: String? = null,
+    val lastError: String? = null,
+    val lastErrorBy: String? = null,
+    val consecutiveFailures: Int = 0,
+    val snapshotFetchedAt: String? = null,
+    val snapshotHlc: String = "",
+    val createdAt: String,
+    val updatedAt: String,
+    val hlc: String = "",
+    val isLocalDirty: Boolean = false,
+    val isSnapshotDirty: Boolean = false,
+)
+
+@Entity(
+    tableName = "board_items",
+    primaryKeys = ["boardId", "externalId"],
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = BoardEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["boardId"],
+                onDelete = ForeignKey.CASCADE,
+            )
+        ],
+    indices =
+        [
+            Index(value = ["boardId", "rank"]),
+            Index(value = ["url"]),
+        ],
+)
+data class BoardItemEntity(
+    val boardId: String,
+    val externalId: String,
+    val rank: Int,
+    val title: String,
+    val url: String,
+    val discussionUrl: String? = null,
+    val author: String? = null,
+    val domain: String? = null,
+    val publishedAt: String? = null,
+    val score: Int? = null,
+    val commentCount: Int? = null,
+    val summary: String? = null,
+    val selfTextHtml: String? = null,
+    val metadataJson: String = "{}",
+    val fetchedAt: String,
+)
+
+@Entity(
+    tableName = "board_item_states",
+    primaryKeys = ["boardId", "externalId"],
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = BoardEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["boardId"],
+                onDelete = ForeignKey.CASCADE,
+            )
+        ],
+    indices =
+        [
+            Index(value = ["lastSeenInSnapshotAt"]),
+            Index(value = ["isLocalDirty"]),
+        ],
+)
+data class BoardItemStateEntity(
+    val boardId: String,
+    val externalId: String,
+    val seenAt: String? = null,
+    val dismissedAt: String? = null,
+    val lastSeenInSnapshotAt: String,
+    val updatedAt: String,
+    val hlc: String = "",
+    val isLocalDirty: Boolean = false,
+)
+
 @Suppress("LongParameterList")
 data class FeedRow(
     val id: String,
@@ -389,6 +488,8 @@ data class InboxItemRow(
     val inboxState: String = DEFAULT_INBOX_STATE,
     val entryKind: String = DEFAULT_ENTRY_KIND,
     val isFinished: Boolean = false,
+    val metadataJson: String = "{}",
+    val hackerNewsId: String? = null,
 )
 
 @Suppress("LongParameterList")
@@ -457,6 +558,9 @@ data class RepositoryStampRow(
     val statesStamp: Long,
     val contentsStamp: Long,
     val feedsStamp: Long,
+    val boardsStamp: Long = 0L,
+    val boardItemsStamp: Long = 0L,
+    val boardItemStatesStamp: Long = 0L,
 )
 
 internal fun RepositoryStampRow.toCatalogStamp(): CatalogStampRow =

@@ -14,6 +14,7 @@ import com.grayvines.roche.core.TOMBSTONE_ENTITY_ENTRY
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_FEED
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_ITEM
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_TAG
+import com.grayvines.roche.core.TOMBSTONE_TYPE_BOARD
 import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_SLUG
@@ -28,6 +29,7 @@ import com.grayvines.roche.core.feedNaturalKey
 import com.grayvines.roche.core.formatDurationSecondsLabel
 import com.grayvines.roche.core.isLocalPollNewer
 import com.grayvines.roche.core.itemNaturalKey
+import com.grayvines.roche.core.mergeEntryMetadataJson
 import com.grayvines.roche.core.newerIsoTimestamp
 import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.core.normalizeIdentifierScheme
@@ -80,6 +82,7 @@ import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.data.remote.SyncTombstoneDto
 import com.grayvines.roche.model.ContentType
 import java.util.UUID
+import kotlinx.serialization.json.JsonObject
 
 internal suspend fun reconcilePeerSyncResponse(
     dao: RocheDao,
@@ -118,6 +121,13 @@ internal suspend fun reconcilePeerSyncResponse(
                 nowIso = nowIso,
                 nowMs = syncNowMs,
             )
+            mergeIncomingBoardsInTx(
+                dao = dao,
+                response = response,
+                serverNode = serverNode,
+                nowIso = nowIso,
+                nowMs = syncNowMs,
+            )
         }
     }
     if (catalogStore != null) {
@@ -139,6 +149,11 @@ private fun collectResponseHlcs(response: PeerSyncResponseDto): List<String?> = 
     response.consumptionLog.forEach { add(it.hlc) }
     response.comparisons.forEach { add(it.hlc) }
     response.tombstones.forEach { add(it.hlc) }
+    response.boards.forEach { board ->
+        add(board.hlc)
+        add(board.snapshotHlc)
+    }
+    response.boardItemStates.forEach { add(it.hlc) }
 }
 
 private suspend fun acknowledgeSentDirtyRows(
@@ -168,6 +183,20 @@ private suspend fun acknowledgeSentDirtyRows(
     }
     for ((key, hlc) in sentBatch.sentTombstoneHlcByKey) {
         dao.clearTombstoneDirtyIfSameHlc(key.first, key.second, hlc)
+    }
+    for ((boardId, version) in sentBatch.sentBoardVersionById) {
+        dao.clearBoardDirtyIfSameHlc(
+            id = boardId,
+            expectedHlc = version.hlc,
+            expectedSnapshotHlc = version.snapshotHlc,
+            expectedLastPolledAt = version.lastPolledAt,
+        )
+    }
+    for ((boardId, snapshotHlc) in sentBatch.sentBoardSnapshotHlcById) {
+        dao.clearBoardSnapshotDirtyIfSameHlc(boardId, snapshotHlc)
+    }
+    for ((key, hlc) in sentBatch.sentBoardItemStateHlcByKey) {
+        dao.clearBoardItemStateDirtyIfSameHlc(key.first, key.second, hlc)
     }
     if (sentBatch.countOverflowEntryIds.isNotEmpty()) {
         sentBatch.countOverflowEntryIds.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach {
@@ -386,6 +415,7 @@ private suspend fun applyIncomingTombstonesInTx(
                 applyConsumptionLogTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_COMPARISON -> applyComparisonTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_ENTRY -> applyEntryTombstone(dao, rawKey, deletedAt, tombHlc)
+            TOMBSTONE_TYPE_BOARD -> applyBoardTombstoneInTx(dao, rawKey, deletedAt, tombHlc)
         }
     }
 }
@@ -1299,9 +1329,14 @@ private fun buildMergedEntryEntity(
     val incomingWins = shouldIncomingWinHlc(entryHlc, existing?.hlc, existing?.isLocalDirty == true)
     val richerSummary =
         pickRicherString(existing?.summary, rec.summary)?.take(MAX_SQLITE_SUMMARY_CHARS)
-    val metadataJson = rec.metadata?.toString()?.takeIf { it.isNotBlank() && it != "{}" }
+    val mergedMetadataJson =
+        mergeEntryMetadataJson(
+            existingJson = existing?.metadataJson ?: "{}",
+            incomingMeta = rec.metadata as? JsonObject,
+            incomingWins = incomingWins,
+        )
     if (existing != null && !incomingWins) {
-        return mergePassiveEntryFields(existing, rec, richerSummary, metadataJson, mergedInto)
+        return mergePassiveEntryFields(existing, rec, richerSummary, mergedMetadataJson, mergedInto)
     }
     return buildWinningEntryEntity(
         rec = rec,
@@ -1312,7 +1347,7 @@ private fun buildMergedEntryEntity(
         entryHlc = entryHlc,
         existing = existing,
         richerSummary = richerSummary,
-        metadataJson = metadataJson,
+        metadataJson = mergedMetadataJson,
         incomingWins = incomingWins,
         nowIso = nowIso,
     )
@@ -1322,7 +1357,7 @@ private fun mergePassiveEntryFields(
     existing: EntryEntity,
     rec: SyncEntryRecordDto,
     richerSummary: String?,
-    metadataJson: String?,
+    metadataJson: String,
     mergedInto: String?,
 ): EntryEntity {
     val creatorsJson =
@@ -1340,8 +1375,7 @@ private fun mergePassiveEntryFields(
         releaseYear = existing.releaseYear ?: rec.releaseYear,
         summary = richerSummary,
         thumbnailUrl = existing.thumbnailUrl ?: sanitizeHttpUrl(rec.thumbnailUrl),
-        metadataJson =
-            if (existing.metadataJson != "{}") existing.metadataJson else metadataJson ?: "{}",
+        metadataJson = metadataJson,
         mergedIntoId = mergedInto ?: existing.mergedIntoId,
     )
 }
@@ -1356,7 +1390,7 @@ private fun buildWinningEntryEntity(
     entryHlc: String,
     existing: EntryEntity?,
     richerSummary: String?,
-    metadataJson: String?,
+    metadataJson: String,
     incomingWins: Boolean,
     nowIso: String,
 ): EntryEntity {
@@ -1379,7 +1413,7 @@ private fun buildWinningEntryEntity(
         releaseYear = rec.releaseYear ?: existing?.releaseYear,
         summary = richerSummary,
         thumbnailUrl = sanitizeHttpUrl(rec.thumbnailUrl) ?: existing?.thumbnailUrl,
-        metadataJson = metadataJson ?: existing?.metadataJson ?: "{}",
+        metadataJson = metadataJson,
         mergedIntoId = mergedInto ?: existing?.mergedIntoId,
         createdAt = nonBlankOrFallback(rec.createdAt, existing?.createdAt) ?: nowIso,
         updatedAt = nonBlankOrFallback(rec.updatedAt, existing?.updatedAt) ?: nowIso,

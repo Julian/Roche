@@ -129,6 +129,78 @@ data class RemoteItemDto(
 @Serializable
 @OptIn(ExperimentalSerializationApi::class)
 @Suppress("LongParameterList")
+data class SyncBoardItemDto(
+    @SerialName("external_id") val externalId: String,
+    val rank: Int,
+    val title: String,
+    val url: String,
+    @SerialName("discussion_url") val discussionUrl: String? = null,
+    val author: String? = null,
+    val domain: String? = null,
+    @SerialName("published_at") val publishedAt: String? = null,
+    val score: Int? = null,
+    @SerialName("comment_count") val commentCount: Int? = null,
+    val summary: String? = null,
+    @SerialName("self_text_html") val selfTextHtml: String? = null,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    @SerialName("metadata_json")
+    val metadataJson: String = "{}",
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS) @SerialName("fetched_at") val fetchedAt: String = "",
+)
+
+@Serializable
+@OptIn(ExperimentalSerializationApi::class)
+@Suppress("LongParameterList")
+data class SyncBoardDto(
+    val id: String = "",
+    @SerialName("adapter_type") val adapterType: String,
+    @SerialName("source_key") val sourceKey: String,
+    @SerialName("source_url") val sourceUrl: String,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    @SerialName("source_config_json")
+    val sourceConfigJson: String = "{}",
+    val title: String,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    @SerialName("order_mode")
+    val orderMode: String = "ranked",
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    @SerialName("poll_interval")
+    val pollInterval: Int = 30,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS) @SerialName("is_active") val isActive: Boolean = true,
+    @SerialName("last_polled_at") val lastPolledAt: String? = null,
+    @SerialName("last_polled_by") val lastPolledBy: String? = null,
+    @SerialName("last_error") val lastError: String? = null,
+    @SerialName("last_error_by") val lastErrorBy: String? = null,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    @SerialName("consecutive_failures")
+    val consecutiveFailures: Int = 0,
+    @SerialName("snapshot_fetched_at") val snapshotFetchedAt: String? = null,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    @SerialName("snapshot_hlc")
+    val snapshotHlc: String = "",
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS) val hlc: String = "",
+    @SerialName("snapshot_items") val snapshotItems: List<SyncBoardItemDto>? = null,
+)
+
+@Serializable
+@OptIn(ExperimentalSerializationApi::class)
+data class SyncBoardItemStateDto(
+    @SerialName("board_id") val boardId: String,
+    @SerialName("external_id") val externalId: String,
+    @SerialName("seen_at") val seenAt: String? = null,
+    @SerialName("dismissed_at") val dismissedAt: String? = null,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    @SerialName("last_seen_in_snapshot_at")
+    val lastSeenInSnapshotAt: String = "",
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS) @SerialName("updated_at") val updatedAt: String = "",
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS) val hlc: String = "",
+)
+
+@Serializable
+@OptIn(ExperimentalSerializationApi::class)
+@Suppress("LongParameterList")
 data class PeerSyncRequestDto(
     @SerialName("peer_id") val peerId: String,
     @SerialName("device_name") val deviceName: String? = null,
@@ -146,6 +218,8 @@ data class PeerSyncRequestDto(
     @SerialName("consumption_log") val consumptionLog: List<SyncConsumptionLogDto> = emptyList(),
     val comparisons: List<SyncComparisonDto> = emptyList(),
     val tombstones: List<SyncTombstoneDto> = emptyList(),
+    val boards: List<SyncBoardDto> = emptyList(),
+    @SerialName("board_item_states") val boardItemStates: List<SyncBoardItemStateDto> = emptyList(),
 )
 
 @Serializable
@@ -166,6 +240,8 @@ data class PeerSyncResponseDto(
     @SerialName("consumption_log") val consumptionLog: List<SyncConsumptionLogDto> = emptyList(),
     val comparisons: List<SyncComparisonDto> = emptyList(),
     val tombstones: List<SyncTombstoneDto> = emptyList(),
+    val boards: List<SyncBoardDto> = emptyList(),
+    @SerialName("board_item_states") val boardItemStates: List<SyncBoardItemStateDto> = emptyList(),
 )
 
 @Serializable

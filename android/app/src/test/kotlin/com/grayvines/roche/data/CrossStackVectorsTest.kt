@@ -5,8 +5,10 @@ import com.grayvines.roche.core.HlcTimestamp
 import com.grayvines.roche.core.PREFERRED_IDENTIFIER_SCHEMES
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
+import com.grayvines.roche.core.boardNaturalKey
 import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.deterministicAutoLogId
+import com.grayvines.roche.core.deterministicBoardId
 import com.grayvines.roche.core.deterministicFeedId
 import com.grayvines.roche.core.deterministicItemId
 import com.grayvines.roche.core.deterministicTagId
@@ -180,6 +182,14 @@ internal data class ThroughputEwmaStepVector(
 )
 
 @Serializable
+internal data class BoardIdVector(
+    @SerialName("adapter_type") val adapterType: String,
+    @SerialName("source_key") val sourceKey: String,
+    @SerialName("expected_natural_key") val expectedNaturalKey: String,
+    @SerialName("expected_board_id") val expectedBoardId: String,
+)
+
+@Serializable
 internal data class CrossStackGoldenVectors(
     @SerialName("canonical_urls") val canonicalUrls: List<CanonicalUrlVector>,
     @SerialName("entity_ids") val entityIds: List<EntityIdVector>,
@@ -200,6 +210,7 @@ internal data class CrossStackGoldenVectors(
     @SerialName("staggered_poll_schedules")
     val staggeredPollSchedules: List<StaggeredPollScheduleVector>,
     @SerialName("throughput_ewma_steps") val throughputEwmaSteps: List<ThroughputEwmaStepVector>,
+    @SerialName("board_ids") val boardIds: List<BoardIdVector> = emptyList(),
 )
 
 class CrossStackVectorsTest {
@@ -227,6 +238,22 @@ class CrossStackVectorsTest {
                 deterministicItemId(vector.feedUrl, vector.itemUrl),
             )
             assertEquals(vector.expectedTagId, deterministicTagId(vector.tagName))
+        }
+    }
+
+    @Test
+    fun `deterministic board natural keys and UUIDs match Rust golden vectors`() {
+        val vectors = loadGoldenVectors()
+        assertTrue(vectors.boardIds.isNotEmpty(), "expected board_ids golden vectors")
+        vectors.boardIds.forEach { vector ->
+            assertEquals(
+                vector.expectedNaturalKey,
+                boardNaturalKey(vector.adapterType, vector.sourceKey),
+            )
+            assertEquals(
+                vector.expectedBoardId,
+                deterministicBoardId(vector.adapterType, vector.sourceKey),
+            )
         }
     }
 

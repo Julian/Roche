@@ -98,7 +98,7 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
             host.repository
                 .importOpml(opmlXml)
                 .onSuccess { importedCount ->
-                    val noun = if (importedCount == 1) "feed" else "feeds"
+                    val noun = if (importedCount == 1) LABEL_FEED else LABEL_FEEDS
                     host.showStatusMessage("Imported $importedCount $noun from OPML")
                 }
                 .onFailure { error ->
@@ -384,7 +384,7 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
                         if (count == 0) {
                             "All cooperative feeds are up to date"
                         } else {
-                            val noun = if (count == 1) "feed" else "feeds"
+                            val noun = if (count == 1) LABEL_FEED else LABEL_FEEDS
                             "Polled $count due $noun on-device"
                         }
                     host.showStatusMessage(msg)
@@ -442,12 +442,14 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
         host.refreshLocalNetworkTier()
         syncResult
             .onSuccess { count ->
+                val hasActiveBoards =
+                    host.repository.latestSnapshot?.boards?.any { it.isActive } == true
                 val message =
-                    when {
-                        hasServer -> "Synced $count entries from server"
-                        count == 0 -> "Feeds are up to date"
-                        else -> "Refreshed $count ${if (count == 1) "feed" else "feeds"}"
-                    }
+                    formatLocalSyncSuccessMessage(
+                        hasServer = hasServer,
+                        hasActiveBoards = hasActiveBoards,
+                        count = count,
+                    )
                 host.showStatusMessage(message)
             }
             .onFailure { error ->
@@ -473,6 +475,29 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
         } else {
             error.message?.takeIf { it.isNotBlank() } ?: fallback
         }
+}
+
+private const val LABEL_FEED = "feed"
+private const val LABEL_FEEDS = "feeds"
+
+internal fun formatLocalSyncSuccessMessage(
+    hasServer: Boolean,
+    hasActiveBoards: Boolean,
+    count: Int,
+): String {
+    val noun =
+        when {
+            hasActiveBoards && count == 1 -> "source"
+            hasActiveBoards -> "sources"
+            count == 1 -> LABEL_FEED
+            else -> LABEL_FEEDS
+        }
+    return when {
+        hasServer -> "Synced $count entries from server"
+        count == 0 && hasActiveBoards -> "Sources are up to date"
+        count == 0 -> "Feeds are up to date"
+        else -> "Refreshed $count $noun"
+    }
 }
 
 internal fun resolveNextBearerToken(

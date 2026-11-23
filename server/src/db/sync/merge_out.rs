@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use roche_core::boards::{BoardOrderMode, BoardType};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 
 use super::{
@@ -11,9 +12,10 @@ use super::{
     identity::UP_NEXT_COLLECTION_ID,
     models::{
         MAX_PEER_SYNC_PAGE_BYTES, MAX_SYNC_INLINE_HTML_BYTES, PeerSyncResponse,
-        SyncCollectionEntryRecord, SyncCollectionGeneratorRecord, SyncCollectionSpec,
-        SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord,
-        SyncEntryState, SyncFeedSource,
+        SyncBoardItemRecord, SyncBoardItemStateRecord, SyncBoardRecord, SyncCollectionEntryRecord,
+        SyncCollectionGeneratorRecord, SyncCollectionSpec, SyncComparisonRecord,
+        SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord, SyncEntryState,
+        SyncFeedSource,
     },
 };
 use crate::db::{CollectionRole, ContentType, EntryIdentifier, EntryKind, FeedType, InboxState};
@@ -130,6 +132,48 @@ struct RawSyncComparisonRow {
     hlc: String,
 }
 
+#[derive(sqlx::FromRow)]
+struct RawSyncBoardRow {
+    id: String,
+    adapter_type: BoardType,
+    source_key: String,
+    source_url: String,
+    source_config_json: String,
+    title: String,
+    order_mode: BoardOrderMode,
+    poll_interval: i64,
+    is_active: bool,
+    last_polled_at: Option<DateTime<Utc>>,
+    last_polled_by: Option<String>,
+    last_error: Option<String>,
+    last_error_by: Option<String>,
+    consecutive_failures: i64,
+    snapshot_fetched_at: Option<DateTime<Utc>>,
+    snapshot_hlc: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    hlc: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct RawSyncBoardItemRow {
+    board_id: String,
+    external_id: String,
+    rank: i64,
+    title: String,
+    url: String,
+    discussion_url: Option<String>,
+    author: Option<String>,
+    domain: Option<String>,
+    published_at: Option<DateTime<Utc>>,
+    score: Option<i64>,
+    comment_count: Option<i64>,
+    summary: Option<String>,
+    self_text_html: Option<String>,
+    metadata_json: String,
+    fetched_at: DateTime<Utc>,
+}
+
 struct SyncPageDelta {
     entries: Vec<SyncEntryRecord>,
     collection_entries: Vec<SyncCollectionEntryRecord>,
@@ -137,6 +181,8 @@ struct SyncPageDelta {
     consumption_log: Vec<SyncConsumptionLogRecord>,
     comparisons: Vec<SyncComparisonRecord>,
     tombstones: Vec<SyncTombstone>,
+    boards: Vec<SyncBoardRecord>,
+    board_item_states: Vec<SyncBoardItemStateRecord>,
 }
 
 impl SyncRepo<'_> {
@@ -249,6 +295,8 @@ impl SyncRepo<'_> {
             consumption_log: delta.consumption_log,
             comparisons: delta.comparisons,
             tombstones: delta.tombstones,
+            boards: delta.boards,
+            board_item_states: delta.board_item_states,
         })
     }
 
@@ -281,9 +329,25 @@ impl SyncRepo<'_> {
              UNION ALL
              SELECT sync_seq, 128 + LENGTH(natural_key) AS est_bytes
              FROM sync_tombstones WHERE sync_seq > ?
+             UNION ALL
+             SELECT sync_seq,
+                    512 + COALESCE((
+                        SELECT SUM(
+                            256 + LENGTH(bi.title) + LENGTH(bi.url)
+                                + COALESCE(LENGTH(bi.summary), 0)
+                                + COALESCE(LENGTH(bi.self_text_html), 0)
+                        )
+                        FROM board_items bi WHERE bi.board_id = boards.id
+                    ), 0) AS est_bytes
+             FROM boards WHERE sync_seq > ?
+             UNION ALL
+             SELECT sync_seq, 128 AS est_bytes
+             FROM board_item_states WHERE sync_seq > ?
              ORDER BY sync_seq ASC
              LIMIT ?"
         ))
+        .bind(effective_since)
+        .bind(effective_since)
         .bind(effective_since)
         .bind(effective_since)
         .bind(effective_since)
@@ -386,6 +450,9 @@ impl SyncRepo<'_> {
         };
 
         let entries = Self::hydrate_outgoing_entries(conn, raw_entries, &future_ref_ids).await?;
+        let (boards, board_item_states) =
+            Self::load_outgoing_boards_and_states_in_tx(conn, effective_since, cutoff_seq).await?;
+
         Ok(Some(SyncPageDelta {
             entries,
             collection_entries,
@@ -393,7 +460,148 @@ impl SyncRepo<'_> {
             consumption_log,
             comparisons,
             tombstones,
+            boards,
+            board_item_states,
         }))
+    }
+
+    async fn load_outgoing_boards_and_states_in_tx(
+        conn: &mut SqliteConnection,
+        effective_since: i64,
+        cutoff_seq: i64,
+    ) -> Result<(Vec<SyncBoardRecord>, Vec<SyncBoardItemStateRecord>)> {
+        let board_item_states: Vec<SyncBoardItemStateRecord> = sqlx::query_as(
+            "SELECT board_id, external_id, seen_at, dismissed_at,
+                    last_seen_in_snapshot_at, updated_at, hlc
+             FROM board_item_states
+             WHERE sync_seq > ? AND sync_seq <= ?
+             ORDER BY sync_seq ASC",
+        )
+        .bind(effective_since)
+        .bind(cutoff_seq)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        let boards =
+            Self::load_outgoing_boards_in_tx(conn, effective_since, cutoff_seq, &board_item_states)
+                .await?;
+        Ok((boards, board_item_states))
+    }
+
+    async fn load_outgoing_boards_in_tx(
+        conn: &mut SqliteConnection,
+        effective_since: i64,
+        cutoff_seq: i64,
+        board_item_states: &[SyncBoardItemStateRecord],
+    ) -> Result<Vec<SyncBoardRecord>> {
+        let mut raw_boards: Vec<RawSyncBoardRow> = sqlx::query_as(
+            "SELECT id, adapter_type, source_key, source_url, source_config_json, title,
+                    order_mode, poll_interval, is_active, last_polled_at, last_polled_by,
+                    last_error, last_error_by, consecutive_failures, snapshot_fetched_at,
+                    snapshot_hlc, created_at, updated_at, hlc
+             FROM boards
+             WHERE sync_seq > ? AND sync_seq <= ?
+             ORDER BY sync_seq ASC",
+        )
+        .bind(effective_since)
+        .bind(cutoff_seq)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        let stub_board_ids = Self::append_future_referenced_boards_in_tx(
+            conn,
+            &mut raw_boards,
+            board_item_states,
+            cutoff_seq,
+        )
+        .await?;
+
+        if raw_boards.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let snapshot_board_ids: Vec<String> = raw_boards
+            .iter()
+            .filter(|b| !stub_board_ids.contains(&b.id) && !b.snapshot_hlc.trim().is_empty())
+            .map(|b| b.id.clone())
+            .collect();
+
+        let mut items_map = load_board_items_map(conn, &snapshot_board_ids).await?;
+
+        Ok(raw_boards
+            .into_iter()
+            .map(|row| {
+                let norm_failures = normalize_consecutive_failures(
+                    row.last_error.as_deref(),
+                    row.consecutive_failures,
+                );
+                let is_stub = stub_board_ids.contains(&row.id);
+                let snapshot_items = if is_stub || row.snapshot_hlc.trim().is_empty() {
+                    None
+                } else {
+                    Some(items_map.remove(&row.id).unwrap_or_default())
+                };
+                SyncBoardRecord {
+                    id: row.id,
+                    adapter_type: row.adapter_type,
+                    source_key: row.source_key,
+                    source_url: row.source_url,
+                    source_config_json: row.source_config_json,
+                    title: row.title,
+                    order_mode: row.order_mode,
+                    poll_interval: row.poll_interval,
+                    is_active: row.is_active,
+                    last_polled_at: row.last_polled_at,
+                    last_polled_by: row.last_polled_by,
+                    last_error: row.last_error,
+                    last_error_by: row.last_error_by,
+                    consecutive_failures: norm_failures,
+                    snapshot_fetched_at: row.snapshot_fetched_at,
+                    snapshot_hlc: row.snapshot_hlc,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                    hlc: row.hlc,
+                    snapshot_items,
+                }
+            })
+            .collect())
+    }
+
+    async fn append_future_referenced_boards_in_tx(
+        conn: &mut SqliteConnection,
+        raw_boards: &mut Vec<RawSyncBoardRow>,
+        board_item_states: &[SyncBoardItemStateRecord],
+        cutoff_seq: i64,
+    ) -> Result<HashSet<String>> {
+        let present_board_ids: HashSet<String> = raw_boards.iter().map(|b| b.id.clone()).collect();
+        let mut future_board_ids: Vec<String> = Vec::new();
+        let mut seen_future: HashSet<String> = HashSet::new();
+        for st in board_item_states {
+            if !present_board_ids.contains(&st.board_id) && seen_future.insert(st.board_id.clone())
+            {
+                future_board_ids.push(st.board_id.clone());
+            }
+        }
+        let mut stub_board_ids = HashSet::new();
+        for chunk in future_board_ids.chunks(SQLITE_BIND_CHUNK) {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT id, adapter_type, source_key, source_url, source_config_json, title,
+                        order_mode, poll_interval, is_active, last_polled_at, last_polled_by,
+                        last_error, last_error_by, consecutive_failures, snapshot_fetched_at,
+                        snapshot_hlc, created_at, updated_at, hlc
+                 FROM boards
+                 WHERE sync_seq > ",
+            );
+            qb.push_bind(cutoff_seq).push(" AND id IN (");
+            push_bound_id_list(&mut qb, chunk);
+            qb.push(")");
+            let extra: Vec<RawSyncBoardRow> = qb.build_query_as().fetch_all(&mut *conn).await?;
+            for row in extra {
+                stub_board_ids.insert(row.id.clone());
+                raw_boards.push(row);
+            }
+        }
+        Ok(stub_board_ids)
     }
 
     /// Ensures every outgoing child record on this page has its referenced `entries` present
@@ -673,6 +881,46 @@ impl SyncRepo<'_> {
     }
 }
 
+async fn load_board_items_map(
+    conn: &mut SqliteConnection,
+    board_ids: &[String],
+) -> Result<HashMap<String, Vec<SyncBoardItemRecord>>> {
+    if board_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<RawSyncBoardItemRow> = fetch_chunked_by_ids(
+        conn,
+        board_ids,
+        "SELECT board_id, external_id, rank, title, url, discussion_url, author, domain,
+                published_at, score, comment_count, summary, self_text_html, metadata_json,
+                fetched_at
+         FROM board_items
+         WHERE board_id IN (",
+        ") ORDER BY board_id ASC, rank ASC",
+    )
+    .await?;
+    let mut map: HashMap<String, Vec<SyncBoardItemRecord>> = HashMap::new();
+    for row in rows {
+        map.entry(row.board_id).or_default().push(SyncBoardItemRecord {
+            external_id: row.external_id,
+            rank: row.rank,
+            title: row.title,
+            url: row.url,
+            discussion_url: row.discussion_url,
+            author: row.author,
+            domain: row.domain,
+            published_at: row.published_at,
+            score: row.score,
+            comment_count: row.comment_count,
+            summary: row.summary,
+            self_text_html: row.self_text_html,
+            metadata_json: row.metadata_json,
+            fetched_at: row.fetched_at,
+        });
+    }
+    Ok(map)
+}
+
 async fn load_entry_identifiers_map(
     conn: &mut SqliteConnection,
     ids: &[String],
@@ -856,6 +1104,8 @@ fn empty_peer_sync_response(
         consumption_log: Vec::new(),
         comparisons: Vec::new(),
         tombstones: Vec::new(),
+        boards: Vec::new(),
+        board_item_states: Vec::new(),
     }
 }
 

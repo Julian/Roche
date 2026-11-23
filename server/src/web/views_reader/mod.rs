@@ -18,6 +18,7 @@ pub(super) use inbox::{
     post_item_unarchive, starred_get,
 };
 pub(super) use reader::{
+    QUEUE_ADD_SVG, QUEUE_CHECK_SVG, TOP_ARROW_SVG, harden_reader_prose_html_with_context,
     item_audio_get, post_item_finish, post_item_progress, post_item_tag_add, post_item_tag_remove,
     post_item_unfinish, reader_get, web_media_get,
 };
@@ -74,6 +75,14 @@ pub(super) struct ItemReturnForm {
 }
 
 #[derive(Debug, Default, Deserialize)]
+pub(super) struct UnfinishItemForm {
+    #[serde(default)]
+    pub return_to: Option<String>,
+    #[serde(default)]
+    pub requeue: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub(super) struct ProgressForm {
     pub progress: f64,
     #[serde(default)]
@@ -93,6 +102,8 @@ pub(super) struct FinishItemForm {
 #[derive(Debug, Deserialize)]
 pub(super) struct AddTagForm {
     pub name: String,
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

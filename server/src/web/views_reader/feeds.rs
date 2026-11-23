@@ -702,11 +702,22 @@ pub(in crate::web) async fn post_feed_refresh_all(
     Form(form): Form<ItemReturnForm>,
 ) -> Result<Response, WebError> {
     let base = safe_local_redirect(form.return_to.as_deref(), "/feeds");
-    let count = service.feeds().refresh_all_in_background().await.web_err(&session)?;
-    let msg = if count == 0 {
-        "No active feeds to refresh".to_owned()
-    } else {
-        format!("Refreshing {count} feeds in background…")
+    let outcome = service.refresh_all_sources_in_background().await.web_err(&session)?;
+    let msg = match (outcome.feeds, outcome.boards) {
+        (0, 0) => "No active feeds or boards to refresh".to_owned(),
+        (f, 0) => {
+            let noun = if f == 1 { "feed" } else { "feeds" };
+            format!("Refreshing {f} {noun} in background…")
+        }
+        (0, b) => {
+            let noun = if b == 1 { "board" } else { "boards" };
+            format!("Refreshing {b} {noun} in background…")
+        }
+        (f, b) => {
+            let f_noun = if f == 1 { "feed" } else { "feeds" };
+            let b_noun = if b == 1 { "board" } else { "boards" };
+            format!("Refreshing {f} {f_noun} and {b} {b_noun} in background…")
+        }
     };
     Ok(redirect_with_flash(&base, "notice", &msg))
 }

@@ -6,7 +6,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use roche_core::{
     feeds::{ArxivParser, RssParser, YouTubeParser},
     hrw::{FeedPollState, NetworkTier, PeerNode, should_peer_poll_feed},
-    identity::deterministic_item_id,
+    identity::{board_natural_key, deterministic_board_id, deterministic_item_id},
 };
 use serde::Deserialize;
 use url::Url;
@@ -311,6 +311,14 @@ struct WireDtoRoundtripSuite {
 }
 
 #[derive(Deserialize)]
+struct BoardIdVector {
+    adapter_type: String,
+    source_key: String,
+    expected_natural_key: String,
+    expected_board_id: String,
+}
+
+#[derive(Deserialize)]
 struct ExpandedCrossStackVectors {
     custom_collection_ids: Vec<CustomCollectionIdVector>,
     url_classification: Vec<UrlClassificationVector>,
@@ -322,6 +330,7 @@ struct ExpandedCrossStackVectors {
     poll_decision_matrix: Vec<PollDecisionVector>,
     feed_xml_fixtures: Vec<FeedXmlFixtureVector>,
     wire_dto_roundtrip: WireDtoRoundtripSuite,
+    board_ids: Vec<BoardIdVector>,
 }
 
 fn load_expanded_vectors() -> ExpandedCrossStackVectors {
@@ -1075,4 +1084,26 @@ fn test_cross_stack_wire_dto_roundtrip() {
     assert_eq!(resp_rt.sync_seq, resp.sync_seq);
     assert_eq!(resp_rt.active_peers.len(), resp.active_peers.len());
     assert_eq!(resp_rt.entries[0].state.as_ref().unwrap().inbox_state, InboxState::Dismissed);
+}
+
+#[test]
+fn test_cross_stack_board_ids() {
+    let vectors = load_expanded_vectors().board_ids;
+    assert!(vectors.len() >= 6);
+    for case in &vectors {
+        assert_eq!(
+            board_natural_key(&case.adapter_type, &case.source_key),
+            case.expected_natural_key,
+            "board_natural_key mismatch for ({}, {})",
+            case.adapter_type,
+            case.source_key
+        );
+        assert_eq!(
+            deterministic_board_id(&case.adapter_type, &case.source_key),
+            case.expected_board_id,
+            "deterministic_board_id mismatch for ({}, {})",
+            case.adapter_type,
+            case.source_key
+        );
+    }
 }

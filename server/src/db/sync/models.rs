@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use roche_core::boards::{BoardOrderMode, BoardType};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -27,6 +28,10 @@ const fn default_poll_interval() -> i64 {
 
 const fn default_true() -> bool {
     true
+}
+
+fn default_empty_json_object() -> String {
+    "{}".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +199,85 @@ pub struct SyncComparisonRecord {
     pub hlc: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SyncBoardItemRecord {
+    pub external_id: String,
+    pub rank: i64,
+    pub title: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discussion_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_text_html: Option<String>,
+    #[serde(default = "default_empty_json_object")]
+    pub metadata_json: String,
+    pub fetched_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncBoardRecord {
+    #[serde(default)]
+    pub id: String,
+    pub adapter_type: BoardType,
+    pub source_key: String,
+    pub source_url: String,
+    #[serde(default = "default_empty_json_object")]
+    pub source_config_json: String,
+    pub title: String,
+    #[serde(default)]
+    pub order_mode: BoardOrderMode,
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval: i64,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_polled_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_polled_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_by: Option<String>,
+    #[serde(default)]
+    pub consecutive_failures: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_fetched_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub snapshot_hlc: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub hlc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_items: Option<Vec<SyncBoardItemRecord>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SyncBoardItemStateRecord {
+    pub board_id: String,
+    pub external_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_at: Option<DateTime<Utc>>,
+    pub last_seen_in_snapshot_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub hlc: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerSyncRequest {
     pub peer_id: String,
@@ -219,6 +303,10 @@ pub struct PeerSyncRequest {
     pub comparisons: Vec<SyncComparisonRecord>,
     #[serde(default)]
     pub tombstones: Vec<SyncTombstone>,
+    #[serde(default)]
+    pub boards: Vec<SyncBoardRecord>,
+    #[serde(default)]
+    pub board_item_states: Vec<SyncBoardItemStateRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +332,10 @@ pub struct PeerSyncResponse {
     pub comparisons: Vec<SyncComparisonRecord>,
     #[serde(default)]
     pub tombstones: Vec<SyncTombstone>,
+    #[serde(default)]
+    pub boards: Vec<SyncBoardRecord>,
+    #[serde(default)]
+    pub board_item_states: Vec<SyncBoardItemStateRecord>,
 }
 
 /// Incoming peer sync entry whose HTML, summary excerpt, and thumbnail URL have already been

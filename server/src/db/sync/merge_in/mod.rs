@@ -1,3 +1,4 @@
+mod boards;
 mod entries;
 mod graph;
 mod tombstones;
@@ -304,6 +305,21 @@ impl SyncRepo<'_> {
         }
         Self::merge_incoming_generators_in_tx(&mut tx, &req.collection_generators, &ctx).await?;
 
+        let board_id_remap = if req.boards.is_empty() {
+            HashMap::new()
+        } else {
+            Self::merge_incoming_boards_in_tx(tx.conn(), &req.boards, &ctx).await?
+        };
+        if !req.board_item_states.is_empty() {
+            Self::merge_incoming_board_item_states_in_tx(
+                tx.conn(),
+                &req.board_item_states,
+                &board_id_remap,
+                &ctx,
+            )
+            .await?;
+        }
+
         let server_hlc = tx.next_hlc_at(now_ms).await?;
         tx.commit().await?;
 
@@ -405,6 +421,19 @@ async fn witness_request_hlcs(
     for tomb in &req.tombstones {
         if !tomb.hlc.is_empty() {
             tx.witness_hlc(&tomb.hlc, now_ms).await?;
+        }
+    }
+    for board in &req.boards {
+        if !board.hlc.is_empty() {
+            tx.witness_hlc(&board.hlc, now_ms).await?;
+        }
+        if !board.snapshot_hlc.is_empty() {
+            tx.witness_hlc(&board.snapshot_hlc, now_ms).await?;
+        }
+    }
+    for st in &req.board_item_states {
+        if !st.hlc.is_empty() {
+            tx.witness_hlc(&st.hlc, now_ms).await?;
         }
     }
     Ok(())

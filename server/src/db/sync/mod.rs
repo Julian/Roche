@@ -25,9 +25,9 @@ pub use hrw::{
 pub use models::{
     InsertedItemCandidate, MAX_PEER_SYNC_PAGE_BYTES, MAX_PEER_SYNC_PAGE_CHANGES,
     MAX_SYNC_INLINE_HTML_BYTES, PeerSyncRequest, PeerSyncResponse, PreparedSyncEntry,
-    SyncCollectionEntryRecord, SyncCollectionGeneratorRecord, SyncCollectionSpec,
-    SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord,
-    SyncEntryState, SyncFeedSource,
+    SyncBoardItemRecord, SyncBoardItemStateRecord, SyncBoardRecord, SyncCollectionEntryRecord,
+    SyncCollectionGeneratorRecord, SyncCollectionSpec, SyncComparisonRecord,
+    SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord, SyncEntryState, SyncFeedSource,
 };
 #[allow(unused_imports)]
 pub use roche_core::{
@@ -37,9 +37,9 @@ pub use roche_core::{
     },
     identity::{
         self, STARRED_COLLECTION_ID, UP_NEXT_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID,
-        WANT_TO_READ_SLUG, WANT_TO_READ_TITLE, canonical_ordering_json, canonicalize_sync_url,
-        collection_entry_natural_key, deterministic_auto_consumption_log_id,
-        deterministic_catalog_entry_id, deterministic_comparison_id,
+        WANT_TO_READ_SLUG, WANT_TO_READ_TITLE, board_natural_key, canonical_ordering_json,
+        canonicalize_sync_url, collection_entry_natural_key, deterministic_auto_consumption_log_id,
+        deterministic_board_id, deterministic_catalog_entry_id, deterministic_comparison_id,
         deterministic_consumption_log_id, deterministic_enclosure_media_id,
         deterministic_entity_uuid, deterministic_feed_id, deterministic_item_id,
         deterministic_system_collection_id, deterministic_tag_id, deterministic_title_entry_id,

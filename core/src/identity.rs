@@ -50,6 +50,20 @@ pub fn deterministic_feed_id(url: &str) -> String {
 }
 
 #[must_use]
+pub fn board_natural_key(adapter_type: &str, source_key: &str) -> String {
+    format!(
+        "{}\0{}",
+        adapter_type.trim().to_ascii_lowercase(),
+        source_key.trim().to_ascii_lowercase()
+    )
+}
+
+#[must_use]
+pub fn deterministic_board_id(adapter_type: &str, source_key: &str) -> String {
+    deterministic_entity_uuid("board", &board_natural_key(adapter_type, source_key))
+}
+
+#[must_use]
 pub fn deterministic_item_id(feed_url: Option<&str>, item_url: &str) -> String {
     deterministic_entity_uuid("item", &item_natural_key(feed_url, item_url))
 }

@@ -3,6 +3,7 @@
 package com.grayvines.roche.data
 
 import com.grayvines.roche.core.deterministicItemId
+import com.grayvines.roche.core.extractDiscussionsForEntry
 import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.core.nowUtcIso
 import com.grayvines.roche.data.catalog.EntryKind
@@ -177,6 +178,7 @@ internal fun toInboxEntry(entity: InboxItemRow, tags: List<String>): InboxEntry 
         inFeedInbox = entity.feedId != null && !entity.inboxState.equals("none", ignoreCase = true),
         entryKind = EntryKind.fromWireValue(entity.entryKind),
         isFinished = entity.isFinished,
+        discussions = extractDiscussionsForEntry(entity.metadataJson, entity.hackerNewsId),
     )
 
 internal fun createSavedItemEntity(

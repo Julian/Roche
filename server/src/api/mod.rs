@@ -1,4 +1,5 @@
 mod auth;
+mod boards;
 mod catalog;
 mod error;
 mod feeds;
@@ -124,6 +125,7 @@ impl ApiRoutes {
                 // Sync
                 .route("/api/v1/sync/status", get(sync::sync_status))
                 .route("/api/v1/sync/changes", get(sync::sync_changes))
+                .merge(Self::board_routes())
                 .merge(Self::catalog_routes()),
             API_STANDARD_BODY_LIMIT,
         )
@@ -163,6 +165,37 @@ impl ApiRoutes {
             .layer(TraceLayer::new_for_http())
             .layer(compression)
             .with_state(service)
+    }
+
+    fn board_routes() -> Router<Arc<RocheService>> {
+        Router::new()
+            .route("/api/v1/boards", get(boards::boards_list).post(boards::boards_create))
+            .route("/api/v1/boards/refresh-all", post(boards::boards_refresh_all))
+            .route(
+                "/api/v1/boards/{id}",
+                get(boards::boards_get).patch(boards::boards_update).delete(boards::boards_delete),
+            )
+            .route("/api/v1/boards/{id}/archive", post(boards::boards_archive))
+            .route("/api/v1/boards/{id}/unarchive", post(boards::boards_unarchive))
+            .route("/api/v1/boards/{id}/refresh", post(boards::boards_refresh))
+            .route("/api/v1/boards/{id}/items", get(boards::boards_items))
+            .route(
+                "/api/v1/boards/{id}/items/{external_id}/reader",
+                get(boards::boards_item_reader),
+            )
+            .route("/api/v1/boards/{id}/items/{external_id}/seen", post(boards::boards_item_seen))
+            .route(
+                "/api/v1/boards/{id}/items/{external_id}/dismiss",
+                post(boards::boards_item_dismiss),
+            )
+            .route(
+                "/api/v1/boards/{id}/items/{external_id}/undismiss",
+                post(boards::boards_item_undismiss),
+            )
+            .route(
+                "/api/v1/boards/{id}/items/{external_id}/promote",
+                post(boards::boards_item_promote),
+            )
     }
 
     fn catalog_routes() -> Router<Arc<RocheService>> {
@@ -267,13 +300,16 @@ impl ApiRoutes {
             "/api/v1/sync/peer"
                 | "/api/v1/catalog/batch"
                 | "/api/v1/import/opml"
+                | "/api/v1/boards/refresh-all"
                 | "/web/feeds/opml"
                 | "/web/feeds/refresh-all"
+                | "/web/boards/refresh-all"
                 | "/api/v1/export/data"
                 | "/api/v1/export/feeds"
                 | "/web/feeds/export.opml"
         ) || path.ends_with("/refresh")
             || path.ends_with("/enrich")
+            || (path.starts_with("/api/v1/boards/") && path.ends_with("/reader"))
         {
             return Some(LONG_REQUEST_TIMEOUT);
         }

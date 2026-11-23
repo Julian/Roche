@@ -21,8 +21,10 @@ import com.grayvines.roche.core.deterministicComparisonId
 import com.grayvines.roche.core.deterministicConsumptionLogId
 import com.grayvines.roche.core.earlierIsoTimestamp
 import com.grayvines.roche.core.itemNaturalKey
+import com.grayvines.roche.core.mergeEntryMetadataJson
 import com.grayvines.roche.core.newerIsoTimestamp
 import com.grayvines.roche.core.parseIsoInstant
+import com.grayvines.roche.core.parseMetadataJsonObject
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.CollectionRole
 import com.grayvines.roche.data.catalog.ConsumptionStatus
@@ -997,7 +999,12 @@ private suspend fun backfillCanonicalEntryOnFold(
             releaseYear = canon.releaseYear ?: dup.releaseYear,
             summary = firstNonBlank(canon.summary, dup.summary),
             thumbnailUrl = firstNonBlank(canon.thumbnailUrl, dup.thumbnailUrl),
-            metadataJson = pickNonEmptyJson(canon.metadataJson, dup.metadataJson, "{}"),
+            metadataJson =
+                mergeEntryMetadataJson(
+                    existingJson = canon.metadataJson,
+                    incomingMeta = parseMetadataJsonObject(dup.metadataJson),
+                    incomingWins = false,
+                ),
             updatedAt = nowIso,
         )
     if (updated != canon) {

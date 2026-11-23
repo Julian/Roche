@@ -1,4 +1,5 @@
 mod auth;
+mod boards;
 mod catalog;
 pub mod enrich;
 mod error;
@@ -24,6 +25,10 @@ use tokio::sync::Semaphore;
 
 pub use self::{
     auth::WEB_SESSION_MAX_AGE_SECS,
+    boards::{
+        BoardDismissOutcome, BoardItemsPage, BoardPromoteResult, BoardReaderCache, BoardReaderView,
+        BoardService, CreateBoardInput,
+    },
     catalog::{
         CatalogService, ClusterSelectFilter, EntryListAppearance, EpScoreCache, PrioritizedCluster,
         RankedCollectionFilter, RankedCollectionView, RankedEntryRow,
@@ -34,6 +39,10 @@ pub use self::{
     media::unlink_and_delete_media_rows,
     sync::{SyncChanges, SyncStatus},
 };
+// Re-exported for Web UI board reader fallback card rendering.
+#[allow(unused_imports)]
+pub use self::boards::BoardReaderFallbackReason;
+
 use self::{
     auth::{AuthService, PairingRateLimiter},
     enrich::{ArtistEnricher, EnrichService},
@@ -149,6 +158,14 @@ impl Drop for ActiveRefreshGuard {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RefreshAllSourcesOutcome {
+    pub feeds: usize,
+    pub boards: usize,
+    pub total: usize,
+}
+
 /// Application service layer coordinating repositories, domain validation, and external fetchers.
 #[derive(Debug, Clone)]
 pub struct RocheService {
@@ -161,6 +178,7 @@ pub struct RocheService {
     poll_semaphore: Arc<Semaphore>,
     active_refreshes: Arc<AtomicUsize>,
     feed_poll_locks: FeedPollLocks,
+    board_reader_cache: BoardReaderCache,
     task_tracker: TaskTracker,
     ep_cache: EpScoreCache,
     pairing_limiter: Arc<PairingRateLimiter>,
@@ -187,6 +205,7 @@ impl RocheService {
             poll_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_POLLS)),
             active_refreshes: Arc::new(AtomicUsize::new(0)),
             feed_poll_locks: FeedPollLocks::new(),
+            board_reader_cache: BoardReaderCache::new(),
             task_tracker: TaskTracker::new(),
             ep_cache: EpScoreCache::new(),
             pairing_limiter: Arc::new(PairingRateLimiter::default()),
@@ -265,6 +284,22 @@ impl RocheService {
     #[must_use]
     pub const fn feeds(&self) -> FeedService<'_> {
         FeedService { service: self }
+    }
+
+    #[must_use]
+    pub const fn boards(&self) -> BoardService<'_> {
+        BoardService { service: self }
+    }
+
+    /// Triggers background refreshes for all active feeds AND all active boards (used by global
+    /// masthead Refresh).
+    #[allow(dead_code)]
+    pub async fn refresh_all_sources_in_background(
+        &self,
+    ) -> Result<RefreshAllSourcesOutcome, AppError> {
+        let feeds = self.feeds().refresh_all_in_background().await?;
+        let boards = self.boards().refresh_all_in_background().await?;
+        Ok(RefreshAllSourcesOutcome { feeds, boards, total: feeds.saturating_add(boards) })
     }
 
     #[must_use]

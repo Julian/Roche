@@ -563,4 +563,290 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     await expect(page.locator('.diary-toolbar-pills')).toContainText('Skipped');
     await assertAccessible(page, '/diary (unified status labels)');
   });
+
+  test('boards empty onboarding, populated ranked stream, backfill/undo, reader, and dark mode pass axe WCAG AA checks', async ({
+    page,
+  }) => {
+    await page.context().addCookies(sessionCookies);
+
+    // 1. Empty Boards onboarding state passes axe WCAG 2.1/2.2 AA
+    await gotoAndAssertOk(page, baseUrl, '/boards', '/boards');
+    await expect(page.locator('.board-empty-onboarding')).toBeVisible();
+    await expect(page.locator('.board-quick-add-btn')).toHaveCount(4);
+    await assertAccessible(page, '/boards (empty onboarding)');
+
+    // 2. Seed a deterministic populated Hacker News board via authenticated peer sync API
+    //    (zero external network calls; includes Ask HN self-post, PDF fallback item, and 32 stories for backfill)
+    const apiPairCode = execFileSync(serverBin, ['--data-dir', dataDir!, 'pair'], {
+      encoding: 'utf8',
+      env: { ...process.env, ROCHE_TAILSCALE_ENABLED: 'false' },
+    }).trim();
+    const pairRes = await fetch(`${baseUrl}/api/v1/auth/pair`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_name: 'a11y-seeder', pairing_code: apiPairCode }),
+    });
+    expect(pairRes.status).toBe(200);
+    const { token } = (await pairRes.json()) as { token: string };
+
+    const snapIso = new Date(Date.now() - 5 * 60_000).toISOString();
+    const hlcMs = String(Date.now()).padStart(15, '0');
+    const snapshotItems = [
+      {
+        external_id: '40001',
+        rank: 1,
+        title: 'Ask HN: Accessible editorial web typography patterns?',
+        url: 'https://news.ycombinator.com/item?id=40001',
+        discussion_url: 'https://news.ycombinator.com/item?id=40001',
+        author: 'alice',
+        domain: null,
+        published_at: snapIso,
+        score: 245,
+        comment_count: 38,
+        summary: 'Collecting favorite print-inspired type scales, contrast rules, and reading layouts.',
+        self_text_html:
+          '<h3>Background</h3><p>Collecting favorite print-inspired type scales and contrast rules.</p><h3>Questions</h3><p>What serif stacks age best across macOS, Linux, and mobile?</p>',
+        metadata_json: '{}',
+        fetched_at: snapIso,
+      },
+      {
+        external_id: '40002',
+        rank: 2,
+        title: 'A Note on Distributed Systems Typography (PDF)',
+        url: 'https://example.org/papers/distributed-typography.pdf',
+        discussion_url: 'https://news.ycombinator.com/item?id=40002',
+        author: 'bob',
+        domain: 'example.org',
+        published_at: snapIso,
+        score: 192,
+        comment_count: 64,
+        summary: null,
+        self_text_html: null,
+        metadata_json: '{}',
+        fetched_at: snapIso,
+      },
+      ...Array.from({ length: 30 }, (_, idx) => {
+        const rank = idx + 3;
+        const extId = String(40000 + rank);
+        return {
+          external_id: extId,
+          rank,
+          title: `Ranked Engineering Story #${rank}`,
+          url: `https://stories.example.org/post-${rank}`,
+          discussion_url: `https://news.ycombinator.com/item?id=${extId}`,
+          author: 'builder',
+          domain: 'stories.example.org',
+          published_at: snapIso,
+          score: 180 - idx * 3,
+          comment_count: 10 + idx,
+          summary: null,
+          self_text_html: null,
+          metadata_json: '{}',
+          fetched_at: snapIso,
+        };
+      }),
+    ];
+
+    const syncRes = await fetch(`${baseUrl}/api/v1/sync/peer`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        peer_id: 'a11y-seeder',
+        since_seq: 0,
+        boards: [
+          {
+            id: '',
+            adapter_type: 'hacker_news',
+            source_key: 'top',
+            source_url: 'https://news.ycombinator.com/',
+            source_config_json: '{"section":"top"}',
+            title: 'Hacker News',
+            order_mode: 'ranked',
+            poll_interval: 30,
+            is_active: true,
+            last_polled_at: snapIso,
+            last_polled_by: 'a11y-seeder',
+            snapshot_fetched_at: snapIso,
+            snapshot_hlc: `${hlcMs}-0001-a11y-seeder`,
+            created_at: snapIso,
+            updated_at: snapIso,
+            hlc: `${hlcMs}-0000-a11y-seeder`,
+            snapshot_items: snapshotItems,
+          },
+        ],
+      }),
+    });
+    expect(syncRes.status).toBe(200);
+    const syncData = (await syncRes.json()) as { boards: Array<{ id: string }> };
+    const boardId = syncData.boards[0]?.id;
+    expect(boardId).toBeTruthy();
+
+    const assertNoHorizontalOverflow = async (label: string) => {
+      const { scrollWidth, clientWidth } = await page.evaluate(() => ({
+        scrollWidth: document.documentElement.scrollWidth,
+        clientWidth: document.documentElement.clientWidth,
+      }));
+      expect(
+        scrollWidth,
+        `${label}: horizontal overflow (${scrollWidth} > ${clientWidth})`
+      ).toBeLessThanOrEqual(clientWidth);
+    };
+
+    // 3. Populated /boards view passes axe WCAG AA (light & dark themes) + zero overflow + Settings popover
+    await gotoAndAssertOk(page, baseUrl, `/boards/${boardId}`, `/boards/${boardId}`);
+    await expect(page.locator('#roche-board-list .board-row')).toHaveCount(30);
+    await expect(page.locator('.board-comments-link').first()).toContainText('38 comments');
+    await assertNoHorizontalOverflow('/boards (populated)');
+    await assertAccessible(page, '/boards (populated light)');
+
+    await page.locator('.board-settings-details > summary').click();
+    await expect(page.locator('.board-settings-panel')).toBeVisible();
+    await assertNoHorizontalOverflow('/boards (settings popover open)');
+    const settingsBox = await page.locator('.board-settings-panel').boundingBox();
+    const viewportWidth = await page.evaluate(() => document.documentElement.clientWidth);
+    expect(settingsBox).toBeTruthy();
+    expect(settingsBox!.x).toBeGreaterThanOrEqual(0);
+    expect(settingsBox!.x + settingsBox!.width).toBeLessThanOrEqual(viewportWidth + 1);
+    await assertAccessible(page, '/boards (settings popover open)');
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.board-settings-panel')).toBeHidden();
+
+    await page.locator('#roche-theme-toggle').click();
+    await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+    await expect(page.locator('nav.primary-nav a.is-active')).toHaveCSS(
+      'color',
+      'rgb(229, 112, 104)'
+    );
+    await expect(page.locator('.board-comments-link').first()).toHaveCSS(
+      'color',
+      'rgb(230, 157, 103)'
+    );
+    await expect(page.locator('.board-comments-link').first()).toHaveCSS(
+      'background-color',
+      'rgb(33, 29, 24)'
+    );
+    await page.evaluate(() =>
+      Promise.all(
+        document
+          .getAnimations()
+          .filter((a) => a instanceof CSSTransition)
+          .map((a) => a.finished.catch(() => undefined))
+      )
+    );
+    await assertAccessible(page, '/boards (populated dark)');
+    await page.locator('#roche-theme-toggle').click();
+    await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+    await expect(page.locator('nav.primary-nav a.is-active')).toHaveCSS(
+      'color',
+      'rgb(143, 29, 24)'
+    );
+    await expect(page.locator('.board-comments-link').first()).toHaveCSS(
+      'color',
+      'rgb(124, 53, 18)'
+    );
+    await page.evaluate(() =>
+      Promise.all(
+        document
+          .getAnimations()
+          .filter((a) => a instanceof CSSTransition)
+          .map((a) => a.finished.catch(() => undefined))
+      )
+    );
+
+    // 4. Instant dismiss + backfill of #31 + Undo, then concurrent double-dismiss backfilling #31 & #32
+    const thirdRow = page.locator('#roche-board-list .board-row[data-external-id="40003"]');
+    const fourthRow = page.locator('#roche-board-list .board-row[data-external-id="40004"]');
+    await thirdRow.locator('form[data-triage-kind="board-dismiss"] button[type="submit"]').click();
+    await expect(thirdRow).toBeHidden();
+    await expect(
+      page.locator('#roche-board-list .board-row[data-external-id="40031"]')
+    ).toBeVisible();
+    const undoBtn = page.locator('#roche-toast-region .roche-toast-undo');
+    await expect(undoBtn).toBeVisible();
+    await undoBtn.click();
+    await expect(thirdRow).toBeVisible();
+    await expect(
+      page.locator('#roche-board-list .board-row[data-external-id="40031"]')
+    ).toHaveCount(0);
+
+    // Trigger two simultaneous dismisses in the same tick to exercise pendingBackfills tracking
+    await page.evaluate(() => {
+      const f3 = document.querySelector(
+        '#roche-board-list .board-row[data-external-id="40003"] form[data-triage-kind="board-dismiss"]'
+      ) as HTMLFormElement | null;
+      const f4 = document.querySelector(
+        '#roche-board-list .board-row[data-external-id="40004"] form[data-triage-kind="board-dismiss"]'
+      ) as HTMLFormElement | null;
+      f3?.requestSubmit();
+      f4?.requestSubmit();
+    });
+    await expect(thirdRow).toBeHidden();
+    await expect(fourthRow).toBeHidden();
+    await expect(
+      page.locator('#roche-board-list .board-row[data-external-id="40031"]')
+    ).toBeVisible();
+    await expect(
+      page.locator('#roche-board-list .board-row[data-external-id="40032"]')
+    ).toBeVisible();
+    await expect(page.locator('#roche-board-list .board-row:not([hidden])')).toHaveCount(30);
+    await expect(undoBtn).toBeVisible();
+    await undoBtn.click();
+    await expect(page.locator('#roche-board-list .board-row:not([hidden])')).toHaveCount(30);
+
+    // 5. Optimistic Star & + Queue toggles pass axe WCAG AA
+    const firstRow = page.locator('#roche-board-list .board-row[data-external-id="40001"]');
+    await firstRow.locator('.inbox-star-btn').click();
+    await expect(firstRow.locator('.inbox-star-btn')).toHaveAttribute('aria-pressed', 'true');
+    await firstRow.locator('form[data-triage-kind="board-queue"] button[type="submit"]').click();
+    await expect(firstRow.locator('form[data-triage-kind="unqueue"] button[type="submit"]')).toContainText(
+      'In Queue'
+    );
+    await assertAccessible(page, '/boards (after star & queue)');
+
+    // 6. Dismissed view passes axe WCAG AA & restoring last item reveals empty state cleanly
+    await gotoAndAssertOk(
+      page,
+      baseUrl,
+      `/boards/${boardId}?view=dismissed`,
+      `/boards/${boardId}`
+    );
+    await assertAccessible(page, '/boards (dismissed view)');
+    const restoreBtn = page
+      .locator('#roche-board-list form[data-triage-kind="board-restore"] button[type="submit"]')
+      .first();
+    await expect(restoreBtn).toBeVisible();
+    await restoreBtn.click();
+    await expect(page.locator('#roche-board-dismissed-empty')).toBeVisible();
+    await assertAccessible(page, '/boards (dismissed empty after restore)');
+
+    // 7. On-demand Board Reader: Ask HN prose view + tailored PDF fallback card pass axe WCAG AA
+    await gotoAndAssertOk(
+      page,
+      baseUrl,
+      `/boards/${boardId}/read/40001`,
+      `/boards/${boardId}/read/40001`
+    );
+    await expect(page.locator('.reader-prose')).toContainText('print-inspired type scales');
+    await expect(page.locator('.reader-discussion-link')).toContainText('Hacker News (38 comments)');
+    await assertAccessible(page, '/boards/{id}/read/40001 (Ask HN prose)');
+
+    await gotoAndAssertOk(
+      page,
+      baseUrl,
+      `/boards/${boardId}/read/40002`,
+      `/boards/${boardId}/read/40002`
+    );
+    await expect(page.locator('.board-reader-fallback')).toBeVisible();
+    await expect(page.locator('.board-reader-fallback')).toContainText('PDF document');
+    await expect(page.locator('.board-reader-fallback')).toContainText('Open PDF');
+    await expect(page.locator('.board-reader-fallback')).toContainText(
+      'Open Hacker News Discussion (64 comments)'
+    );
+    await expect(page.locator('.js-font-dec')).toHaveCount(0);
+    await expect(page.locator('.js-font-inc')).toHaveCount(0);
+    await assertAccessible(page, '/boards/{id}/read/40002 (PDF fallback card)');
+  });
 });

@@ -18,6 +18,8 @@ sealed interface RocheNavKey : NavKey {
 
     @Serializable data class Reader(val entryId: String) : RocheNavKey
 
+    @Serializable data class BoardReader(val boardId: String, val externalId: String) : RocheNavKey
+
     @Serializable data class FullscreenPlayer(val entryId: String) : RocheNavKey
 }
 
@@ -69,8 +71,25 @@ internal fun deriveRocheBackStack(
     if (state.isSearchOpen) {
         add(RocheNavKey.Search)
     }
+    addOverlayNavKeys(
+        state = state,
+        activeReaderEntryId = activeReaderEntryId,
+        activeFullscreenPlayerEntryId = activeFullscreenPlayerEntryId,
+    )
+}
+
+private fun MutableList<RocheNavKey>.addOverlayNavKeys(
+    state: MainUiState,
+    activeReaderEntryId: String?,
+    activeFullscreenPlayerEntryId: String?,
+) {
     if (activeReaderEntryId != null) {
         add(RocheNavKey.Reader(activeReaderEntryId))
+    }
+    val boardReaderBoardId = state.selectedBoardReaderBoardId
+    val boardReaderExternalId = state.selectedBoardReaderExternalId
+    if (boardReaderBoardId != null && boardReaderExternalId != null) {
+        add(RocheNavKey.BoardReader(boardReaderBoardId, boardReaderExternalId))
     }
     if (activeFullscreenPlayerEntryId != null) {
         add(RocheNavKey.FullscreenPlayer(activeFullscreenPlayerEntryId))
@@ -80,6 +99,7 @@ internal fun deriveRocheBackStack(
 internal fun popActionForTopKey(topKey: RocheNavKey): MainAction? =
     when (topKey) {
         is RocheNavKey.FullscreenPlayer -> MainAction.CloseFullscreenPlayer
+        is RocheNavKey.BoardReader -> MainAction.CloseBoardReader
         is RocheNavKey.Reader -> MainAction.CloseReader
         RocheNavKey.Search -> MainAction.CloseSearch
         is RocheNavKey.ScopedInbox -> MainAction.NavigateBackFromScope

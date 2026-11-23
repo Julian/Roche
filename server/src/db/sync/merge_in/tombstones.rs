@@ -50,6 +50,16 @@ impl SyncRepo<'_> {
                     Self::apply_feed_tombstone_in_tx(tx, key, safe_deleted_at, &tomb_hlc, ctx.now)
                         .await?;
                 }
+                ActivityEntityType::Board => {
+                    Self::apply_board_tombstone_in_tx(
+                        tx.conn(),
+                        key,
+                        safe_deleted_at,
+                        &tomb_hlc,
+                        ctx.now,
+                    )
+                    .await?;
+                }
                 ActivityEntityType::Item => {
                     Self::apply_item_tombstone_in_tx(tx, key, safe_deleted_at, &tomb_hlc, ctx.now)
                         .await?;
@@ -138,6 +148,7 @@ impl SyncRepo<'_> {
                         .await?;
                 }
                 ActivityEntityType::Feed
+                | ActivityEntityType::Board
                 | ActivityEntityType::Item
                 | ActivityEntityType::Tag
                 | ActivityEntityType::Entry

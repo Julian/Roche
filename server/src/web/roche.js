@@ -86,17 +86,32 @@
   let syncPlayButtonsFn = null;
   let isAudioActiveForItemFn = null;
   let navigateViaPjaxFn = null;
+  let applyBoardFilterFn = null;
 
-  const markReaderUiFinished = (itemId, toastLabel = "Marked finished") => {
-    const root = document.querySelector(".js-reader-root[data-item-id]");
+  const markReaderUiFinished = (itemId, toastLabel = "Marked finished", opts = {}) => {
+    const root = document.querySelector(".js-reader-root");
+    const isBoardReader = Boolean(
+      opts.isBoardReader ?? (root?.getAttribute("data-board-reader") === "1")
+    );
     if (root && root.getAttribute("data-item-id") === itemId) {
       root.setAttribute("data-finished", "1");
       root.setAttribute("data-dismissed", "0");
       const finishForm = root.querySelector(".js-finish-toggle-form");
       const finishBtn = root.querySelector(".js-finish-toggle-btn");
       if (finishForm && finishBtn) {
-        const unfinishAction = finishForm.getAttribute("data-unfinish-action");
-        if (unfinishAction) finishForm.setAttribute("action", unfinishAction);
+        const unfinishAction =
+          finishForm.getAttribute("data-unfinish-action") ||
+          `/web/items/${encodeURIComponent(itemId)}/unfinish`;
+        finishForm.setAttribute("data-unfinish-action", unfinishAction);
+        finishForm.setAttribute("action", unfinishAction);
+        finishForm.querySelector('input[name="action"]')?.remove();
+        if (isBoardReader && !finishForm.querySelector('input[name="requeue"]')) {
+          const reqInput = document.createElement("input");
+          reqInput.type = "hidden";
+          reqInput.name = "requeue";
+          reqInput.value = "0";
+          finishForm.appendChild(reqInput);
+        }
         finishForm.setAttribute(
           "data-confirm",
           "Undo Finished and remove this item from your Diary?"
@@ -106,6 +121,88 @@
         finishBtn.setAttribute("aria-pressed", "true");
         finishBtn.setAttribute("title", "Marked finished — click to undo");
         finishBtn.textContent = "✓ Finished";
+      }
+      if (isBoardReader) {
+        const layout = root.closest(".reader-layout") || document;
+        root.querySelector(".reader-end-rank-btn")?.closest("form")?.remove();
+        if (opts.rankHref) {
+          const endPrimary = root.querySelector(".reader-end-primary");
+          if (endPrimary && !endPrimary.querySelector('a[href*="/rank/"]')) {
+            const cmp = document.createElement("a");
+            cmp.className = "btn btn-small btn-ghost js-auto-finish-compare";
+            cmp.href = opts.rankHref;
+            cmp.textContent = "Compare →";
+            endPrimary.appendChild(cmp);
+          }
+          const railLinks = layout.querySelector(".js-reader-rail-links");
+          if (railLinks && !railLinks.querySelector(".js-reader-compare-link")) {
+            if (railLinks.querySelector("a")) {
+              railLinks.appendChild(document.createElement("br"));
+            }
+            const railCmp = document.createElement("a");
+            railCmp.className = "reader-rail-link js-reader-compare-link js-auto-finish-compare";
+            railCmp.href = opts.rankHref;
+            railCmp.textContent = "Compare →";
+            railLinks.appendChild(railCmp);
+          }
+          const mobileLinks = layout.querySelector(".js-reader-mobile-links");
+          if (mobileLinks && !mobileLinks.querySelector(".js-reader-compare-link")) {
+            const mobCmp = document.createElement("a");
+            mobCmp.className = "reader-rail-link js-reader-compare-link js-auto-finish-compare";
+            mobCmp.href = opts.rankHref;
+            mobCmp.textContent = "Compare →";
+            mobileLinks.appendChild(mobCmp);
+          }
+        }
+        if (opts.entryHref) {
+          const railLinks = layout.querySelector(".js-reader-rail-links");
+          if (railLinks && !railLinks.querySelector(".js-reader-history-link")) {
+            if (railLinks.querySelector("a")) {
+              railLinks.appendChild(document.createElement("br"));
+            }
+            const railHist = document.createElement("a");
+            railHist.className = "reader-rail-link js-reader-history-link";
+            railHist.href = opts.entryHref;
+            railHist.textContent = "History & Lists →";
+            railLinks.appendChild(railHist);
+          }
+          const mobileLinks = layout.querySelector(".js-reader-mobile-links");
+          if (mobileLinks && !mobileLinks.querySelector(".js-reader-history-link")) {
+            const mobHist = document.createElement("a");
+            mobHist.className = "reader-rail-link js-reader-history-link";
+            mobHist.href = opts.entryHref;
+            mobHist.textContent = "History & Lists →";
+            mobileLinks.appendChild(mobHist);
+          }
+        }
+        // Finishing clears Want to Read on the server; flip any Reader "In Queue" controls back to "+ Queue".
+        for (const qForm of layout.querySelectorAll(".js-reader-queue-form, .js-reader-queue-rail-form")) {
+          if (opts.queueAction) {
+            qForm.setAttribute("action", opts.queueAction);
+            qForm.querySelector('input[name="action"]')?.remove();
+            if (!qForm.querySelector('input[name="list_slug_or_id"]')) {
+              const slugIn = document.createElement("input");
+              slugIn.type = "hidden";
+              slugIn.name = "list_slug_or_id";
+              slugIn.value = WANT_TO_READ_COLLECTION_ID;
+              qForm.appendChild(slugIn);
+            }
+          }
+          const qBtn = qForm.querySelector("button[type='submit']");
+          if (!qBtn) continue;
+          if (qForm.classList.contains("js-reader-queue-form")) {
+            qBtn.classList.remove("is-in-queue");
+            qBtn.textContent = "+ Queue";
+          } else {
+            const itemTitle = qBtn.getAttribute("data-title") || "story";
+            qBtn.setAttribute("title", "Add to Queue");
+            qBtn.setAttribute("aria-label", `Add ${itemTitle} to Queue`);
+            const paths = qBtn.querySelectorAll("svg path");
+            if (paths.length >= 2) {
+              paths[1].setAttribute("d", "M8 5.2v3.6M6.2 7h3.6");
+            }
+          }
+        }
       }
       const byline = root.querySelector(".js-reader-byline");
       if (byline) {
@@ -126,6 +223,9 @@
         const csrf = getCsrfToken();
         const params = new URLSearchParams();
         params.append("_csrf", csrf);
+        if (isBoardReader) {
+          params.append("requeue", "0");
+        }
         fetch(unfinishUrl, {
           method: "POST",
           headers: {
@@ -140,7 +240,7 @@
               showToast("Could not undo Finished — please try again.", { isError: true });
               return;
             }
-            const curRoot = document.querySelector(".js-reader-root[data-item-id]");
+            const curRoot = document.querySelector(".js-reader-root");
             if (curRoot && curRoot.getAttribute("data-item-id") === itemId) {
               curRoot.setAttribute("data-finished", "0");
               curRoot.setAttribute("data-suppress-auto-finish", "1");
@@ -148,7 +248,20 @@
               const btnEl = curRoot.querySelector(".js-finish-toggle-btn");
               if (formEl && btnEl) {
                 const finishAction = formEl.getAttribute("data-finish-action");
-                if (finishAction) formEl.setAttribute("action", finishAction);
+                if (finishAction) {
+                  formEl.setAttribute("action", finishAction);
+                  if (
+                    finishAction.endsWith("/promote") &&
+                    !formEl.querySelector('input[name="action"]')
+                  ) {
+                    const actInput = document.createElement("input");
+                    actInput.type = "hidden";
+                    actInput.name = "action";
+                    actInput.value = "finish";
+                    formEl.appendChild(actInput);
+                  }
+                }
+                formEl.querySelector('input[name="requeue"]')?.remove();
                 formEl.removeAttribute("data-confirm");
                 btnEl.classList.remove("btn-small", "btn-ghost", "is-done");
                 btnEl.classList.add("btn-primary");
@@ -157,6 +270,11 @@
                 btnEl.textContent = "✓ Mark Finished";
               }
               curRoot.querySelector(".js-reader-state-badge")?.remove();
+              const curLayout = curRoot.closest(".reader-layout") || document;
+              for (const el of curLayout.querySelectorAll(".js-auto-finish-compare")) {
+                if (el.previousSibling?.nodeName === "BR") el.previousSibling.remove();
+                el.remove();
+              }
             }
             showToast("Undid Finished");
           })
@@ -848,10 +966,13 @@
       readerCleanup();
       readerCleanup = null;
     }
-    const root = document.querySelector(".js-reader-root[data-item-id]");
+    const root = document.querySelector(".js-reader-root");
     if (!root) return;
 
-    const itemId = root.getAttribute("data-item-id");
+    const isBoardReader = root.getAttribute("data-board-reader") === "1";
+    const hasReadableBody = root.getAttribute("data-has-readable-body") === "1";
+    const promoteFinishAction = root.getAttribute("data-promote-finish-action") || "";
+    const itemId = root.getAttribute("data-item-id") || "";
     const kind = root.getAttribute("data-kind") || "article";
     const cleanups = [];
 
@@ -903,8 +1024,11 @@
     }
 
     const contentType = root.getAttribute("data-content-type") || "";
+    const canTrackScroll = isBoardReader
+      ? hasReadableBody && Boolean(promoteFinishAction)
+      : (kind === "article" || kind === "paper") && contentType !== "audio" && Boolean(itemId);
 
-    if ((kind === "article" || kind === "paper") && contentType !== "audio") {
+    if (canTrackScroll) {
       let best = Number.parseFloat(root.getAttribute("data-progress") || "0") || 0;
       let lastPosted = best;
       let timer = null;
@@ -934,10 +1058,49 @@
       };
 
       const triggerAutoFinish = () => {
-        if (isSuppressedOrDone() || isAudioActiveForItemFn?.(itemId)) return;
+        if (isSuppressedOrDone() || (itemId && isAudioActiveForItemFn?.(itemId))) return;
         autoFinishSent = true;
         cancelDwellTimer();
         lastPosted = 1.0;
+        if (isBoardReader) {
+          const csrf = getCsrfToken();
+          const params = new URLSearchParams();
+          params.append("_csrf", csrf);
+          params.append("action", "finish");
+          fetch(promoteFinishAction, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              "X-Roche-Csrf": csrf,
+              "X-Roche-Ajax": "1",
+              Accept: "application/json",
+            },
+            body: params.toString(),
+            credentials: "same-origin",
+          })
+            .then((resp) => (resp.ok && !isLoginUrl(resp.url) ? resp.json() : null))
+            .then((data) => {
+              if (!data?.entry_id) {
+                autoFinishSent = false;
+                return;
+              }
+              root.setAttribute("data-item-id", data.entry_id);
+              const finishForm = root.querySelector(".js-finish-toggle-form");
+              if (finishForm && data.unfinish_action) {
+                finishForm.setAttribute("data-unfinish-action", data.unfinish_action);
+              }
+              markReaderUiFinished(data.entry_id, "Marked finished & logged to Diary", {
+                isBoardReader: true,
+                rankHref: data.rank_href || null,
+                entryHref: data.entry_href || null,
+                queueAction: data.queue_action || null,
+              });
+            })
+            .catch(() => {
+              autoFinishSent = false;
+            });
+          return;
+        }
         postProgress(itemId, 1.0, false, "reader");
         markReaderUiFinished(itemId, "Marked finished");
       };
@@ -954,7 +1117,7 @@
       };
 
       const checkProgress = () => {
-        if (isAudioActiveForItemFn?.(itemId)) return;
+        if (itemId && isAudioActiveForItemFn?.(itemId)) return;
         if (maxScrollablePixels() <= 8) return;
         const frac = measureFraction();
         if (frac > best) best = frac;
@@ -962,7 +1125,7 @@
           triggerAutoFinish();
           return;
         }
-        if (!isSuppressedOrDone() && best - lastPosted >= 0.05) {
+        if (!isBoardReader && !isSuppressedOrDone() && best - lastPosted >= 0.05) {
           lastPosted = best;
           postProgress(itemId, best, false, "reader");
         }
@@ -2045,11 +2208,16 @@
     let consecutiveErrors = 0;
     const MAX_POLL_ERRORS = 4;
 
+    const isBoardRefreshScope = () =>
+      banner.dataset.refreshScope === "board" ||
+      (window.location.pathname.startsWith("/boards/") && !window.location.pathname.includes("/read/"));
+
     const showCompletionCue = (delta, needsManualReload) => {
       if (refreshHideTimer) clearTimeout(refreshHideTimer);
       banner.classList.add("is-complete");
       banner.hidden = false;
       banner.setAttribute("data-active", "0");
+      const boardScope = isBoardRefreshScope();
       if (label) {
         label.replaceChildren();
         if (delta > 0) {
@@ -2064,13 +2232,14 @@
             label.appendChild(reloadLink);
           }
         } else {
-          label.textContent = "Up to date";
+          label.textContent = boardScope ? "Board updated" : "Up to date";
         }
       }
       if (!needsManualReload || delta === 0) {
         refreshHideTimer = setTimeout(() => {
           banner.hidden = true;
           banner.classList.remove("is-complete");
+          delete banner.dataset.refreshScope;
           if (label) label.textContent = "Refreshing feeds & metadata in background…";
         }, 3500);
       }
@@ -2105,7 +2274,9 @@
             if (label && Number.isFinite(data.active_refresh_count) && data.active_refresh_count > 1) {
               label.textContent = `Refreshing ${data.active_refresh_count} sources in background…`;
             } else if (label) {
-              label.textContent = "Refreshing feeds & metadata in background…";
+              label.textContent = isBoardRefreshScope()
+                ? "Refreshing board…"
+                : "Refreshing feeds & metadata in background…";
             }
             scheduleCheck(1500);
           } else {
@@ -2119,9 +2290,13 @@
               return;
             }
             banner.setAttribute("data-active", "0");
+            const curPath = window.location.pathname;
+            const isBoardListPath =
+              curPath === "/boards" ||
+              (curPath.startsWith("/boards/") && !curPath.includes("/read/"));
             const canAutoSwap =
               !hasDirtyFormOrOpenDetails() &&
-              ["/", "/inbox", "/feeds", "/queue"].includes(window.location.pathname);
+              (["/", "/inbox", "/feeds", "/queue"].includes(curPath) || isBoardListPath);
             if (canAutoSwap) {
               const curUrl = cleanCurrentPathSearch();
               const r = await fetch(curUrl, { credentials: "same-origin" });
@@ -2175,17 +2350,31 @@
     if (ev.defaultPrevented) return;
     const form = ev.target;
     const action = form?.getAttribute?.("action") || "";
+    const isSingleBoardRefresh =
+      action === "/web/boards/create" ||
+      (action.startsWith("/web/boards/") &&
+        action.endsWith("/refresh") &&
+        action !== "/web/boards/refresh-all");
     if (
       action.includes("/refresh") ||
       action === "/web/feeds/create" ||
       action === "/web/feeds/opml" ||
-      action === "/web/items/save"
+      action === "/web/items/save" ||
+      action === "/web/boards/create"
     ) {
       const banner = document.getElementById("roche-refresh-banner");
       if (banner) {
         if (refreshHideTimer) {
           clearTimeout(refreshHideTimer);
           refreshHideTimer = null;
+        }
+        const label = banner.querySelector(".js-refresh-label");
+        if (isSingleBoardRefresh) {
+          banner.dataset.refreshScope = "board";
+          if (label) label.textContent = "Refreshing board…";
+        } else {
+          delete banner.dataset.refreshScope;
+          if (label) label.textContent = "Refreshing feeds & metadata in background…";
         }
         banner.classList.remove("is-complete");
         banner.hidden = false;
@@ -2406,11 +2595,13 @@
           return;
         }
         if (ev.key === "/" && !isRankBoard) {
-          const inboxSearch = document.getElementById("roche-inbox-search");
-          const input = inboxSearch || document.getElementById("roche-global-search");
+          const streamSearch =
+            document.getElementById("roche-inbox-search") ||
+            document.getElementById("roche-board-search");
+          const input = streamSearch || document.getElementById("roche-global-search");
           if (!input) return;
           ev.preventDefault();
-          if (!inboxSearch) {
+          if (!streamSearch) {
             const hdr = document.getElementById("roche-masthead");
             const searchWrap = document.getElementById("roche-masthead-search");
             if (
@@ -2429,7 +2620,7 @@
 
         if (isRankBoard) return;
 
-        /* Reader shortcuts: [, ], e, s, Escape */
+        /* Reader shortcuts: [, ], d, e, s, Escape */
         const readerRoot = document.querySelector(".js-reader-root");
         if (readerRoot) {
           if (ev.key === "[") {
@@ -2440,6 +2631,14 @@
           if (ev.key === "]") {
             ev.preventDefault();
             document.querySelector(".js-font-inc")?.click();
+            return;
+          }
+          if (ev.key === "d") {
+            const discLink = document.querySelector(".js-reader-discussion-link");
+            if (discLink?.href) {
+              ev.preventDefault();
+              window.open(discLink.href, "_blank", "noopener,noreferrer");
+            }
             return;
           }
           if (ev.key === "e") {
@@ -2461,6 +2660,15 @@
             }
             return;
           }
+          if (ev.key === "q") {
+            const qForm = document.querySelector(".js-reader-queue-form");
+            if (qForm) {
+              ev.preventDefault();
+              if (typeof qForm.requestSubmit === "function") qForm.requestSubmit();
+              else qForm.submit();
+            }
+            return;
+          }
           if (ev.key === "Escape") {
             const openDetails = document.querySelector("#roche-main details[open]:not([data-default-open])");
             if (openDetails) {
@@ -2477,7 +2685,7 @@
           }
         }
 
-        /* Inbox / Starred keyboard triage: j/k, Enter/o, e, s, q */
+        /* Inbox / Boards / Starred keyboard triage: j/k, Enter/o, d, e, s, q */
         const rows = Array.from(document.querySelectorAll(".js-kbd-row")).filter((r) => !r.hidden);
         if (rows.length > 0) {
           let curIdx = rows.findIndex((r) => r.classList.contains("is-kbd-selected"));
@@ -2512,9 +2720,17 @@
             }
             return;
           }
+          if (ev.key === "d") {
+            const discLink = activeRow.querySelector(".js-kbd-discuss, .board-comments-link");
+            if (discLink?.href) {
+              ev.preventDefault();
+              window.open(discLink.href, "_blank", "noopener,noreferrer");
+            }
+            return;
+          }
           if (ev.key === "e") {
             const triageForm = activeRow.querySelector(
-              '.js-triage-form[data-triage-kind="dismiss"], .js-triage-form[data-triage-kind="mark-new"], .js-triage-form[data-triage-kind="archive"], .js-triage-form[data-triage-kind="unarchive"]'
+              '.js-triage-form[data-triage-kind="dismiss"], .js-triage-form[data-triage-kind="mark-new"], .js-triage-form[data-triage-kind="archive"], .js-triage-form[data-triage-kind="unarchive"], .js-triage-form[data-triage-kind="board-dismiss"], .js-triage-form[data-triage-kind="board-restore"]'
             );
             if (triageForm) {
               ev.preventDefault();
@@ -2541,7 +2757,7 @@
           }
           if (ev.key === "q") {
             const qForm = activeRow.querySelector(
-              '.js-triage-form[data-triage-kind="queue"], .js-triage-form[data-triage-kind="unqueue"]'
+              '.js-triage-form[data-triage-kind="queue"], .js-triage-form[data-triage-kind="unqueue"], .js-triage-form[data-triage-kind="board-queue"]'
             );
             if (qForm) {
               ev.preventDefault();
@@ -2853,6 +3069,46 @@
     };
   };
 
+  const syncBoardBadge = (row, selector, present, className, text, extraAttrs = null) => {
+    if (!row || !row.classList?.contains("board-row")) return;
+    const byline = row.querySelector(".board-byline");
+    if (!byline) return;
+    const existing = byline.querySelector(selector);
+    if (present) {
+      if (!existing) {
+        const badge = document.createElement("span");
+        badge.className = className;
+        badge.textContent = text;
+        if (extraAttrs) {
+          for (const [k, v] of Object.entries(extraAttrs)) badge.setAttribute(k, v);
+        }
+        byline.prepend(badge);
+      }
+    } else if (existing) {
+      existing.remove();
+    }
+  };
+
+  const syncBoardCounts = (boardId, visibleCount, dismissedCount) => {
+    if (Number.isFinite(visibleCount)) {
+      for (const el of document.querySelectorAll(".js-board-active-count")) {
+        el.textContent = String(Math.max(0, visibleCount));
+      }
+      if (boardId) {
+        for (const el of document.querySelectorAll(".js-board-sidebar-count")) {
+          if (el.getAttribute("data-board-id") === boardId) {
+            el.textContent = visibleCount > 0 ? String(visibleCount) : "";
+          }
+        }
+      }
+    }
+    if (Number.isFinite(dismissedCount)) {
+      for (const el of document.querySelectorAll(".js-board-dismissed-count")) {
+        el.textContent = String(Math.max(0, dismissedCount));
+      }
+    }
+  };
+
   const initOptimisticStars = () => {
     if (document.body?.dataset.starDelegationBound === "1") return;
     if (document.body) document.body.dataset.starDelegationBound = "1";
@@ -2860,6 +3116,10 @@
       const btn = ev.target?.closest?.(".inbox-star-btn, .reader-star-btn, .js-star-toggle");
       if (!btn) return;
       const form = btn.closest("form");
+      if (form?.dataset.inflight === "1") {
+        ev.preventDefault();
+        return;
+      }
       const prevStarred = btn.getAttribute("aria-pressed") === "true";
       const nextStarred = !prevStarred;
       const isReaderGroup =
@@ -2891,30 +3151,55 @@
       const action = form.getAttribute("action") || "";
       if (!action.startsWith("/web/")) return;
       ev.preventDefault();
+      form.dataset.inflight = "1";
+      const isBoardPromote = action.startsWith("/web/boards/") && action.endsWith("/promote");
       const csrf = getCsrfToken();
       const fd = new FormData(form);
       const params = new URLSearchParams();
       for (const [k, v] of fd.entries()) {
         if (typeof v === "string") params.append(k, v);
       }
+      const headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Roche-Csrf": csrf,
+      };
+      if (isBoardPromote) {
+        headers["X-Roche-Ajax"] = "1";
+        headers.Accept = "application/json";
+      }
       fetch(action, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "X-Roche-Csrf": csrf,
-        },
+        headers,
         body: params.toString(),
         credentials: "same-origin",
       })
-        .then((resp) => {
+        .then(async (resp) => {
           if (!resp.ok || isLoginUrl(resp.url)) {
             applyStarState(prevStarred);
             showToast("Could not update star — please try again.", { isError: true });
+            return;
+          }
+          if (isBoardPromote) {
+            try {
+              const data = await resp.json();
+              if (data?.star_action) {
+                for (const el of targets) {
+                  const targetForm = el.closest("form");
+                  if (targetForm) {
+                    targetForm.setAttribute("action", data.star_action);
+                    targetForm.querySelector('input[name="action"]')?.remove();
+                  }
+                }
+              }
+            } catch {}
           }
         })
         .catch(() => {
           applyStarState(prevStarred);
           showToast("Network error while updating star.", { isError: true });
+        })
+        .finally(() => {
+          delete form.dataset.inflight;
         });
     });
   };
@@ -2933,17 +3218,22 @@
       }
     };
 
-    const postSimpleWebAction = (actionUrl, extraPairs = []) => {
+    const postSimpleWebAction = (actionUrl, extraPairs = [], asJson = false) => {
       const csrf = getCsrfToken();
       const params = new URLSearchParams();
       params.append("_csrf", csrf);
       for (const [k, v] of extraPairs) params.append(k, v);
+      const headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Roche-Csrf": csrf,
+      };
+      if (asJson) {
+        headers["X-Roche-Ajax"] = "1";
+        headers.Accept = "application/json";
+      }
       return fetch(actionUrl, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "X-Roche-Csrf": csrf,
-        },
+        headers,
         body: params.toString(),
         credentials: "same-origin",
       });
@@ -2971,10 +3261,20 @@
       }
       if (btn) {
         btn.classList.toggle("is-in-queue", nowQueued);
-        btn.setAttribute("aria-label", nowQueued ? `Remove ${title} from Queue` : `Add ${title} to Queue`);
+        btn.setAttribute(
+          "aria-label",
+          nowQueued ? `In Queue — remove ${title} from Queue` : `Add ${title} to Queue`
+        );
         btn.setAttribute("title", nowQueued ? "Remove from Queue" : "Add to Queue");
         btn.textContent = nowQueued ? "✓ In Queue" : "+ Queue";
       }
+      syncBoardBadge(
+        form.closest(".board-row"),
+        ".js-board-queue-badge",
+        nowQueued,
+        "badge badge-queued js-board-queue-badge",
+        "In Queue"
+      );
     };
 
     document.addEventListener("submit", (ev) => {
@@ -2996,18 +3296,239 @@
         if (typeof v === "string") params.append(k, v);
       }
 
-      const sendRequest = () =>
-        fetch(action, {
+      const sendRequest = (asJson = false) => {
+        const headers = {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "X-Roche-Csrf": getCsrfToken(),
+        };
+        if (asJson) {
+          headers["X-Roche-Ajax"] = "1";
+          headers.Accept = "application/json";
+        }
+        return fetch(action, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Roche-Csrf": getCsrfToken(),
-          },
+          headers,
           body: params.toString(),
           credentials: "same-origin",
         });
+      };
+
+      if (kind === "board-queue") {
+        if (form.dataset.inflight === "1") return;
+        form.dataset.inflight = "1";
+        const btn = form.querySelector("button[type='submit']");
+        const setBoardQueueBtn = (queued) => {
+          if (btn) {
+            btn.classList.toggle("is-in-queue", queued);
+            btn.setAttribute(
+              "aria-label",
+              queued ? `In Queue — remove ${title} from Queue` : `Add ${title} to Queue`
+            );
+            btn.setAttribute("title", queued ? "Remove from Queue" : "Add to Queue");
+            btn.textContent = queued ? "✓ In Queue" : "+ Queue";
+          }
+          syncBoardBadge(
+            row,
+            ".js-board-queue-badge",
+            queued,
+            "badge badge-queued js-board-queue-badge",
+            "In Queue"
+          );
+        };
+        setBoardQueueBtn(true);
+        sendRequest(true)
+          .then(async (resp) => {
+            if (!resp.ok || isLoginUrl(resp.url)) {
+              setBoardQueueBtn(false);
+              showToast("Could not add to Queue — please try again.", { isError: true });
+              return;
+            }
+            let data = null;
+            try {
+              data = await resp.json();
+            } catch {}
+            if (data?.unqueue_action && data?.queue_action) {
+              form.setAttribute("action", data.unqueue_action);
+              form.setAttribute("data-undo-action", data.queue_action);
+              form.setAttribute("data-triage-kind", "unqueue");
+              form.querySelector('input[name="action"]')?.remove();
+            }
+            showToast(`Added "${title}" to Queue`, {
+              onUndo: data?.unqueue_action
+                ? () => {
+                    const revAction = form.getAttribute("action") || data.unqueue_action;
+                    setQueueFormState(form, false);
+                    postSimpleWebAction(revAction)
+                      .then((undoResp) => {
+                        if (!undoResp.ok || isLoginUrl(undoResp.url)) {
+                          setQueueFormState(form, true);
+                          showToast("Could not undo Queue change.", { isError: true });
+                        }
+                      })
+                      .catch(() => {
+                        setQueueFormState(form, true);
+                        showToast("Network error while undoing Queue change.", { isError: true });
+                      });
+                  }
+                : undefined,
+            });
+          })
+          .catch(() => {
+            setBoardQueueBtn(false);
+            showToast("Network error while updating Queue.", { isError: true });
+          })
+          .finally(() => {
+            delete form.dataset.inflight;
+          });
+        return;
+      }
+
+      if (kind === "board-dismiss" || kind === "board-restore") {
+        if (!row) {
+          form.submit();
+          return;
+        }
+        const list = document.getElementById("roche-board-list");
+        const boardId = row.getAttribute("data-board-id") || list?.getAttribute("data-board-id") || "";
+        const isDismiss = kind === "board-dismiss";
+        const isLiveRow = row.getAttribute("data-live-row") === "1";
+        const shouldBackfill = Boolean(isDismiss && list && !isLiveRow);
+        row.hidden = true;
+        row.dataset.dismissedLocal = "1";
+
+        const syncDismissedEmptyState = () => {
+          if (!list || list.getAttribute("data-view") !== "dismissed") return;
+          const emptyDismissed = document.getElementById("roche-board-dismissed-empty");
+          const remaining = list.querySelectorAll('.board-row:not([data-dismissed-local="1"])').length;
+          list.hidden = remaining === 0;
+          if (emptyDismissed) emptyDismissed.hidden = remaining > 0;
+        };
+        syncDismissedEmptyState();
+
+        let pendingReleased = !shouldBackfill;
+        const releasePending = () => {
+          if (pendingReleased) return;
+          pendingReleased = true;
+          if (list) {
+            const cur = Number.parseInt(list.dataset.pendingBackfills || "0", 10) || 0;
+            list.dataset.pendingBackfills = String(Math.max(0, cur - 1));
+          }
+        };
+
+        if (shouldBackfill) {
+          const baseOffset = Number.parseInt(list.getAttribute("data-base-offset") || "0", 10) || 0;
+          const remainingBuffered = list.querySelectorAll(
+            '.board-row:not([data-dismissed-local="1"]):not([data-live-row="1"])'
+          ).length;
+          const pendingBefore = Number.parseInt(list.dataset.pendingBackfills || "0", 10) || 0;
+          list.dataset.pendingBackfills = String(pendingBefore + 1);
+          params.set("backfill_offset", String(baseOffset + remainingBuffered + pendingBefore));
+        } else if (isDismiss && isLiveRow) {
+          params.set("skip_backfill", "1");
+        }
+
+        sendRequest(true)
+          .then(async (resp) => {
+            if (!resp.ok || isLoginUrl(resp.url)) {
+              releasePending();
+              row.hidden = false;
+              delete row.dataset.dismissedLocal;
+              syncDismissedEmptyState();
+              showToast("Action failed — please try again.", { isError: true });
+              return;
+            }
+            let data = null;
+            try {
+              data = await resp.json();
+            } catch {}
+            releasePending();
+            if (data) {
+              syncBoardCounts(boardId, data.visible_count, data.dismissed_count);
+            }
+            let backfilledRow = null;
+            let insertLoadMoreEpoch = 0;
+            if (shouldBackfill && data?.replacement_html) {
+              const repId = data.replacement_external_id || "";
+              const alreadyPresent =
+                repId &&
+                Array.from(list.querySelectorAll(".board-row")).some(
+                  (r) => r.getAttribute("data-external-id") === repId
+                );
+              if (!alreadyPresent) {
+                const tpl = document.createElement("template");
+                tpl.innerHTML = data.replacement_html.trim();
+                const newRow = tpl.content.firstElementChild;
+                if (newRow) {
+                  const firstLive = list.querySelector('.board-row[data-live-row="1"]');
+                  if (firstLive) list.insertBefore(newRow, firstLive);
+                  else list.appendChild(newRow);
+                  backfilledRow = newRow;
+                  insertLoadMoreEpoch = Number.parseInt(list.dataset.loadMoreCount || "0", 10) || 0;
+                  applyBoardFilterFn?.();
+                }
+              }
+            }
+            const verb = isDismiss ? "Dismissed" : "Restored";
+            showToast(`${verb} "${title}"`, {
+              onUndo: undoAction
+                ? () => {
+                    row.hidden = false;
+                    delete row.dataset.dismissedLocal;
+                    syncDismissedEmptyState();
+                    let removedBackfill = false;
+                    if (backfilledRow && backfilledRow.isConnected && list) {
+                      const curEpoch = Number.parseInt(list.dataset.loadMoreCount || "0", 10) || 0;
+                      const nextSib = backfilledRow.nextElementSibling;
+                      const hasBufferedAfter = Boolean(
+                        nextSib && nextSib.getAttribute("data-live-row") !== "1"
+                      );
+                      if (curEpoch === insertLoadMoreEpoch && !hasBufferedAfter) {
+                        backfilledRow.remove();
+                        removedBackfill = true;
+                      }
+                    }
+                    applyBoardFilterFn?.();
+                    postSimpleWebAction(undoAction, [], true)
+                      .then(async (undoResp) => {
+                        if (!undoResp.ok || isLoginUrl(undoResp.url)) {
+                          row.hidden = true;
+                          row.dataset.dismissedLocal = "1";
+                          syncDismissedEmptyState();
+                          if (removedBackfill && backfilledRow && list) list.appendChild(backfilledRow);
+                          showToast("Could not undo action.", { isError: true });
+                          return;
+                        }
+                        try {
+                          const undoData = await undoResp.json();
+                          syncBoardCounts(boardId, undoData.visible_count, undoData.dismissed_count);
+                        } catch {}
+                      })
+                      .catch(() => {
+                        row.hidden = true;
+                        row.dataset.dismissedLocal = "1";
+                        syncDismissedEmptyState();
+                        if (removedBackfill && backfilledRow && list) list.appendChild(backfilledRow);
+                        showToast("Network error while undoing action.", { isError: true });
+                      });
+                  }
+                : undefined,
+            });
+          })
+          .catch(() => {
+            row.hidden = false;
+            delete row.dataset.dismissedLocal;
+            syncDismissedEmptyState();
+            showToast("Network error — please try again.", { isError: true });
+          })
+          .finally(() => {
+            releasePending();
+          });
+        return;
+      }
 
       if (kind === "queue" || kind === "unqueue") {
+        if (form.dataset.inflight === "1") return;
+        form.dataset.inflight = "1";
         const becomingQueued = kind === "queue";
         setQueueFormState(form, becomingQueued);
         sendRequest()
@@ -3041,6 +3562,9 @@
           .catch(() => {
             setQueueFormState(form, !becomingQueued);
             showToast("Network error while updating Queue.", { isError: true });
+          })
+          .finally(() => {
+            delete form.dataset.inflight;
           });
         return;
       }
@@ -3411,6 +3935,156 @@
     }
   };
 
+  const initBoardWidgets = () => {
+    const list = document.getElementById("roche-board-list");
+    const input = document.getElementById("roche-board-search");
+    const emptyEl = document.getElementById("roche-board-filter-empty");
+    const clearBtn = document.querySelector(".js-board-filter-clear");
+
+    if (list && list.dataset.boardBound !== "1") {
+      list.dataset.boardBound = "1";
+      const applyFilter = () => {
+        const q = (input?.value || "").trim().toLowerCase();
+        let activeCount = 0;
+        let visibleCount = 0;
+        for (const row of list.querySelectorAll(".board-row")) {
+          if (row.dataset.dismissedLocal === "1") {
+            row.hidden = true;
+            continue;
+          }
+          activeCount += 1;
+          const hay = (row.getAttribute("data-board-search") || row.textContent || "").toLowerCase();
+          const show = !q || hay.includes(q);
+          row.hidden = !show;
+          if (show) visibleCount += 1;
+        }
+        if (emptyEl) emptyEl.hidden = !(q && activeCount > 0 && visibleCount === 0);
+      };
+      applyBoardFilterFn = applyFilter;
+
+      if (input && input.dataset.bound !== "1") {
+        input.dataset.bound = "1";
+        input.addEventListener("input", applyFilter);
+        input.addEventListener("keydown", (ev) => {
+          if (ev.key === "Escape") {
+            if (input.value) {
+              input.value = "";
+              applyFilter();
+            }
+            input.blur();
+          }
+        });
+      }
+      if (clearBtn && clearBtn.dataset.bound !== "1") {
+        clearBtn.dataset.bound = "1";
+        clearBtn.addEventListener("click", () => {
+          const clearHref = clearBtn.getAttribute("data-clear-href");
+          if (clearHref && new URLSearchParams(window.location.search).has("q")) {
+            if (navigateViaPjaxFn) navigateViaPjaxFn(clearHref);
+            else window.location.href = clearHref;
+            return;
+          }
+          if (input) input.value = "";
+          applyFilter();
+        });
+      }
+    } else if (!list) {
+      applyBoardFilterFn = null;
+    }
+
+    const loadMoreLink = document.querySelector(".js-board-load-more");
+    if (loadMoreLink && list && loadMoreLink.dataset.bound !== "1") {
+      loadMoreLink.dataset.bound = "1";
+      loadMoreLink.addEventListener("click", async (ev) => {
+        if (
+          ev.defaultPrevented ||
+          ev.button !== 0 ||
+          ev.metaKey ||
+          ev.ctrlKey ||
+          ev.shiftKey ||
+          ev.altKey
+        ) {
+          return;
+        }
+        const loadUrl = loadMoreLink.getAttribute("data-load-url");
+        if (!loadUrl) return;
+        ev.preventDefault();
+        if (loadMoreLink.dataset.loading === "1") return;
+        loadMoreLink.dataset.loading = "1";
+        const origLabel = loadMoreLink.textContent || "Load more stories";
+        loadMoreLink.textContent = "Loading…";
+        loadMoreLink.setAttribute("aria-busy", "true");
+        try {
+          const resp = await fetch(loadUrl, {
+            headers: {
+              Accept: "application/json",
+              "X-Roche-Ajax": "1",
+            },
+            credentials: "same-origin",
+          });
+          if (resp.redirected && isLoginUrl(resp.url)) {
+            window.location.href = resp.url;
+            return;
+          }
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          const data = await resp.json();
+          const existingIds = new Set(
+            Array.from(list.querySelectorAll(".board-row"))
+              .map((r) => r.getAttribute("data-external-id") || "")
+              .filter(Boolean)
+          );
+          if (data?.rows_html) {
+            const tpl = document.createElement("template");
+            tpl.innerHTML = data.rows_html;
+            const frag = document.createDocumentFragment();
+            for (const node of Array.from(tpl.content.children)) {
+              const extId = node.getAttribute?.("data-external-id") || "";
+              if (extId && existingIds.has(extId)) continue;
+              if (extId) existingIds.add(extId);
+              frag.appendChild(node);
+            }
+            list.appendChild(frag);
+            const curEpoch = Number.parseInt(list.dataset.loadMoreCount || "0", 10) || 0;
+            list.dataset.loadMoreCount = String(curEpoch + 1);
+            applyBoardFilterFn?.();
+            initFaviconFallbacks();
+          }
+          if (data?.has_more && data?.next_href && data?.next_load_url) {
+            loadMoreLink.href = data.next_href;
+            loadMoreLink.setAttribute("data-load-url", data.next_load_url);
+            loadMoreLink.textContent = data.next_label || "Load more stories";
+          } else {
+            const endNote = document.createElement("span");
+            endNote.className = "meta board-end-note";
+            endNote.textContent = "End of board";
+            loadMoreLink.replaceWith(endNote);
+          }
+        } catch {
+          loadMoreLink.textContent = origLabel;
+          showToast("Could not load more stories — please try again.", { isError: true });
+        } finally {
+          delete loadMoreLink.dataset.loading;
+          loadMoreLink.removeAttribute("aria-busy");
+        }
+      });
+    }
+
+    if (document.body && document.body.dataset.boardSettingsBound !== "1") {
+      document.body.dataset.boardSettingsBound = "1";
+      document.addEventListener("click", (ev) => {
+        for (const d of document.querySelectorAll(".board-settings-details[open]")) {
+          if (!d.contains(ev.target)) d.open = false;
+        }
+      });
+      document.addEventListener("keydown", (ev) => {
+        if (ev.key !== "Escape") return;
+        for (const d of document.querySelectorAll(".board-settings-details[open]")) {
+          d.open = false;
+        }
+      });
+    }
+  };
+
   const initPageWidgets = () => {
     scrollActiveNavIntoView();
     syncPlayButtonsFn?.();
@@ -3423,6 +4097,7 @@
     initSidebarFeedFilter();
     initMobileFeedSelect();
     initFeedsFilter();
+    initBoardWidgets();
     initListFilter();
     initListsViewToggle();
     initDiaryFilter();

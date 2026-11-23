@@ -261,6 +261,27 @@
       "raw_value": "HTTP://Feeds.Example.ORG:80/podcast.xml",
       "expected_scheme": "feed_url",
       "expected_value": "http://feeds.example.org/podcast.xml"
+    },
+    {
+      "kind": "article",
+      "scheme": "hacker-news",
+      "raw_value": "https://news.ycombinator.com/item?id=42123456",
+      "expected_scheme": "hacker_news",
+      "expected_value": "42123456"
+    },
+    {
+      "kind": "article",
+      "scheme": "hacker_news",
+      "raw_value": "  42123456  ",
+      "expected_scheme": "hacker_news",
+      "expected_value": "42123456"
+    },
+    {
+      "kind": "article",
+      "scheme": "hacker_news",
+      "raw_value": "HTTPS://NEWS.YCOMBINATOR.COM/item?id=998877&p=2",
+      "expected_scheme": "hacker_news",
+      "expected_value": "998877"
     }
   ],
   "album_edition_stripping": [
@@ -1763,6 +1784,36 @@
       "scheme": "imdb",
       "value": "javascript:alert(1)",
       "kind": "movie",
+      "expected_url": null
+    },
+    {
+      "scheme": "hacker_news",
+      "value": "42123456",
+      "kind": "article",
+      "expected_url": "https://news.ycombinator.com/item?id=42123456"
+    },
+    {
+      "scheme": "hacker_news",
+      "value": "https://news.ycombinator.com/item?id=42123456",
+      "kind": "article",
+      "expected_url": "https://news.ycombinator.com/item?id=42123456"
+    },
+    {
+      "scheme": "hacker_news",
+      "value": "http://news.ycombinator.com/item?id=42123456",
+      "kind": "article",
+      "expected_url": null
+    },
+    {
+      "scheme": "hacker_news",
+      "value": "https://evil.example/item?id=42123456",
+      "kind": "article",
+      "expected_url": null
+    },
+    {
+      "scheme": "hacker_news",
+      "value": "not-digits",
+      "kind": "article",
       "expected_url": null
     },
     {
@@ -4193,5 +4244,43 @@
         }
       ]
     }
-  }
+  },
+  "board_ids": [
+    {
+      "adapter_type": "hacker_news",
+      "source_key": "top",
+      "expected_natural_key": "hacker_news\u0000top",
+      "expected_board_id": "04c4f7a8-4795-5c04-83c2-8a2d95b25437"
+    },
+    {
+      "adapter_type": "hacker_news",
+      "source_key": "best",
+      "expected_natural_key": "hacker_news\u0000best",
+      "expected_board_id": "b0bb4e34-b689-54c6-955e-a3aacae7d416"
+    },
+    {
+      "adapter_type": "hacker_news",
+      "source_key": "ask",
+      "expected_natural_key": "hacker_news\u0000ask",
+      "expected_board_id": "0149440e-7497-575c-84ad-1b0d0e57be1d"
+    },
+    {
+      "adapter_type": "hacker_news",
+      "source_key": "show",
+      "expected_natural_key": "hacker_news\u0000show",
+      "expected_board_id": "6755c353-b7fa-55c1-8854-976bd4140086"
+    },
+    {
+      "adapter_type": "hacker_news",
+      "source_key": "new",
+      "expected_natural_key": "hacker_news\u0000new",
+      "expected_board_id": "5fb4e900-9773-52bb-8ff2-f41dcf5f315a"
+    },
+    {
+      "adapter_type": "  HACKER_NEWS ",
+      "source_key": "  TOP ",
+      "expected_natural_key": "hacker_news\u0000top",
+      "expected_board_id": "04c4f7a8-4795-5c04-83c2-8a2d95b25437"
+    }
+  ]
 }

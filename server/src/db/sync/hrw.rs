@@ -13,7 +13,41 @@ pub use roche_core::hrw::{
 use sqlx::SqliteConnection;
 
 use super::SyncRepo;
-use crate::db::Feed;
+use crate::db::{Board, Feed};
+
+impl PollableFeed for Board {
+    fn url_str(&self) -> &str {
+        self.source_url.as_str()
+    }
+
+    fn poll_interval_mins(&self) -> i64 {
+        self.poll_interval
+    }
+
+    fn is_active(&self) -> bool {
+        self.is_active
+    }
+
+    fn last_polled(&self) -> Option<DateTime<Utc>> {
+        self.last_polled_at
+    }
+
+    fn last_polled_by(&self) -> Option<&str> {
+        self.last_polled_by.as_deref()
+    }
+
+    fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    fn last_error_by(&self) -> Option<&str> {
+        self.last_error_by.as_deref()
+    }
+
+    fn consecutive_failures(&self) -> i64 {
+        self.consecutive_failures
+    }
+}
 
 impl PollableFeed for Feed {
     fn url_str(&self) -> &str {

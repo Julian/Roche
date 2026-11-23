@@ -54,12 +54,16 @@ import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.data.boards.BoardItemView
+import com.grayvines.roche.data.boards.BoardSummary
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.MusicTrackLaunchRequest
 import com.grayvines.roche.data.catalog.generatorFor
 import com.grayvines.roche.model.AppTab
+import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.ui.components.PlusIcon
 import com.grayvines.roche.ui.components.RocheBottomBar
@@ -238,6 +242,16 @@ fun MainScreen(
                                 )
                             }
 
+                            entry<RocheNavKey.BoardReader> { boardKey ->
+                                MainBoardReaderDestination(
+                                    boardKey = boardKey,
+                                    state = currentState,
+                                    onAction = currentOnAction,
+                                    onShareEntry = currentOnShareEntry,
+                                    onOpenExternalUrl = currentOnOpenExternalUrl,
+                                )
+                            }
+
                             entry<RocheNavKey.FullscreenPlayer> { playerKey ->
                                 MainPlayerDestination(
                                     playerKey = playerKey,
@@ -316,6 +330,7 @@ private val HEADER_SEARCH_TABS =
     setOf(
         AppTab.HOME,
         AppTab.INBOX,
+        AppTab.BOARDS,
         AppTab.FEEDS,
         AppTab.LISTS,
         AppTab.DIARY,
@@ -325,13 +340,16 @@ private val HEADER_SEARCH_TABS =
     )
 
 internal fun computeChromeFlags(topKey: RocheNavKey): MainChromeFlags {
-    val showChrome = topKey !is RocheNavKey.Reader && topKey !is RocheNavKey.FullscreenPlayer
+    val showChrome =
+        topKey !is RocheNavKey.Reader &&
+            topKey !is RocheNavKey.BoardReader &&
+            topKey !is RocheNavKey.FullscreenPlayer
     val topTab = (topKey as? RocheNavKey.Tab)?.tab
     val isInboxTop = topKey is RocheNavKey.ScopedInbox || topTab == AppTab.INBOX
     val hasHeaderSearch = isInboxTop || topTab in HEADER_SEARCH_TABS
     val hasFab = showChrome && topKey !is RocheNavKey.Search && topTab != AppTab.SETTINGS
     val showSearchFab = hasFab && !hasHeaderSearch
-    val showAddFab = hasFab && !isInboxTop
+    val showAddFab = hasFab && !isInboxTop && topTab != AppTab.BOARDS
     return MainChromeFlags(
         showChrome = showChrome,
         hasFab = showSearchFab || showAddFab,
@@ -375,10 +393,10 @@ internal fun MainDestinationScaffold(
             if (hasFab && (showSearchFab || showAddFab)) {
                 val addAction = resolveAddFabAction(state)
                 val addLabel =
-                    if (addAction is MainAction.OpenQuickLogSheet) {
-                        "Log or Add Entry"
-                    } else {
-                        SAVE_FAB_DEFAULT_LABEL
+                    when (addAction) {
+                        is MainAction.OpenQuickLogSheet -> "Log or Add Entry"
+                        MainAction.OpenAddBoardSheet -> "Add Board"
+                        else -> SAVE_FAB_DEFAULT_LABEL
                     }
                 FloatingOverlayButtonStack(
                     showSearchFab = showSearchFab,
@@ -680,6 +698,58 @@ internal fun MainOverlaySheets(
             onAction = onAction,
         )
     }
+
+    if (state.isAddBoardSheetOpen) {
+        AddBoardBottomSheet(
+            existingBoards = state.boards,
+            onDismiss = { onAction(MainAction.CloseAddBoardSheet) },
+            onCreateBoard = { adapterType, sectionOrUrl, title, pollInterval ->
+                onAction(
+                    MainAction.CreateBoard(
+                        adapterType = adapterType,
+                        sectionOrUrl = sectionOrUrl,
+                        title = title,
+                        pollInterval = pollInterval,
+                    )
+                )
+            },
+        )
+    }
+
+    val editBoard = state.editBoardSheetBoard
+    if (editBoard != null) {
+        EditBoardBottomSheet(
+            board = editBoard,
+            isRefreshing = editBoard.id in state.refreshingBoardIds,
+            onAction = onAction,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+    }
+
+    val boardContextTarget = state.boardContextSheetTarget
+    if (boardContextTarget != null) {
+        val liveContextItem =
+            resolveLiveBoardReaderItem(
+                state,
+                boardContextTarget.boardId,
+                boardContextTarget.externalId,
+            ) ?: boardContextTarget.item
+        val editableLists =
+            remember(state.catalog.lists) {
+                state.catalog.lists.filter(::isEditableManualUserList)
+            }
+        BoardStoryContextBottomSheet(
+            item = liveContextItem,
+            userLists = editableLists,
+            onAction = onAction,
+            onShareLink = { title, url ->
+                onShareEntry(
+                    buildShareableBoardStubEntry(boardContextTarget.externalId, title, url)
+                )
+            },
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+    }
 }
 
 @Composable
@@ -737,6 +807,90 @@ private fun MainReaderDestination(
         }
     }
 }
+
+private class BoardReaderExitCache {
+    var board: BoardSummary? = null
+    var item: BoardItemView? = null
+    var readerState: BoardReaderUiState? = null
+}
+
+@Composable
+private fun MainBoardReaderDestination(
+    boardKey: RocheNavKey.BoardReader,
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    onShareEntry: (InboxEntry) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val exitCache = remember(boardKey) { BoardReaderExitCache() }
+    val liveBoard = state.boards.firstOrNull { it.id == boardKey.boardId }
+    val liveItem = resolveLiveBoardReaderItem(state, boardKey.boardId, boardKey.externalId)
+    val liveReaderState =
+        state.boardReaderState?.takeIf {
+            it.boardId == boardKey.boardId && it.externalId == boardKey.externalId
+        }
+    if (liveBoard != null) {
+        exitCache.board = liveBoard
+    }
+    if (liveItem != null) {
+        exitCache.item = liveItem
+    }
+    if (liveReaderState != null) {
+        exitCache.readerState = liveReaderState
+    }
+    val effectiveBoard = liveBoard ?: exitCache.board
+    val effectiveItem = liveItem ?: exitCache.item
+    val effectiveReaderState =
+        liveReaderState
+            ?: exitCache.readerState
+            ?: BoardReaderUiState(
+                boardId = boardKey.boardId,
+                externalId = boardKey.externalId,
+                initialItem = effectiveItem,
+                isLoading = false,
+            )
+    CompositionLocalProvider(LocalReaderFontScale provides state.settings.readerFontScale) {
+        BoardReaderScreen(
+            board = effectiveBoard,
+            item = effectiveItem,
+            readerState = effectiveReaderState,
+            settings = state.settings,
+            onAction = onAction,
+            onShareLink = { title, url ->
+                onShareEntry(buildShareableBoardStubEntry(boardKey.externalId, title, url))
+            },
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+    }
+}
+
+private fun buildShareableBoardStubEntry(
+    externalId: String,
+    title: String,
+    url: String,
+): InboxEntry =
+    InboxEntry(
+        id = "board_share_$externalId",
+        feedId = null,
+        feedTitle = "Boards",
+        title = title,
+        url = url,
+        author = null,
+        summary = null,
+        contentText = null,
+        contentHtml = null,
+        contentType = ContentType.ARTICLE,
+        status = ItemStatus.UNREAD,
+        isFavorite = false,
+        isCachedOffline = false,
+        publishedAt = null,
+        createdAt = "",
+        readProgress = 0.0,
+        thumbnailMediaId = null,
+        duration = null,
+        tags = emptyList(),
+        inFeedInbox = false,
+    )
 
 @Composable
 private fun MainPlayerDestination(
@@ -838,6 +992,13 @@ internal fun MainTabDestinationContent(
                 onAction = onAction,
                 scrollState = scrollStates.scrollState("feeds"),
             )
+        AppTab.BOARDS ->
+            BoardsTabContent(
+                state = state,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+                listState = scrollStates.lazyListState(boardScrollKey(state)),
+            )
         AppTab.OFFLINE ->
             OfflineTabContent(
                 state = state,
@@ -873,6 +1034,7 @@ internal fun MainTabDestinationContent(
 
 internal fun resolveAddFabAction(state: MainUiState): MainAction =
     when (state.activeTab) {
+        AppTab.BOARDS -> MainAction.OpenAddBoardSheet
         AppTab.LISTS -> resolveListsFabAction(state)
         AppTab.DIARY -> MainAction.OpenQuickLogSheet(defaultToWant = false)
         AppTab.STARRED ->
@@ -954,10 +1116,14 @@ internal fun companionScrollKey(state: MainUiState): String =
         }
     }
 
+internal fun boardScrollKey(state: MainUiState): String =
+    "boards:${state.activeBoardId ?: "none"}:${state.boardStreamFilter.name}"
+
 internal fun readerBackLabel(state: MainUiState): String =
     when {
         state.isSearchOpen -> "← Search"
         state.activeTab == AppTab.HOME -> "← Home"
+        state.activeTab == AppTab.BOARDS -> "← Boards"
         state.activeTab == AppTab.QUEUE -> "← Queue"
         state.activeTab == AppTab.STARRED -> "← Stars"
         state.activeTab == AppTab.OFFLINE -> "← Offline"
@@ -1007,6 +1173,7 @@ internal class MainScrollStateHolder(
             AppTab.QUEUE -> lazyListState(queueScrollKey(state.queueSubTab)).animateScrollToItem(0)
             AppTab.STARRED -> lazyListState("starred").animateScrollToItem(0)
             AppTab.FEEDS -> scrollState("feeds").animateScrollTo(0)
+            AppTab.BOARDS -> lazyListState(boardScrollKey(state)).animateScrollToItem(0)
             AppTab.OFFLINE -> lazyListState("offline").animateScrollToItem(0)
             AppTab.LISTS -> scrollListsToTop(state)
             AppTab.DIARY -> lazyListState("diary").animateScrollToItem(0)

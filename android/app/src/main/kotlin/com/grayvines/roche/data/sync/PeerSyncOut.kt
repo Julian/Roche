@@ -26,6 +26,9 @@ import com.grayvines.roche.data.catalog.SyncEntryStateDto
 import com.grayvines.roche.data.catalog.SyncFeedSourceDto
 import com.grayvines.roche.data.catalog.decodeComparisonOrdering
 import com.grayvines.roche.data.catalog.isGeneratorEligible
+import com.grayvines.roche.data.local.BoardEntity
+import com.grayvines.roche.data.local.BoardItemEntity
+import com.grayvines.roche.data.local.BoardItemStateEntity
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
@@ -41,6 +44,9 @@ import com.grayvines.roche.data.local.entryHasCatalogHistory
 import com.grayvines.roche.data.local.isDynamic
 import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
+import com.grayvines.roche.data.remote.SyncBoardDto
+import com.grayvines.roche.data.remote.SyncBoardItemDto
+import com.grayvines.roche.data.remote.SyncBoardItemStateDto
 import com.grayvines.roche.data.remote.SyncTombstoneDto
 import kotlinx.serialization.json.JsonObject
 
@@ -49,7 +55,9 @@ internal const val MAX_PEER_SYNC_ENTRIES = 2_000
 private const val MAX_SYNC_COLLECTION_ENTRIES = 8_000
 private const val MAX_SYNC_CONSUMPTION_LOG = 8_000
 private const val MAX_SYNC_COMPARISONS = 8_000
+private const val MAX_SYNC_BOARD_ITEM_STATES = 8_000
 private const val ENTRY_JSON_BASE_BYTES = 512
+private const val BOARD_ITEM_JSON_BASE_BYTES = 256
 private const val UTF8_JSON_ESCAPE_FACTOR = 2
 
 @Suppress("LongParameterList")
@@ -66,6 +74,12 @@ internal data class PeerSyncRequestConfig(
     val maxEntries: Int = MAX_PEER_SYNC_ENTRIES,
 )
 
+internal data class SentBoardVersion(
+    val hlc: String,
+    val snapshotHlc: String,
+    val lastPolledAt: String,
+)
+
 @Suppress("LongParameterList")
 internal data class TrackedOutgoingSyncBatch(
     val request: PeerSyncRequestDto,
@@ -77,6 +91,9 @@ internal data class TrackedOutgoingSyncBatch(
     val sentLogHlcById: Map<String, String> = emptyMap(),
     val sentComparisonHlcById: Map<String, String> = emptyMap(),
     val sentTombstoneHlcByKey: Map<Pair<String, String>, String> = emptyMap(),
+    val sentBoardVersionById: Map<String, SentBoardVersion> = emptyMap(),
+    val sentBoardSnapshotHlcById: Map<String, String> = emptyMap(),
+    val sentBoardItemStateHlcByKey: Map<Pair<String, String>, String> = emptyMap(),
     val byteOverflowEntryIds: Set<String> = emptySet(),
     val countOverflowEntryIds: Set<String> = emptySet(),
 ) {
@@ -99,6 +116,9 @@ private data class OutgoingGraphSnapshot(
     val logs: List<ConsumptionLogEntity>,
     val comparisons: List<ComparisonEntity>,
     val tombstones: List<TombstoneEntity>,
+    val boards: List<BoardEntity> = emptyList(),
+    val boardItemsByBoardId: Map<String, List<BoardItemEntity>> = emptyMap(),
+    val boardItemStates: List<BoardItemStateEntity> = emptyList(),
     val clientHlc: String?,
 )
 
@@ -135,6 +155,13 @@ internal suspend fun buildTrackedPeerSyncRequest(
         )
     val allOverflowIds = part.countOverflowIds + part.byteOverflowIds + config.quarantinedEntryIds
     val filtered = filterNonOverflowSlices(resolvedSlices, allOverflowIds)
+    val boardSlice =
+        prepareOutgoingBoards(
+            snap = resolvedSnap,
+            config = config,
+            entriesUsedBytes = part.usedBytes,
+            hasEntries = part.wireEntries.isNotEmpty(),
+        )
     return assembleTrackedBatch(
         config,
         resolvedSnap,
@@ -146,6 +173,7 @@ internal suspend fun buildTrackedPeerSyncRequest(
         filtered.logs,
         filtered.comparisons,
         resolvedSlices.sentTombstones,
+        boardSlice,
         part.byteOverflowIds,
         part.countOverflowIds,
     )
@@ -266,6 +294,7 @@ private data class PartitionedOutgoingEntries(
     val wireEntries: List<SyncEntryRecordDto>,
     val countOverflowIds: Set<String>,
     val byteOverflowIds: Set<String>,
+    val usedBytes: Int,
 )
 
 private const val SQLITE_CONTENT_CHUNK_SIZE = 500
@@ -309,7 +338,16 @@ private fun partitionOutgoingEntries(
     val wireEntries = budgetEntries.map {
         toSyncEntryRecordDto(it, snap, contentsById, unsyncedFeedIds)
     }
-    return PartitionedOutgoingEntries(budgetEntries, wireEntries, countOverflowIds, byteOverflowIds)
+    val usedBytes = budgetEntries.sumOf {
+        estimateSyncEntryBytes(it, contentsById, unsyncedFeedIds)
+    }
+    return PartitionedOutgoingEntries(
+        budgetEntries,
+        wireEntries,
+        countOverflowIds,
+        byteOverflowIds,
+        usedBytes,
+    )
 }
 
 private fun selectOutgoingLogs(
@@ -371,6 +409,9 @@ private suspend fun loadFullOutgoingSnapshot(
     val logs = dao.getAllConsumptionLogs()
     val comparisons = dao.getAllComparisons()
     val tombstones = dao.getAllTombstones()
+    val boards = dao.getAllBoards()
+    val boardItemsByBoardId = dao.getAllBoardItems().groupBy { it.boardId }
+    val boardItemStates = dao.getAllBoardItemStates()
     val entryIdsInUnsyncedFeeds =
         memberships.filter { it.collectionId in unsyncedFeedIds }.mapTo(HashSet()) { it.entryId }
     val catalogRefIds =
@@ -390,6 +431,9 @@ private suspend fun loadFullOutgoingSnapshot(
         logs = logs,
         comparisons = comparisons,
         tombstones = tombstones,
+        boards = boards,
+        boardItemsByBoardId = boardItemsByBoardId,
+        boardItemStates = boardItemStates,
         clientHlc = clientHlc,
     )
 }
@@ -409,6 +453,9 @@ private suspend fun loadDeltaOutgoingSnapshot(
     val dirtyLogs = dao.getDirtyConsumptionLogs()
     val dirtyComparisons = dao.getDirtyComparisons()
     val dirtyTombstones = dao.getDirtyTombstones()
+    val dirtyBoards = dao.getDirtyBoards()
+    val boardItemsByBoardId = loadDeltaBoardItemsByBoardId(dao, dirtyBoards)
+    val dirtyBoardItemStates = dao.getDirtyBoardItemStates()
     val entryIdsInUnsyncedFeeds = loadEntryIdsInUnsyncedFeeds(dao, unsyncedFeedIds)
     val candidateEntryIds =
         collectDeltaCandidateEntryIds(
@@ -443,8 +490,23 @@ private suspend fun loadDeltaOutgoingSnapshot(
         logs = dirtyLogs,
         comparisons = dirtyComparisons,
         tombstones = dirtyTombstones,
+        boards = dirtyBoards,
+        boardItemsByBoardId = boardItemsByBoardId,
+        boardItemStates = dirtyBoardItemStates,
         clientHlc = resolveOutgoingClientHlc(dao, config.peerId),
     )
+}
+
+private suspend fun loadDeltaBoardItemsByBoardId(
+    dao: RocheDao,
+    dirtyBoards: List<BoardEntity>,
+): Map<String, List<BoardItemEntity>> {
+    val dirtySnapshotBoardIds = dirtyBoards.filter { it.isSnapshotDirty }.map { it.id }
+    if (dirtySnapshotBoardIds.isEmpty()) return emptyMap()
+    return dirtySnapshotBoardIds
+        .chunked(SQLITE_CONTENT_CHUNK_SIZE)
+        .flatMap { dao.getBoardItemsByBoardIds(it) }
+        .groupBy { it.boardId }
 }
 
 private suspend fun resolveOutgoingClientHlc(dao: RocheDao, peerId: String): String =
@@ -895,6 +957,189 @@ private fun toSyncFeedSourceDto(source: FeedSourceEntity): SyncFeedSourceDto =
         hlc = source.hlc,
     )
 
+private data class PreparedOutgoingBoards(
+    val wireBoards: List<SyncBoardDto>,
+    val wireBoardItemStates: List<SyncBoardItemStateDto>,
+    val sentBoardVersionById: Map<String, SentBoardVersion>,
+    val sentBoardSnapshotHlcById: Map<String, String>,
+    val sentBoardItemStateHlcByKey: Map<Pair<String, String>, String>,
+)
+
+private data class PreparedOutgoingWireBoards(
+    val wireBoards: List<SyncBoardDto>,
+    val sentBoardVersionById: Map<String, SentBoardVersion>,
+    val sentBoardSnapshotHlcById: Map<String, String>,
+)
+
+private fun prepareOutgoingBoards(
+    snap: OutgoingGraphSnapshot,
+    config: PeerSyncRequestConfig,
+    entriesUsedBytes: Int,
+    hasEntries: Boolean,
+): PreparedOutgoingBoards {
+    val isInitial = config.sinceSeq <= 0L
+    val wireBoards =
+        selectOutgoingWireBoards(
+            snap = snap,
+            isInitial = isInitial,
+            remainingSnapshotBudget = (config.maxPayloadBytes - entriesUsedBytes).coerceAtLeast(0),
+            hasEntries = hasEntries,
+        )
+    val (wireStates, sentStateHlcs) = selectOutgoingBoardStates(snap.boardItemStates, isInitial)
+    return PreparedOutgoingBoards(
+        wireBoards = wireBoards.wireBoards,
+        wireBoardItemStates = wireStates,
+        sentBoardVersionById = wireBoards.sentBoardVersionById,
+        sentBoardSnapshotHlcById = wireBoards.sentBoardSnapshotHlcById,
+        sentBoardItemStateHlcByKey = sentStateHlcs,
+    )
+}
+
+private fun selectOutgoingWireBoards(
+    snap: OutgoingGraphSnapshot,
+    isInitial: Boolean,
+    remainingSnapshotBudget: Int,
+    hasEntries: Boolean,
+): PreparedOutgoingWireBoards {
+    val eligibleBoards =
+        snap.boards
+            .filter { board ->
+                isSyncablePublicUrl(board.sourceUrl) &&
+                    (isInitial || board.isLocalDirty || board.isSnapshotDirty)
+            }
+            .sortedWith(
+                compareByDescending<BoardEntity> { it.isLocalDirty || it.isSnapshotDirty }
+                    .thenComparator { a, b -> compareHlc(a.hlc, b.hlc) }
+            )
+    var usedSnapshotBytes = 0
+    var attachedAnySnapshot = false
+    val wireBoards = ArrayList<SyncBoardDto>(eligibleBoards.size)
+    val sentVersions = LinkedHashMap<String, SentBoardVersion>(eligibleBoards.size)
+    val sentSnapshotHlcs = LinkedHashMap<String, String>()
+
+    for (board in eligibleBoards) {
+        val rawItems = snap.boardItemsByBoardId[board.id].orEmpty()
+        val wantsSnapshot = shouldAttachBoardSnapshot(board, rawItems, isInitial)
+        val snapshotBytes = if (wantsSnapshot) estimateBoardSnapshotBytes(rawItems) else 0
+        val fitsBudget =
+            usedSnapshotBytes + snapshotBytes <= remainingSnapshotBudget ||
+                !hasEntries && !attachedAnySnapshot
+        val wireSnapshotItems =
+            if (wantsSnapshot && fitsBudget) {
+                usedSnapshotBytes += snapshotBytes
+                attachedAnySnapshot = true
+                sentSnapshotHlcs[board.id] = board.snapshotHlc
+                rawItems.map(::toSyncBoardItemDto)
+            } else {
+                null
+            }
+        sentVersions[board.id] =
+            SentBoardVersion(
+                hlc = board.hlc,
+                snapshotHlc = board.snapshotHlc,
+                lastPolledAt = board.lastPolledAt.orEmpty(),
+            )
+        wireBoards.add(toSyncBoardDto(board, wireSnapshotItems))
+    }
+    return PreparedOutgoingWireBoards(wireBoards, sentVersions, sentSnapshotHlcs)
+}
+
+private fun shouldAttachBoardSnapshot(
+    board: BoardEntity,
+    rawItems: List<BoardItemEntity>,
+    isInitial: Boolean,
+): Boolean =
+    board.isSnapshotDirty || isInitial && (board.snapshotHlc.isNotBlank() || rawItems.isNotEmpty())
+
+private fun selectOutgoingBoardStates(
+    states: List<BoardItemStateEntity>,
+    isInitial: Boolean,
+): Pair<List<SyncBoardItemStateDto>, Map<Pair<String, String>, String>> {
+    val eligibleStates =
+        states
+            .filter { isInitial || it.isLocalDirty }
+            .sortedWith(
+                compareByDescending<BoardItemStateEntity> { it.isLocalDirty }
+                    .thenComparator { a, b -> compareHlc(a.hlc, b.hlc) }
+            )
+            .take(MAX_SYNC_BOARD_ITEM_STATES)
+    val wireStates = eligibleStates.map(::toSyncBoardItemStateDto)
+    val sentStateHlcs = eligibleStates.associate { state ->
+        Pair(state.boardId, state.externalId) to state.hlc
+    }
+    return wireStates to sentStateHlcs
+}
+
+private fun estimateBoardSnapshotBytes(items: List<BoardItemEntity>): Int = items.sumOf { item ->
+    val chars =
+        item.externalId.length +
+            item.title.length +
+            item.url.length +
+            (item.discussionUrl?.length ?: 0) +
+            (item.author?.length ?: 0) +
+            (item.summary?.length ?: 0) +
+            (item.selfTextHtml?.length ?: 0) +
+            item.metadataJson.length
+    BOARD_ITEM_JSON_BASE_BYTES + chars * UTF8_JSON_ESCAPE_FACTOR
+}
+
+private fun toSyncBoardItemDto(item: BoardItemEntity): SyncBoardItemDto =
+    SyncBoardItemDto(
+        externalId = item.externalId,
+        rank = item.rank,
+        title = item.title,
+        url = item.url,
+        discussionUrl = item.discussionUrl,
+        author = item.author,
+        domain = item.domain,
+        publishedAt = item.publishedAt,
+        score = item.score,
+        commentCount = item.commentCount,
+        summary = item.summary,
+        selfTextHtml = item.selfTextHtml,
+        metadataJson = item.metadataJson.ifBlank { "{}" },
+        fetchedAt = item.fetchedAt,
+    )
+
+private fun toSyncBoardDto(
+    board: BoardEntity,
+    snapshotItems: List<SyncBoardItemDto>?,
+): SyncBoardDto =
+    SyncBoardDto(
+        id = board.id,
+        adapterType = board.adapterType,
+        sourceKey = board.sourceKey,
+        sourceUrl = board.sourceUrl,
+        sourceConfigJson = board.sourceConfigJson.ifBlank { "{}" },
+        title = board.title,
+        orderMode = board.orderMode,
+        pollInterval = board.pollInterval,
+        isActive = board.isActive,
+        lastPolledAt = board.lastPolledAt,
+        lastPolledBy = board.lastPolledBy,
+        lastError = board.lastError,
+        lastErrorBy = board.lastErrorBy,
+        consecutiveFailures =
+            normalizeConsecutiveFailures(board.lastError, board.consecutiveFailures),
+        snapshotFetchedAt = board.snapshotFetchedAt,
+        snapshotHlc = board.snapshotHlc,
+        createdAt = board.createdAt,
+        updatedAt = board.updatedAt,
+        hlc = board.hlc,
+        snapshotItems = snapshotItems,
+    )
+
+private fun toSyncBoardItemStateDto(state: BoardItemStateEntity): SyncBoardItemStateDto =
+    SyncBoardItemStateDto(
+        boardId = state.boardId,
+        externalId = state.externalId,
+        seenAt = state.seenAt,
+        dismissedAt = state.dismissedAt,
+        lastSeenInSnapshotAt = state.lastSeenInSnapshotAt,
+        updatedAt = state.updatedAt,
+        hlc = state.hlc,
+    )
+
 @Suppress("LongParameterList")
 private fun assembleTrackedBatch(
     config: PeerSyncRequestConfig,
@@ -907,6 +1152,7 @@ private fun assembleTrackedBatch(
     sentLogs: List<ConsumptionLogEntity>,
     sentComparisons: List<ComparisonEntity>,
     sentTombstones: List<TombstoneEntity>,
+    boardSlice: PreparedOutgoingBoards,
     byteOverflowIds: Set<String>,
     countOverflowIds: Set<String>,
 ): TrackedOutgoingSyncBatch {
@@ -926,6 +1172,8 @@ private fun assembleTrackedBatch(
             consumptionLog = toWireConsumptionLogDtos(sentLogs),
             comparisons = toWireComparisonDtos(sentComparisons),
             tombstones = toWireTombstoneDtos(sentTombstones),
+            boards = boardSlice.wireBoards,
+            boardItemStates = boardSlice.wireBoardItemStates,
         )
     val wireStateIds = wireEntries.filter { it.state != null }.mapTo(HashSet()) { it.id }
     return TrackedOutgoingSyncBatch(
@@ -948,6 +1196,9 @@ private fun assembleTrackedBatch(
         sentComparisonHlcById = sentComparisons.associate { it.id to it.hlc },
         sentTombstoneHlcByKey =
             sentTombstones.associate { Pair(it.entityType, it.naturalKey) to it.hlc },
+        sentBoardVersionById = boardSlice.sentBoardVersionById,
+        sentBoardSnapshotHlcById = boardSlice.sentBoardSnapshotHlcById,
+        sentBoardItemStateHlcByKey = boardSlice.sentBoardItemStateHlcByKey,
         byteOverflowEntryIds = byteOverflowIds,
         countOverflowEntryIds = countOverflowIds,
     )

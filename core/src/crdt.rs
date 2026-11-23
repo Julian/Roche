@@ -3,8 +3,9 @@ use std::{cmp::Ordering, collections::HashSet};
 use chrono::{DateTime, SubsecRound, Utc};
 
 use crate::{
+    boards::merge_discussions_json_arrays,
     domain::{EntryKind, InboxState},
-    hlc::clamp_incoming_timestamp_opt,
+    hlc::{clamp_incoming_timestamp, clamp_incoming_timestamp_opt},
     identity_norm::strip_album_edition_suffix,
 };
 
@@ -143,8 +144,67 @@ pub fn compute_merged_entry_title(
     }
 }
 
+/// Pure value representation of a board item's user interaction state for CRDT merging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardItemStateSnapshot {
+    pub seen_at: Option<DateTime<Utc>>,
+    pub dismissed_at: Option<DateTime<Utc>>,
+    pub last_seen_in_snapshot_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub hlc: String,
+}
+
+/// Pure CRDT LWW + equal-HLC commutative join for `board_item_states`.
+///
+/// - `last_seen_in_snapshot_at` is always monotonic `max(existing, clamped_incoming)`.
+/// - When `incoming.hlc > existing.hlc`: incoming wins (`seen_at`, `dismissed_at`, `updated_at`,
+///   `hlc`).
+/// - When `incoming.hlc == existing.hlc`: commutative join (`max(seen_at)`, `max(dismissed_at)`,
+///   `max(updated_at)`).
+/// - When `incoming.hlc < existing.hlc`: existing wins (`seen_at`, `dismissed_at`, `updated_at`,
+///   `hlc`).
+#[must_use]
+pub fn resolve_merged_board_item_state(
+    existing: &BoardItemStateSnapshot,
+    incoming: &BoardItemStateSnapshot,
+    now: DateTime<Utc>,
+) -> BoardItemStateSnapshot {
+    let inc_seen = clamp_incoming_timestamp_opt(incoming.seen_at, now);
+    let inc_dismissed = clamp_incoming_timestamp_opt(incoming.dismissed_at, now);
+    let inc_last_seen = clamp_incoming_timestamp(incoming.last_seen_in_snapshot_at, now);
+    let inc_updated = clamp_incoming_timestamp(incoming.updated_at, now);
+    let last_seen_in_snapshot_at = existing.last_seen_in_snapshot_at.max(inc_last_seen);
+
+    match incoming.hlc.as_str().cmp(existing.hlc.as_str()) {
+        Ordering::Greater => BoardItemStateSnapshot {
+            seen_at: inc_seen,
+            dismissed_at: inc_dismissed,
+            last_seen_in_snapshot_at,
+            updated_at: inc_updated,
+            hlc: incoming.hlc.clone(),
+        },
+        Ordering::Equal => BoardItemStateSnapshot {
+            seen_at: existing.seen_at.max(inc_seen),
+            dismissed_at: existing.dismissed_at.max(inc_dismissed),
+            last_seen_in_snapshot_at,
+            updated_at: existing.updated_at.max(inc_updated),
+            hlc: existing.hlc.clone(),
+        },
+        Ordering::Less => BoardItemStateSnapshot {
+            seen_at: existing.seen_at,
+            dismissed_at: existing.dismissed_at,
+            last_seen_in_snapshot_at,
+            updated_at: existing.updated_at,
+            hlc: existing.hlc.clone(),
+        },
+    }
+}
+
 /// Merges incoming JSON metadata object keys into `existing_json`, overwriting existing keys only
 /// when `inc_newer` is true and backfilling missing keys regardless.
+///
+/// The `"discussions"` array performs a grow-only deduplicated set-union by canonicalized `url`
+/// regardless of `inc_newer`, preserving existing order and enriching blank fields from incoming.
 #[must_use]
 pub fn merge_entry_metadata_json(
     existing_json: &str,
@@ -159,6 +219,19 @@ pub fn merge_entry_metadata_json(
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default();
         for (k, v) in inc_map {
+            if k == "discussions"
+                && let serde_json::Value::Array(inc_arr) = v
+            {
+                let ex_arr = cur_obj
+                    .get("discussions")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(&[][..], Vec::as_slice);
+                let union = merge_discussions_json_arrays(ex_arr, inc_arr);
+                if !union.is_empty() || !cur_obj.contains_key(k) {
+                    cur_obj.insert(k.clone(), serde_json::Value::Array(union));
+                }
+                continue;
+            }
             if inc_newer || !cur_obj.contains_key(k) {
                 cur_obj.insert(k.clone(), v.clone());
             }
@@ -265,5 +338,107 @@ mod tests {
             rewrite_ordering_after_merge(&ord, "dup", "canon"),
             vec![vec!["canon".to_owned(), "other".to_owned()], vec!["third".to_owned()]]
         );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_merge_entry_metadata_json_unions_discussions_regardless_of_hlc_order() {
+        let existing = serde_json::json!({
+            "want_notes": "existing note",
+            "discussions": [
+                {
+                    "source": "hacker_news",
+                    "url": "https://news.ycombinator.com/item?id=101",
+                    "external_id": "101",
+                    "label": ""
+                }
+            ]
+        })
+        .to_string();
+        let incoming = serde_json::json!({
+            "want_notes": "older incoming note",
+            "discussions": [
+                {
+                    "source": "hacker_news",
+                    "url": "HTTPS://NEWS.YCOMBINATOR.COM:443/item?id=101",
+                    "external_id": "101",
+                    "label": "Hacker News"
+                },
+                {
+                    "source": "hacker_news",
+                    "url": "https://news.ycombinator.com/item?id=202",
+                    "external_id": "202",
+                    "label": "Hacker News"
+                }
+            ]
+        });
+
+        // Even with `inc_newer = false`, discussions perform a deduplicated set-union and enrich blank label
+        let merged_str = merge_entry_metadata_json(&existing, Some(&incoming), false);
+        let merged: serde_json::Value = serde_json::from_str(&merged_str).unwrap();
+        assert_eq!(merged["want_notes"], "existing note");
+        let discs = merged["discussions"].as_array().unwrap();
+        assert_eq!(discs.len(), 2);
+        assert_eq!(discs[0]["url"], "https://news.ycombinator.com/item?id=101");
+        assert_eq!(discs[0]["label"], "Hacker News");
+        assert_eq!(discs[1]["url"], "https://news.ycombinator.com/item?id=202");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_resolve_merged_board_item_state_lww_and_commutative_equal_hlc_join() {
+        let t1 = Utc.with_ymd_and_hms(2026, 6, 1, 10, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 6, 1, 11, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2026, 6, 1, 11, 30, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+
+        let same_hlc = "001780315200000-0001-peer-a".to_owned();
+        let a = BoardItemStateSnapshot {
+            seen_at: Some(t1),
+            dismissed_at: None,
+            last_seen_in_snapshot_at: t2,
+            updated_at: t1,
+            hlc: same_hlc.clone(),
+        };
+        let b = BoardItemStateSnapshot {
+            seen_at: None,
+            dismissed_at: Some(t2),
+            last_seen_in_snapshot_at: t1,
+            updated_at: t2,
+            hlc: same_hlc,
+        };
+        let ab = resolve_merged_board_item_state(&a, &b, now);
+        let ba = resolve_merged_board_item_state(&b, &a, now);
+        assert_eq!(ab, ba);
+        assert_eq!(ab.seen_at, Some(t1));
+        assert_eq!(ab.dismissed_at, Some(t2));
+        assert_eq!(ab.last_seen_in_snapshot_at, t2);
+        assert_eq!(ab.updated_at, t2);
+
+        // Higher HLC undismiss wins dismissed_at = None while keeping max(last_seen_in_snapshot_at)
+        let undismiss = BoardItemStateSnapshot {
+            seen_at: Some(t1),
+            dismissed_at: None,
+            last_seen_in_snapshot_at: t1,
+            updated_at: t3,
+            hlc: "001780317000000-0000-peer-b".to_owned(),
+        };
+        let res = resolve_merged_board_item_state(&ab, &undismiss, now);
+        assert_eq!(res.dismissed_at, None);
+        assert_eq!(res.last_seen_in_snapshot_at, t2);
+        assert_eq!(res.hlc, undismiss.hlc);
+
+        // Lower HLC still advances last_seen_in_snapshot_at without overwriting dismissed_at
+        let older_with_fresh_snap = BoardItemStateSnapshot {
+            seen_at: None,
+            dismissed_at: Some(t1),
+            last_seen_in_snapshot_at: t3,
+            updated_at: t1,
+            hlc: "001780310000000-0000-peer-c".to_owned(),
+        };
+        let res2 = resolve_merged_board_item_state(&res, &older_with_fresh_snap, now);
+        assert_eq!(res2.dismissed_at, None);
+        assert_eq!(res2.last_seen_in_snapshot_at, t3);
+        assert_eq!(res2.hlc, res.hlc);
     }
 }

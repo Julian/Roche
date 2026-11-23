@@ -409,6 +409,22 @@ impl CatalogRepo<'_> {
         Ok(())
     }
 
+    /// Resolves a collection by slug or ID, verifies it is manually mutable, and attaches
+    /// `entry_id` inside an existing write transaction.
+    pub(crate) async fn add_entry_to_manual_collection_in_tx(
+        tx: &mut WriteTx<'_>,
+        slug_or_id: &str,
+        entry_id: &str,
+        position: Option<f64>,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<()> {
+        let col = Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, false).await?;
+        if let Some(reason) = col.immutable_reason() {
+            return Err(CatalogError::ImmutableCollection { title: col.title, reason });
+        }
+        Self::attach_collection_member_in_tx(tx, &col.id, entry_id, position, now, true).await
+    }
+
     /// Manually adds an entry to a collection, strictly rejecting `feed` and `dynamic` collections
     /// as well as self-containment and ancestor cycles.
     pub async fn add_collection_entry(
@@ -419,20 +435,15 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<()> {
         let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
-        let col = Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, false).await?;
-        if let Some(reason) = col.immutable_reason() {
-            return Err(CatalogError::ImmutableCollection { title: col.title, reason });
-        }
         let target_entry_id = Self::follow_merged_id_in_tx(tx.conn(), entry_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Entry '{entry_id}'")))?;
-        Self::attach_collection_member_in_tx(
+        Self::add_entry_to_manual_collection_in_tx(
             &mut tx,
-            &col.id,
+            slug_or_id,
             &target_entry_id,
             position,
             now,
-            true,
         )
         .await?;
         tx.commit().await?;

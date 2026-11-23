@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use roche_core::boards::{DiscussionLink, extract_discussions_with_hn_ids};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use url::Url;
@@ -59,8 +60,10 @@ pub const IS_FEED_INBOX_ITEM_SQL: &str = "(
     )
 )";
 
+pub use mutations::{set_collection_flag_membership_in_tx, set_favorite_membership_in_tx};
+
 #[derive(Debug, Clone, Copy)]
-pub(super) enum ItemContentProjection {
+pub enum ItemContentProjection {
     Full,
     List,
     MetadataOnly,
@@ -146,7 +149,15 @@ pub(super) fn push_item_select_projection(
                  AND e_t.merged_into_id IS NULL
                ORDER BY e_t.title ASC
            )
-       ), '[]') AS tag_names
+       ), '[]') AS tag_names,
+       json_object(
+           'metadata_json', COALESCE(i.metadata_json, '{}'),
+           'hn_ids', COALESCE((
+               SELECT json_group_array(ei_hn.value)
+               FROM entry_identifiers ei_hn
+               WHERE ei_hn.entry_id = i.id AND ei_hn.scheme = 'hacker_news'
+           ), '[]')
+       ) AS discussions
 ",
     )
     .push(from_clause)
@@ -170,7 +181,7 @@ LEFT JOIN collection_entries ce_wtr ON ce_wtr.collection_id = ",
     .push(" AND ce_fav.entry_id = i.id");
 }
 
-pub(super) fn item_select_query_builder(proj: ItemContentProjection) -> QueryBuilder<Sqlite> {
+pub fn item_select_query_builder(proj: ItemContentProjection) -> QueryBuilder<Sqlite> {
     let mut qb = QueryBuilder::<Sqlite>::new("");
     push_item_select_projection(&mut qb, proj, "FROM entries i");
     qb
@@ -185,6 +196,27 @@ impl TryFrom<&str> for TagNames {
 
     fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
         serde_json::from_str(value).map(Self)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawItemDiscussionsPayload {
+    #[serde(default)]
+    metadata_json: String,
+    #[serde(default)]
+    hn_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, sqlx::Type)]
+#[sqlx(transparent)]
+struct RawDiscussionsJson(String);
+
+impl TryFrom<RawDiscussionsJson> for Vec<DiscussionLink> {
+    type Error = serde_json::Error;
+
+    fn try_from(raw: RawDiscussionsJson) -> std::result::Result<Self, Self::Error> {
+        let payload: RawItemDiscussionsPayload = serde_json::from_str(&raw.0)?;
+        Ok(extract_discussions_with_hn_ids(&payload.metadata_json, &payload.hn_ids))
     }
 }
 
@@ -234,6 +266,9 @@ pub struct Item {
     #[serde(default)]
     #[sqlx(try_from = "&'a str")]
     pub tag_names: TagNames,
+    #[serde(default)]
+    #[sqlx(try_from = "RawDiscussionsJson")]
+    pub discussions: Vec<DiscussionLink>,
 }
 
 impl Item {

@@ -1,5 +1,6 @@
 package com.grayvines.roche.model
 
+import com.grayvines.roche.core.DiscussionLink
 import com.grayvines.roche.core.formatArticleMinutes
 import com.grayvines.roche.core.formatAudioDurationEstimate
 import com.grayvines.roche.core.inferContentTypeWireValue
@@ -95,6 +96,7 @@ enum class InboxFilter(val label: String) {
 enum class AppTab(val label: String) {
     HOME("Home"),
     FEEDS("Feeds"),
+    BOARDS("Boards"),
     LISTS("Lists"),
     DIARY("Diary"),
     QUEUE("Queue"),
@@ -110,7 +112,7 @@ enum class AppTab(val label: String) {
         private const val CENTER_SLOT_INDEX = 2
 
         val bottomTabCandidates: List<AppTab> =
-            listOf(HOME, INBOX, LISTS, FEEDS, STARRED, DIARY, QUEUE, OFFLINE, SETTINGS)
+            listOf(HOME, INBOX, BOARDS, LISTS, FEEDS, STARRED, DIARY, QUEUE, OFFLINE, SETTINGS)
         val sideTabCandidates: List<AppTab> = bottomTabCandidates
 
         val defaultBottomTabs: List<AppTab> = listOf(HOME, INBOX, LISTS, FEEDS, STARRED)
@@ -243,6 +245,7 @@ data class InboxEntry(
     val inFeedInbox: Boolean = feedId != null,
     val entryKind: EntryKind = EntryKind.ARTICLE,
     val isFinished: Boolean = false,
+    val discussions: List<DiscussionLink> = emptyList(),
 ) {
     val isPlayableAudio: Boolean
         get() = contentType == ContentType.AUDIO || !audioUrl.isNullOrBlank()

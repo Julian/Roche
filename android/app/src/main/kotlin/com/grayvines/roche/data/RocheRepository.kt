@@ -5,6 +5,7 @@ import com.grayvines.roche.core.ENTRY_KIND_PODCAST_EPISODE
 import com.grayvines.roche.core.RocheLog
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.canonicalArxivAbstractUrl
 import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.collectionEntryNaturalKey
 import com.grayvines.roche.core.deterministicFeedId
@@ -21,6 +22,26 @@ import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.core.nowUtcIso
 import com.grayvines.roche.core.parseTagCsv
 import com.grayvines.roche.core.runSuspendCatching
+import com.grayvines.roche.data.boards.BOARD_DEFAULT_PAGE_SIZE
+import com.grayvines.roche.data.boards.BoardAdapterRegistry
+import com.grayvines.roche.data.boards.BoardAdapterType
+import com.grayvines.roche.data.boards.BoardItemView
+import com.grayvines.roche.data.boards.BoardOrderMode
+import com.grayvines.roche.data.boards.BoardPageResult
+import com.grayvines.roche.data.boards.BoardPromoteAction
+import com.grayvines.roche.data.boards.BoardPromoteResult
+import com.grayvines.roche.data.boards.BoardReaderContent
+import com.grayvines.roche.data.boards.BoardReaderHtmlCache
+import com.grayvines.roche.data.boards.BoardSummary
+import com.grayvines.roche.data.boards.DEFAULT_BOARD_POLL_INTERVAL_MINUTES
+import com.grayvines.roche.data.boards.HackerNewsSection
+import com.grayvines.roche.data.boards.LocalBoardPoller
+import com.grayvines.roche.data.boards.buildBoardSummary
+import com.grayvines.roche.data.boards.loadBoardDedupLookupFromDao
+import com.grayvines.roche.data.boards.loadBoardItemReaderContent
+import com.grayvines.roche.data.boards.projectBoardCandidateView
+import com.grayvines.roche.data.boards.projectBoardItemView
+import com.grayvines.roche.data.boards.resolveBoardItemForAction
 import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
@@ -40,6 +61,10 @@ import com.grayvines.roche.data.feeds.discoverFeedFromUrl
 import com.grayvines.roche.data.feeds.enrichWantToReadItemOnDevice
 import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
 import com.grayvines.roche.data.feeds.validateEditedFeedUrl
+import com.grayvines.roche.data.local.BoardEntity
+import com.grayvines.roche.data.local.BoardItemStateEntity
+import com.grayvines.roche.data.local.BoardPromoteCommitResult
+import com.grayvines.roche.data.local.BoardPromoteParams
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.DbWriteLock
 import com.grayvines.roche.data.local.FeedRow
@@ -52,17 +77,24 @@ import com.grayvines.roche.data.local.TagRow
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.attachTagsLocally
 import com.grayvines.roche.data.local.buildSqlContainsPattern
+import com.grayvines.roche.data.local.createOrReactivateBoardInTx
+import com.grayvines.roche.data.local.deleteBoardWithTombstonesInTx
 import com.grayvines.roche.data.local.deleteFeedPreservingHistory
 import com.grayvines.roche.data.local.deleteItemPreservingHistory
 import com.grayvines.roche.data.local.ensureWantToReadSpecExists
 import com.grayvines.roche.data.local.extractFtsTokenQueries
 import com.grayvines.roche.data.local.insertItemTag
+import com.grayvines.roche.data.local.markBoardItemSeenInTx
 import com.grayvines.roche.data.local.nextLocalHlc
+import com.grayvines.roche.data.local.promoteBoardItemInTx
+import com.grayvines.roche.data.local.pruneExpiredBoardStatesInDao
 import com.grayvines.roche.data.local.removeItemTag
+import com.grayvines.roche.data.local.setBoardItemDismissedInTx
 import com.grayvines.roche.data.local.setItemFavorite
 import com.grayvines.roche.data.local.setItemReadAt
 import com.grayvines.roche.data.local.setItemReadProgress
 import com.grayvines.roche.data.local.setItemStatusAndReadAt
+import com.grayvines.roche.data.local.updateBoardConfigInTx
 import com.grayvines.roche.data.local.updateFeedActiveGraph
 import com.grayvines.roche.data.local.updateFeedTitleGraph
 import com.grayvines.roche.data.local.updateFeedTypeGraph
@@ -85,6 +117,7 @@ import com.grayvines.roche.data.settings.parsePairingInput
 import com.grayvines.roche.data.settings.tailscaleHttpsUpgrades
 import com.grayvines.roche.data.sync.NetworkTierProvider
 import com.grayvines.roche.data.sync.PeerSyncCoordinator
+import com.grayvines.roche.data.sync.pollCooperativeBoardsOnDevice
 import com.grayvines.roche.data.sync.pollCooperativeFeedsOnDevice
 import com.grayvines.roche.media.DEFAULT_MAX_OFFLINE_CACHE_BYTES
 import com.grayvines.roche.media.OfflineCacheManager
@@ -169,6 +202,9 @@ data class RepositorySnapshot(
     val tags: List<TagItem>,
     val activePeers: List<PeerNodeDto> = emptyList(),
     val catalog: CatalogSnapshot = CatalogSnapshot(),
+    val boards: List<BoardSummary> = emptyList(),
+    val boardItems: Map<String, List<BoardItemView>> = emptyMap(),
+    val boardItemStates: Map<Pair<String, String>, BoardItemStateEntity> = emptyMap(),
 )
 
 @Suppress("TooManyFunctions", "LargeClass", "LongParameterList")
@@ -196,6 +232,8 @@ class RocheRepository(
     val syncStatus: StateFlow<SyncStatusState> = _syncStatus.asStateFlow()
     private val entryCache = InboxEntryCache()
     private val activePeersFlow = MutableStateFlow<List<PeerNodeDto>>(emptyList())
+    private val boardAdapterRegistry = BoardAdapterRegistry.default(publicWebFetcher)
+    private val boardReaderCache = BoardReaderHtmlCache()
     internal val hasBackgroundScope: Boolean
         get() = backgroundScope != null
 
@@ -1784,16 +1822,7 @@ class RocheRepository(
                     val currentTier = networkTierProvider.currentNetworkTier()
                     if (currentSettings.serverUrl.isBlank()) {
                         check(currentTier != NetworkTier.OFFLINE) { "Device is currently offline" }
-                        val pollOutcome =
-                            pollCooperativeFeedsOnDevice(
-                                dao = dao,
-                                publicWebFetcher = publicWebFetcher,
-                                localPeerId = currentSettings.peerId,
-                                activePeers = emptyList(),
-                                writeLock = database.writeLock,
-                            )
-                        offlineCacheManager.autoDownloadNewEpisodes()
-                        pollOutcome.polledFeedsCount
+                        pollOfflineLocalSources(currentSettings.peerId)
                     } else {
                         check(currentSettings.bearerToken.isNotBlank()) {
                             "Pair device in Settings before syncing"
@@ -1824,6 +1853,31 @@ class RocheRepository(
                 result
             }
         }
+    }
+
+    private suspend fun pollOfflineLocalSources(peerId: String): Int {
+        database.writeLock.withLock {
+            dao.executeInTransaction { pruneExpiredBoardStatesInDao(dao) }
+        }
+        val pollOutcome =
+            pollCooperativeFeedsOnDevice(
+                dao = dao,
+                publicWebFetcher = publicWebFetcher,
+                localPeerId = peerId,
+                activePeers = emptyList(),
+                writeLock = database.writeLock,
+            )
+        val boardPollOutcome =
+            pollCooperativeBoardsOnDevice(
+                dao = dao,
+                publicWebFetcher = publicWebFetcher,
+                localPeerId = peerId,
+                activePeers = emptyList(),
+                adapterRegistry = boardAdapterRegistry,
+                writeLock = database.writeLock,
+            )
+        offlineCacheManager.autoDownloadNewEpisodes()
+        return pollOutcome.polledFeedsCount + boardPollOutcome.polledFeedsCount
     }
 
     private suspend fun recordSyncStatus(
@@ -1866,6 +1920,9 @@ class RocheRepository(
                     val currentTier = networkTierProvider.currentNetworkTier()
                     check(currentTier != NetworkTier.OFFLINE) { "Device is currently offline" }
                     val currentSettings = settings.settings.first()
+                    database.writeLock.withLock {
+                        dao.executeInTransaction { pruneExpiredBoardStatesInDao(dao) }
+                    }
                     val pollOutcome =
                         pollCooperativeFeedsOnDevice(
                             dao = dao,
@@ -1874,8 +1931,19 @@ class RocheRepository(
                             activePeers = activePeersFlow.value,
                             writeLock = database.writeLock,
                         )
+                    val boardPollOutcome =
+                        pollCooperativeBoardsOnDevice(
+                            dao = dao,
+                            publicWebFetcher = publicWebFetcher,
+                            localPeerId = currentSettings.peerId,
+                            activePeers = activePeersFlow.value,
+                            adapterRegistry = boardAdapterRegistry,
+                            writeLock = database.writeLock,
+                        )
+                    val totalPolled =
+                        pollOutcome.polledFeedsCount + boardPollOutcome.polledFeedsCount
                     if (
-                        pollOutcome.polledFeedsCount > 0 &&
+                        totalPolled > 0 &&
                             currentSettings.serverUrl.isNotBlank() &&
                             currentSettings.bearerToken.isNotBlank()
                     ) {
@@ -1883,7 +1951,9 @@ class RocheRepository(
                             peerSyncCoordinator(currentTier)
                                 .syncAndCooperativePoll(
                                     currentSettings = currentSettings,
-                                    initialWeightOverride = pollOutcome.measuredWeight,
+                                    initialWeightOverride =
+                                        boardPollOutcome.measuredWeight
+                                            ?: pollOutcome.measuredWeight,
                                 )
                         }
                             .onFailure { err ->
@@ -1891,7 +1961,7 @@ class RocheRepository(
                             }
                     }
                     offlineCacheManager.autoDownloadNewEpisodes()
-                    pollOutcome.polledFeedsCount
+                    totalPolled
                 }
             }
         }
@@ -1913,14 +1983,29 @@ class RocheRepository(
             syncMutex.withLock {
                 runSuspendCatching {
                     catalog.ensureSystemSeeded()
-                    pollCooperativeFeedsOnDevice(
-                            dao = dao,
-                            publicWebFetcher = publicWebFetcher,
-                            localPeerId = currentSettings.peerId,
-                            activePeers = activePeersFlow.value,
-                            writeLock = database.writeLock,
-                        )
-                        .polledFeedsCount
+                    database.writeLock.withLock {
+                        dao.executeInTransaction { pruneExpiredBoardStatesInDao(dao) }
+                    }
+                    val feedsPolled =
+                        pollCooperativeFeedsOnDevice(
+                                dao = dao,
+                                publicWebFetcher = publicWebFetcher,
+                                localPeerId = currentSettings.peerId,
+                                activePeers = activePeersFlow.value,
+                                writeLock = database.writeLock,
+                            )
+                            .polledFeedsCount
+                    val boardsPolled =
+                        pollCooperativeBoardsOnDevice(
+                                dao = dao,
+                                publicWebFetcher = publicWebFetcher,
+                                localPeerId = currentSettings.peerId,
+                                activePeers = activePeersFlow.value,
+                                adapterRegistry = boardAdapterRegistry,
+                                writeLock = database.writeLock,
+                            )
+                            .polledFeedsCount
+                    feedsPolled + boardsPolled
                 }
             }
         }
@@ -2071,6 +2156,434 @@ class RocheRepository(
         }
     }
 
+    // --- Boards API ---
+
+    suspend fun createBoard(
+        adapterType: BoardAdapterType = BoardAdapterType.HACKER_NEWS,
+        sectionOrUrl: String,
+        title: String? = null,
+        pollInterval: Int = DEFAULT_BOARD_POLL_INTERVAL_MINUTES,
+    ): Result<BoardSummary> = withSyncIndicator {
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val section =
+                    when (adapterType) {
+                        BoardAdapterType.HACKER_NEWS ->
+                            HackerNewsSection.fromSectionOrUrl(sectionOrUrl)
+                                ?: throw IllegalArgumentException(
+                                    "Unsupported Hacker News section or URL: $sectionOrUrl"
+                                )
+                    }
+                val currentSettings = settings.settings.first()
+                val nodeId = currentSettings.peerId.ifBlank { DEFAULT_LOCAL_HLC_NODE }
+                val created = itemMutationMutex.withLock {
+                    var entity: BoardEntity? = null
+                    dao.executeInTransaction {
+                        entity =
+                            dao.createOrReactivateBoardInTx(
+                                adapterType = adapterType,
+                                sourceKey = section.sourceKey,
+                                sourceUrl = section.sourceUrl,
+                                sourceConfigJson = section.sourceConfigJson,
+                                title = title,
+                                defaultTitle = section.defaultTitle,
+                                orderMode = section.orderMode.wireValue,
+                                pollInterval = pollInterval,
+                                nodeId = nodeId,
+                            )
+                    }
+                    checkNotNull(entity)
+                }
+                if (networkTierProvider.currentNetworkTier() != NetworkTier.OFFLINE) {
+                    pollBoardBestEffort(created, currentSettings.peerId)
+                }
+                triggerBackgroundSync()
+                loadBoardSummaryFromDao(created.id) ?: buildBoardSummary(created, emptyList())
+            }
+        }
+    }
+
+    private suspend fun pollBoardBestEffort(board: BoardEntity, peerId: String) {
+        LocalBoardPoller.pollBoard(
+                dao = dao,
+                publicWebFetcher = publicWebFetcher,
+                board = board,
+                localPeerId = peerId,
+                adapterRegistry = boardAdapterRegistry,
+                writeLock = database.writeLock,
+            )
+            .onFailure { err ->
+                RocheLog.warn(LOG_TAG, "Initial poll failed for board ${board.sourceUrl}", err)
+            }
+    }
+
+    suspend fun updateBoard(
+        boardId: String,
+        title: String? = null,
+        pollInterval: Int? = null,
+        isActive: Boolean? = null,
+        orderMode: BoardOrderMode? = null,
+    ): Result<BoardSummary> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val nodeId = currentLocalPeerId()
+                val updated = itemMutationMutex.withLock {
+                    var result: BoardEntity? = null
+                    dao.executeInTransaction {
+                        result =
+                            dao.updateBoardConfigInTx(
+                                boardId = boardId,
+                                title = title,
+                                pollInterval = pollInterval,
+                                isActive = isActive,
+                                orderMode = orderMode,
+                                nodeId = nodeId,
+                            )
+                    }
+                    checkNotNull(result)
+                }
+                triggerBackgroundSync()
+                loadBoardSummaryFromDao(updated.id) ?: buildBoardSummary(updated, emptyList())
+            }
+        }
+
+    suspend fun deleteBoard(boardId: String): Result<String> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val nodeId = currentLocalPeerId()
+                val deletedTitle = itemMutationMutex.withLock {
+                    var title: String? = null
+                    dao.executeInTransaction {
+                        title = dao.deleteBoardWithTombstonesInTx(boardId, nodeId)
+                    }
+                    title
+                }
+                boardReaderCache.clear()
+                triggerBackgroundSync()
+                deletedTitle ?: boardId
+            }
+        }
+
+    suspend fun refreshBoard(boardId: String): Result<Int> = withSyncIndicator {
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                catalog.ensureSystemSeeded()
+                check(networkTierProvider.currentNetworkTier() != NetworkTier.OFFLINE) {
+                    OFFLINE_BOARD_REFRESH_ERROR
+                }
+                val currentSettings = settings.settings.first()
+                val board = dao.getBoardById(boardId) ?: missingBoardError(boardId)
+                val localPoll =
+                    LocalBoardPoller.pollBoard(
+                        dao = dao,
+                        publicWebFetcher = publicWebFetcher,
+                        board = board,
+                        localPeerId = currentSettings.peerId,
+                        adapterRegistry = boardAdapterRegistry,
+                        writeLock = database.writeLock,
+                    )
+                val hasServer =
+                    currentSettings.serverUrl.isNotBlank() &&
+                        currentSettings.bearerToken.isNotBlank() &&
+                        isServerSyncAllowedByTransport(currentSettings.serverUrl)
+                if (hasServer) {
+                    val syncOutcome = syncWithServer()
+                    if (localPoll.isFailure && syncOutcome.isFailure) {
+                        localPoll.getOrThrow()
+                    }
+                } else {
+                    localPoll.getOrThrow()
+                }
+                localPoll.getOrDefault(dao.countBoardItems(boardId))
+            }
+        }
+    }
+
+    suspend fun refreshAllBoards(): Result<Int> = withSyncIndicator {
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                catalog.ensureSystemSeeded()
+                check(networkTierProvider.currentNetworkTier() != NetworkTier.OFFLINE) {
+                    OFFLINE_BOARD_REFRESH_ERROR
+                }
+                val currentSettings = settings.settings.first()
+                database.writeLock.withLock {
+                    dao.executeInTransaction { pruneExpiredBoardStatesInDao(dao) }
+                }
+                val activeBoards = dao.getActiveBoards()
+                var polledCount = 0
+                for (board in activeBoards) {
+                    val outcome =
+                        LocalBoardPoller.pollBoard(
+                            dao = dao,
+                            publicWebFetcher = publicWebFetcher,
+                            board = board,
+                            localPeerId = currentSettings.peerId,
+                            adapterRegistry = boardAdapterRegistry,
+                            writeLock = database.writeLock,
+                        )
+                    if (outcome.isSuccess) {
+                        polledCount++
+                    }
+                }
+                val hasServer =
+                    currentSettings.serverUrl.isNotBlank() &&
+                        currentSettings.bearerToken.isNotBlank() &&
+                        isServerSyncAllowedByTransport(currentSettings.serverUrl)
+                if (hasServer) {
+                    syncWithServer()
+                }
+                polledCount
+            }
+        }
+    }
+
+    suspend fun fetchLiveBoardPage(
+        boardId: String,
+        offset: Int,
+        limit: Int = BOARD_DEFAULT_PAGE_SIZE,
+    ): Result<BoardPageResult> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val board = dao.getBoardById(boardId) ?: missingBoardError(boardId)
+                val adapter =
+                    boardAdapterRegistry.resolve(board.adapterType)
+                        ?: error("Unsupported board adapter: ${board.adapterType}")
+                val safeOffset = offset.coerceAtLeast(0)
+                val safeLimit = limit.coerceAtLeast(1)
+                val batch =
+                    adapter
+                        .fetchPage(
+                            sourceKey = board.sourceKey,
+                            sourceConfigJson = board.sourceConfigJson,
+                            offset = safeOffset,
+                            limit = safeLimit,
+                        )
+                        .getOrThrow()
+                val dedup = loadBoardDedupLookupFromDao(dao)
+                val statesByExtId =
+                    dao.getBoardItemStatesForBoard(board.id).associateBy { it.externalId }
+                val projected =
+                    batch.items.map { candidate ->
+                        projectBoardCandidateView(
+                            board = board,
+                            candidate = candidate,
+                            fetchedAtIso = batch.fetchedAtIso,
+                            state = statesByExtId[candidate.externalId],
+                            dedup = dedup,
+                            isEphemeralPageItem = true,
+                        )
+                    }
+                BoardPageResult(
+                    items = projected,
+                    offset = safeOffset,
+                    nextOffset = batch.nextOffset,
+                    totalAvailable = batch.totalAvailable,
+                    hasMore = batch.nextOffset < batch.totalAvailable,
+                )
+            }
+        }
+
+    suspend fun markBoardItemSeen(boardId: String, externalId: String): Boolean {
+        val nodeId = currentLocalPeerId()
+        val changed = itemMutationMutex.withLock {
+            var didMark = false
+            dao.executeInTransaction {
+                didMark =
+                    dao.markBoardItemSeenInTx(
+                        boardId = boardId,
+                        externalId = externalId,
+                        nodeId = nodeId,
+                    )
+            }
+            didMark
+        }
+        if (changed) {
+            triggerBackgroundSync()
+        }
+        return changed
+    }
+
+    suspend fun dismissBoardItem(boardId: String, externalId: String): Boolean {
+        val nodeId = currentLocalPeerId()
+        val changed = itemMutationMutex.withLock {
+            var didChange = false
+            dao.executeInTransaction {
+                didChange =
+                    dao.setBoardItemDismissedInTx(
+                        boardId = boardId,
+                        externalId = externalId,
+                        dismissed = true,
+                        nodeId = nodeId,
+                    )
+            }
+            didChange
+        }
+        if (changed) {
+            triggerBackgroundSync()
+        }
+        return changed
+    }
+
+    suspend fun undismissBoardItem(boardId: String, externalId: String): Boolean {
+        val nodeId = currentLocalPeerId()
+        val changed = itemMutationMutex.withLock {
+            var didChange = false
+            dao.executeInTransaction {
+                didChange =
+                    dao.setBoardItemDismissedInTx(
+                        boardId = boardId,
+                        externalId = externalId,
+                        dismissed = false,
+                        nodeId = nodeId,
+                    )
+            }
+            didChange
+        }
+        if (changed) {
+            triggerBackgroundSync()
+        }
+        return changed
+    }
+
+    suspend fun loadBoardItemReader(
+        boardId: String,
+        externalId: String,
+        fallbackItem: BoardItemView? = null,
+        forceRefresh: Boolean = false,
+    ): Result<BoardReaderContent> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val board = dao.getBoardById(boardId) ?: missingBoardError(boardId)
+                markBoardItemSeen(boardId, externalId)
+                loadBoardItemReaderContent(
+                    dao = dao,
+                    publicWebFetcher = publicWebFetcher,
+                    adapterRegistry = boardAdapterRegistry,
+                    readerCache = boardReaderCache,
+                    board = board,
+                    externalId = externalId,
+                    fallbackItem = fallbackItem,
+                    forceRefresh = forceRefresh,
+                ) ?: error("Board item not found: $externalId")
+            }
+        }
+
+    suspend fun unfinishBoardItem(
+        boardId: String,
+        externalId: String,
+        entryId: String,
+    ): Result<Unit> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val resolvedId = catalog.followMergedId(entryId) ?: entryId
+                val nodeId = currentLocalPeerId()
+                val updated = itemMutationMutex.withLock {
+                    var didUpdate = false
+                    dao.executeInTransaction {
+                        if (dao.getEntryById(resolvedId) != null) {
+                            val nowIso = nowUtcIso()
+                            deleteConsumedLogsInDao(dao, resolvedId, nowIso, nodeId)
+                            dao.setItemStatusAndReadAt(
+                                itemId = resolvedId,
+                                status = ItemStatus.UNREAD.wireValue,
+                                readAt = null,
+                                nodeId = nodeId,
+                                restoreToWantToRead = false,
+                            )
+                            dao.setItemReadProgress(resolvedId, MIN_READ_PROGRESS, null, nodeId)
+                            didUpdate = true
+                        }
+                    }
+                    didUpdate
+                }
+                if (updated) {
+                    markBoardItemSeen(boardId, externalId)
+                    triggerBackgroundSync()
+                }
+            }
+        }
+
+    @Suppress("LongParameterList")
+    suspend fun promoteBoardItem(
+        boardId: String,
+        externalId: String,
+        action: BoardPromoteAction,
+        fallbackItem: BoardItemView? = null,
+        extractedHtml: String? = null,
+        notes: String? = null,
+        tagName: String? = null,
+        listId: String? = null,
+    ): Result<BoardPromoteResult> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val board = dao.getBoardById(boardId) ?: missingBoardError(boardId)
+                val resolvedItem =
+                    resolveBoardItemForAction(
+                        dao = dao,
+                        adapterRegistry = boardAdapterRegistry,
+                        board = board,
+                        externalId = externalId,
+                        fallbackItem = fallbackItem,
+                    ) ?: error("Board item not found: $externalId")
+                val cachedExtract = boardReaderCache.get(resolvedItem.url)
+                val effectiveHtml =
+                    extractedHtml?.takeIf { it.isNotBlank() } ?: cachedExtract?.contentHtml
+                val nodeId = currentLocalPeerId()
+                var commitResult: BoardPromoteCommitResult? = null
+                itemMutationMutex.withLock {
+                    catalog.withMutationLock {
+                        dao.executeInTransaction {
+                            commitResult =
+                                dao.promoteBoardItemInTx(
+                                    BoardPromoteParams(
+                                        board = board,
+                                        item = resolvedItem,
+                                        action = action,
+                                        extractedHtml = effectiveHtml,
+                                        extractedSummary = cachedExtract?.summary,
+                                        extractedAuthor = cachedExtract?.author,
+                                        extractedThumbnailUrl = cachedExtract?.thumbnailUrl,
+                                        notes = notes,
+                                        tagName = tagName,
+                                        listId = listId,
+                                        nodeId = nodeId,
+                                    )
+                                )
+                        }
+                    }
+                }
+                val commit = checkNotNull(commitResult)
+                if (commit.needsHtmlEnrichment && backgroundScope != null) {
+                    launchWantToReadEnrichment(
+                        itemId = commit.result.entryId,
+                        url = canonicalArxivAbstractUrl(resolvedItem.url) ?: resolvedItem.url,
+                        hasUserTitleOverride = true,
+                        pdfInputStream = null,
+                    )
+                } else {
+                    triggerBackgroundSync()
+                }
+                commit.result
+            }
+        }
+
+    private suspend fun loadBoardSummaryFromDao(boardId: String): BoardSummary? {
+        val board = dao.getBoardById(boardId) ?: return null
+        val items = dao.getBoardItemsForBoard(boardId)
+        val statesByExtId = dao.getBoardItemStatesForBoard(boardId).associateBy { it.externalId }
+        val dedup = loadBoardDedupLookupFromDao(dao)
+        val projected = items.map { item ->
+            projectBoardItemView(
+                board = board,
+                item = item,
+                state = statesByExtId[item.externalId],
+                dedup = dedup,
+            )
+        }
+        return buildBoardSummary(board, projected)
+    }
+
     companion object {
         fun filterEntries(
             entries: List<InboxEntry>,
@@ -2090,8 +2603,11 @@ class RocheRepository(
 }
 
 private const val LOG_TAG = "RocheRepository"
+private const val OFFLINE_BOARD_REFRESH_ERROR = "Offline — connect to refresh boards"
 
 internal fun missingFeedError(feedId: String): Nothing = error("Feed not found: $feedId")
+
+internal fun missingBoardError(boardId: String): Nothing = error("Board not found: $boardId")
 
 private const val FLAG_LAST_SYNCED_AT_ISO = "last_synced_at_iso"
 private const val FLAG_LAST_SYNC_ERROR = "last_sync_error"

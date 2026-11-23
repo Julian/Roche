@@ -3,6 +3,7 @@ mod html;
 mod links;
 #[cfg(test)]
 mod tests;
+mod views_boards;
 mod views_catalog;
 mod views_home;
 mod views_rank;
@@ -106,8 +107,9 @@ pub fn router(service: Arc<RocheService>) -> Router<Arc<RocheService>> {
         .route("/web/lists/{slug}/generator/toggle", post(views_home::post_generator_toggle))
         .route("/web/lists/{slug}/generator/finish", post(views_home::post_generator_finish))
         .route("/web/lists/{slug}/generator/abandon", post(views_home::post_generator_abandon))
-        // Reader, Inbox, Starred, Feeds & Media Streaming
+        // Reader, Inbox, Boards, Starred, Feeds & Media Streaming
         .route("/inbox", get(views_reader::inbox_get))
+        .merge(board_web_routes())
         .route("/starred", get(views_reader::starred_get))
         .route("/feeds", get(views_reader::feeds_get))
         .route("/reader/{id}", get(views_reader::reader_get))
@@ -170,6 +172,32 @@ pub fn router(service: Arc<RocheService>) -> Router<Arc<RocheService>> {
         .merge(protected)
         .merge(opml_upload)
         .route_layer(middleware::from_fn(attach_web_security_headers))
+}
+
+fn board_web_routes() -> Router<Arc<RocheService>> {
+    Router::new()
+        .route("/boards", get(views_boards::boards_get))
+        .route("/boards/{id}", get(views_boards::board_detail_get))
+        .route("/boards/{id}/read/{external_id}", get(views_boards::board_reader_get))
+        .route("/web/boards/create", post(views_boards::post_board_create))
+        .route("/web/boards/refresh-all", post(views_boards::post_board_refresh_all))
+        .route("/web/boards/{id}/items", get(views_boards::board_items_fragment_get))
+        .route("/web/boards/{id}/refresh", post(views_boards::post_board_refresh))
+        .route("/web/boards/{id}/edit", post(views_boards::post_board_edit))
+        .route("/web/boards/{id}/toggle-active", post(views_boards::post_board_toggle_active))
+        .route("/web/boards/{id}/delete", post(views_boards::post_board_delete))
+        .route(
+            "/web/boards/{id}/items/{external_id}/dismiss",
+            post(views_boards::post_board_item_dismiss),
+        )
+        .route(
+            "/web/boards/{id}/items/{external_id}/undismiss",
+            post(views_boards::post_board_item_undismiss),
+        )
+        .route(
+            "/web/boards/{id}/items/{external_id}/promote",
+            post(views_boards::post_board_item_promote),
+        )
 }
 
 fn strip_weak_etag_prefix(tag: &str) -> &str {

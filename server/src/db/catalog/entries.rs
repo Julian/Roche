@@ -660,19 +660,12 @@ impl CatalogRepo<'_> {
                         .bind(&existing_id)
                         .fetch_one(tx.conn())
                         .await?;
-                let mut merged_obj = serde_json::from_str::<serde_json::Value>(&cur_meta_str)
-                    .ok()
-                    .and_then(|v| v.as_object().cloned())
-                    .unwrap_or_default();
-                let mut changed = false;
-                for (k, v) in inc_map {
-                    if !merged_obj.contains_key(k) {
-                        merged_obj.insert(k.clone(), v.clone());
-                        changed = true;
-                    }
-                }
-                if changed {
-                    let merged_json = serde_json::Value::Object(merged_obj).to_string();
+                let merged_json = roche_core::crdt::merge_entry_metadata_json(
+                    &cur_meta_str,
+                    input.metadata.as_ref(),
+                    false,
+                );
+                if merged_json != cur_meta_str {
                     let meta_hlc = match explicit_hlc {
                         Some(h) if !h.is_empty() => h.to_owned(),
                         _ => tx.next_hlc().await?,

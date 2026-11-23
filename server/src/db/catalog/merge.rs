@@ -174,6 +174,18 @@ impl CatalogRepo<'_> {
         let dup_url = dup_row.url.as_deref();
         let dup_summary = dup_row.summary.as_deref();
         let dup_thumb = dup_row.thumbnail_url.as_deref();
+        let canon_meta_str: String =
+            sqlx::query_scalar("SELECT metadata_json FROM entries WHERE id = ?")
+                .bind(canon_resolved)
+                .fetch_one(tx.conn())
+                .await?;
+        let dup_meta_val = serde_json::from_str::<serde_json::Value>(&dup_row.metadata_json).ok();
+        let merged_meta = roche_core::crdt::merge_entry_metadata_json(
+            &canon_meta_str,
+            dup_meta_val.as_ref(),
+            false,
+        );
+        let meta_changed = merged_meta != canon_meta_str;
         let backfill_hlc = tx.next_hlc().await?;
         sqlx::query(
             "UPDATE entries
@@ -183,7 +195,7 @@ impl CatalogRepo<'_> {
                  release_year = COALESCE(release_year, ?),
                  summary = COALESCE(summary, ?),
                  thumbnail_url = COALESCE(thumbnail_url, ?),
-                 metadata_json = CASE WHEN metadata_json = '{}' AND ? != '{}' THEN ? ELSE metadata_json END,
+                 metadata_json = ?,
                  updated_at = ?,
                  hlc = CASE
                      WHEN (creators_json = '[]' AND ? != '[]')
@@ -192,7 +204,7 @@ impl CatalogRepo<'_> {
                        OR (release_year IS NULL AND ? IS NOT NULL)
                        OR (summary IS NULL AND ? IS NOT NULL)
                        OR (thumbnail_url IS NULL AND ? IS NOT NULL)
-                       OR (metadata_json = '{}' AND ? != '{}')
+                       OR ?
                      THEN ?
                      ELSE hlc
                  END
@@ -205,8 +217,7 @@ impl CatalogRepo<'_> {
         .bind(dup_row.release_year)
         .bind(dup_summary)
         .bind(dup_thumb)
-        .bind(&dup_row.metadata_json)
-        .bind(&dup_row.metadata_json)
+        .bind(&merged_meta)
         .bind(now)
         .bind(&dup_row.creators_json)
         .bind(dup_url)
@@ -214,7 +225,7 @@ impl CatalogRepo<'_> {
         .bind(dup_row.release_year)
         .bind(dup_summary)
         .bind(dup_thumb)
-        .bind(&dup_row.metadata_json)
+        .bind(meta_changed)
         .bind(&backfill_hlc)
         .bind(canon_resolved)
         .execute(tx.conn())

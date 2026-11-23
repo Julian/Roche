@@ -1,9 +1,13 @@
 package com.grayvines.roche.data
 
 import com.grayvines.roche.core.PROTECTED_SYSTEM_COLLECTION_IDS
+import com.grayvines.roche.core.SCHEME_HACKER_NEWS
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.decodeCreatorsJson
+import com.grayvines.roche.data.boards.ProjectedBoardsSnapshot
+import com.grayvines.roche.data.boards.RawBoardTables
+import com.grayvines.roche.data.boards.projectBoardsSnapshot
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.RawCatalogTables
 import com.grayvines.roche.data.local.CollectionEntryEntity
@@ -32,6 +36,7 @@ internal class UnifiedSnapshotLoader(
     private val loadMutex = Mutex()
     private var cachedTablesState: CachedUnifiedTables? = null
     private var cachedInboxState: CachedInboxBase? = null
+    private var cachedBoardsState: CachedBoardsBase? = null
 
     @Volatile
     internal var unifiedTxCount: Int = 0
@@ -60,7 +65,14 @@ internal class UnifiedSnapshotLoader(
                 tables = tablesState.catalogTables,
             )
         val inboxBase = resolveInboxBase(tablesState, activePeers)
-        inboxBase.copy(activePeers = activePeers, catalog = catalogSnap)
+        val boardsProjection = resolveBoardsProjection(tablesState)
+        inboxBase.copy(
+            activePeers = activePeers,
+            catalog = catalogSnap,
+            boards = boardsProjection.boards,
+            boardItems = boardsProjection.boardItems,
+            boardItemStates = boardsProjection.boardItemStates,
+        )
     }
 
     private suspend fun refreshUnifiedTables(
@@ -93,6 +105,7 @@ internal class UnifiedSnapshotLoader(
             stamp = stamp,
             catalogTables = loadCatalogTablesSlice(stamp, previous),
             satellites = loadSatelliteTablesSlice(stamp, previous),
+            boardTables = loadBoardTablesSlice(stamp, previous),
         )
 
     private suspend fun loadCatalogTablesSlice(
@@ -166,6 +179,34 @@ internal class UnifiedSnapshotLoader(
         )
     }
 
+    private suspend fun loadBoardTablesSlice(
+        stamp: RepositoryStampRow,
+        previous: CachedUnifiedTables?,
+    ): RawBoardTables {
+        val prevStamp = previous?.stamp
+        val prevBoards = previous?.boardTables
+        return RawBoardTables(
+            boards =
+                reloadTable(stamp.boardsStamp != prevStamp?.boardsStamp, prevBoards?.boards) {
+                    dao.getAllBoards()
+                },
+            boardItems =
+                reloadTable(
+                    stamp.boardItemsStamp != prevStamp?.boardItemsStamp,
+                    prevBoards?.boardItems,
+                ) {
+                    dao.getAllBoardItems()
+                },
+            boardItemStates =
+                reloadTable(
+                    stamp.boardItemStatesStamp != prevStamp?.boardItemStatesStamp,
+                    prevBoards?.boardItemStates,
+                ) {
+                    dao.getAllBoardItemStates()
+                },
+        )
+    }
+
     private suspend fun <T> reloadTable(
         changed: Boolean,
         previous: T?,
@@ -202,16 +243,48 @@ internal class UnifiedSnapshotLoader(
             base
         }
     }
+
+    private fun resolveBoardsProjection(tablesState: CachedUnifiedTables): ProjectedBoardsSnapshot {
+        val boardsStamp = tablesState.stamp.toBoardsInputStamp()
+        val existing = cachedBoardsState
+        return if (existing != null && existing.stamp == boardsStamp) {
+            existing.projected
+        } else {
+            val projected =
+                projectBoardsSnapshot(tablesState.boardTables, tablesState.catalogTables)
+            cachedBoardsState = CachedBoardsBase(stamp = boardsStamp, projected = projected)
+            projected
+        }
+    }
 }
 
+@Suppress("LongParameterList")
 internal data class InboxInputStamp(
     val entriesStamp: Long,
+    val identsStamp: Long,
     val specsStamp: Long,
     val membersStamp: Long,
     val logsStamp: Long,
     val statesStamp: Long,
     val contentsStamp: Long,
     val feedsStamp: Long,
+)
+
+@Suppress("LongParameterList")
+internal data class BoardsInputStamp(
+    val boardsStamp: Long,
+    val boardItemsStamp: Long,
+    val boardItemStatesStamp: Long,
+    val entriesStamp: Long,
+    val identsStamp: Long,
+    val specsStamp: Long,
+    val membersStamp: Long,
+    val logsStamp: Long,
+)
+
+internal data class CachedBoardsBase(
+    val stamp: BoardsInputStamp,
+    val projected: ProjectedBoardsSnapshot,
 )
 
 internal data class InboxSatelliteTables(
@@ -224,6 +297,7 @@ internal data class CachedUnifiedTables(
     val stamp: RepositoryStampRow,
     val catalogTables: RawCatalogTables,
     val satellites: InboxSatelliteTables,
+    val boardTables: RawBoardTables = RawBoardTables(),
 )
 
 internal data class CachedInboxBase(
@@ -238,6 +312,7 @@ internal data class ProjectedInboxTables(
     val itemTags: List<ItemTagRow>,
 )
 
+@Suppress("LongParameterList")
 internal data class InboxProjectionContext(
     val allEntriesById: Map<String, EntryEntity>,
     val specsById: Map<String, CollectionSpecEntity>,
@@ -246,17 +321,31 @@ internal data class InboxProjectionContext(
     val contentPreviewsById: Map<String, EntryContentPreviewRow>,
     val membershipsByEntry: Map<String, List<CollectionEntryEntity>>,
     val consumedEntryIds: Set<String> = emptySet(),
+    val hackerNewsIdByEntryId: Map<String, String> = emptyMap(),
 )
 
 internal fun RepositoryStampRow.toInboxInputStamp(): InboxInputStamp =
     InboxInputStamp(
         entriesStamp = entriesStamp,
+        identsStamp = identsStamp,
         specsStamp = specsStamp,
         membersStamp = membersStamp,
         logsStamp = logsStamp,
         statesStamp = statesStamp,
         contentsStamp = contentsStamp,
         feedsStamp = feedsStamp,
+    )
+
+internal fun RepositoryStampRow.toBoardsInputStamp(): BoardsInputStamp =
+    BoardsInputStamp(
+        boardsStamp = boardsStamp,
+        boardItemsStamp = boardItemsStamp,
+        boardItemStatesStamp = boardItemStatesStamp,
+        entriesStamp = entriesStamp,
+        identsStamp = identsStamp,
+        specsStamp = specsStamp,
+        membersStamp = membersStamp,
+        logsStamp = logsStamp,
     )
 
 internal fun projectInboxTables(
@@ -279,6 +368,13 @@ internal fun projectInboxTables(
             .asSequence()
             .filter { it.status.equals(STATUS_CONSUMED, ignoreCase = true) }
             .mapTo(HashSet()) { it.entryId }
+    val hackerNewsIdByEntryId = buildMap {
+        catalogTables.identifiers
+            .asSequence()
+            .filter { it.scheme == SCHEME_HACKER_NEWS }
+            .sortedBy { it.value }
+            .forEach { ident -> putIfAbsent(ident.entryId, ident.value) }
+    }
     val ctx =
         InboxProjectionContext(
             allEntriesById = allEntriesById,
@@ -288,6 +384,7 @@ internal fun projectInboxTables(
             contentPreviewsById = contentPreviewsById,
             membershipsByEntry = membershipsByEntry,
             consumedEntryIds = consumedEntryIds,
+            hackerNewsIdByEntryId = hackerNewsIdByEntryId,
         )
     val tags = projectTagRows(catalogTables.specs, activeEntriesById)
     val activeTagIds = tags.mapTo(HashSet(tags.size)) { it.id }
@@ -430,6 +527,8 @@ internal fun buildProjectedInboxItem(
         inboxState = inboxState,
         entryKind = entry.kind,
         isFinished = entry.id in ctx.consumedEntryIds,
+        metadataJson = entry.metadataJson,
+        hackerNewsId = ctx.hackerNewsIdByEntryId[entry.id],
     )
 }
 

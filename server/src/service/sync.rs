@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
+use roche_core::boards::BoardSourceSpec;
 use serde::Serialize;
 use url::Url;
 
@@ -8,8 +9,8 @@ use super::{AppError, RocheService};
 use crate::{
     content::{HtmlSanitizer, MAX_SUMMARY_CHARS},
     db::{
-        ActivityEntry, PeerSyncRequest, PeerSyncResponse, PreparedSyncEntry, SyncEntryRecord,
-        deterministic_feed_id,
+        ActivityEntry, PeerSyncRequest, PeerSyncResponse, PreparedSyncEntry, SyncBoardItemRecord,
+        SyncBoardRecord, SyncEntryRecord, deterministic_feed_id,
     },
     domain::ItemStatus,
     feeds::FeedSource,
@@ -29,6 +30,9 @@ const MAX_SYNC_COLLECTION_ENTRIES: usize = 25_000;
 const MAX_SYNC_GENERATORS: usize = 64;
 const MAX_SYNC_CONSUMPTION_LOG: usize = 25_000;
 const MAX_SYNC_COMPARISONS: usize = 25_000;
+const MAX_SYNC_BOARDS: usize = 256;
+const MAX_SYNC_BOARD_ITEM_STATES: usize = 25_000;
+const MAX_SYNC_BOARD_SNAPSHOT_ITEMS: usize = 500;
 
 fn is_valid_sync_item_url(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
@@ -113,6 +117,14 @@ impl SyncService<'_> {
                 AppError::Internal(anyhow::anyhow!("Sync entry preparation failed: {e}"))
             })?
         };
+        if !req.boards.is_empty() {
+            let raw_boards = std::mem::take(&mut req.boards);
+            req.boards = tokio::task::spawn_blocking(move || sanitize_sync_boards(raw_boards))
+                .await
+                .map_err(|e| {
+                    AppError::Internal(anyhow::anyhow!("Sync board preparation failed: {e}"))
+                })?;
+        }
 
         let (response, mut inserted_candidates) =
             self.service.db.sync().merge_peer_state_prepared(&req, &prepared_entries).await?;
@@ -143,10 +155,22 @@ fn validate_peer_sync_limits(req: &PeerSyncRequest) -> Result<(), AppError> {
         ("collection_generators", req.collection_generators.len(), MAX_SYNC_GENERATORS),
         ("consumption_log", req.consumption_log.len(), MAX_SYNC_CONSUMPTION_LOG),
         ("comparisons", req.comparisons.len(), MAX_SYNC_COMPARISONS),
+        ("boards", req.boards.len(), MAX_SYNC_BOARDS),
+        ("board_item_states", req.board_item_states.len(), MAX_SYNC_BOARD_ITEM_STATES),
     ] {
         if len > limit {
             return Err(AppError::payload_too_large(format!(
                 "peer_sync '{field}' array ({len}) exceeds per-request limit ({limit}); paginate into smaller batches"
+            )));
+        }
+    }
+    for board in &req.boards {
+        if let Some(ref items) = board.snapshot_items
+            && items.len() > MAX_SYNC_BOARD_SNAPSHOT_ITEMS
+        {
+            return Err(AppError::payload_too_large(format!(
+                "peer_sync board snapshot_items ({}) exceeds per-board limit ({MAX_SYNC_BOARD_SNAPSHOT_ITEMS})",
+                items.len()
             )));
         }
     }
@@ -313,6 +337,68 @@ pub fn prepare_sync_entry(rec: SyncEntryRecord) -> PreparedSyncEntry {
         clean_summary,
         clean_thumb,
     )
+}
+
+fn sanitize_sync_boards(boards: Vec<SyncBoardRecord>) -> Vec<SyncBoardRecord> {
+    boards
+        .into_iter()
+        .filter_map(|mut board| {
+            let Ok(spec) = BoardSourceSpec::validate_config(
+                board.adapter_type,
+                &board.source_key,
+                &board.source_url,
+                &board.source_config_json,
+            ) else {
+                tracing::warn!(
+                    board_id = %board.id,
+                    source_url = %board.source_url,
+                    "Skipping invalid or disallowed board in peer_sync"
+                );
+                return None;
+            };
+            board.source_key = spec.source_key;
+            board.source_url = spec.source_url;
+            board.source_config_json = spec.source_config_json;
+
+            if let Some(items) = board.snapshot_items.take() {
+                let sanitized_items: Vec<SyncBoardItemRecord> =
+                    items.into_iter().filter_map(sanitize_sync_board_item).collect();
+                board.snapshot_items = Some(sanitized_items);
+            }
+            Some(board)
+        })
+        .collect()
+}
+
+fn sanitize_sync_board_item(mut item: SyncBoardItemRecord) -> Option<SyncBoardItemRecord> {
+    let parsed_url = parse_public_url(&item.url).ok()?;
+    if parsed_url.as_str().len() > MAX_SYNC_URL_LEN {
+        return None;
+    }
+    item.url = parsed_url.to_string();
+    item.discussion_url = item
+        .discussion_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= MAX_SYNC_URL_LEN)
+        .and_then(|u| parse_public_url(u).ok().map(String::from));
+    item.self_text_html = item
+        .self_text_html
+        .as_deref()
+        .map(|h| HtmlSanitizer::clean_with_base(h, Some(&parsed_url)))
+        .filter(|h| !h.trim().is_empty());
+    item.summary = item
+        .summary
+        .as_deref()
+        .map(|s| HtmlSanitizer::plain_text_excerpt(s, MAX_SUMMARY_CHARS))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            item.self_text_html
+                .as_deref()
+                .map(|h| HtmlSanitizer::plain_text_excerpt_from_clean(h, MAX_SUMMARY_CHARS))
+                .filter(|s| !s.is_empty())
+        });
+    Some(item)
 }
 
 #[cfg(test)]

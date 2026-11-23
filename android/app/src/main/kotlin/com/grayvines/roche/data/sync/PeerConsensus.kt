@@ -6,6 +6,7 @@ import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.isSyncablePublicUrl
 import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.core.parseIsoEpochSecs
+import com.grayvines.roche.data.local.BoardEntity
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.remote.PeerNodeDto
@@ -260,6 +261,41 @@ private fun scorePeerForFeed(
     return score.takeIf { it.isFinite() }
 }
 
+private data class PollableSource(
+    val canonicalKeyUrl: String,
+    val pollInterval: Int,
+    val isActive: Boolean,
+    val lastPolledAt: String?,
+    val lastPolledBy: String?,
+    val lastError: String?,
+    val lastErrorBy: String?,
+    val consecutiveFailures: Int,
+)
+
+private fun FeedRow.toPollableSource(): PollableSource =
+    PollableSource(
+        canonicalKeyUrl = url,
+        pollInterval = pollInterval,
+        isActive = isActive,
+        lastPolledAt = lastPolled,
+        lastPolledBy = lastPolledBy,
+        lastError = lastError,
+        lastErrorBy = lastErrorBy,
+        consecutiveFailures = consecutiveFailures,
+    )
+
+private fun BoardEntity.toPollableSource(): PollableSource =
+    PollableSource(
+        canonicalKeyUrl = canonicalizeSyncUrl(sourceUrl),
+        pollInterval = pollInterval,
+        isActive = isActive,
+        lastPolledAt = lastPolledAt,
+        lastPolledBy = lastPolledBy,
+        lastError = lastError,
+        lastErrorBy = lastErrorBy,
+        consecutiveFailures = consecutiveFailures,
+    )
+
 private data class FeedPollScheduleState(
     val isCrossPeerRescue: Boolean,
     val lastPolledEpochSecs: Long?,
@@ -267,26 +303,27 @@ private data class FeedPollScheduleState(
     val intervalSecs: Long,
 )
 
-private fun evaluateFeedPollSchedule(
+private fun evaluatePollSchedule(
     localPeerId: String,
-    feed: FeedRow,
+    source: PollableSource,
     nowEpochSeconds: Long,
 ): FeedPollScheduleState {
-    val hasError = !feed.lastError.isNullOrBlank()
-    val effectiveFailures = normalizeConsecutiveFailures(feed.lastError, feed.consecutiveFailures)
-    val cleanErrorBy = feed.lastErrorBy?.trim()?.takeIf { it.isNotEmpty() }
+    val hasError = !source.lastError.isNullOrBlank()
+    val effectiveFailures =
+        normalizeConsecutiveFailures(source.lastError, source.consecutiveFailures)
+    val cleanErrorBy = source.lastErrorBy?.trim()?.takeIf { it.isNotEmpty() }
     val isCrossPeerRescue =
         hasError && effectiveFailures == 1 && cleanErrorBy != null && cleanErrorBy != localPeerId
-    val lastPolledEpochSecs = parseIsoEpochSecs(feed.lastPolled)
+    val lastPolledEpochSecs = parseIsoEpochSecs(source.lastPolledAt)
     val intervalSecs =
-        feed.pollInterval.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES).toLong() * SECONDS_PER_MINUTE
+        source.pollInterval.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES).toLong() * SECONDS_PER_MINUTE
     val dueAtSecs =
         if (lastPolledEpochSecs == null) {
             nowEpochSeconds
         } else {
             nextScheduledPollEpochSecs(
-                feedUrl = feed.url,
-                pollIntervalMinutes = feed.pollInterval,
+                feedUrl = source.canonicalKeyUrl,
+                pollIntervalMinutes = source.pollInterval,
                 lastPolledEpochSeconds = lastPolledEpochSecs,
                 consecutiveFailures = effectiveFailures,
             )
@@ -299,32 +336,20 @@ private fun evaluateFeedPollSchedule(
     )
 }
 
-internal fun isFeedDueOrRescueForPeer(
-    localPeerId: String,
-    feed: FeedRow,
-    nowInstant: Instant,
-): Boolean {
-    if (!feed.isActive) return false
-    val nowSecs = nowInstant.epochSecond
-    val schedule = evaluateFeedPollSchedule(localPeerId, feed, nowSecs)
-    return schedule.isCrossPeerRescue || nowSecs >= schedule.dueAtSecs
-}
-
-internal fun shouldPeerPollFeed(
+private fun shouldPeerPollSource(
     localPeerId: String,
     activePeers: List<PeerNodeDto>,
-    feed: FeedRow,
-    nowInstant: Instant = Instant.now(),
+    source: PollableSource,
+    nowEpochSeconds: Long,
 ): Boolean {
-    if (!feed.isActive) return false
-    val nowSecs = nowInstant.epochSecond
-    val schedule = evaluateFeedPollSchedule(localPeerId, feed, nowSecs)
-    if (!schedule.isCrossPeerRescue && nowSecs < schedule.dueAtSecs) return false
+    if (!source.isActive) return false
+    val schedule = evaluatePollSchedule(localPeerId, source, nowEpochSeconds)
+    if (!schedule.isCrossPeerRescue && nowEpochSeconds < schedule.dueAtSecs) return false
 
-    val overdueSecs = (nowSecs - schedule.dueAtSecs).coerceAtLeast(0L)
+    val overdueSecs = (nowEpochSeconds - schedule.dueAtSecs).coerceAtLeast(0L)
     val isOverdueRescue =
         schedule.lastPolledEpochSecs != null && overdueSecs >= schedule.intervalSecs
-    if (isOverdueRescue || !isSyncablePublicUrl(feed.url) || activePeers.size <= 1) {
+    if (isOverdueRescue || !isSyncablePublicUrl(source.canonicalKeyUrl) || activePeers.size <= 1) {
         return true
     }
 
@@ -337,16 +362,66 @@ internal fun shouldPeerPollFeed(
         }
     return selectFeedPoller(
         activePeers = activePeers,
-        feedUrl = feed.url,
-        pollIntervalMinutes = feed.pollInterval,
-        nowEpochSeconds = nowSecs,
-        lastPolledBy = feed.lastPolledBy,
-        lastError = feed.lastError,
-        lastErrorBy = feed.lastErrorBy,
+        feedUrl = source.canonicalKeyUrl,
+        pollIntervalMinutes = source.pollInterval,
+        nowEpochSeconds = nowEpochSeconds,
+        lastPolledBy = source.lastPolledBy,
+        lastError = source.lastError,
+        lastErrorBy = source.lastErrorBy,
         localBoostPeerId = localPeerId,
         localBoostFactor = localStealBoost,
     ) == localPeerId
 }
+
+internal fun isFeedDueOrRescueForPeer(
+    localPeerId: String,
+    feed: FeedRow,
+    nowInstant: Instant,
+): Boolean {
+    if (!feed.isActive) return false
+    val nowSecs = nowInstant.epochSecond
+    val schedule = evaluatePollSchedule(localPeerId, feed.toPollableSource(), nowSecs)
+    return schedule.isCrossPeerRescue || nowSecs >= schedule.dueAtSecs
+}
+
+internal fun shouldPeerPollFeed(
+    localPeerId: String,
+    activePeers: List<PeerNodeDto>,
+    feed: FeedRow,
+    nowInstant: Instant = Instant.now(),
+): Boolean =
+    shouldPeerPollSource(
+        localPeerId = localPeerId,
+        activePeers = activePeers,
+        source = feed.toPollableSource(),
+        nowEpochSeconds = nowInstant.epochSecond,
+    )
+
+internal fun shouldPeerPollBoard(
+    localPeerId: String,
+    activePeers: List<PeerNodeDto>,
+    board: BoardEntity,
+    nowEpochSeconds: Long = Instant.now().epochSecond,
+): Boolean =
+    shouldPeerPollSource(
+        localPeerId = localPeerId,
+        activePeers = activePeers,
+        source = board.toPollableSource(),
+        nowEpochSeconds = nowEpochSeconds,
+    )
+
+internal fun shouldPeerPollBoard(
+    localPeerId: String,
+    activePeers: List<PeerNodeDto>,
+    board: BoardEntity,
+    nowInstant: Instant,
+): Boolean =
+    shouldPeerPollBoard(
+        localPeerId = localPeerId,
+        activePeers = activePeers,
+        board = board,
+        nowEpochSeconds = nowInstant.epochSecond,
+    )
 
 private const val DIGEST_ALGORITHM_SHA256 = "SHA-256"
 internal const val DEFAULT_ONLINE_PEER_WEIGHT = 1.0

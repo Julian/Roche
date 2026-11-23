@@ -1,9 +1,17 @@
+mod boards;
+
 use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex, Weak},
     time::Duration,
+};
+
+#[allow(unused_imports)]
+pub use boards::{
+    BOARD_ITEM_FETCH_CONCURRENCY, BoardAdapter, BoardIngester, BoardPageFetch, BoardPollOutcome,
+    HackerNewsAdapter, board_poll_lock_key,
 };
 
 use anyhow::Result;
