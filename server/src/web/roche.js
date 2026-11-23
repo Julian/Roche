@@ -3290,17 +3290,22 @@
       if (btn.dataset.bound === "1") continue;
       btn.dataset.bound = "1";
       btn.addEventListener("click", async () => {
-        const text = btn.getAttribute("data-copy-text") || "";
-        if (!text) return;
-        const orig = btn.textContent || "Copy";
+        const fromId = btn.getAttribute("data-copy-from");
+        const fromEl = fromId ? document.getElementById(fromId) : null;
+        const text = (fromEl && "value" in fromEl ? fromEl.value.trim() : "")
+          || btn.getAttribute("data-copy-text")
+          || "";
+        if (!text || !navigator.clipboard?.writeText) return;
+        const orig = btn.dataset.origLabel || (btn.textContent || "Copy");
+        btn.dataset.origLabel = orig;
         try {
-          if (navigator.clipboard?.writeText) {
-            await navigator.clipboard.writeText(text);
-          }
+          await navigator.clipboard.writeText(text);
           btn.textContent = "Copied ✓";
-          window.setTimeout(() => {
+          if (btn.dataset.copyTimer) window.clearTimeout(Number(btn.dataset.copyTimer));
+          btn.dataset.copyTimer = String(window.setTimeout(() => {
             btn.textContent = orig;
-          }, 1800);
+            delete btn.dataset.copyTimer;
+          }, 1800));
         } catch {}
       });
     }

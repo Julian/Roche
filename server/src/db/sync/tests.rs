@@ -767,7 +767,10 @@ async fn test_tombstone_resurrection_requires_newer_hlc_and_preserves_custom_fee
     // User renames feed on server; subsequent peer poll with older config HLC must NOT clobber custom title
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     assert!(
-        db.feeds().update(&feed.id, Some("My Custom Feed Name"), None, None, None).await.unwrap()
+        db.feeds()
+            .update(&feed.id, Some("My Custom Feed Name"), None, None, None, None)
+            .await
+            .unwrap()
     );
     let poll_bump_req = PeerSyncRequest {
         peer_id: "android-peer-1".to_string(),
@@ -4590,7 +4593,10 @@ async fn test_rust_hlc_causal_monotonicity_under_peer_clock_skew() {
 
     // 2. Server locally updates feed title and deletes the item using normal wall clock (`now`).
     assert!(
-        db.feeds().update(&feed_id, Some("Server Renamed Feed"), None, None, None).await.unwrap()
+        db.feeds()
+            .update(&feed_id, Some("Server Renamed Feed"), None, None, None, None)
+            .await
+            .unwrap()
     );
     assert!(db.items().delete(&item_id).await.unwrap());
 
@@ -4931,7 +4937,9 @@ async fn test_all_local_repo_writes_stamp_valid_causal_hlcs_and_single_insert_me
         .append_comparison(None, &[vec![b.id.clone()], vec![a.id.clone()]], None)
         .await
         .unwrap();
-    assert!(db.feeds().update(&feed.id, Some("HLC Feed 2"), Some(45), None, None).await.unwrap());
+    assert!(
+        db.feeds().update(&feed.id, Some("HLC Feed 2"), Some(45), None, None, None).await.unwrap()
+    );
 
     let last_hlc: String = sqlx::query_scalar("SELECT last_hlc FROM sync_clock WHERE id = 1")
         .fetch_one(db.pool())
@@ -5734,4 +5742,305 @@ async fn test_sync_narrated_article_preserves_article_kind_and_audio_enclosure()
         .unwrap();
     let still_cleared = db.items().get(&item_id).await.unwrap().unwrap();
     assert!(still_cleared.audio_url.is_none());
+}
+
+#[tokio::test]
+async fn test_peer_sync_feed_url_edit_lww_conflict_and_moved_delete_tombstone() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let old_url = Url::parse("https://old-sync.example.com/rss.xml").unwrap();
+    let new_url = Url::parse("https://new-sync.example.com/feed.xml").unwrap();
+    let other_url = Url::parse("https://other-sync.example.com/rss.xml").unwrap();
+
+    let feed = db.feeds().create(FeedType::Rss, &old_url, Some("Sync Blog"), None).await.unwrap();
+    let other =
+        db.feeds().create(FeedType::Rss, &other_url, Some("Other Blog"), None).await.unwrap();
+    db.feeds().mark_error(&feed.id, "410 Gone").await.unwrap();
+
+    let now = Utc::now();
+    let hlc_stale = "000000000000001-0000-android-stale".to_owned();
+    let hlc_newer = HlcTimestamp::new(now.timestamp_millis() + 60_000, 1, "android-1").encode();
+    let hlc_newer2 = HlcTimestamp::new(now.timestamp_millis() + 120_000, 1, "android-1").encode();
+
+    // 1. Incoming newer HLC updates feed_url in place, keeps collection_id, and clears stale error.
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-1".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![make_feed_sync_entry(
+                &feed.id,
+                new_url.as_str(),
+                FeedType::Rss,
+                Some("Sync Blog"),
+                None,
+                true,
+                None,
+                None,
+                &hlc_newer,
+            )],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let after_move = db.feeds().get(&feed.id).await.unwrap().unwrap();
+    assert_eq!(after_move.url, new_url);
+    assert!(after_move.last_error.is_none());
+    assert_eq!(after_move.consecutive_failures, 0);
+
+    // 2. Stale peer sending old URL cannot revert feed_url.
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-stale".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![make_feed_sync_entry(
+                &feed.id,
+                old_url.as_str(),
+                FeedType::Rss,
+                Some("Sync Blog"),
+                None,
+                true,
+                None,
+                None,
+                &hlc_stale,
+            )],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().url, new_url);
+
+    // 3. Incoming URL change that collides with another subscribed feed does NOT abort sync or corrupt either feed.
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-1".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![make_feed_sync_entry(
+                &feed.id,
+                other_url.as_str(),
+                FeedType::Rss,
+                Some("Sync Blog"),
+                None,
+                true,
+                None,
+                None,
+                &hlc_newer2,
+            )],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().url, new_url);
+    assert_eq!(db.feeds().get(&other.id).await.unwrap().unwrap().url, other_url);
+
+    // 4. Deleting a moved feed emits BOTH URL and collection_id tombstones so peers at old_url also delete it.
+    assert!(db.feeds().delete(&feed.id).await.unwrap());
+    let feed_tomb_keys: Vec<String> =
+        sqlx::query_scalar("SELECT natural_key FROM sync_tombstones WHERE entity_type = 'feed'")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert!(feed_tomb_keys.contains(&feed_natural_key(new_url.as_str())));
+    assert!(feed_tomb_keys.contains(&feed.id));
+
+    // Peer B still has `(id = det(old_url), feed_url = old_url)`: receiving tombstone for `feed.id` deletes it.
+    let peer_b = Db::connect("sqlite::memory:").await.unwrap();
+    let peer_b_feed =
+        peer_b.feeds().create(FeedType::Rss, &old_url, Some("Sync Blog"), None).await.unwrap();
+    assert_eq!(peer_b_feed.id, feed.id);
+    let delete_hlc = HlcTimestamp::new(now.timestamp_millis() + 180_000, 1, "android-1").encode();
+    peer_b
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-1".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            tombstones: vec![
+                SyncTombstone {
+                    entity_type: ActivityEntityType::Feed,
+                    natural_key: feed_natural_key(new_url.as_str()),
+                    deleted_at: now,
+                    hlc: delete_hlc.clone(),
+                },
+                SyncTombstone {
+                    entity_type: ActivityEntityType::Feed,
+                    natural_key: feed.id.clone(),
+                    deleted_at: now,
+                    hlc: delete_hlc,
+                },
+            ],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(peer_b.feeds().get(&feed.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_peer_sync_feed_url_edge_cases_resubscribe_swap_tombstones_and_stale_poll() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let u1 = Url::parse("https://edge-one.example.com/rss.xml").unwrap();
+    let u2 = Url::parse("https://edge-two.example.com/rss.xml").unwrap();
+    let u3 = Url::parse("https://edge-three.example.com/rss.xml").unwrap();
+
+    let f1 = db.feeds().create(FeedType::Rss, &u1, Some("Feed One"), None).await.unwrap();
+    let fb = db.feeds().create(FeedType::Rss, &u2, Some("Feed B"), None).await.unwrap();
+    let item_url = Url::parse("https://edge-one.example.com/posts/to-delete").unwrap();
+    let local_item = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&f1.id),
+            title: "Will Delete Same Batch",
+            url: &item_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let hlc_move = HlcTimestamp::new(now.timestamp_millis() + 60_000, 1, "android-1").encode();
+    let hlc_del = HlcTimestamp::new(now.timestamp_millis() + 120_000, 1, "android-1").encode();
+    let hlc_stale = "000000000000001-0000-android-old".to_owned();
+    let f2_id = uuid::Uuid::new_v4().to_string();
+
+    // 1. Single sync batch with F2(random id, u1) arriving BEFORE F1(u1->u2) and FB(u2->u3),
+    //    plus an item tombstone keyed under u2 for F1's existing local item.
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-1".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![
+                make_feed_sync_entry(
+                    &f2_id,
+                    u1.as_str(),
+                    FeedType::Rss,
+                    Some("Resubscribed U1"),
+                    None,
+                    true,
+                    None,
+                    None,
+                    &hlc_move,
+                ),
+                make_feed_sync_entry(
+                    &f1.id,
+                    u2.as_str(),
+                    FeedType::Rss,
+                    Some("Feed One"),
+                    None,
+                    true,
+                    None,
+                    None,
+                    &hlc_move,
+                ),
+                make_feed_sync_entry(
+                    &fb.id,
+                    u3.as_str(),
+                    FeedType::Rss,
+                    Some("Feed B"),
+                    None,
+                    true,
+                    None,
+                    None,
+                    &hlc_move,
+                ),
+            ],
+            tombstones: vec![SyncTombstone {
+                entity_type: ActivityEntityType::Item,
+                natural_key: item_natural_key(Some(u2.as_str()), item_url.as_str()),
+                deleted_at: now,
+                hlc: hlc_move.clone(),
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(db.feeds().get(&f1.id).await.unwrap().unwrap().url, u2);
+    assert_eq!(db.feeds().get(&fb.id).await.unwrap().unwrap().url, u3);
+    assert_eq!(db.feeds().get(&f2_id).await.unwrap().unwrap().url, u1);
+    assert!(
+        db.items().get(&local_item.id).await.unwrap().is_none(),
+        "same-batch item tombstone under new URL must delete already-local item after feed move"
+    );
+
+    // 2. Stale-URL poll telemetry on u1 must NOT overwrite moved F1(u2) health.
+    let mut stale_rec = make_feed_sync_entry(
+        &f1.id,
+        u1.as_str(),
+        FeedType::Rss,
+        Some("Feed One"),
+        None,
+        true,
+        Some(now + chrono::Duration::seconds(90)),
+        Some("HTTP 404"),
+        &hlc_stale,
+    );
+    if let Some(ref mut fs) = stale_rec.feed_source {
+        fs.consecutive_failures = 3;
+    }
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-old".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            entries: vec![stale_rec],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let f1_after_stale = db.feeds().get(&f1.id).await.unwrap().unwrap();
+    assert_eq!(f1_after_stale.url, u2);
+    assert!(f1_after_stale.last_polled.is_none());
+    assert!(f1_after_stale.last_error.is_none());
+    assert_eq!(f1_after_stale.consecutive_failures, 0);
+
+    // 3. Deleting F2(f2_id, u1) emits tombstones for u1 + f2_id and must NOT delete moved F1(det(u1), u2).
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-1".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            tombstones: vec![
+                SyncTombstone {
+                    entity_type: ActivityEntityType::Feed,
+                    natural_key: feed_natural_key(u1.as_str()),
+                    deleted_at: now,
+                    hlc: hlc_del.clone(),
+                },
+                SyncTombstone {
+                    entity_type: ActivityEntityType::Feed,
+                    natural_key: f2_id.clone(),
+                    deleted_at: now,
+                    hlc: hlc_del.clone(),
+                },
+            ],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(db.feeds().get(&f2_id).await.unwrap().is_none());
+    assert_eq!(db.feeds().get(&f1.id).await.unwrap().unwrap().url, u2);
+
+    // 4. Late item tombstone under old u1 copies to u2 for moved F1(det(u1), u2).
+    let late_item_url = "https://edge-one.example.com/posts/late-delete";
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-old".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            tombstones: vec![SyncTombstone {
+                entity_type: ActivityEntityType::Item,
+                natural_key: item_natural_key(Some(u1.as_str()), late_item_url),
+                deleted_at: now,
+                hlc: hlc_del,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let item_tomb_keys: Vec<String> =
+        sqlx::query_scalar("SELECT natural_key FROM sync_tombstones WHERE entity_type = 'item'")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert!(item_tomb_keys.contains(&item_natural_key(Some(u1.as_str()), late_item_url)));
+    assert!(item_tomb_keys.contains(&item_natural_key(Some(u2.as_str()), late_item_url)));
 }

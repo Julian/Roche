@@ -381,17 +381,10 @@ fn render_feed_row_details(
     return_url: &str,
     csrf: &str,
 ) {
-    let _ = write!(
-        out,
+    out.push_str(
         "<details class=\"feed-row-details\">\n\
            <summary>Details &amp; Edit</summary>\n\
-           <div class=\"feed-row-details-body\">\n\
-             <div class=\"feed-url-bar\">\n\
-               <input type=\"text\" readonly value=\"{url}\" class=\"feed-url-code\" aria-label=\"Feed URL for {title}\">\n\
-               <button type=\"button\" class=\"btn btn-small btn-ghost js-copy-text\" data-copy-text=\"{url}\">Copy URL</button>\n\
-             </div>",
-        url = esc(f.url.as_str()),
-        title = esc(title),
+           <div class=\"feed-row-details-body\">\n",
     );
     if let Some(raw_err) = full_err {
         let _ = writeln!(
@@ -416,15 +409,23 @@ fn render_feed_row_details(
     } else {
         String::new()
     };
+    let explicit_title = f.title.as_deref().map_or("", str::trim);
     let _ = write!(
         out,
         "<form method=\"post\" action=\"/web/feeds/{id_enc}/edit\" class=\"feed-edit-form js-feeds-preserve-form\">\n\
            <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
            <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
+           <div class=\"field\">\n\
+             <label for=\"fe-url-{id_enc}\">Feed URL</label>\n\
+             <div class=\"feed-url-bar\">\n\
+               <input id=\"fe-url-{id_enc}\" name=\"url\" type=\"text\" inputmode=\"url\" spellcheck=\"false\" value=\"{url}\" class=\"feed-url-code\" aria-label=\"Feed URL for {title}\" required>\n\
+               <button type=\"button\" class=\"btn btn-small btn-ghost js-copy-text\" data-copy-text=\"{url}\" data-copy-from=\"fe-url-{id_enc}\">Copy URL</button>\n\
+             </div>\n\
+           </div>\n\
            <div class=\"feed-edit-grid\">\n\
              <div class=\"field\">\n\
                <label for=\"fe-title-{id_enc}\">Title</label>\n\
-               <input id=\"fe-title-{id_enc}\" name=\"title\" type=\"text\" value=\"{title}\" required>\n\
+               <input id=\"fe-title-{id_enc}\" name=\"title\" type=\"text\" value=\"{explicit_title}\" placeholder=\"Auto-detected from feed\">\n\
              </div>\n\
              <div class=\"field\">\n\
                <label for=\"fe-interval-{id_enc}\">Poll every (min)</label>\n\
@@ -439,7 +440,9 @@ fn render_feed_row_details(
         id_enc = esc(id_enc),
         csrf = esc(csrf),
         ret = esc(return_url),
+        url = esc(f.url.as_str()),
         title = esc(title),
+        explicit_title = esc(explicit_title),
         interval = f.poll_interval,
     );
 }
@@ -645,6 +648,8 @@ pub(in crate::web) async fn post_feed_edit(
     Form(form): Form<EditFeedForm>,
 ) -> Response {
     let dest = safe_local_redirect(form.return_to.as_deref(), "/feeds");
+    let previous_url = service.feeds().get(&id).await.ok().map(|f| f.url.to_string());
+    let submitted_url = form.url.as_deref();
     let clean_title = form.title.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let parsed_interval =
         match form.poll_interval.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -669,10 +674,24 @@ pub(in crate::web) async fn post_feed_edit(
         }
         None => None,
     };
-    if let Err(err) =
-        service.feeds().update(&id, clean_title, parsed_interval, None, parsed_feed_type).await
+    let updated = match service
+        .feeds()
+        .update(&id, clean_title, parsed_interval, None, parsed_feed_type, submitted_url)
+        .await
     {
-        return redirect_with_flash(&dest, "err", &safe_web_error_message(&err));
+        Ok(feed) => feed,
+        Err(err) => {
+            return redirect_with_flash(&dest, "err", &safe_web_error_message(&err));
+        }
+    };
+    let url_changed = previous_url.as_deref().is_some_and(|prev| prev != updated.url.as_str());
+    if url_changed && updated.is_active {
+        let service_bg = Arc::clone(&service);
+        let feed_id = updated.id;
+        service.spawn_background(async move {
+            let _ = service_bg.feeds().refresh(&feed_id).await;
+        });
+        return redirect_with_flash(&dest, "notice", "Updated feed URL (refreshing in background)");
     }
     redirect_with_flash(&dest, "notice", "Updated feed settings")
 }

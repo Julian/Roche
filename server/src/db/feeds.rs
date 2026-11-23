@@ -257,7 +257,7 @@ impl<'a> FeedRepo<'a> {
     async fn reactivate_archived_feed_in_tx(
         tx: &mut WriteTx<'_>,
         url_str: &str,
-        det_id: &str,
+        _det_id: &str,
         requested_feed_type: Option<FeedType>,
         title: Option<&str>,
         description: Option<&str>,
@@ -266,11 +266,10 @@ impl<'a> FeedRepo<'a> {
     ) -> std::result::Result<Option<String>, sqlx::Error> {
         let existing_archived: Option<(String, FeedType)> = sqlx::query_as(
             "SELECT collection_id, source_type FROM feed_sources
-             WHERE (feed_url = ? OR collection_id = ?) AND is_active = 0
+             WHERE feed_url = ? AND is_active = 0
              LIMIT 1",
         )
         .bind(url_str)
-        .bind(det_id)
         .fetch_optional(tx.conn())
         .await?;
 
@@ -384,6 +383,7 @@ impl<'a> FeedRepo<'a> {
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, &nat_key).await?;
+        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, &id).await?;
 
         if let Some(existing_id) = Self::reactivate_archived_feed_in_tx(
             &mut tx,
@@ -397,6 +397,7 @@ impl<'a> FeedRepo<'a> {
         )
         .await?
         {
+            SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, &existing_id).await?;
             tx.commit().await?;
             return self
                 .get(&existing_id)
@@ -404,17 +405,25 @@ impl<'a> FeedRepo<'a> {
                 .ok_or_else(|| anyhow::anyhow!("Feed disappeared after unarchive"));
         }
 
-        let active_feed_exists: Option<i64> = sqlx::query_scalar!(
-            "SELECT 1 AS \"found!: i64\" FROM feed_sources WHERE collection_id = ? OR feed_url = ? LIMIT 1",
-            id,
-            url_str,
-        )
-        .fetch_optional(tx.conn())
-        .await?;
+        let active_feed_exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM feed_sources WHERE feed_url = ? LIMIT 1")
+                .bind(url_str)
+                .fetch_optional(tx.conn())
+                .await?;
 
         if active_feed_exists.is_some() {
             return Err(super::ConflictError(format!("Feed '{url_str}' already exists")).into());
         }
+
+        // If a prior feed originally created at `url_str` moved to a different URL, its
+        // `collection_id` is still `deterministic_feed_id(url_str)`. Allocate a fresh UUID
+        // so subscribing to `url_str` again doesn't collide with that moved feed.
+        let det_id_taken: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM feed_sources WHERE collection_id = ? LIMIT 1")
+                .bind(&id)
+                .fetch_optional(tx.conn())
+                .await?;
+        let id = if det_id_taken.is_some() { uuid::Uuid::new_v4().to_string() } else { id };
 
         Self::insert_feed_in_tx(
             &mut tx,
@@ -580,6 +589,7 @@ impl<'a> FeedRepo<'a> {
         let nat_key = feed_natural_key(xml_url_str);
         let clean_title = outline.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
         SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, &nat_key).await?;
+        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, &id).await?;
 
         if let Some(existing_id) = Self::reactivate_archived_feed_in_tx(
             tx,
@@ -593,6 +603,7 @@ impl<'a> FeedRepo<'a> {
         )
         .await?
         {
+            SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, &existing_id).await?;
             let raw = sqlx::query_as::<_, RawFeedRow>(FEED_SELECT_BY_ID_SQL)
                 .bind(&existing_id)
                 .fetch_optional(tx.conn())
@@ -600,16 +611,21 @@ impl<'a> FeedRepo<'a> {
             return Ok(raw.map(Feed::try_from).transpose()?);
         }
 
-        let already_exists: Option<i64> = sqlx::query_scalar!(
-            "SELECT 1 AS \"found!: i64\" FROM feed_sources WHERE feed_url = ? OR collection_id = ? LIMIT 1",
-            xml_url_str,
-            id,
-        )
-        .fetch_optional(tx.conn())
-        .await?;
+        let already_exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM feed_sources WHERE feed_url = ? LIMIT 1")
+                .bind(xml_url_str)
+                .fetch_optional(tx.conn())
+                .await?;
         if already_exists.is_some() {
             return Ok(None);
         }
+
+        let det_id_taken: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM feed_sources WHERE collection_id = ? LIMIT 1")
+                .bind(&id)
+                .fetch_optional(tx.conn())
+                .await?;
+        let id = if det_id_taken.is_some() { uuid::Uuid::new_v4().to_string() } else { id };
 
         Self::insert_feed_in_tx(
             tx,
@@ -680,8 +696,13 @@ impl<'a> FeedRepo<'a> {
         poll_interval: Option<i64>,
         is_active: Option<bool>,
         feed_type: Option<FeedType>,
+        url: Option<&Url>,
     ) -> Result<bool> {
-        if title.is_none() && poll_interval.is_none() && is_active.is_none() && feed_type.is_none()
+        if title.is_none()
+            && poll_interval.is_none()
+            && is_active.is_none()
+            && feed_type.is_none()
+            && url.is_none()
         {
             return Ok(self.get(id).await?.is_some());
         }
@@ -689,19 +710,103 @@ impl<'a> FeedRepo<'a> {
         let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
-        let existing_feed: Option<(String, FeedType)> = sqlx::query_as(
-            "SELECT feed_url, source_type FROM feed_sources WHERE collection_id = ?",
+        let existing_feed: Option<(String, FeedType, Option<String>)> = sqlx::query_as(
+            "SELECT feed_url, source_type, feed_title FROM feed_sources WHERE collection_id = ?",
         )
         .bind(id)
         .fetch_optional(tx.conn())
         .await?;
-        let Some((feed_url, existing_type)) = existing_feed else {
+        let Some((existing_feed_url, existing_type, existing_feed_title)) = existing_feed else {
             return Ok(false);
         };
 
+        let mut current_feed_url = existing_feed_url.clone();
+        let mut mutated = false;
         let feed_hlc = tx.next_hlc().await?;
+
+        if let Some(new_url) = url {
+            let new_url_str = new_url.as_str();
+            if new_url_str != existing_feed_url {
+                let conflict: Option<String> = sqlx::query_scalar(
+                    "SELECT collection_id FROM feed_sources
+                     WHERE collection_id != ? AND feed_url = ?
+                     LIMIT 1",
+                )
+                .bind(id)
+                .bind(new_url_str)
+                .fetch_optional(tx.conn())
+                .await?;
+                if conflict.is_some() {
+                    return Err(super::ConflictError(format!(
+                        "Another feed already uses '{new_url_str}'"
+                    ))
+                    .into());
+                }
+
+                let new_nat_key = feed_natural_key(new_url_str);
+                SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, &new_nat_key)
+                    .await?;
+                SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, id).await?;
+
+                sqlx::query(
+                    "UPDATE feed_sources
+                     SET feed_url = ?,
+                         last_polled_at = NULL,
+                         last_polled_by = NULL,
+                         consecutive_failures = 0,
+                         last_error = NULL,
+                         last_error_by = NULL,
+                         hlc = ?
+                     WHERE collection_id = ?",
+                )
+                .bind(new_url_str)
+                .bind(&feed_hlc)
+                .bind(id)
+                .execute(tx.conn())
+                .await?;
+
+                entries_core::replace_entry_identifier_in_tx(
+                    tx.conn(),
+                    id,
+                    "feed_url",
+                    &new_nat_key,
+                )
+                .await?;
+                SyncRepo::copy_item_tombstones_for_feed_url_change(
+                    tx.conn(),
+                    &existing_feed_url,
+                    new_url_str,
+                )
+                .await?;
+
+                let entry_hlc = tx.next_hlc().await?;
+                if title.is_none()
+                    && existing_feed_title.as_deref().map(str::trim).is_none_or(str::is_empty)
+                {
+                    sqlx::query(
+                        "UPDATE entries SET title = ?, updated_at = ?, hlc = ? WHERE id = ?",
+                    )
+                    .bind(new_url_str)
+                    .bind(now)
+                    .bind(&entry_hlc)
+                    .bind(id)
+                    .execute(tx.conn())
+                    .await?;
+                } else {
+                    sqlx::query("UPDATE entries SET updated_at = ?, hlc = ? WHERE id = ?")
+                        .bind(now)
+                        .bind(&entry_hlc)
+                        .bind(id)
+                        .execute(tx.conn())
+                        .await?;
+                }
+                current_feed_url = new_url_str.to_owned();
+                mutated = true;
+            }
+        }
+
         if let Some(t) = title {
-            let entry_title = if t.trim().is_empty() { feed_url.as_str() } else { t };
+            let entry_title = if t.trim().is_empty() { current_feed_url.as_str() } else { t };
             sqlx::query("UPDATE feed_sources SET feed_title = ?, hlc = ? WHERE collection_id = ?")
                 .bind(t)
                 .bind(&feed_hlc)
@@ -716,6 +821,7 @@ impl<'a> FeedRepo<'a> {
                 .bind(id)
                 .execute(tx.conn())
                 .await?;
+            mutated = true;
         }
         if let Some(interval) = poll_interval {
             sqlx::query(
@@ -726,6 +832,7 @@ impl<'a> FeedRepo<'a> {
             .bind(id)
             .execute(tx.conn())
             .await?;
+            mutated = true;
         }
         if let Some(active) = is_active {
             if active {
@@ -751,6 +858,7 @@ impl<'a> FeedRepo<'a> {
                 .execute(tx.conn())
                 .await?;
             }
+            mutated = true;
         }
         if let Some(new_type) = feed_type
             && matches!(
@@ -774,6 +882,10 @@ impl<'a> FeedRepo<'a> {
                 .execute(tx.conn())
                 .await?;
             Self::reclassify_feed_items_for_type_change_in_tx(&mut tx, id, new_type, now).await?;
+            mutated = true;
+        }
+        if !mutated {
+            return Ok(true);
         }
         sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, id)
             .execute(tx.conn())
@@ -908,11 +1020,11 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub async fn archive(&self, id: &str) -> Result<bool> {
-        self.update(id, None, None, Some(false), None).await
+        self.update(id, None, None, Some(false), None, None).await
     }
 
     pub async fn unarchive(&self, id: &str) -> Result<bool> {
-        self.update(id, None, None, Some(true), None).await
+        self.update(id, None, None, Some(true), None, None).await
     }
 
     pub(crate) async fn delete_feed_preserving_history_in_tx(
@@ -991,11 +1103,21 @@ impl<'a> FeedRepo<'a> {
 
         Self::delete_feed_preserving_history_in_tx(&mut tx, id, now).await?;
 
-        SyncRepo::record_tombstone(
-            &mut tx,
+        let tomb_hlc = tx.next_hlc().await?;
+        SyncRepo::record_tombstone_with_hlc(
+            tx.conn(),
             ActivityEntityType::Feed,
             &feed_natural_key(&feed_url),
             now,
+            &tomb_hlc,
+        )
+        .await?;
+        SyncRepo::record_tombstone_with_hlc(
+            tx.conn(),
+            ActivityEntityType::Feed,
+            id,
+            now,
+            &tomb_hlc,
         )
         .await?;
         SyncRepo::record_activity(
@@ -1924,7 +2046,10 @@ mod tests {
 
         // Toggle RSS -> Podcast
         assert!(
-            db.feeds().update(&feed.id, None, None, None, Some(FeedType::Podcast)).await.unwrap()
+            db.feeds()
+                .update(&feed.id, None, None, None, Some(FeedType::Podcast), None)
+                .await
+                .unwrap()
         );
         assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().feed_type, FeedType::Podcast);
         assert_eq!(
@@ -1948,7 +2073,9 @@ mod tests {
         assert_eq!(video.content_type, ContentType::Video);
 
         // Toggle Podcast -> RSS: preserves audio_url + duration while reverting to Article
-        assert!(db.feeds().update(&feed.id, None, None, None, Some(FeedType::Rss)).await.unwrap());
+        assert!(
+            db.feeds().update(&feed.id, None, None, None, Some(FeedType::Rss), None).await.unwrap()
+        );
         assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().feed_type, FeedType::Rss);
         assert_eq!(
             db.catalog().get_entry(&feed.id).await.unwrap().unwrap().kind,
@@ -2029,5 +2156,121 @@ mod tests {
         assert_eq!(item.content_type, ContentType::Article);
         assert_eq!(item.audio_url.as_deref(), Some("https://cdn.backfill.example.com/post-1.mp3"));
         assert_eq!(item.duration, Some(1500));
+    }
+
+    #[tokio::test]
+    async fn test_update_feed_url_preserves_id_dedups_items_migrates_tombstones_and_blocks_conflicts()
+     {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let old_url = Url::parse("https://oldblog.example.com/rss.xml").unwrap();
+        let new_url = Url::parse("https://newblog.example.com/atom.xml").unwrap();
+        let feed =
+            db.feeds().create(FeedType::Rss, &old_url, Some("Systems Blog"), None).await.unwrap();
+
+        let post1_url = Url::parse("https://blog.example.com/posts/1").unwrap();
+        let post2_url = Url::parse("https://blog.example.com/posts/2").unwrap();
+        let initial_batch = PollBatch {
+            title: Some("Systems Blog".to_owned()),
+            description: None,
+            language: None,
+            items: vec![
+                PollItemCandidate {
+                    title: "Post 1".to_owned(),
+                    url: post1_url,
+                    creators: Vec::new(),
+                    published_at: None,
+                    summary: "Summary 1".to_owned(),
+                    content_html: None,
+                    thumbnail_url: None,
+                    audio_url: None,
+                    duration: None,
+                    content_type: ContentType::Article,
+                },
+                PollItemCandidate {
+                    title: "Post 2".to_owned(),
+                    url: post2_url,
+                    creators: Vec::new(),
+                    published_at: None,
+                    summary: "Summary 2".to_owned(),
+                    content_html: None,
+                    thumbnail_url: None,
+                    audio_url: None,
+                    duration: None,
+                    content_type: ContentType::Article,
+                },
+            ],
+        };
+        let inserted = db.feeds().record_poll_batch(&feed.id, &initial_batch).await.unwrap();
+        assert_eq!(inserted.len(), 2);
+        let post1_id = inserted[0].0.clone();
+        let post2_id = inserted[1].0.clone();
+
+        // Hard-delete post 2 (creating a feed-scoped item tombstone) and record a poll error.
+        assert!(db.items().delete(&post2_id).await.unwrap());
+        db.feeds().mark_error(&feed.id, "404 Not Found").await.unwrap();
+        assert_eq!(
+            db.feeds().get(&feed.id).await.unwrap().unwrap().last_error.as_deref(),
+            Some("404 Not Found")
+        );
+
+        // Update feed URL: preserves collection_id, clears poll state & error, updates identifier, migrates tombstone.
+        assert!(db.feeds().update(&feed.id, None, None, None, None, Some(&new_url)).await.unwrap());
+        let updated = db.feeds().get(&feed.id).await.unwrap().unwrap();
+        assert_eq!(updated.id, feed.id);
+        assert_eq!(updated.url, new_url);
+        assert!(updated.last_polled.is_none());
+        assert!(updated.last_error.is_none());
+        assert_eq!(updated.consecutive_failures, 0);
+
+        let idents: Vec<String> = sqlx::query_scalar(
+            "SELECT value FROM entry_identifiers WHERE entry_id = ? AND scheme = 'feed_url'",
+        )
+        .bind(&feed.id)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(idents, vec![super::feed_natural_key(new_url.as_str())]);
+
+        // Re-polling the new URL with both old posts deduplicates post 1 and suppresses deleted post 2.
+        let repoll = db.feeds().record_poll_batch(&feed.id, &initial_batch).await.unwrap();
+        assert!(repoll.is_empty());
+        assert!(db.items().get(&post1_id).await.unwrap().is_some());
+        assert!(db.items().get(&post2_id).await.unwrap().is_none());
+        assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().unread_count, 1);
+
+        // Re-subscribing to old_url creates a separate feed instead of colliding on det(old_url).
+        let other_feed = db
+            .feeds()
+            .create(FeedType::Rss, &old_url, Some("Resubscribed Old"), None)
+            .await
+            .unwrap();
+        assert_ne!(other_feed.id, feed.id);
+        assert_eq!(other_feed.url, old_url);
+
+        // Updating other_feed to new_url fails with ConflictError.
+        let conflict = db
+            .feeds()
+            .update(&other_feed.id, None, None, None, None, Some(&new_url))
+            .await
+            .unwrap_err();
+        assert!(conflict.downcast_ref::<crate::db::ConflictError>().is_some());
+
+        // Case-sensitive paths remain distinct feeds, and deleting an unmoved feed emits both URL & ID tombstones.
+        let case_upper = Url::parse("https://case.example.com/FeedA").unwrap();
+        let case_lower = Url::parse("https://case.example.com/feeda").unwrap();
+        let upper_feed =
+            db.feeds().create(FeedType::Rss, &case_upper, Some("Upper"), None).await.unwrap();
+        let lower_feed =
+            db.feeds().create(FeedType::Rss, &case_lower, Some("Lower"), None).await.unwrap();
+        assert_ne!(upper_feed.id, lower_feed.id);
+        assert!(db.feeds().delete(&upper_feed.id).await.unwrap());
+        let tomb_keys: Vec<String> = sqlx::query_scalar(
+            "SELECT natural_key FROM sync_tombstones WHERE entity_type = 'feed'",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert!(tomb_keys.contains(&super::feed_natural_key(case_upper.as_str())));
+        assert!(tomb_keys.contains(&upper_feed.id));
     }
 }

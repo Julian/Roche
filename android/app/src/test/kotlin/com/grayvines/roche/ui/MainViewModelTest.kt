@@ -544,6 +544,31 @@ class MainViewModelTest {
                 renamed.visibleEntries.first { it.id == "i-polish" }.feedTitle,
             )
 
+            viewModel.dispatch(
+                MainAction.UpdateFeedUrl("f-polish", "https://updated-polish.example.com/feed.xml")
+            )
+            val urlUpdated =
+                viewModel.uiState.first { state ->
+                    state.feeds.any {
+                        it.id == "f-polish" &&
+                            it.url == "https://updated-polish.example.com/feed.xml"
+                    } && state.statusBanner == "Updated feed URL"
+                }
+            assertEquals(
+                "https://updated-polish.example.com/feed.xml",
+                urlUpdated.feeds.first { it.id == "f-polish" }.url,
+            )
+
+            viewModel.dispatch(MainAction.UpdateFeedUrl("f-polish", "ftp://bad.example.com/rss"))
+            val urlFailed =
+                viewModel.uiState.first { state ->
+                    state.statusBanner?.startsWith("Feed URL update failed") == true
+                }
+            assertEquals(
+                "https://updated-polish.example.com/feed.xml",
+                urlFailed.feeds.first { it.id == "f-polish" }.url,
+            )
+
             viewModel.dispatch(MainAction.ApplyTagToFeed("f-polish", "Systems"))
             val tagged =
                 viewModel.uiState.first { state ->

@@ -22,14 +22,27 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
 
     private suspend fun executeFeedSyncAction(action: MainAction.FeedSyncAction) {
         when (action) {
+            is MainAction.FeedManagementAction -> executeFeedManagementAction(action)
+            is MainAction.SyncTriggerAction -> executeSyncTriggerAction(action)
+        }
+    }
+
+    private suspend fun executeFeedManagementAction(action: MainAction.FeedManagementAction) {
+        when (action) {
             is MainAction.ImportOpml -> performImportOpml(action.opmlXml)
             is MainAction.RefreshFeed -> performRefreshFeed(action.feedId)
             is MainAction.RenameFeed -> performRenameFeed(action.feedId, action.newTitle)
+            is MainAction.UpdateFeedUrl -> performUpdateFeedUrl(action.feedId, action.newUrl)
             is MainAction.SetFeedType -> performSetFeedType(action.feedId, action.feedType)
             is MainAction.ApplyTagToFeed -> performApplyTagToFeed(action.feedId, action.tagName)
             is MainAction.ArchiveFeedUnread -> performArchiveFeedUnread(action.feedId)
             is MainAction.ToggleFeedArchive -> performToggleFeedArchive(action.feedId)
             is MainAction.DeleteFeed -> performDeleteFeed(action.feedId)
+        }
+    }
+
+    private suspend fun executeSyncTriggerAction(action: MainAction.SyncTriggerAction) {
+        when (action) {
             MainAction.SyncNow -> performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
             MainAction.ManualRefresh -> performManualRefresh()
             MainAction.PollFeedsOnDeviceNow -> performPollFeedsOnDevice()
@@ -124,6 +137,20 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
         if (updatedTitle != null) {
             host.showStatusMessage("Renamed feed to \"${updatedTitle.take(SNACKBAR_TITLE_LIMIT)}\"")
         }
+    }
+
+    private suspend fun performUpdateFeedUrl(feedId: String, newUrl: String) {
+        host.repository
+            .updateFeedUrl(feedId = feedId, rawNewUrl = newUrl)
+            .onSuccess { (_, changed) ->
+                val message = if (changed) "Updated feed URL" else "Feed URL is unchanged"
+                host.showStatusMessage(message)
+            }
+            .onFailure { error ->
+                host.showStatusMessage(
+                    "Feed URL update failed (${formatErrorDetail(error, "invalid URL")})"
+                )
+            }
     }
 
     private suspend fun performSetFeedType(feedId: String, feedType: FeedType) {

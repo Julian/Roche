@@ -37,6 +37,7 @@ import com.grayvines.roche.data.feeds.copySharedPdfStreamToCache
 import com.grayvines.roche.data.feeds.discoverFeedFromUrl
 import com.grayvines.roche.data.feeds.enrichWantToReadItemOnDevice
 import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
+import com.grayvines.roche.data.feeds.validateEditedFeedUrl
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.DbWriteLock
 import com.grayvines.roche.data.local.FeedRow
@@ -63,6 +64,7 @@ import com.grayvines.roche.data.local.setItemStatusAndReadAt
 import com.grayvines.roche.data.local.updateFeedActiveGraph
 import com.grayvines.roche.data.local.updateFeedTitleGraph
 import com.grayvines.roche.data.local.updateFeedTypeGraph
+import com.grayvines.roche.data.local.updateFeedUrlGraph
 import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.local.upsertTag
@@ -96,6 +98,7 @@ import com.grayvines.roche.model.TagItem
 import com.grayvines.roche.model.inferContentType
 import java.io.File
 import java.io.InputStream
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
@@ -811,6 +814,38 @@ class RocheRepository(
         return cleanTitle
     }
 
+    internal suspend fun updateFeedUrl(
+        feedId: String,
+        rawNewUrl: String,
+    ): Result<Pair<String, Boolean>> = runSuspendCatching {
+        val outcome = itemMutationMutex.withLock {
+            val existing = dao.getFeedById(feedId) ?: missingFeedError(feedId)
+            val trimmed = rawNewUrl.trim()
+            if (trimmed == existing.url) {
+                existing.url to false
+            } else {
+                val feedType = FeedType.fromWireValue(existing.feedType)
+                val normalized = validateEditedFeedUrl(trimmed, feedType)
+                if (canonicalizeSyncUrl(normalized) == canonicalizeSyncUrl(existing.url)) {
+                    existing.url to false
+                } else {
+                    val didUpdate =
+                        dao.updateFeedUrlGraph(
+                            feedId = feedId,
+                            newFeedUrl = normalized,
+                            markDirty = isSyncablePublicUrl(normalized),
+                            nodeId = currentLocalPeerId(),
+                        )
+                    normalized to didUpdate
+                }
+            }
+        }
+        if (outcome.second) {
+            triggerBackgroundSync()
+        }
+        outcome
+    }
+
     internal suspend fun setFeedType(feedId: String, targetType: FeedType): Result<FeedType> =
         runSuspendCatching {
             require(targetType == FeedType.RSS || targetType == FeedType.PODCAST) {
@@ -939,15 +974,7 @@ class RocheRepository(
                         dao.executeInTransaction {
                             val hlc = nextLocalHlc(dao, nodeId)
                             if (existing != null) {
-                                dao.upsertTombstone(
-                                    TombstoneEntity(
-                                        entityType = "feed",
-                                        naturalKey = feedNaturalKey(existing.url),
-                                        deletedAt = nowUtcIso(),
-                                        hlc = hlc,
-                                        isLocalDirty = !isLocalOnly,
-                                    )
-                                )
+                                recordDeletedFeedTombstones(existing, hlc, isLocalOnly)
                             }
                             ids.addAll(
                                 dao.deleteFeedPreservingHistory(
@@ -969,6 +996,32 @@ class RocheRepository(
                 deletedTitle
             }
         }
+
+    private suspend fun recordDeletedFeedTombstones(
+        existing: FeedRow,
+        hlc: String,
+        isLocalOnly: Boolean,
+    ) {
+        val deletedAtIso = nowUtcIso()
+        dao.upsertTombstone(
+            TombstoneEntity(
+                entityType = "feed",
+                naturalKey = feedNaturalKey(existing.url),
+                deletedAt = deletedAtIso,
+                hlc = hlc,
+                isLocalDirty = !isLocalOnly,
+            )
+        )
+        dao.upsertTombstone(
+            TombstoneEntity(
+                entityType = "feed",
+                naturalKey = existing.id,
+                deletedAt = deletedAtIso,
+                hlc = hlc,
+                isLocalDirty = !isLocalOnly,
+            )
+        )
+    }
 
     internal suspend fun cachedItemBytesByEntryId(): Map<String, Long> =
         offlineCacheManager.cachedBytesByEntryId()
@@ -1398,9 +1451,7 @@ class RocheRepository(
     ): Pair<FeedRow?, String> = itemMutationMutex.withLock {
         val isPublic = isSyncablePublicUrl(canonicalUrl)
         val resolvedNewType = resolveNewFeedTypeWire(rawUrl, requestedFeedType)
-        dao.deleteTombstone("feed", feedNaturalKey(canonicalUrl))
-        val existingLocal =
-            dao.getFeedByUrl(canonicalUrl) ?: dao.getFeedById(deterministicFeedId(canonicalUrl))
+        val (existingLocal, newFeedId) = resolveFeedSubscriptionTarget(canonicalUrl)
         if (existingLocal != null && !existingLocal.isActive) {
             reactivateArchivedFeedLocked(
                 existingLocal = existingLocal,
@@ -1410,31 +1461,18 @@ class RocheRepository(
                 hasPrefetchedBatch = hasPrefetchedBatch,
             )
         } else {
-            val nextFeedType =
-                if (existingLocal != null) {
-                    applyFeedTypeIfToggleable(
-                        existingLocal = existingLocal,
-                        requestedFeedType = requestedFeedType?.takeIf { it == FeedType.PODCAST },
-                        markDirty = isPublic,
-                        nodeId = nodeId,
-                    )
-                } else {
-                    resolvedNewType
-                }
             val entity =
-                existingLocal?.copy(
-                    title = cleanTitleOverride ?: existingLocal.title,
-                    feedType = nextFeedType,
-                    isActive = true,
+                buildActiveSubscriptionFeedRow(
+                    existingLocal = existingLocal,
+                    newFeedId = newFeedId,
+                    canonicalUrl = canonicalUrl,
+                    fallbackTitle = fallbackTitle,
+                    cleanTitleOverride = cleanTitleOverride,
+                    resolvedNewType = resolvedNewType,
+                    requestedFeedType = requestedFeedType,
+                    isPublic = isPublic,
+                    nodeId = nodeId,
                 )
-                    ?: FeedRow(
-                        id = deterministicFeedId(canonicalUrl),
-                        title = fallbackTitle,
-                        url = canonicalUrl,
-                        siteUrl = null,
-                        feedType = resolvedNewType,
-                        lastPolled = null,
-                    )
             val hlc = nextLocalHlc(dao, nodeId)
             dao.upsertFeed(
                 feed = entity,
@@ -1444,6 +1482,63 @@ class RocheRepository(
             )
             entity to entity.title
         }
+    }
+
+    private suspend fun resolveFeedSubscriptionTarget(
+        canonicalUrl: String
+    ): Pair<FeedRow?, String> {
+        val canonTarget = canonicalizeSyncUrl(canonicalUrl)
+        val detId = deterministicFeedId(canonTarget)
+        val allFeeds = dao.getAllFeeds()
+        val existingByUrl = allFeeds.firstOrNull { canonicalizeSyncUrl(it.url) == canonTarget }
+        val existingByDetId = if (existingByUrl == null) dao.getFeedById(detId) else null
+        val matchingExisting =
+            existingByUrl ?: existingByDetId?.takeIf { canonicalizeSyncUrl(it.url) == canonTarget }
+        val newFeedId =
+            if (existingByDetId != null && matchingExisting == null) {
+                UUID.randomUUID().toString()
+            } else {
+                detId
+            }
+        dao.deleteTombstone("feed", feedNaturalKey(canonicalUrl))
+        dao.deleteTombstone("feed", matchingExisting?.id ?: newFeedId)
+        return matchingExisting to newFeedId
+    }
+
+    @Suppress("LongParameterList")
+    private suspend fun buildActiveSubscriptionFeedRow(
+        existingLocal: FeedRow?,
+        newFeedId: String,
+        canonicalUrl: String,
+        fallbackTitle: String,
+        cleanTitleOverride: String?,
+        resolvedNewType: String,
+        requestedFeedType: FeedType?,
+        isPublic: Boolean,
+        nodeId: String,
+    ): FeedRow {
+        if (existingLocal == null) {
+            return FeedRow(
+                id = newFeedId,
+                title = fallbackTitle,
+                url = canonicalUrl,
+                siteUrl = null,
+                feedType = resolvedNewType,
+                lastPolled = null,
+            )
+        }
+        val nextFeedType =
+            applyFeedTypeIfToggleable(
+                existingLocal = existingLocal,
+                requestedFeedType = requestedFeedType?.takeIf { it == FeedType.PODCAST },
+                markDirty = isPublic,
+                nodeId = nodeId,
+            )
+        return existingLocal.copy(
+            title = cleanTitleOverride ?: existingLocal.title,
+            feedType = nextFeedType,
+            isActive = true,
+        )
     }
 
     private fun resolveNewFeedTypeWire(rawUrl: String, requestedFeedType: FeedType?): String {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::{DateTime, SubsecRound, Utc};
@@ -12,9 +12,9 @@ use super::super::{
     },
     hrw::normalize_consecutive_failures,
     identity::{
-        deterministic_entity_uuid, deterministic_feed_id, deterministic_item_id,
-        deterministic_tag_id, feed_natural_key, is_protected_system_collection_id,
-        item_natural_key, tag_natural_key,
+        canonicalize_sync_url, deterministic_entity_uuid, deterministic_feed_id,
+        deterministic_item_id, deterministic_tag_id, feed_natural_key,
+        is_protected_system_collection_id, item_natural_key, tag_natural_key,
     },
     models::{
         InsertedItemCandidate, PreparedSyncEntry, SyncCollectionEntryRecord, SyncCollectionSpec,
@@ -113,6 +113,72 @@ enum ItemTombstoneAction {
     SkipEntry,
 }
 
+struct FeedMergeOutcome {
+    local_id: String,
+    effective_url: String,
+    url_changed: bool,
+    deferred_url_collision: bool,
+}
+
+struct FeedConfigMergeOutcome {
+    effective_url: String,
+    url_changed: bool,
+    deferred_url_collision: bool,
+}
+
+type Pass1aPartition<'a> = (
+    Vec<(&'a PreparedSyncEntry, &'a SyncCollectionSpec)>,
+    Vec<(&'a PreparedSyncEntry, &'a SyncFeedSource)>,
+    Vec<(&'a PreparedSyncEntry, &'a SyncFeedSource)>,
+);
+
+async fn partition_pass_1a_entries<'a>(
+    conn: &mut SqliteConnection,
+    entries: &'a [PreparedSyncEntry],
+    pending_merges: &mut Vec<(&'a PreparedSyncEntry, String)>,
+) -> Result<Pass1aPartition<'a>> {
+    let existing_feed_ids: HashSet<String> =
+        sqlx::query_scalar("SELECT collection_id FROM feed_sources")
+            .fetch_all(conn)
+            .await?
+            .into_iter()
+            .collect();
+    let mut existing_feeds = Vec::new();
+    let mut new_feeds = Vec::new();
+    let mut spec_entries = Vec::new();
+    for prep in entries {
+        let rec = &prep.record;
+        if let Some(target_merge) =
+            rec.merged_into_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            pending_merges.push((prep, target_merge.to_owned()));
+            continue;
+        }
+        if let Some(ref fs) = rec.feed_source {
+            if existing_feed_ids.contains(rec.id.trim()) {
+                existing_feeds.push((prep, fs));
+            } else {
+                new_feeds.push((prep, fs));
+            }
+        } else if let Some(ref cs) = rec.collection_spec {
+            spec_entries.push((prep, cs));
+        }
+    }
+    Ok((spec_entries, existing_feeds, new_feeds))
+}
+
+fn record_feed_url_mapping(
+    feed_url_by_id: &mut HashMap<String, String>,
+    raw_incoming_id: &str,
+    outcome: FeedMergeOutcome,
+) {
+    feed_url_by_id.insert(outcome.local_id, outcome.effective_url.clone());
+    let trimmed = raw_incoming_id.trim();
+    if !trimmed.is_empty() {
+        feed_url_by_id.insert(trimmed.to_owned(), outcome.effective_url);
+    }
+}
+
 impl SyncRepo<'_> {
     pub(super) async fn merge_incoming_entries_in_tx(
         tx: &mut WriteTx<'_>,
@@ -124,27 +190,14 @@ impl SyncRepo<'_> {
         let mut pending_merges: Vec<(&PreparedSyncEntry, String)> = Vec::new();
         let mut feed_url_by_id: HashMap<String, String> = HashMap::new();
 
-        // Pass 1a: Feeds, Tags, and Manual Lists/Want Collections first so parent IDs map cleanly
-        for prep in entries {
-            let rec = &prep.record;
-            if let Some(target_merge) =
-                rec.merged_into_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
-            {
-                pending_merges.push((prep, target_merge.to_owned()));
-                continue;
-            }
-            if let Some(ref fs) = rec.feed_source {
-                if let Some((local_fid, feed_url)) =
-                    Self::merge_single_feed_entry_in_tx(tx, prep, fs, ctx).await?
-                {
-                    feed_url_by_id.insert(local_fid, feed_url.clone());
-                    if !rec.id.trim().is_empty() {
-                        feed_url_by_id.insert(rec.id.trim().to_owned(), feed_url);
-                    }
-                }
-            } else if let Some(ref cs) = rec.collection_spec {
-                Self::merge_collection_spec_entry_in_tx(tx.conn(), prep, cs, ctx).await?;
-            }
+        // Pass 1a: Feeds (existing local collection_ids first, retrying deferred URL swaps,
+        // then new/URL-matched feeds), Tags, and Manual Lists/Want Collections so parent IDs map cleanly
+        let (spec_entries, existing_feeds, new_feeds) =
+            partition_pass_1a_entries(tx.conn(), entries, &mut pending_merges).await?;
+        Self::merge_pass_1a_feeds_in_tx(tx, existing_feeds, new_feeds, &mut feed_url_by_id, ctx)
+            .await?;
+        for (prep, cs) in spec_entries {
+            Self::merge_collection_spec_entry_in_tx(tx.conn(), prep, cs, ctx).await?;
         }
 
         // Map entry_id -> candidate parent feed_id from incoming `collection_entries`
@@ -178,6 +231,50 @@ impl SyncRepo<'_> {
         Self::apply_pending_merges_in_tx(tx, &pending_merges, ctx).await?;
 
         Ok(inserted_candidates)
+    }
+
+    async fn merge_pass_1a_feeds_in_tx(
+        tx: &mut WriteTx<'_>,
+        existing_feeds: Vec<(&PreparedSyncEntry, &SyncFeedSource)>,
+        new_feeds: Vec<(&PreparedSyncEntry, &SyncFeedSource)>,
+        feed_url_by_id: &mut HashMap<String, String>,
+        ctx: &mut MergeContext<'_>,
+    ) -> Result<()> {
+        let mut moved_feeds: Vec<(String, String)> = Vec::new();
+        let mut pending_existing = existing_feeds;
+        loop {
+            let mut next_deferred: Vec<(&PreparedSyncEntry, &SyncFeedSource)> = Vec::new();
+            let prev_len = pending_existing.len();
+            for (prep, fs) in pending_existing {
+                if let Some(outcome) =
+                    Self::merge_single_feed_entry_in_tx(tx, prep, fs, ctx).await?
+                {
+                    if outcome.url_changed {
+                        moved_feeds.push((outcome.local_id.clone(), outcome.effective_url.clone()));
+                    }
+                    if outcome.deferred_url_collision {
+                        next_deferred.push((prep, fs));
+                    }
+                    record_feed_url_mapping(feed_url_by_id, &prep.record.id, outcome);
+                }
+            }
+            if next_deferred.is_empty() || next_deferred.len() >= prev_len {
+                break;
+            }
+            pending_existing = next_deferred;
+        }
+        for (prep, fs) in new_feeds {
+            if let Some(outcome) = Self::merge_single_feed_entry_in_tx(tx, prep, fs, ctx).await? {
+                if outcome.url_changed {
+                    moved_feeds.push((outcome.local_id.clone(), outcome.effective_url.clone()));
+                }
+                record_feed_url_mapping(feed_url_by_id, &prep.record.id, outcome);
+            }
+        }
+        for (local_fid, new_url) in moved_feeds {
+            Self::enforce_item_tombstones_for_feed_in_tx(tx, &local_fid, &new_url, ctx.now).await?;
+        }
+        Ok(())
     }
 
     async fn merge_collection_spec_entry_in_tx(
@@ -215,12 +312,43 @@ impl SyncRepo<'_> {
         Ok(())
     }
 
+    async fn check_and_clear_feed_tombstones_in_tx(
+        conn: &mut SqliteConnection,
+        nat_key: &str,
+        incoming_id: &str,
+        effective_hlc: &str,
+    ) -> Result<bool> {
+        let mut keys = vec![nat_key];
+        if !incoming_id.is_empty() && incoming_id != nat_key {
+            keys.push(incoming_id);
+        }
+        let mut stale_keys = Vec::new();
+        for key in keys {
+            let tomb_hlc: Option<String> = sqlx::query_scalar(
+                "SELECT hlc FROM sync_tombstones WHERE entity_type = 'feed' AND natural_key = ? LIMIT 1",
+            )
+            .bind(key)
+            .fetch_optional(&mut *conn)
+            .await?;
+            if let Some(hlc) = tomb_hlc {
+                if hlc.as_str() >= effective_hlc {
+                    return Ok(true);
+                }
+                stale_keys.push(key);
+            }
+        }
+        for stale in stale_keys {
+            Self::clear_tombstone(&mut *conn, ActivityEntityType::Feed, stale).await?;
+        }
+        Ok(false)
+    }
+
     async fn merge_single_feed_entry_in_tx(
         tx: &mut WriteTx<'_>,
         prep: &PreparedSyncEntry,
         fs: &SyncFeedSource,
         ctx: &mut MergeContext<'_>,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<Option<FeedMergeOutcome>> {
         let rec = &prep.record;
         let feed_url = fs.feed_url.trim();
         if feed_url.is_empty() {
@@ -245,10 +373,11 @@ impl SyncRepo<'_> {
         };
         let effective_hlc = if entry_hlc > fs_hlc { &entry_hlc } else { &fs_hlc };
 
-        if Self::check_and_clear_tombstone_in_tx(
+        let incoming_id = rec.id.trim();
+        if Self::check_and_clear_feed_tombstones_in_tx(
             tx.conn(),
-            ActivityEntityType::Feed,
             &nat_key,
+            incoming_id,
             effective_hlc,
         )
         .await?
@@ -262,12 +391,22 @@ impl SyncRepo<'_> {
                     fs.feed_title, fs.last_polled_at, fs.is_active, fs.hlc
              FROM feed_sources fs
              JOIN entries e ON e.id = fs.collection_id
-             WHERE fs.feed_url = ? OR fs.collection_id = ? OR fs.collection_id = ?
+             WHERE fs.collection_id = ?
+                OR fs.feed_url = ?
+                OR (? = '' AND fs.collection_id = ?)
+             ORDER BY CASE
+                 WHEN fs.collection_id = ? THEN 0
+                 WHEN fs.feed_url = ? THEN 1
+                 ELSE 2
+             END
              LIMIT 1",
         )
+        .bind(incoming_id)
         .bind(feed_url)
-        .bind(rec.id.trim())
+        .bind(incoming_id)
         .bind(&det_id)
+        .bind(incoming_id)
+        .bind(feed_url)
         .fetch_optional(tx.conn())
         .await?;
 
@@ -296,13 +435,14 @@ impl SyncRepo<'_> {
             interval: fs.poll_interval.clamp(5, 1440),
         };
 
-        let (local_id, local_url) = if let Some(existing_feed) = existing {
+        let outcome = if let Some(existing_feed) = existing {
             Self::update_existing_feed_in_tx(tx.conn(), existing_feed, fs, &fields, ctx.now).await?
         } else {
-            Self::insert_new_feed_in_tx(tx, rec.created_at, fs, &fields, ctx.now).await?
+            Self::insert_new_feed_in_tx(tx, incoming_id, rec.created_at, fs, &fields, ctx.now)
+                .await?
         };
-        ctx.id_resolver.record(&rec.id, &local_id);
-        Ok(Some((local_id, local_url)))
+        ctx.id_resolver.record(&rec.id, &outcome.local_id);
+        Ok(Some(outcome))
     }
 
     async fn update_existing_feed_in_tx(
@@ -311,18 +451,29 @@ impl SyncRepo<'_> {
         fs: &SyncFeedSource,
         fields: &NormalizedFeedFields<'_>,
         now: DateTime<Utc>,
-    ) -> Result<(String, String)> {
+    ) -> Result<FeedMergeOutcome> {
         let clamped_polled_at = clamp_incoming_timestamp_opt(fs.last_polled_at, now);
-        let poll_newer = match (clamped_polled_at, existing.last_polled_at) {
+        let raw_poll_newer = match (clamped_polled_at, existing.last_polled_at) {
             (Some(inc_p), Some(loc_p)) => inc_p > loc_p,
             (Some(_), None) => true,
             _ => false,
         };
 
-        Self::maybe_update_existing_feed_config_in_tx(tx, &existing, fs, fields, poll_newer, now)
-            .await?;
+        let cfg = Self::maybe_update_existing_feed_config_in_tx(
+            tx,
+            &existing,
+            fs,
+            fields,
+            raw_poll_newer,
+            now,
+        )
+        .await?;
 
-        if poll_newer {
+        let poll_matches_effective_url =
+            canonicalize_sync_url(fields.feed_url) == canonicalize_sync_url(&cfg.effective_url);
+        let apply_incoming_poll = poll_matches_effective_url
+            && (raw_poll_newer || (cfg.url_changed && clamped_polled_at.is_some()));
+        if apply_incoming_poll {
             sqlx::query(
                 "UPDATE feed_sources
                  SET last_polled_at = ?,
@@ -342,9 +493,48 @@ impl SyncRepo<'_> {
             .await?;
         }
 
-        Ok((existing.collection_id, existing.feed_url))
+        Ok(FeedMergeOutcome {
+            local_id: existing.collection_id,
+            effective_url: cfg.effective_url,
+            url_changed: cfg.url_changed,
+            deferred_url_collision: cfg.deferred_url_collision,
+        })
     }
 
+    async fn can_apply_synced_feed_url_change_in_tx(
+        tx: &mut SqliteConnection,
+        existing: &ExistingFeedRow,
+        incoming_url: &str,
+    ) -> Result<bool> {
+        let incoming_nat_key = feed_natural_key(incoming_url);
+        let conflicting_owner: Option<String> = sqlx::query_scalar(
+            "SELECT fs.collection_id FROM feed_sources fs
+             WHERE fs.collection_id != ?
+               AND (fs.feed_url = ? OR EXISTS (
+                   SELECT 1 FROM entry_identifiers ei
+                   WHERE ei.entry_id = fs.collection_id
+                     AND ei.scheme = 'feed_url'
+                     AND ei.value = ?
+               ))
+             LIMIT 1",
+        )
+        .bind(&existing.collection_id)
+        .bind(incoming_url)
+        .bind(&incoming_nat_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if conflicting_owner.is_some() {
+            tracing::warn!(
+                collection_id = %existing.collection_id,
+                incoming_url = %incoming_url,
+                "Skipping synced feed_url update due to conflict with another subscribed feed"
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn maybe_update_existing_feed_config_in_tx(
         tx: &mut SqliteConnection,
         existing: &ExistingFeedRow,
@@ -352,11 +542,18 @@ impl SyncRepo<'_> {
         fields: &NormalizedFeedFields<'_>,
         poll_newer: bool,
         now: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<FeedConfigMergeOutcome> {
         let config_newer = fields.fs_hlc.as_str() > existing.hlc.as_str();
         let merged_type = if config_newer { fs.source_type } else { existing.source_type };
         let target_kind = entry_kind_for_feed_type(merged_type);
         let kind_mismatch = existing.entry_kind != target_kind;
+
+        let wants_url_change = config_newer && fields.feed_url != existing.feed_url;
+        let apply_url_change = wants_url_change
+            && Self::can_apply_synced_feed_url_change_in_tx(tx, existing, fields.feed_url).await?;
+        let deferred_url_collision = wants_url_change && !apply_url_change;
+        let target_feed_url =
+            if apply_url_change { fields.feed_url } else { existing.feed_url.as_str() };
 
         let target_feed_title = if config_newer {
             fields.clean_feed_title.or(existing.feed_title.as_deref())
@@ -366,48 +563,86 @@ impl SyncRepo<'_> {
 
         if !config_newer
             && !kind_mismatch
+            && !apply_url_change
             && target_feed_title == existing.feed_title.as_deref()
             && merged_type == existing.source_type
         {
-            return Ok(());
+            return Ok(FeedConfigMergeOutcome {
+                effective_url: existing.feed_url.clone(),
+                url_changed: false,
+                deferred_url_collision: false,
+            });
         }
 
         let target_active = if config_newer { fs.is_active } else { existing.is_active };
-        let target_hlc = if config_newer { fields.fs_hlc.as_str() } else { existing.hlc.as_str() };
-        let clear_stale_errors_on_unarchive = config_newer
-            && !existing.is_active
-            && target_active
-            && !poll_newer
-            && fields.clean_err.is_none();
+        // Do not advance `feed_sources.hlc` when a URL move was blocked by a collision so
+        // convergence succeeds once the colliding feed moves or is deleted.
+        let target_hlc = if config_newer && !deferred_url_collision {
+            fields.fs_hlc.as_str()
+        } else {
+            existing.hlc.as_str()
+        };
+        let clear_stale_errors = apply_url_change
+            || (config_newer
+                && !existing.is_active
+                && target_active
+                && !poll_newer
+                && fields.clean_err.is_none());
+        let clear_stale_polled = apply_url_change;
         sqlx::query(
             "UPDATE feed_sources
-             SET source_type = ?,
+             SET feed_url = ?,
+                 source_type = ?,
                  feed_title = ?,
                  language = COALESCE(?, language),
                  poll_interval = CASE WHEN ? THEN ? ELSE poll_interval END,
                  is_active = ?,
+                 last_polled_at = CASE WHEN ? THEN NULL ELSE last_polled_at END,
+                 last_polled_by = CASE WHEN ? THEN NULL ELSE last_polled_by END,
                  last_error = CASE WHEN ? THEN NULL ELSE last_error END,
                  last_error_by = CASE WHEN ? THEN NULL ELSE last_error_by END,
                  consecutive_failures = CASE WHEN ? THEN 0 ELSE consecutive_failures END,
                  hlc = ?
              WHERE collection_id = ?",
         )
+        .bind(target_feed_url)
         .bind(merged_type)
         .bind(target_feed_title)
         .bind(fields.clean_lang)
         .bind(config_newer)
         .bind(fields.interval)
         .bind(target_active)
-        .bind(clear_stale_errors_on_unarchive)
-        .bind(clear_stale_errors_on_unarchive)
-        .bind(clear_stale_errors_on_unarchive)
+        .bind(clear_stale_polled)
+        .bind(clear_stale_polled)
+        .bind(clear_stale_errors)
+        .bind(clear_stale_errors)
+        .bind(clear_stale_errors)
         .bind(target_hlc)
         .bind(&existing.collection_id)
         .execute(&mut *tx)
         .await?;
 
-        let entry_title = target_feed_title.unwrap_or(&existing.feed_url);
-        let target_entry_hlc = if config_newer || kind_mismatch {
+        if apply_url_change {
+            let new_nat_key = feed_natural_key(target_feed_url);
+            entries_core::replace_entry_identifier_in_tx(
+                &mut *tx,
+                &existing.collection_id,
+                "feed_url",
+                &new_nat_key,
+            )
+            .await?;
+            SyncRepo::copy_item_tombstones_for_feed_url_change(
+                &mut *tx,
+                &existing.feed_url,
+                target_feed_url,
+            )
+            .await?;
+        }
+
+        let entry_title = target_feed_title.unwrap_or(target_feed_url);
+        let target_entry_hlc = if deferred_url_collision {
+            existing.hlc.as_str()
+        } else if config_newer || kind_mismatch {
             fields.entry_hlc.as_str().max(target_hlc)
         } else {
             fields.entry_hlc.as_str()
@@ -430,17 +665,44 @@ impl SyncRepo<'_> {
         .bind(&existing.collection_id)
         .execute(&mut *tx)
         .await?;
-        Ok(())
+        Ok(FeedConfigMergeOutcome {
+            effective_url: target_feed_url.to_owned(),
+            url_changed: apply_url_change,
+            deferred_url_collision,
+        })
     }
 
     async fn insert_new_feed_in_tx(
         tx: &mut WriteTx<'_>,
+        incoming_id: &str,
         rec_created_at: Option<DateTime<Utc>>,
         fs: &SyncFeedSource,
         fields: &NormalizedFeedFields<'_>,
         now: DateTime<Utc>,
-    ) -> Result<(String, String)> {
-        let local_id = fields.det_id.clone();
+    ) -> Result<FeedMergeOutcome> {
+        let local_id = if uuid::Uuid::parse_str(incoming_id).is_ok() {
+            let incoming_taken: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM feed_sources WHERE collection_id = ? LIMIT 1")
+                    .bind(incoming_id)
+                    .fetch_optional(tx.conn())
+                    .await?;
+            if incoming_taken.is_none() {
+                incoming_id.to_owned()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            }
+        } else {
+            let det_taken: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM feed_sources WHERE collection_id = ? LIMIT 1")
+                    .bind(&fields.det_id)
+                    .fetch_optional(tx.conn())
+                    .await?;
+            if det_taken.is_some() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                fields.det_id.clone()
+            }
+        };
         let created_at = clamp_incoming_timestamp(rec_created_at.unwrap_or(now), now);
         let clamped_polled_at = clamp_incoming_timestamp_opt(fs.last_polled_at, now);
         FeedRepo::insert_feed_in_tx(
@@ -467,7 +729,12 @@ impl SyncRepo<'_> {
         )
         .await?;
 
-        Ok((local_id, fields.feed_url.to_owned()))
+        Ok(FeedMergeOutcome {
+            local_id,
+            effective_url: fields.feed_url.to_owned(),
+            url_changed: false,
+            deferred_url_collision: false,
+        })
     }
 
     async fn merge_single_tag_entry_in_tx(

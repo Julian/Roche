@@ -14,6 +14,8 @@ import com.grayvines.roche.core.STARRED_SLUG
 import com.grayvines.roche.core.STARRED_TITLE
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_GENERATOR
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_FEED
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_ITEM
 import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_SLUG
@@ -23,7 +25,9 @@ import com.grayvines.roche.core.collectionEntryNaturalKey
 import com.grayvines.roche.core.deterministicTagId
 import com.grayvines.roche.core.encodeCreatorsJson
 import com.grayvines.roche.core.extractArxivIdentifier
+import com.grayvines.roche.core.extractHostTitle
 import com.grayvines.roche.core.extractYearPrefix
+import com.grayvines.roche.core.feedNaturalKey
 import com.grayvines.roche.core.formatArticleMinutes
 import com.grayvines.roche.core.inferContentTypeWireValue
 import com.grayvines.roche.core.isLocalPdfUrl
@@ -32,6 +36,7 @@ import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.core.nowUtcIso
 import com.grayvines.roche.core.resolveArticleDuration
+import com.grayvines.roche.data.sync.compareHlc
 import com.grayvines.roche.model.ContentType
 
 internal const val SQLITE_DELETE_CHUNK_SIZE = 500
@@ -1040,6 +1045,146 @@ internal suspend fun RocheDao.setItemFavorite(
             }
         }
     }
+}
+
+internal suspend fun RocheDao.replaceEntryIdentifier(
+    entryId: String,
+    scheme: String,
+    value: String,
+) {
+    deleteEntryIdentifiersByScheme(scheme, entryId)
+    if (scheme.isNotEmpty() && value.isNotEmpty()) {
+        upsertEntryIdentifier(EntryIdentifierEntity(scheme, value, entryId))
+    }
+}
+
+internal suspend fun RocheDao.copyItemTombstonesForFeedUrl(
+    oldFeedUrl: String,
+    newFeedUrl: String,
+    markDirty: Boolean,
+): List<TombstoneEntity> {
+    val oldCanon = canonicalizeSyncUrl(oldFeedUrl)
+    val newCanon = canonicalizeSyncUrl(newFeedUrl)
+    if (oldCanon.isEmpty() || newCanon.isEmpty() || oldCanon == newCanon) return emptyList()
+    val oldPrefix = "$oldCanon\u0000"
+    val allTombstones = getAllTombstones()
+    val existingItemKeys =
+        allTombstones
+            .filter { it.entityType == TOMBSTONE_ENTITY_ITEM }
+            .associateBy { it.naturalKey }
+    val migrated = ArrayList<TombstoneEntity>()
+    for (tomb in existingItemKeys.values) {
+        if (!tomb.naturalKey.startsWith(oldPrefix)) continue
+        val itemPart = tomb.naturalKey.substring(oldPrefix.length)
+        val migratedKey = "$newCanon\u0000$itemPart"
+        val existingTarget = existingItemKeys[migratedKey]
+        if (existingTarget == null || compareHlc(tomb.hlc, existingTarget.hlc) > 0) {
+            val entity =
+                TombstoneEntity(
+                    entityType = TOMBSTONE_ENTITY_ITEM,
+                    naturalKey = migratedKey,
+                    deletedAt = tomb.deletedAt,
+                    hlc = tomb.hlc,
+                    isLocalDirty = markDirty || tomb.isLocalDirty,
+                )
+            upsertTombstone(entity)
+            migrated.add(entity)
+        }
+    }
+    return migrated
+}
+
+internal suspend fun RocheDao.updateFeedUrlGraph(
+    feedId: String,
+    newFeedUrl: String,
+    markDirty: Boolean = true,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+): Boolean {
+    var updated = false
+    executeInTransaction {
+        updated = applyFeedUrlUpdateInTx(feedId, newFeedUrl, markDirty, nodeId)
+    }
+    return updated
+}
+
+private suspend fun RocheDao.applyFeedUrlUpdateInTx(
+    feedId: String,
+    newFeedUrl: String,
+    markDirty: Boolean,
+    nodeId: String,
+): Boolean {
+    val source = getFeedSourceById(feedId) ?: return false
+    if (source.feedUrl == newFeedUrl) return false
+    checkNoFeedUrlConflict(feedId, newFeedUrl)
+
+    val nowIso = nowUtcIso()
+    val hlc = nextLocalHlc(this, nodeId)
+    deleteTombstone(TOMBSTONE_ENTITY_FEED, feedNaturalKey(newFeedUrl))
+    deleteTombstone(TOMBSTONE_ENTITY_FEED, feedId)
+
+    val wasHostFallbackTitle =
+        source.feedTitle != null &&
+            source.feedTitle.equals(extractHostTitle(source.feedUrl), ignoreCase = true)
+    val nextFeedTitle = if (wasHostFallbackTitle) extractHostTitle(newFeedUrl) else source.feedTitle
+    upsertFeedSource(
+        source.copy(
+            feedUrl = newFeedUrl,
+            siteUrl = null,
+            feedTitle = nextFeedTitle,
+            lastPolledAt = null,
+            lastPolledBy = null,
+            lastError = null,
+            lastErrorBy = null,
+            consecutiveFailures = 0,
+            hlc = hlc,
+            isLocalDirty = markDirty || source.isLocalDirty,
+        )
+    )
+    updateFeedEntryAfterUrlChange(feedId, source, newFeedUrl, nextFeedTitle, nowIso, hlc, markDirty)
+    replaceEntryIdentifier(feedId, "feed_url", feedNaturalKey(newFeedUrl))
+    copyItemTombstonesForFeedUrl(source.feedUrl, newFeedUrl, markDirty)
+    return true
+}
+
+private suspend fun RocheDao.checkNoFeedUrlConflict(feedId: String, newFeedUrl: String) {
+    val newCanon = canonicalizeSyncUrl(newFeedUrl)
+    val hasConflict =
+        getAllFeedSources().any { other ->
+            other.collectionId != feedId && canonicalizeSyncUrl(other.feedUrl) == newCanon
+        }
+    check(!hasConflict) { "Another feed already uses that URL" }
+}
+
+@Suppress("LongParameterList")
+private suspend fun RocheDao.updateFeedEntryAfterUrlChange(
+    feedId: String,
+    source: FeedSourceEntity,
+    newFeedUrl: String,
+    nextFeedTitle: String?,
+    nowIso: String,
+    hlc: String,
+    markDirty: Boolean,
+) {
+    val entry = getEntryById(feedId) ?: return
+    val useFallbackTitle =
+        source.feedTitle.isNullOrBlank() && (entry.title.isBlank() || entry.title == source.feedUrl)
+    val nextEntryTitle =
+        when {
+            nextFeedTitle != source.feedTitle && !nextFeedTitle.isNullOrBlank() -> nextFeedTitle
+            useFallbackTitle -> newFeedUrl
+            else -> entry.title
+        }
+    val replaceEntryUrl =
+        entry.url == null || entry.url == source.feedUrl || entry.url == source.siteUrl
+    upsertEntry(
+        entry.copy(
+            title = nextEntryTitle,
+            url = if (replaceEntryUrl) newFeedUrl else entry.url,
+            updatedAt = nowIso,
+            hlc = hlc,
+            isLocalDirty = markDirty || entry.isLocalDirty,
+        )
+    )
 }
 
 internal suspend fun RocheDao.updateFeedTitleGraph(

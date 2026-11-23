@@ -121,6 +121,8 @@ pub(super) struct FeedToggleForm {
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct EditFeedForm {
     #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
     pub poll_interval: Option<String>,

@@ -348,6 +348,10 @@ sealed interface MainAction {
 
     sealed interface FeedSyncAction : SyncFeedMutation
 
+    sealed interface FeedManagementAction : FeedSyncAction
+
+    sealed interface SyncTriggerAction : FeedSyncAction
+
     sealed interface SettingsServerAction : SyncFeedMutation
 
     sealed interface CatalogMutation : Mutation
@@ -468,7 +472,7 @@ sealed interface MainAction {
 
     data object ArchiveVisibleEntries : EntryMutation
 
-    data class ImportOpml(val opmlXml: String) : FeedSyncAction
+    data class ImportOpml(val opmlXml: String) : FeedManagementAction
 
     data class ToggleStar(val entryId: String) : EntryMutation
 
@@ -492,34 +496,36 @@ sealed interface MainAction {
         val feedType: FeedType? = null,
     ) : EntryMutation
 
-    data class RefreshFeed(val feedId: String) : FeedSyncAction
+    data class RefreshFeed(val feedId: String) : FeedManagementAction
 
-    data class RenameFeed(val feedId: String, val newTitle: String) : FeedSyncAction
+    data class RenameFeed(val feedId: String, val newTitle: String) : FeedManagementAction
 
-    data class SetFeedType(val feedId: String, val feedType: FeedType) : FeedSyncAction
+    data class UpdateFeedUrl(val feedId: String, val newUrl: String) : FeedManagementAction
 
-    data class ApplyTagToFeed(val feedId: String, val tagName: String) : FeedSyncAction
+    data class SetFeedType(val feedId: String, val feedType: FeedType) : FeedManagementAction
 
-    data class ArchiveFeedUnread(val feedId: String) : FeedSyncAction
+    data class ApplyTagToFeed(val feedId: String, val tagName: String) : FeedManagementAction
 
-    data class ToggleFeedArchive(val feedId: String) : FeedSyncAction
+    data class ArchiveFeedUnread(val feedId: String) : FeedManagementAction
 
-    data class DeleteFeed(val feedId: String) : FeedSyncAction
+    data class ToggleFeedArchive(val feedId: String) : FeedManagementAction
+
+    data class DeleteFeed(val feedId: String) : FeedManagementAction
 
     data class DeleteEntry(val entryId: String) : EntryMutation
 
-    data object SyncNow : FeedSyncAction
+    data object SyncNow : SyncTriggerAction
 
-    data object ManualRefresh : FeedSyncAction
+    data object ManualRefresh : SyncTriggerAction
 
-    data object PollFeedsOnDeviceNow : FeedSyncAction
+    data object PollFeedsOnDeviceNow : SyncTriggerAction
 
     data class SyncWithServerConfig(
         val serverUrl: String,
         val bearerToken: String? = null,
-    ) : FeedSyncAction
+    ) : SyncTriggerAction
 
-    data object StartupSyncIfConfigured : FeedSyncAction
+    data object StartupSyncIfConfigured : SyncTriggerAction
 
     data class SetThemeMode(val mode: ThemeMode) : SettingsServerAction
 

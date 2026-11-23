@@ -2,6 +2,7 @@
 
 package com.grayvines.roche.ui
 
+import android.content.ClipData
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -23,20 +25,27 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -61,6 +70,8 @@ import com.grayvines.roche.ui.components.TagChipsEditor
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import java.net.URI
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Suppress("LongParameterList")
@@ -408,6 +419,7 @@ fun FeedContextBottomSheet(
             FeedContextHeaderRow(feed = feed)
             FeedHealthDetailsCard(feed = feed, onAction = onAction)
             FeedRenameRow(feed = feed, onAction = onAction)
+            FeedUrlEditorSection(feed = feed, onAction = onAction)
             FeedTypeSelectorSection(feed = feed, onAction = onAction)
             FeedPodcastSettingsSection(feed = feed, onAction = onAction)
             FeedBulkTagRow(feed = feed, availableTags = availableTags, onAction = onAction)
@@ -489,6 +501,116 @@ internal fun FeedRenameRow(
         )
     }
 }
+
+@Composable
+internal fun FeedUrlEditorSection(
+    feed: FeedItem,
+    onAction: (MainAction) -> Unit,
+) {
+    val clipboard = LocalClipboard.current
+    val coroutineScope = rememberCoroutineScope()
+    var urlDraft by rememberSaveable(feed.id, feed.url) { mutableStateOf(feed.url) }
+    var copiedTick by remember(feed.id) { mutableIntStateOf(0) }
+    var isCopied by remember(feed.id) { mutableStateOf(false) }
+
+    LaunchedEffect(copiedTick) {
+        if (copiedTick > 0) {
+            isCopied = true
+            delay(COPIED_FEED_URL_DURATION_MS)
+            isCopied = false
+        }
+    }
+
+    val trimmedDraft = urlDraft.trim()
+    val hasUrlChanges = trimmedDraft.isNotEmpty() && trimmedDraft != feed.url
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        FeedUrlHeaderRow(
+            isCopied = isCopied,
+            onCopy = {
+                val toCopy = trimmedDraft.ifEmpty { feed.url }
+                if (toCopy.isNotEmpty()) {
+                    coroutineScope.launch {
+                        runCatching {
+                            clipboard.setClipEntry(
+                                ClipEntry(ClipData.newPlainText("Feed URL", toCopy))
+                            )
+                        }
+                            .onSuccess { copiedTick++ }
+                    }
+                }
+            },
+        )
+        FeedUrlInputRow(
+            urlDraft = urlDraft,
+            hasUrlChanges = hasUrlChanges,
+            onUrlChange = { urlDraft = it.replace("\n", "").replace("\r", "") },
+            onSave = {
+                if (hasUrlChanges) {
+                    onAction(MainAction.UpdateFeedUrl(feedId = feed.id, newUrl = trimmedDraft))
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun FeedUrlInputRow(
+    urlDraft: String,
+    hasUrlChanges: Boolean,
+    onUrlChange: (String) -> Unit,
+    onSave: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        OutlinedTextField(
+            value = urlDraft,
+            onValueChange = onUrlChange,
+            label = { Text("Feed URL", fontSize = 12.sp) },
+            textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp),
+            keyboardOptions =
+                KeyboardOptions(keyboardType = KeyboardType.Uri, autoCorrectEnabled = false),
+            maxLines = 3,
+            modifier = Modifier.weight(1f).testTag("feed_url_input"),
+        )
+        HeaderActionButton(
+            label = "Save",
+            style = if (hasUrlChanges) RocheButtonStyle.PRIMARY else RocheButtonStyle.SECONDARY,
+            enabled = hasUrlChanges,
+            onClick = onSave,
+            modifier = Modifier.testTag("feed_url_save_btn"),
+        )
+    }
+}
+
+@Composable
+private fun FeedUrlHeaderRow(
+    isCopied: Boolean,
+    onCopy: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "FEED URL",
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
+        )
+        HeaderActionButton(
+            label = if (isCopied) "Copied ✓" else "Copy URL",
+            onClick = onCopy,
+            modifier = Modifier.testTag("feed_url_copy_btn"),
+        )
+    }
+}
+
+private const val COPIED_FEED_URL_DURATION_MS = 1_800L
 
 @Composable
 internal fun FeedTypeSelectorSection(

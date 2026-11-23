@@ -26,6 +26,7 @@ pub(super) struct CreateFeedRequest {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct UpdateFeedRequest {
+    url: Option<String>,
     title: Option<String>,
     poll_interval: Option<i64>,
     is_active: Option<bool>,
@@ -71,7 +72,14 @@ pub(super) async fn feeds_update(
 ) -> Result<Json<Feed>, ApiError> {
     let updated = service
         .feeds()
-        .update(&id, req.title.as_deref(), req.poll_interval, req.is_active, req.feed_type)
+        .update(
+            &id,
+            req.title.as_deref(),
+            req.poll_interval,
+            req.is_active,
+            req.feed_type,
+            req.url.as_deref(),
+        )
         .await?;
     Ok(Json(updated))
 }

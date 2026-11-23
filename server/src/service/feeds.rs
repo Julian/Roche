@@ -192,6 +192,7 @@ impl FeedService<'_> {
         poll_interval: Option<i64>,
         is_active: Option<bool>,
         feed_type: Option<FeedType>,
+        url: Option<&str>,
     ) -> Result<Feed, AppError> {
         let clean_title = match title {
             Some(t) => {
@@ -215,22 +216,66 @@ impl FeedService<'_> {
         }
 
         let repo = self.service.db.feeds();
-        if let Some(target_type) = feed_type {
-            let existing = self.get(id).await?;
-            if existing.feed_type != target_type {
-                let valid_toggle = matches!(
-                    (existing.feed_type, target_type),
-                    (FeedType::Rss, FeedType::Podcast) | (FeedType::Podcast, FeedType::Rss)
-                );
-                if !valid_toggle {
-                    return Err(AppError::bad_request(
-                        "Only RSS and Podcast feed types can be toggled between each other",
-                    ));
-                }
+        let existing =
+            if feed_type.is_some() || url.is_some() { Some(self.get(id).await?) } else { None };
+
+        if let Some(target_type) = feed_type
+            && let Some(ref existing) = existing
+            && existing.feed_type != target_type
+        {
+            let valid_toggle = matches!(
+                (existing.feed_type, target_type),
+                (FeedType::Rss, FeedType::Podcast) | (FeedType::Podcast, FeedType::Rss)
+            );
+            if !valid_toggle {
+                return Err(AppError::bad_request(
+                    "Only RSS and Podcast feed types can be toggled between each other",
+                ));
             }
         }
 
-        if !repo.update(id, clean_title, poll_interval, is_active, feed_type).await? {
+        let validated_url = if let Some(raw_url) = url {
+            let trimmed_url = raw_url.trim();
+            if trimmed_url.is_empty() {
+                return Err(AppError::bad_request("Feed URL cannot be empty"));
+            }
+            let existing =
+                existing.as_ref().ok_or_else(|| AppError::not_found("Feed not found"))?;
+            if trimmed_url == existing.url.as_str() {
+                None
+            } else {
+                let effective_type = feed_type.unwrap_or(existing.feed_type);
+                let source = Self::parse_source(trimmed_url)?;
+                let (resolved_type, parsed_url) =
+                    source.into_feed_url(effective_type).map_err(|e| {
+                        if e.downcast_ref::<SsrfBlockedError>().is_some() {
+                            AppError::ssrf_blocked(format!("Invalid feed URL: {e}"))
+                        } else {
+                            AppError::bad_request(format!("Invalid feed URL: {e}"))
+                        }
+                    })?;
+                validate_public_url(&parsed_url)
+                    .map_err(|e| AppError::ssrf_blocked(format!("Invalid feed URL: {e}")))?;
+                if resolved_type != effective_type {
+                    return Err(AppError::bad_request(format!(
+                        "Feed URL resolves to a {resolved_type:?} feed, which does not match this {effective_type:?} feed"
+                    )));
+                }
+                if effective_type == FeedType::Youtube && !is_youtube_feed_url(&parsed_url) {
+                    return Err(AppError::bad_request(
+                        "YouTube feed URL must be a channel ID, /channel/UC... URL, or youtube.com/feeds/videos.xml URL",
+                    ));
+                }
+                if parsed_url.as_str() == existing.url.as_str() { None } else { Some(parsed_url) }
+            }
+        } else {
+            None
+        };
+
+        if !repo
+            .update(id, clean_title, poll_interval, is_active, feed_type, validated_url.as_ref())
+            .await?
+        {
             return Err(AppError::not_found("Feed not found"));
         }
 

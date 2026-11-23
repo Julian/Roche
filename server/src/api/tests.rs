@@ -2640,3 +2640,112 @@ async fn test_api_feed_type_toggle_item_audio_filters_and_progress_source() {
         .unwrap();
     assert_eq!(toggle_bad.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn test_api_patch_feed_url_updates_validates_and_rejects_conflicts() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let token = TokenManager::new(db.auth()).create("feed-url-api", 32).await.unwrap();
+    let auth = format!("Bearer {token}");
+    let service = RocheService::new(db.clone(), FakeFeedFetcher, crate::config::Config::default());
+    let app = ApiRoutes::router_with_service(service);
+
+    let url1 = Url::parse("https://alpha.example.com/rss.xml").unwrap();
+    let url2 = Url::parse("https://beta.example.com/rss.xml").unwrap();
+    let feed1 =
+        db.feeds().create(crate::db::FeedType::Rss, &url1, Some("Alpha"), None).await.unwrap();
+    let _feed2 =
+        db.feeds().create(crate::db::FeedType::Rss, &url2, Some("Beta"), None).await.unwrap();
+
+    // 1. Valid URL update preserves id and returns updated URL
+    let ok_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/feeds/{}", feed1.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"https://alpha-moved.example.com/atom.xml"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_res.status(), StatusCode::OK);
+    let ok_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(ok_res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(ok_json["id"], feed1.id);
+    assert_eq!(ok_json["url"], "https://alpha-moved.example.com/atom.xml");
+
+    // 2. Rejects duplicate URL owned by another feed (409 Conflict)
+    let conflict_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/feeds/{}", feed1.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"https://beta.example.com/rss.xml"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflict_res.status(), StatusCode::CONFLICT);
+
+    // 3. Rejects SSRF / private IP URL
+    let ssrf_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/feeds/{}", feed1.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"http://127.0.0.1:8080/feed.xml"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ssrf_res.status(), StatusCode::BAD_REQUEST);
+    let ssrf_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(ssrf_res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(ssrf_json["title"], "URL Target Blocked");
+
+    // 4. Rejects incompatible source kind (arXiv URL on RSS feed) and non-feed YouTube watch URL
+    let mismatch_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/feeds/{}", feed1.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"https://rss.arxiv.org/rss/cs.AI"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mismatch_res.status(), StatusCode::BAD_REQUEST);
+
+    let yt_url =
+        Url::parse("https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA")
+            .unwrap();
+    let yt_feed = db
+        .feeds()
+        .create(crate::db::FeedType::Youtube, &yt_url, Some("YT Channel"), None)
+        .await
+        .unwrap();
+    let yt_watch_res = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/feeds/{}", yt_feed.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(yt_watch_res.status(), StatusCode::BAD_REQUEST);
+}

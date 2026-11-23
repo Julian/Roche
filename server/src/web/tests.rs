@@ -4211,3 +4211,95 @@ async fn test_web_audio_podcast_decoupling_filters_feed_toggle_and_progress_sour
         EntryKind::PodcastEpisode
     );
 }
+
+#[tokio::test]
+async fn test_web_feeds_editable_url_form_and_post_edit_validation() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    let url1 = Url::parse("https://webedit-old.example.com/rss.xml").unwrap();
+    let url2 = Url::parse("https://webedit-other.example.com/rss.xml").unwrap();
+    let feed1 = db.feeds().create(FeedType::Rss, &url1, Some("Editable Blog"), None).await.unwrap();
+    let _feed2 = db.feeds().create(FeedType::Rss, &url2, Some("Other Blog"), None).await.unwrap();
+
+    // 1. /feeds renders an editable Feed URL input (not readonly) inside the edit form with Copy URL
+    let feeds_html = read_body_html(get_authed(&app, "/feeds", &cookie).await).await;
+    assert!(feeds_html.contains("name=\"url\""));
+    assert!(feeds_html.contains("value=\"https://webedit-old.example.com/rss.xml\""));
+    assert!(feeds_html.contains("data-copy-from=\"fe-url-"));
+    assert!(!feeds_html.contains("readonly value=\"https://webedit-old.example.com/rss.xml\""));
+
+    // 2. Submitting an updated URL via /web/feeds/{id}/edit updates the feed URL in place
+    let edit_ok = post_form(
+        &app,
+        &format!("/web/feeds/{}/edit", feed1.id),
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("url", "https://webedit-new.example.com/atom.xml"),
+            ("title", "Editable Blog"),
+            ("poll_interval", "60"),
+            ("return_to", "/feeds?q=Editable"),
+        ],
+    )
+    .await;
+    assert_eq!(edit_ok.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        edit_ok.headers().get(header::LOCATION).unwrap().to_str().unwrap(),
+        "/feeds?q=Editable"
+    );
+    assert!(find_set_cookie(&edit_ok, "roche_flash=n:").is_some());
+    let updated = db.feeds().get(&feed1.id).await.unwrap().unwrap();
+    assert_eq!(updated.id, feed1.id);
+    assert_eq!(updated.url.as_str(), "https://webedit-new.example.com/atom.xml");
+    assert_eq!(updated.poll_interval, 60);
+
+    // 3. Submitting a conflicting or blank URL returns an error flash and leaves the feed unchanged
+    let edit_conflict = post_form(
+        &app,
+        &format!("/web/feeds/{}/edit", feed1.id),
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("url", "https://webedit-other.example.com/rss.xml"),
+            ("title", "Editable Blog"),
+        ],
+    )
+    .await;
+    assert_eq!(edit_conflict.status(), StatusCode::SEE_OTHER);
+    assert!(find_set_cookie(&edit_conflict, "roche_flash=e:").is_some());
+    assert_eq!(
+        db.feeds().get(&feed1.id).await.unwrap().unwrap().url.as_str(),
+        "https://webedit-new.example.com/atom.xml"
+    );
+
+    let edit_blank_url = post_form(
+        &app,
+        &format!("/web/feeds/{}/edit", feed1.id),
+        &cookie,
+        &[("_csrf", &csrf), ("url", "   "), ("title", "Editable Blog")],
+    )
+    .await;
+    assert_eq!(edit_blank_url.status(), StatusCode::SEE_OTHER);
+    assert!(find_set_cookie(&edit_blank_url, "roche_flash=e:").is_some());
+    assert_eq!(
+        db.feeds().get(&feed1.id).await.unwrap().unwrap().url.as_str(),
+        "https://webedit-new.example.com/atom.xml"
+    );
+
+    // 4. Editing URL on an untitled feed keeps title unset instead of freezing the old URL as title
+    let untitled_old = Url::parse("https://untitled-old.example.com/rss.xml").unwrap();
+    let untitled_feed = db.feeds().create(FeedType::Rss, &untitled_old, None, None).await.unwrap();
+    let untitled_edit = post_form(
+        &app,
+        &format!("/web/feeds/{}/edit", untitled_feed.id),
+        &cookie,
+        &[("_csrf", &csrf), ("url", "https://untitled-new.example.com/rss.xml"), ("title", "")],
+    )
+    .await;
+    assert_eq!(untitled_edit.status(), StatusCode::SEE_OTHER);
+    assert!(find_set_cookie(&untitled_edit, "roche_flash=n:").is_some());
+    let untitled_after = db.feeds().get(&untitled_feed.id).await.unwrap().unwrap();
+    assert_eq!(untitled_after.url.as_str(), "https://untitled-new.example.com/rss.xml");
+    assert!(untitled_after.title.is_none());
+}

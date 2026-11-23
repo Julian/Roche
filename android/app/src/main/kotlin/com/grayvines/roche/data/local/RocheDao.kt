@@ -736,6 +736,12 @@ interface RocheDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertEntryIdentifiersIgnore(identifiers: List<EntryIdentifierEntity>)
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertEntryIdentifier(identifier: EntryIdentifierEntity)
+
+    @Query("DELETE FROM entry_identifiers WHERE scheme = :scheme AND entryId = :entryId")
+    suspend fun deleteEntryIdentifiersByScheme(scheme: String, entryId: String)
+
     @Query("UPDATE entry_identifiers SET entryId = :newEntryId WHERE entryId = :oldEntryId")
     suspend fun repointIdentifiersToEntry(oldEntryId: String, newEntryId: String)
 

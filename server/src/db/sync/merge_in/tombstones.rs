@@ -197,17 +197,19 @@ impl SyncRepo<'_> {
         tomb_hlc: &str,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let canon_key = feed_natural_key(key);
-        let det_id = deterministic_feed_id(&canon_key);
+        let trimmed_key = key.trim();
+        let canon_key = feed_natural_key(trimmed_key);
         let existing: Option<FeedTombstoneTarget> = sqlx::query_as(
             "SELECT fs.collection_id, fs.hlc AS fs_hlc, e.hlc AS entry_hlc
              FROM feed_sources fs
              JOIN entries e ON e.id = fs.collection_id
-             WHERE fs.feed_url = ? OR fs.collection_id = ?
+             WHERE fs.collection_id = ? OR fs.feed_url = ?
+             ORDER BY CASE WHEN fs.collection_id = ? THEN 0 ELSE 1 END
              LIMIT 1",
         )
+        .bind(trimmed_key)
         .bind(&canon_key)
-        .bind(&det_id)
+        .bind(trimmed_key)
         .fetch_optional(tx.conn())
         .await?;
 
@@ -330,6 +332,116 @@ impl SyncRepo<'_> {
             tomb_hlc,
         )
         .await?;
+        if let Some(ref cf) = canon_feed_opt {
+            Self::copy_late_item_tombstone_to_moved_feed_in_tx(
+                tx.conn(),
+                cf,
+                &canon_item,
+                deleted_at,
+                tomb_hlc,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// If a feed originally created at `old_canon_feed` has since moved to a new URL,
+    /// copy an incoming `old_canon_feed\0item_url` tombstone to the current URL prefix so
+    /// polling the new URL doesn't resurrect the deleted item.
+    async fn copy_late_item_tombstone_to_moved_feed_in_tx(
+        conn: &mut SqliteConnection,
+        old_canon_feed: &str,
+        canon_item: &str,
+        deleted_at: DateTime<Utc>,
+        tomb_hlc: &str,
+    ) -> Result<()> {
+        let parent_feed_id = deterministic_feed_id(old_canon_feed);
+        let moved_url: Option<String> =
+            sqlx::query_scalar("SELECT feed_url FROM feed_sources WHERE collection_id = ? LIMIT 1")
+                .bind(&parent_feed_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if let Some(ref current_url) = moved_url
+            && canonicalize_sync_url(current_url) != old_canon_feed
+        {
+            let migrated_key = item_natural_key(Some(current_url), canon_item);
+            Self::record_tombstone_with_hlc(
+                conn,
+                ActivityEntityType::Item,
+                &migrated_key,
+                deleted_at,
+                tomb_hlc,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn enforce_item_tombstones_for_feed_in_tx(
+        tx: &mut WriteTx<'_>,
+        feed_id: &str,
+        feed_url: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let canon_feed = canonicalize_sync_url(feed_url);
+        if canon_feed.is_empty() {
+            return Ok(());
+        }
+        let prefix = format!("{canon_feed}\0");
+        let prefix_end = format!("{canon_feed}\u{0001}");
+        let tombs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT natural_key, hlc
+             FROM sync_tombstones
+             WHERE entity_type = 'item'
+               AND natural_key >= ?
+               AND natural_key < ?",
+        )
+        .bind(&prefix)
+        .bind(&prefix_end)
+        .fetch_all(tx.conn())
+        .await?;
+        if tombs.is_empty() {
+            return Ok(());
+        }
+        let mut tomb_by_item_url = std::collections::HashMap::with_capacity(tombs.len());
+        for (nat_key, hlc) in tombs {
+            if let Some(item_part) = nat_key.strip_prefix(&prefix) {
+                tomb_by_item_url.insert(canonicalize_sync_url(item_part), (nat_key, hlc));
+            }
+        }
+        let members: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT e.id, e.url, es.hlc
+             FROM collection_entries ce
+             JOIN entries e ON e.id = ce.entry_id
+             JOIN entry_state es ON es.entry_id = e.id
+             WHERE ce.collection_id = ?
+               AND es.inbox_state IN ('unread', 'dismissed')",
+        )
+        .bind(feed_id)
+        .fetch_all(tx.conn())
+        .await?;
+        for (entry_id, raw_url, state_hlc) in members {
+            let Some(item_url) = raw_url.as_deref().map(canonicalize_sync_url) else {
+                continue;
+            };
+            let Some((nat_key, tomb_hlc)) = tomb_by_item_url.get(&item_url) else {
+                continue;
+            };
+            if state_hlc.as_str() > tomb_hlc.as_str() {
+                Self::clear_tombstone(tx.conn(), ActivityEntityType::Item, nat_key).await?;
+            } else if ItemRepo::delete_inbox_item_preserving_history_in_tx(tx, &entry_id, true, now)
+                .await?
+            {
+                Self::record_activity(
+                    tx.conn(),
+                    ActivityEntityType::Item,
+                    &entry_id,
+                    ActivityAction::Delete,
+                    now,
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 

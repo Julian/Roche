@@ -2,16 +2,24 @@ package com.grayvines.roche.data.feeds
 
 import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
 import com.grayvines.roche.core.buildYoutubeChannelFeedUrl
+import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.encodeQueryValue
 import com.grayvines.roche.core.extractArxivIdentifier
 import com.grayvines.roche.core.extractHostTitle
+import com.grayvines.roche.core.extractQueryParam
 import com.grayvines.roche.core.extractYoutubeChannelId
 import com.grayvines.roche.core.inferFeedTypeWireValue
+import com.grayvines.roche.core.isArxivPaperUrl
+import com.grayvines.roche.core.isArxivUrl
 import com.grayvines.roche.core.isHttpOrHttpsUrl
 import com.grayvines.roche.core.isLikelyFeedUrl
 import com.grayvines.roche.core.isLocalPdfUrl
+import com.grayvines.roche.core.isSyncablePublicUrl
 import com.grayvines.roche.core.isValidArxivId
+import com.grayvines.roche.core.isYoutubeChannelFeedInput
 import com.grayvines.roche.core.isYoutubeChannelId
+import com.grayvines.roche.core.isYoutubeFeedUrl
+import com.grayvines.roche.core.isYoutubeUrl
 import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.local.DbWriteLock
 import com.grayvines.roche.data.local.MAX_SQLITE_HTML_CHARS
@@ -19,6 +27,7 @@ import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.enrichEntryMetadataIfPresent
 import com.grayvines.roche.data.remote.PublicWebFetcher
 import com.grayvines.roche.model.ContentType
+import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.inferContentType
 import com.grayvines.roche.reader.parseStylesheetRules
 import com.grayvines.roche.reader.sanitizeRocheHtml
@@ -52,6 +61,59 @@ internal fun normalizeUserSubmittedUrl(rawInput: String): String {
         "://" in trimmed -> trimmed
         else -> "https://$trimmed"
     }
+}
+
+internal fun validateEditedFeedUrl(rawInput: String, currentFeedType: FeedType): String {
+    val trimmed = rawInput.trim()
+    require(trimmed.isNotEmpty()) { "Feed URL cannot be empty" }
+    val preCanonical = canonicalizeFeedUrl(normalizeUserSubmittedUrl(trimmed))
+    val normalized = canonicalizeSyncUrl(preCanonical)
+    require(normalized.none(Char::isWhitespace) && isSyncablePublicUrl(normalized)) {
+        "Enter a valid public http:// or https:// feed URL"
+    }
+    validateEditedFeedUrlForType(trimmed, normalized, currentFeedType)
+    return normalized
+}
+
+private fun validateEditedFeedUrlForType(
+    rawTrimmed: String,
+    normalizedUrl: String,
+    currentFeedType: FeedType,
+) {
+    when (currentFeedType) {
+        FeedType.YOUTUBE -> {
+            require(isYoutubeFeedUrl(normalizedUrl)) {
+                "YouTube feed URL must be a channel ID, /channel/UC... URL, or youtube.com/feeds/videos.xml URL"
+            }
+        }
+        FeedType.ARXIV -> {
+            require(isArxivUrl(normalizedUrl)) { "arXiv feed URL must point to arxiv.org" }
+            val path = runCatching { URI.create(normalizedUrl).path.orEmpty() }.getOrDefault("")
+            val isSinglePaper =
+                isArxivPaperUrl(normalizedUrl) ||
+                    path.startsWith("/abs/") ||
+                    path.startsWith("/pdf/") ||
+                    path.endsWith(".pdf", ignoreCase = true)
+            require(!isSinglePaper) { "URL points to a single arXiv paper, not an arXiv feed" }
+        }
+        FeedType.RSS,
+        FeedType.PODCAST,
+        FeedType.SAVED -> {
+            val isYoutubeTarget = isYoutubeFeedOrChannelTarget(rawTrimmed, normalizedUrl)
+            require(!isYoutubeTarget && !isArxivUrl(normalizedUrl)) {
+                "Feed URL points to a different source kind than this feed"
+            }
+        }
+    }
+}
+
+private fun isYoutubeFeedOrChannelTarget(rawTrimmed: String, normalizedUrl: String): Boolean {
+    if (isYoutubeChannelFeedInput(rawTrimmed) || isYoutubeFeedUrl(normalizedUrl)) return true
+    if (!isYoutubeUrl(normalizedUrl)) return false
+    if (extractYoutubeChannelId(normalizedUrl, matchPathOnly = true) != null) return true
+    val query = runCatching { URI.create(normalizedUrl).rawQuery }.getOrNull()
+    val chanParam = extractQueryParam(query, "channel_id")
+    return chanParam != null && isYoutubeChannelId(chanParam)
 }
 
 internal suspend fun discoverFeedFromUrl(

@@ -6473,6 +6473,12 @@ body.has-player-bar .roche-toast-region {
   overflow-wrap: anywhere;
 }
 
+.feed-edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
 .feed-edit-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 8.5rem auto;

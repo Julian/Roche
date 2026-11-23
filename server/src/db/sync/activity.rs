@@ -105,6 +105,45 @@ impl SyncRepo<'_> {
         Ok(())
     }
 
+    pub(crate) async fn copy_item_tombstones_for_feed_url_change(
+        conn: &mut SqliteConnection,
+        old_feed_url: &str,
+        new_feed_url: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let old_canon = super::canonicalize_sync_url(old_feed_url);
+        let new_canon = super::canonicalize_sync_url(new_feed_url);
+        if old_canon.is_empty() || new_canon.is_empty() || old_canon == new_canon {
+            return Ok(());
+        }
+        let old_prefix = format!("{old_canon}\0");
+        let old_prefix_end = format!("{old_canon}\u{0001}");
+        let rows: Vec<(String, DateTime<Utc>, String)> = sqlx::query_as(
+            "SELECT natural_key, deleted_at, hlc
+             FROM sync_tombstones
+             WHERE entity_type = 'item'
+               AND natural_key >= ?
+               AND natural_key < ?",
+        )
+        .bind(&old_prefix)
+        .bind(&old_prefix_end)
+        .fetch_all(&mut *conn)
+        .await?;
+        for (natural_key, deleted_at, hlc) in rows {
+            if let Some(item_part) = natural_key.strip_prefix(&old_prefix) {
+                let migrated_key = format!("{new_canon}\0{item_part}");
+                Self::record_tombstone_with_hlc(
+                    &mut *conn,
+                    ActivityEntityType::Item,
+                    &migrated_key,
+                    deleted_at,
+                    &hlc,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn list_activity_in_tx(
         conn: &mut SqliteConnection,
     ) -> Result<Vec<ActivityEntry>> {

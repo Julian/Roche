@@ -67,16 +67,19 @@ import com.grayvines.roche.data.local.MAX_SQLITE_SUMMARY_CHARS
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.SQLITE_DELETE_CHUNK_SIZE
 import com.grayvines.roche.data.local.TombstoneEntity
+import com.grayvines.roche.data.local.copyItemTombstonesForFeedUrl
 import com.grayvines.roche.data.local.deleteEntryCascade
 import com.grayvines.roche.data.local.deleteFeedPreservingHistory
 import com.grayvines.roche.data.local.deleteItemPreservingHistory
 import com.grayvines.roche.data.local.ensureStarredSpecExists
 import com.grayvines.roche.data.local.entryHasCatalogHistory
 import com.grayvines.roche.data.local.entryKindForFeedTypeWire
+import com.grayvines.roche.data.local.replaceEntryIdentifier
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.data.remote.SyncTombstoneDto
 import com.grayvines.roche.model.ContentType
+import java.util.UUID
 
 internal suspend fun reconcilePeerSyncResponse(
     dao: RocheDao,
@@ -177,6 +180,9 @@ private suspend fun acknowledgeSentDirtyRows(
 private const val INBOX_STATE_UNREAD = "unread"
 private const val INBOX_STATE_DISMISSED = "dismissed"
 private const val INBOX_STATE_NONE = "none"
+private const val IDENT_SCHEME_FEED_URL = "feed_url"
+private const val ITEM_TOMBSTONE_MANUAL_PREFIX = "manual"
+private val RESERVED_SYNC_IDENT_SCHEMES = setOf("slug", "tag", IDENT_SCHEME_FEED_URL)
 
 private class TombstoneBatchCache(private val dao: RocheDao) {
     private var feedsById: MutableMap<String, FeedSourceEntity>? = null
@@ -189,7 +195,7 @@ private class TombstoneBatchCache(private val dao: RocheDao) {
     private val entriesByCanonUrl = HashMap<String, MutableList<EntryEntity>>()
     private var tagEntries: MutableList<Pair<CollectionSpecEntity, EntryEntity>>? = null
 
-    suspend fun findFeed(canonKey: String, detId: String): FeedSourceEntity? {
+    suspend fun findFeed(canonKey: String, rawKey: String = canonKey): FeedSourceEntity? {
         val byId =
             feedsById
                 ?: HashMap<String, FeedSourceEntity>().also { map ->
@@ -201,13 +207,13 @@ private class TombstoneBatchCache(private val dao: RocheDao) {
                     feedsById = map
                     feedIdByKey = keyMap
                 }
-        val keyMatchedId = feedIdByKey?.get(canonKey)
-        return keyMatchedId?.let { byId[it] } ?: byId[detId]
+        return byId[rawKey] ?: feedIdByKey?.get(canonKey)?.let { byId[it] }
     }
 
-    fun onFeedDeleted(feedId: String, canonKey: String) {
+    fun onFeedDeleted(feedId: String, canonKey: String, matchedFeedUrlKey: String? = null) {
         feedsById?.remove(feedId)
         feedIdByKey?.remove(canonKey)
+        matchedFeedUrlKey?.let { feedIdByKey?.remove(it) }
         itemIndexLoaded = false
     }
 
@@ -340,12 +346,17 @@ private class TombstoneBatchCache(private val dao: RocheDao) {
                     state.inboxState == INBOX_STATE_DISMISSED ||
                     canonFeed == null && state.inboxState == INBOX_STATE_NONE)
         if (!validInboxState) return false
-        val entryFeeds = membershipsByEntry[entry.id].orEmpty().mapNotNull { feedUrlsByColId[it] }
+        val entryColIds = membershipsByEntry[entry.id].orEmpty()
+        val entryFeeds = entryColIds.mapNotNull { feedUrlsByColId[it] }
         if (entry.id == detId) {
             return if (canonFeed == null) entryFeeds.isEmpty() else true
         }
         if (canonicalizeSyncUrl(entry.url.orEmpty()) != canonItem) return false
-        return if (canonFeed == null) entryFeeds.isEmpty() else canonFeed in entryFeeds
+        return if (canonFeed == null) {
+            entryFeeds.isEmpty()
+        } else {
+            canonFeed in entryFeeds || deterministicFeedId(canonFeed) in entryColIds
+        }
     }
 }
 
@@ -387,8 +398,7 @@ private suspend fun applyFeedTombstone(
     tombHlc: String,
 ) {
     val canonKey = feedNaturalKey(rawKey)
-    val detId = deterministicFeedId(canonKey)
-    val match = cache.findFeed(canonKey, detId)
+    val match = cache.findFeed(canonKey, rawKey)
     if (match != null) {
         val entryHlc = dao.getEntryById(match.collectionId)?.hlc
         val liveHlc = maxHlc(match.hlc, entryHlc)
@@ -398,7 +408,7 @@ private suspend fun applyFeedTombstone(
             recordTombstones = false,
             hlcOverride = tombHlc,
         )
-        cache.onFeedDeleted(match.collectionId, canonKey)
+        cache.onFeedDeleted(match.collectionId, canonKey, feedNaturalKey(match.feedUrl))
     }
     upsertCleanTombstone(dao, TOMBSTONE_ENTITY_FEED, canonKey, deletedAt, tombHlc)
 }
@@ -415,7 +425,8 @@ private suspend fun applyItemTombstone(
         upsertCleanTombstone(dao, TOMBSTONE_ENTITY_ITEM, rawKey, deletedAt, tombHlc)
         return
     }
-    val canonFeed = if (parts[0] == "manual") null else canonicalizeSyncUrl(parts[0])
+    val canonFeed =
+        if (parts[0] == ITEM_TOMBSTONE_MANUAL_PREFIX) null else canonicalizeSyncUrl(parts[0])
     val canonItem = canonicalizeSyncUrl(parts[1])
     val canonKey = itemNaturalKey(canonFeed, canonItem)
     val detId = deterministicItemId(canonFeed, canonItem)
@@ -431,6 +442,13 @@ private suspend fun applyItemTombstone(
         cache.refreshItemAfterDelete(cand.id)
     }
     upsertCleanTombstone(dao, TOMBSTONE_ENTITY_ITEM, canonKey, deletedAt, tombHlc)
+    if (canonFeed != null) {
+        val movedFeed = dao.getFeedSourceById(deterministicFeedId(canonFeed))
+        if (movedFeed != null && canonicalizeSyncUrl(movedFeed.feedUrl) != canonFeed) {
+            val migratedKey = itemNaturalKey(movedFeed.feedUrl, canonItem)
+            upsertCleanTombstone(dao, TOMBSTONE_ENTITY_ITEM, migratedKey, deletedAt, tombHlc)
+        }
+    }
 }
 
 private suspend fun applyTagTombstone(
@@ -582,8 +600,11 @@ private data class MergedIncomingEntriesResult(
 @Suppress("LongParameterList")
 private data class IncomingEntriesMergeCtx(
     val tombstonesByKey: MutableMap<Pair<String, String>, TombstoneEntity>,
-    val itemDetIdToNatKey: Map<String, String>,
+    val itemDetIdToNatKey: MutableMap<String, String>,
+    val existingFeedIds: Set<String>,
     val feedSourceIdByCanonUrl: MutableMap<String, String>,
+    val movedFeedsById: MutableMap<String, String>,
+    val deferredFeedUrlIds: MutableSet<String>,
     val parentFeedsByEntryId: Map<String, Set<String>>,
     val incomingWtrEntryIds: Set<String>,
     val incomingCatalogReferencedIds: Set<String>,
@@ -603,13 +624,8 @@ private suspend fun mergeIncomingEntriesInTx(
 ): MergedIncomingEntriesResult {
     val ctx = buildIncomingEntriesMergeCtx(dao, response, serverNode, nowIso, nowMs)
     val explicitMerges = ArrayList<Pair<String, String>>()
+    mergeOrderedIncomingEntries(dao, response.entries, ctx, explicitMerges)
 
-    for (rec in response.entries) {
-        val mergedPair = mergeSingleIncomingEntry(dao, rec, ctx)
-        if (mergedPair != null) {
-            explicitMerges.add(mergedPair)
-        }
-    }
     val mergeRedirects = buildMergeRedirectMap(dao.getMergedEntries())
     val combinedRedirects = ctx.idRemap + mergeRedirects
     val arrivedIds = HashSet<String>(response.entries.size + ctx.idRemap.size)
@@ -632,6 +648,82 @@ private suspend fun mergeIncomingEntriesInTx(
         redirects = combinedRedirects,
         suppressedEntryIds = ctx.suppressedEntryIds,
     )
+}
+
+private suspend fun mergeOrderedIncomingEntries(
+    dao: RocheDao,
+    entries: List<SyncEntryRecordDto>,
+    ctx: IncomingEntriesMergeCtx,
+    explicitMerges: MutableList<Pair<String, String>>,
+) {
+    val existingFeeds = ArrayList<SyncEntryRecordDto>()
+    val newFeeds = ArrayList<SyncEntryRecordDto>()
+    val otherEntries = ArrayList<SyncEntryRecordDto>()
+    for (rec in entries) {
+        when {
+            rec.feedSource == null -> otherEntries.add(rec)
+            rec.id.trim() in ctx.existingFeedIds -> existingFeeds.add(rec)
+            else -> newFeeds.add(rec)
+        }
+    }
+    mergeExistingFeedsWithRetries(dao, existingFeeds, ctx, explicitMerges)
+    for (rec in newFeeds) {
+        mergeSingleIncomingEntry(dao, rec, ctx)?.let(explicitMerges::add)
+    }
+    enforceMovedFeedItemTombstones(dao, ctx)
+    for (rec in otherEntries) {
+        mergeSingleIncomingEntry(dao, rec, ctx)?.let(explicitMerges::add)
+    }
+}
+
+private suspend fun mergeExistingFeedsWithRetries(
+    dao: RocheDao,
+    existingFeeds: List<SyncEntryRecordDto>,
+    ctx: IncomingEntriesMergeCtx,
+    explicitMerges: MutableList<Pair<String, String>>,
+) {
+    var pending = existingFeeds
+    while (pending.isNotEmpty()) {
+        ctx.deferredFeedUrlIds.clear()
+        for (rec in pending) {
+            mergeSingleIncomingEntry(dao, rec, ctx)?.let(explicitMerges::add)
+        }
+        val nextPending = pending.filter { it.id.trim() in ctx.deferredFeedUrlIds }
+        if (nextPending.isEmpty() || nextPending.size >= pending.size) break
+        pending = nextPending
+    }
+}
+
+private suspend fun enforceMovedFeedItemTombstones(dao: RocheDao, ctx: IncomingEntriesMergeCtx) {
+    for ((feedId, newCanonUrl) in ctx.movedFeedsById) {
+        if (newCanonUrl.isEmpty()) continue
+        for (member in dao.getCollectionMemberships(feedId)) {
+            enforceMovedMemberTombstone(dao, member.entryId, newCanonUrl, ctx)
+        }
+    }
+}
+
+private suspend fun enforceMovedMemberTombstone(
+    dao: RocheDao,
+    entryId: String,
+    newCanonFeedUrl: String,
+    ctx: IncomingEntriesMergeCtx,
+) {
+    val state = dao.getEntryStateById(entryId) ?: return
+    val isLiveInbox =
+        state.inboxState == INBOX_STATE_UNREAD || state.inboxState == INBOX_STATE_DISMISSED
+    if (!isLiveInbox) return
+    val canonItem = canonicalizeSyncUrl(dao.getEntryById(entryId)?.url.orEmpty())
+    if (canonItem.isEmpty()) return
+    val tombKey = itemNaturalKey(newCanonFeedUrl, canonItem)
+    val tomb = ctx.tombstonesByKey[TOMBSTONE_ENTITY_ITEM to tombKey] ?: return
+    if (compareHlc(state.hlc, tomb.hlc) <= 0) {
+        dao.deleteItemPreservingHistory(
+            itemId = entryId,
+            recordTombstones = false,
+            hlcOverride = tomb.hlc,
+        )
+    }
 }
 
 @Suppress("LongParameterList")
@@ -696,6 +788,8 @@ private suspend fun buildIncomingEntriesMergeCtx(
             .associateBy { it.entityType.lowercase() to it.naturalKey }
             .toMutableMap()
     val existingFeedSources = dao.getAllFeedSources()
+    val existingFeedIds =
+        existingFeedSources.mapTo(HashSet(existingFeedSources.size)) { it.collectionId }
     val feedSourceIdByCanonUrl = HashMap<String, String>(existingFeedSources.size)
     for (src in existingFeedSources) {
         val canonUrl = canonicalizeSyncUrl(src.feedUrl)
@@ -713,7 +807,10 @@ private suspend fun buildIncomingEntriesMergeCtx(
     return IncomingEntriesMergeCtx(
         tombstonesByKey = tombstonesByKey,
         itemDetIdToNatKey = buildItemTombstoneDetIdMap(tombstonesByKey),
+        existingFeedIds = existingFeedIds,
         feedSourceIdByCanonUrl = feedSourceIdByCanonUrl,
+        movedFeedsById = LinkedHashMap(),
+        deferredFeedUrlIds = HashSet(),
         parentFeedsByEntryId = parentFeedsByEntryId,
         incomingWtrEntryIds = incomingWtrEntryIds,
         incomingCatalogReferencedIds = collectIncomingCatalogRefIds(response),
@@ -727,17 +824,23 @@ private suspend fun buildIncomingEntriesMergeCtx(
 
 private fun buildItemTombstoneDetIdMap(
     tombstonesByKey: Map<Pair<String, String>, TombstoneEntity>
-): Map<String, String> = buildMap {
-    for ((type, natKey) in tombstonesByKey.keys) {
-        if (type != TOMBSTONE_ENTITY_ITEM) continue
-        val parts = natKey.split('\u0000')
-        if (parts.size == 2) {
-            val canonFeed = if (parts[0] == "manual") null else canonicalizeSyncUrl(parts[0])
-            val canonItem = canonicalizeSyncUrl(parts[1])
-            put(deterministicItemId(canonFeed, canonItem), natKey)
+): MutableMap<String, String> =
+    HashMap<String, String>().apply {
+        for ((type, natKey) in tombstonesByKey.keys) {
+            if (type != TOMBSTONE_ENTITY_ITEM) continue
+            val parts = natKey.split('\u0000')
+            if (parts.size == 2) {
+                val canonFeed =
+                    if (parts[0] == ITEM_TOMBSTONE_MANUAL_PREFIX) {
+                        null
+                    } else {
+                        canonicalizeSyncUrl(parts[0])
+                    }
+                val canonItem = canonicalizeSyncUrl(parts[1])
+                put(deterministicItemId(canonFeed, canonItem), natKey)
+            }
         }
     }
-}
 
 private fun buildFeedUrlLookup(
     existingFeedSources: List<FeedSourceEntity>,
@@ -1046,13 +1149,26 @@ private suspend fun isSuppressedByFeedTombstone(
     ctx: IncomingEntriesMergeCtx,
 ): Boolean {
     val fs = rec.feedSource ?: return false
-    val feedKey = feedNaturalKey(fs.feedUrl)
     val fsHlc = resolveOrSynthesizeHlc(fs.hlc, rec.updatedAt, ctx.nowIso, ctx.serverNode, ctx.nowMs)
     val liveHlc = maxHlc(entryHlc, fsHlc)
-    val tomb = ctx.tombstonesByKey[TOMBSTONE_ENTITY_FEED to feedKey] ?: return false
-    if (compareHlc(tomb.hlc, liveHlc) >= 0) return true
-    dao.deleteTombstone(TOMBSTONE_ENTITY_FEED, feedKey)
-    ctx.tombstonesByKey.remove(TOMBSTONE_ENTITY_FEED to feedKey)
+    val candidateKeys =
+        listOfNotNull(
+                feedNaturalKey(fs.feedUrl).takeIf { it.isNotEmpty() },
+                rec.id.trim().takeIf { it.isNotEmpty() },
+            )
+            .distinct()
+    val staleKeys = ArrayList<String>(candidateKeys.size)
+    for (key in candidateKeys) {
+        val tomb = ctx.tombstonesByKey[TOMBSTONE_ENTITY_FEED to key] ?: continue
+        if (compareHlc(tomb.hlc, liveHlc) >= 0) {
+            return true
+        }
+        staleKeys.add(key)
+    }
+    for (staleKey in staleKeys) {
+        dao.deleteTombstone(TOMBSTONE_ENTITY_FEED, staleKey)
+        ctx.tombstonesByKey.remove(TOMBSTONE_ENTITY_FEED to staleKey)
+    }
     return false
 }
 
@@ -1109,7 +1225,7 @@ private suspend fun matchFeedOrSpecOwnerId(
     if (fs != null) {
         val canonUrl = canonicalizeSyncUrl(fs.feedUrl)
         val existingId = feedSourceIdByCanonUrl[canonUrl]
-        return existingId ?: rawId.ifEmpty { deterministicFeedId(canonUrl) }
+        return existingId ?: rawId.ifEmpty { allocateUnoccupiedFeedId(dao, canonUrl) }
     }
     val spec = rec.collectionSpec ?: return null
     return if (CollectionRole.fromWireValue(spec.role) == CollectionRole.TAG) {
@@ -1119,6 +1235,12 @@ private suspend fun matchFeedOrSpecOwnerId(
         val slug = spec.slug?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
         slug?.let { dao.getCollectionSpecBySlug(it) }?.takeIf { !isProtectedSpec(it) }?.collectionId
     }
+}
+
+private suspend fun allocateUnoccupiedFeedId(dao: RocheDao, canonUrl: String): String {
+    val detId = deterministicFeedId(canonUrl)
+    val occupied = dao.getFeedSourceById(detId) != null || dao.getEntryById(detId) != null
+    return if (occupied) UUID.randomUUID().toString() else detId
 }
 
 private suspend fun matchIdentifierOwnerId(
@@ -1145,7 +1267,7 @@ private suspend fun matchSingleIdentifierOwner(
     val resolved = owner?.let { followMergedIdInDao(dao, it) ?: it }
     val compatible =
         resolved != null &&
-            (s != "url" && s != "feed_url" ||
+            (s != "url" && s != IDENT_SCHEME_FEED_URL ||
                 dao.getEntryById(resolved)?.let {
                     EntryKind.fromWireValue(it.kind) == resolvedKind
                 } != false)
@@ -1351,6 +1473,11 @@ private suspend fun mergeProtectedSystemSpecInDao(
     return true
 }
 
+private data class FeedSourceMergeResult(
+    val entity: FeedSourceEntity,
+    val deferredUrlCollision: Boolean,
+)
+
 private suspend fun mergeIncomingFeedSourceInDao(
     dao: RocheDao,
     targetId: String,
@@ -1367,37 +1494,158 @@ private suspend fun mergeIncomingFeedSourceInDao(
             ctx.serverNode,
             ctx.nowMs,
         )
-    val merged = buildMergedFeedSourceEntity(targetId, fsDto, existing, fsHlc)
-    if (dao.getCollectionSpecById(targetId) == null) {
-        dao.upsertCollectionSpec(
-            CollectionSpecEntity(
-                collectionId = targetId,
-                slug = null,
-                mode = TOMBSTONE_ENTITY_FEED,
-                role = TOMBSTONE_ENTITY_FEED,
-                showInLists = false,
+    val allowIncomingFeedUrl =
+        canAcceptSyncedFeedUrl(dao, targetId, existing, fsDto.feedUrl, ctx.feedSourceIdByCanonUrl)
+    if (existing == null && !allowIncomingFeedUrl) return
+    val mergeResult =
+        buildMergedFeedSourceEntity(targetId, fsDto, existing, fsHlc, allowIncomingFeedUrl)
+    if (mergeResult.deferredUrlCollision) {
+        ctx.deferredFeedUrlIds.add(targetId)
+    }
+    val merged = mergeResult.entity
+    ensureFeedCollectionSpec(dao, targetId)
+    val urlChanged = existing != null && merged.feedUrl != existing.feedUrl
+    dao.upsertFeedSource(merged)
+    syncFeedEntryAfterSourceMerge(dao, targetId, existing, merged, urlChanged)
+    updateFeedUrlIndexesAfterMerge(dao, targetId, existing, merged, urlChanged, ctx)
+    dao.clearFallbackFeedTitleForFeed(targetId)
+}
+
+private suspend fun ensureFeedCollectionSpec(dao: RocheDao, targetId: String) {
+    if (dao.getCollectionSpecById(targetId) != null) return
+    dao.upsertCollectionSpec(
+        CollectionSpecEntity(
+            collectionId = targetId,
+            slug = null,
+            mode = TOMBSTONE_ENTITY_FEED,
+            role = TOMBSTONE_ENTITY_FEED,
+            showInLists = false,
+        )
+    )
+}
+
+@Suppress("LongParameterList")
+private suspend fun updateFeedUrlIndexesAfterMerge(
+    dao: RocheDao,
+    targetId: String,
+    existing: FeedSourceEntity?,
+    merged: FeedSourceEntity,
+    urlChanged: Boolean,
+    ctx: IncomingEntriesMergeCtx,
+) {
+    val canonFeedUrl = canonicalizeSyncUrl(merged.feedUrl)
+    if (urlChanged && existing != null) {
+        val oldCanon = canonicalizeSyncUrl(existing.feedUrl)
+        if (ctx.feedSourceIdByCanonUrl[oldCanon] == targetId) {
+            ctx.feedSourceIdByCanonUrl.remove(oldCanon)
+        }
+        dao.replaceEntryIdentifier(targetId, IDENT_SCHEME_FEED_URL, canonFeedUrl)
+        val migrated =
+            dao.copyItemTombstonesForFeedUrl(existing.feedUrl, merged.feedUrl, markDirty = false)
+        registerMigratedItemTombstones(migrated, ctx)
+        ctx.movedFeedsById[targetId] = canonFeedUrl
+    } else if (canonFeedUrl.isNotEmpty()) {
+        dao.insertEntryIdentifierIgnore(
+            EntryIdentifierEntity(IDENT_SCHEME_FEED_URL, canonFeedUrl, targetId)
+        )
+    }
+    if (canonFeedUrl.isNotEmpty()) {
+        ctx.feedSourceIdByCanonUrl[canonFeedUrl] = targetId
+    }
+}
+
+private fun registerMigratedItemTombstones(
+    migrated: List<TombstoneEntity>,
+    ctx: IncomingEntriesMergeCtx,
+) {
+    for (tomb in migrated) {
+        ctx.tombstonesByKey[TOMBSTONE_ENTITY_ITEM to tomb.naturalKey] = tomb
+        val parts = tomb.naturalKey.split('\u0000')
+        if (parts.size == 2) {
+            val canonFeed =
+                if (parts[0] == ITEM_TOMBSTONE_MANUAL_PREFIX) {
+                    null
+                } else {
+                    canonicalizeSyncUrl(parts[0])
+                }
+            val canonItem = canonicalizeSyncUrl(parts[1])
+            ctx.itemDetIdToNatKey[deterministicItemId(canonFeed, canonItem)] = tomb.naturalKey
+        }
+    }
+}
+
+private suspend fun canAcceptSyncedFeedUrl(
+    dao: RocheDao,
+    targetId: String,
+    existing: FeedSourceEntity?,
+    incomingUrl: String,
+    feedSourceIdByCanonUrl: Map<String, String>,
+): Boolean {
+    val trimmed = incomingUrl.trim()
+    if (trimmed.isEmpty()) return false
+    if (existing != null && trimmed == existing.feedUrl) return true
+    val canon = canonicalizeSyncUrl(trimmed)
+    val indexedOwner = feedSourceIdByCanonUrl[canon]
+    if (indexedOwner != null && indexedOwner != targetId) return false
+    val dbOwner =
+        dao.getAllFeedSources()
+            .firstOrNull { canonicalizeSyncUrl(it.feedUrl) == canon }
+            ?.collectionId
+    return dbOwner == null || dbOwner == targetId
+}
+
+private suspend fun syncFeedEntryAfterSourceMerge(
+    dao: RocheDao,
+    targetId: String,
+    existing: FeedSourceEntity?,
+    merged: FeedSourceEntity,
+    urlChanged: Boolean,
+) {
+    val expectedFeedKind = entryKindForFeedTypeWire(merged.sourceType)
+    val currentEntry = dao.getEntryById(targetId) ?: return
+    val nextTitle = resolveMergedFeedEntryTitle(currentEntry, existing, merged, urlChanged)
+    val nextUrl = resolveMergedFeedEntryUrl(currentEntry, existing, merged, urlChanged)
+    val entryChanged =
+        currentEntry.kind != expectedFeedKind ||
+            nextTitle != currentEntry.title ||
+            nextUrl != currentEntry.url
+    if (entryChanged) {
+        dao.upsertEntry(
+            currentEntry.copy(
+                kind = expectedFeedKind,
+                title = nextTitle,
+                url = nextUrl,
+                hlc = maxHlc(currentEntry.hlc, merged.hlc),
+                isLocalDirty = currentEntry.isLocalDirty || merged.isLocalDirty,
             )
         )
     }
-    dao.upsertFeedSource(merged)
-    val expectedFeedKind = entryKindForFeedTypeWire(merged.sourceType)
-    dao.getEntryById(targetId)?.let { currentEntry ->
-        if (currentEntry.kind != expectedFeedKind) {
-            dao.upsertEntry(
-                currentEntry.copy(
-                    kind = expectedFeedKind,
-                    hlc = maxHlc(currentEntry.hlc, merged.hlc),
-                    isLocalDirty = currentEntry.isLocalDirty || merged.isLocalDirty,
-                )
-            )
-        }
+}
+
+private fun resolveMergedFeedEntryTitle(
+    currentEntry: EntryEntity,
+    existing: FeedSourceEntity?,
+    merged: FeedSourceEntity,
+    urlChanged: Boolean,
+): String {
+    if (!urlChanged || existing == null || !merged.feedTitle.isNullOrBlank()) {
+        return currentEntry.title
     }
-    val canonFeedUrl = canonicalizeSyncUrl(merged.feedUrl)
-    if (canonFeedUrl.isNotEmpty()) {
-        ctx.feedSourceIdByCanonUrl[canonFeedUrl] = targetId
-        dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("feed_url", canonFeedUrl, targetId))
-    }
-    dao.clearFallbackFeedTitleForFeed(targetId)
+    val wasFallbackTitle = currentEntry.title.isBlank() || currentEntry.title == existing.feedUrl
+    return if (wasFallbackTitle) merged.feedUrl else currentEntry.title
+}
+
+private fun resolveMergedFeedEntryUrl(
+    currentEntry: EntryEntity,
+    existing: FeedSourceEntity?,
+    merged: FeedSourceEntity,
+    urlChanged: Boolean,
+): String? {
+    if (!urlChanged || existing == null) return currentEntry.url
+    val curUrl = currentEntry.url
+    val wasOldFeedOrSite =
+        curUrl == null || curUrl == existing.feedUrl || curUrl == existing.siteUrl
+    return if (wasOldFeedOrSite) merged.feedUrl else curUrl
 }
 
 private data class MergedFeedPollTelemetry(
@@ -1413,6 +1661,22 @@ private fun String?.trimmedOrNull(): String? = this?.trim()?.takeIf { it.isNotEm
 private fun resolveMergedFeedPollTelemetry(
     existing: FeedSourceEntity,
     fsDto: SyncFeedSourceDto,
+    resolvedFeedUrl: String,
+    configWins: Boolean,
+    urlChanged: Boolean,
+): MergedFeedPollTelemetry {
+    val incomingMatchesUrl =
+        canonicalizeSyncUrl(fsDto.feedUrl) == canonicalizeSyncUrl(resolvedFeedUrl)
+    return when {
+        urlChanged -> resolveUrlChangedPollTelemetry(fsDto, incomingMatchesUrl)
+        !incomingMatchesUrl -> localFeedPollTelemetry(existing)
+        else -> resolveSameUrlPollTelemetry(existing, fsDto, configWins)
+    }
+}
+
+private fun resolveSameUrlPollTelemetry(
+    existing: FeedSourceEntity,
+    fsDto: SyncFeedSourceDto,
     configWins: Boolean,
 ): MergedFeedPollTelemetry {
     val incomingError = fsDto.lastError.trimmedOrNull()
@@ -1421,7 +1685,7 @@ private fun resolveMergedFeedPollTelemetry(
     val localPollWins = localPollNewer || !incomingPollNewer && !configWins
     val lastPolledAt = if (localPollWins) existing.lastPolledAt else fsDto.lastPolledAt
     val lastPolledBy = if (localPollWins) existing.lastPolledBy else fsDto.lastPolledBy
-    val isRemoteUnarchive = configWins && !existing.isActive && fsDto.isActive
+    val isRemoteUnarchive = !incomingPollNewer && configWins && !existing.isActive && fsDto.isActive
     if (isRemoteUnarchive && incomingError == null) {
         return MergedFeedPollTelemetry(lastPolledAt, lastPolledBy, null, null, 0)
     }
@@ -1437,50 +1701,117 @@ private fun resolveMergedFeedPollTelemetry(
     )
 }
 
+private fun resolveUrlChangedPollTelemetry(
+    fsDto: SyncFeedSourceDto,
+    incomingMatchesUrl: Boolean,
+): MergedFeedPollTelemetry {
+    if (!incomingMatchesUrl || fsDto.lastPolledAt.isNullOrBlank()) {
+        return MergedFeedPollTelemetry(null, null, null, null, 0)
+    }
+    val cleanError = fsDto.lastError.trimmedOrNull()
+    return MergedFeedPollTelemetry(
+        lastPolledAt = fsDto.lastPolledAt,
+        lastPolledBy = fsDto.lastPolledBy,
+        lastError = cleanError,
+        lastErrorBy = cleanError?.let { fsDto.lastErrorBy.trimmedOrNull() },
+        consecutiveFailures = normalizeConsecutiveFailures(cleanError, fsDto.consecutiveFailures),
+    )
+}
+
+private fun localFeedPollTelemetry(existing: FeedSourceEntity): MergedFeedPollTelemetry {
+    val cleanError = existing.lastError.trimmedOrNull()
+    return MergedFeedPollTelemetry(
+        lastPolledAt = existing.lastPolledAt,
+        lastPolledBy = existing.lastPolledBy,
+        lastError = cleanError,
+        lastErrorBy = cleanError?.let { existing.lastErrorBy.trimmedOrNull() },
+        consecutiveFailures =
+            normalizeConsecutiveFailures(cleanError, existing.consecutiveFailures),
+    )
+}
+
+private fun buildNewFeedSourceEntity(
+    targetId: String,
+    fsDto: SyncFeedSourceDto,
+    fsHlc: String,
+): FeedSourceEntity {
+    val incomingError = fsDto.lastError.trimmedOrNull()
+    val incomingErrorBy = incomingError?.let { fsDto.lastErrorBy.trimmedOrNull() }
+    return FeedSourceEntity(
+        collectionId = targetId,
+        feedUrl = fsDto.feedUrl.trim(),
+        siteUrl = null,
+        sourceType = fsDto.sourceType.ifBlank { "rss" },
+        feedTitle = fsDto.feedTitle?.takeIf { it.isNotBlank() },
+        language = fsDto.language?.takeIf { it.isNotBlank() },
+        pollInterval = fsDto.pollInterval,
+        isActive = fsDto.isActive,
+        lastPolledAt = fsDto.lastPolledAt,
+        lastPolledBy = fsDto.lastPolledBy,
+        lastError = incomingError,
+        lastErrorBy = incomingErrorBy,
+        consecutiveFailures =
+            normalizeConsecutiveFailures(incomingError, fsDto.consecutiveFailures),
+        autoDownloadEpisodes = false,
+        customPlaybackSpeed = null,
+        hlc = fsHlc,
+        isLocalDirty = false,
+    )
+}
+
 private fun buildMergedFeedSourceEntity(
     targetId: String,
     fsDto: SyncFeedSourceDto,
     existing: FeedSourceEntity?,
     fsHlc: String,
-): FeedSourceEntity {
+    allowIncomingFeedUrl: Boolean = true,
+): FeedSourceMergeResult {
     if (existing == null) {
-        val incomingError = fsDto.lastError.trimmedOrNull()
-        val incomingErrorBy = incomingError?.let { fsDto.lastErrorBy.trimmedOrNull() }
-        return FeedSourceEntity(
-            collectionId = targetId,
-            feedUrl = fsDto.feedUrl,
-            siteUrl = null,
-            sourceType = fsDto.sourceType.ifBlank { "rss" },
-            feedTitle = fsDto.feedTitle?.takeIf { it.isNotBlank() },
-            language = fsDto.language?.takeIf { it.isNotBlank() },
-            pollInterval = fsDto.pollInterval,
-            isActive = fsDto.isActive,
-            lastPolledAt = fsDto.lastPolledAt,
-            lastPolledBy = fsDto.lastPolledBy,
-            lastError = incomingError,
-            lastErrorBy = incomingErrorBy,
-            consecutiveFailures =
-                normalizeConsecutiveFailures(incomingError, fsDto.consecutiveFailures),
-            autoDownloadEpisodes = false,
-            customPlaybackSpeed = null,
-            hlc = fsHlc,
-            isLocalDirty = false,
-        )
+        return FeedSourceMergeResult(buildNewFeedSourceEntity(targetId, fsDto, fsHlc), false)
     }
     val configWins = shouldIncomingWinHlc(fsHlc, existing.hlc, existing.isLocalDirty)
-    val telemetry = resolveMergedFeedPollTelemetry(existing, fsDto, configWins)
-    val resolvedType = resolveMergedFeedSourceType(existing, fsDto, configWins)
-    val resolvedTitle =
-        if (configWins) {
-            fsDto.feedTitle?.takeIf { it.isNotBlank() } ?: existing.feedTitle
-        } else {
-            existing.feedTitle
-        }
+    val trimmedUrl = fsDto.feedUrl.trim()
+    val wantsUrlChange = configWins && trimmedUrl.isNotEmpty() && trimmedUrl != existing.feedUrl
+    val deferredUrlCollision = wantsUrlChange && !allowIncomingFeedUrl
+    val resolvedFeedUrl =
+        if (wantsUrlChange && allowIncomingFeedUrl) trimmedUrl else existing.feedUrl
+    val urlChanged = resolvedFeedUrl != existing.feedUrl
+    val telemetry =
+        resolveMergedFeedPollTelemetry(existing, fsDto, resolvedFeedUrl, configWins, urlChanged)
+    val merged =
+        assembleMergedFeedSource(
+            targetId = targetId,
+            existing = existing,
+            fsDto = fsDto,
+            fsHlc = fsHlc,
+            resolvedFeedUrl = resolvedFeedUrl,
+            urlChanged = urlChanged,
+            configWins = configWins,
+            deferredUrlCollision = deferredUrlCollision,
+            telemetry = telemetry,
+        )
+    return FeedSourceMergeResult(merged, deferredUrlCollision)
+}
+
+@Suppress("LongParameterList")
+private fun assembleMergedFeedSource(
+    targetId: String,
+    existing: FeedSourceEntity,
+    fsDto: SyncFeedSourceDto,
+    fsHlc: String,
+    resolvedFeedUrl: String,
+    urlChanged: Boolean,
+    configWins: Boolean,
+    deferredUrlCollision: Boolean,
+    telemetry: MergedFeedPollTelemetry,
+): FeedSourceEntity {
+    val incomingTitle = fsDto.feedTitle?.takeIf { it.isNotBlank() }
+    val resolvedTitle = if (configWins) incomingTitle ?: existing.feedTitle else existing.feedTitle
     return FeedSourceEntity(
         collectionId = targetId,
-        feedUrl = fsDto.feedUrl.ifBlank { existing.feedUrl },
-        siteUrl = existing.siteUrl,
-        sourceType = resolvedType,
+        feedUrl = resolvedFeedUrl,
+        siteUrl = if (urlChanged) null else existing.siteUrl,
+        sourceType = resolveMergedFeedSourceType(existing, fsDto, configWins),
         feedTitle = resolvedTitle,
         language = fsDto.language?.takeIf { it.isNotBlank() } ?: existing.language,
         pollInterval = if (configWins) fsDto.pollInterval else existing.pollInterval,
@@ -1492,8 +1823,13 @@ private fun buildMergedFeedSourceEntity(
         consecutiveFailures = telemetry.consecutiveFailures,
         autoDownloadEpisodes = existing.autoDownloadEpisodes,
         customPlaybackSpeed = existing.customPlaybackSpeed,
-        hlc = maxHlc(fsHlc, existing.hlc),
-        isLocalDirty = existing.isLocalDirty && !configWins,
+        hlc = if (deferredUrlCollision) existing.hlc else maxHlc(fsHlc, existing.hlc),
+        isLocalDirty =
+            if (deferredUrlCollision) {
+                existing.isLocalDirty
+            } else {
+                existing.isLocalDirty && !configWins
+            },
     )
 }
 
@@ -1851,6 +2187,7 @@ private suspend fun mergeIncomingIdentifiersInDao(
     val rows = ArrayList<EntryIdentifierEntity>()
     for (ident in rec.identifiers) {
         val s = normalizeIdentifierScheme(ident.scheme)
+        if (s in RESERVED_SYNC_IDENT_SCHEMES) continue
         val v = normalizeIdentifierValue(resolvedKind, s, ident.value)
         if (s.isNotEmpty() && v.isNotEmpty()) {
             rows.add(EntryIdentifierEntity(s, v, identOwner))
