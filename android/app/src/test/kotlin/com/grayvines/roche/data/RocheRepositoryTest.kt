@@ -154,30 +154,36 @@ class RocheRepositoryTest {
         assertEquals(ItemStatus.UNREAD, previousStatus)
 
         val afterArchive = repository.snapshot.first().entries.first { it.id == "item-1" }
-        assertTrue(afterArchive.isArchived)
-        assertTrue(afterArchive.isRead)
+        assertTrue(afterArchive.isDismissed)
+        assertFalse(afterArchive.isFinished)
+        assertFalse(afterArchive.isRead)
 
         repository.restoreStatus(itemId = "item-1", status = previousStatus!!)
         val afterUndo = repository.snapshot.first().entries.first { it.id == "item-1" }
+        assertTrue(afterUndo.isNew)
         assertFalse(afterUndo.isArchived)
         assertFalse(afterUndo.isRead)
         assertEquals(ItemStatus.UNREAD, afterUndo.status)
 
-        // Mark item-1 read first, then archive, then undo archive — readAt is preserved
-        repository.setReadState(itemId = "item-1", isRead = true)
-        val readBeforeArchive = repository.snapshot.first().entries.first { it.id == "item-1" }
-        assertTrue(readBeforeArchive.isRead)
+        // Dismissing a Finished item deletes its consumed log; Undo restores Finished + progress
+        repository.updateReadProgress("item-1", 0.99, fromAudioPlayback = false)
+        val finishedBeforeDismiss = repository.snapshot.first().entries.first { it.id == "item-1" }
+        assertTrue(finishedBeforeDismiss.isFinished)
         val snap = repository.setArchiveStateWithSnapshot(itemId = "item-1", archived = true)!!
-        assertEquals(readBeforeArchive.readAt, snap.previousReadAt)
+        assertTrue(snap.wasFinished)
+        val dismissedFromFinished = repository.snapshot.first().entries.first { it.id == "item-1" }
+        assertTrue(dismissedFromFinished.isDismissed)
+        assertFalse(dismissedFromFinished.isFinished)
         repository.restoreStatus(
             itemId = "item-1",
             status = snap.previousStatus,
             readAt = snap.previousReadAt,
+            wasFinished = snap.wasFinished,
+            previousProgress = snap.previousProgress,
         )
-        val afterReadUndo = repository.snapshot.first().entries.first { it.id == "item-1" }
-        assertFalse(afterReadUndo.isArchived)
-        assertTrue(afterReadUndo.isRead)
-        assertEquals(readBeforeArchive.readAt, afterReadUndo.readAt)
+        val afterFinishUndo = repository.snapshot.first().entries.first { it.id == "item-1" }
+        assertTrue(afterFinishUndo.isFinished)
+        assertEquals(0.99, afterFinishUndo.readProgress, 1e-3)
     }
 
     @Test

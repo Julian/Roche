@@ -87,6 +87,7 @@ import com.grayvines.roche.ui.components.MoreDotsIcon
 import com.grayvines.roche.ui.components.PredictiveBackDrawerContainer
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheMetaPill
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.theme.LocalReaderFontScale
@@ -95,6 +96,7 @@ import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
@@ -220,6 +222,7 @@ private data class ReaderArticleCallbacks(
     val onSelectTag: (String) -> Unit,
     val onToggleArchive: () -> Unit,
     val onMarkFinished: () -> Unit,
+    val onUnfinish: () -> Unit,
     val onDownloadPdf: () -> Unit,
     val onToggleAudio: () -> Unit,
     val onOpenAudioPlayer: () -> Unit,
@@ -295,6 +298,7 @@ fun ReaderView(
 ) {
     var showTypographyDrawer by rememberSaveable(entry.id) { mutableStateOf(false) }
     var activeLightboxTarget by remember(entry.id) { mutableStateOf<ReaderLightboxTarget?>(null) }
+    var suppressAutoFinish by remember(entry.id) { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
     val listState = key(entry.id) { rememberLazyListState() }
     val content =
@@ -309,6 +313,7 @@ fun ReaderView(
         listState = listState,
         isAwaitingContent = content.awaitingContent,
         pdfPageCount = content.pdfSession?.pageCount ?: 0,
+        suppressAutoFinish = suppressAutoFinish,
         onAction = onAction,
     )
 
@@ -323,6 +328,10 @@ fun ReaderView(
         listState = listState,
         onToggleTypography = { showTypographyDrawer = !showTypographyDrawer },
         onDismissTypography = { showTypographyDrawer = false },
+        onUnfinishEntry = {
+            suppressAutoFinish = true
+            onAction(MainAction.UnfinishFeedEntry(entry.id))
+        },
         onAction = onAction,
         onShareEntry = onShareEntry,
         onOpenExternalUrl = onOpenExternalUrl,
@@ -350,6 +359,7 @@ private fun buildReaderArticleCallbacks(
     listState: LazyListState,
     content: ReaderContentBundle,
     coroutineScope: CoroutineScope,
+    onUnfinishEntry: () -> Unit,
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
@@ -361,10 +371,9 @@ private fun buildReaderArticleCallbacks(
             onAction(MainAction.FilterByFeed(fid))
         },
         onSelectTag = { onAction(MainAction.FilterByTag(it)) },
-        onToggleArchive = {
-            flushAndToggleReaderArchive(entry, listState, content.awaitingContent, onAction)
-        },
+        onToggleArchive = { onAction(MainAction.ToggleArchive(entry = entry)) },
         onMarkFinished = { onAction(MainAction.MarkFeedEntryFinished(entry.id, false)) },
+        onUnfinish = onUnfinishEntry,
         onDownloadPdf = { onAction(MainAction.CacheEntryOffline(entry.id)) },
         onToggleAudio = { onAction(MainAction.PlayAudioEntry(entry.id, openFullscreen = false)) },
         onOpenAudioPlayer = {
@@ -405,6 +414,7 @@ private fun ReaderViewScaffold(
     listState: LazyListState,
     onToggleTypography: () -> Unit,
     onDismissTypography: () -> Unit,
+    onUnfinishEntry: () -> Unit,
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
@@ -418,6 +428,7 @@ private fun ReaderViewScaffold(
             listState = listState,
             content = content,
             coroutineScope = coroutineScope,
+            onUnfinishEntry = onUnfinishEntry,
             onAction = onAction,
             onShareEntry = onShareEntry,
             onOpenExternalUrl = onOpenExternalUrl,
@@ -426,8 +437,6 @@ private fun ReaderViewScaffold(
     Column(modifier = Modifier.fillMaxSize().background(colors.background)) {
         ReaderTopToolbar(
             entry = entry,
-            listState = listState,
-            isAwaitingContent = content.awaitingContent,
             backLabel = backLabel,
             showTypographyDrawer = showTypographyDrawer,
             onToggleTypography = onToggleTypography,
@@ -612,11 +621,13 @@ internal fun computeLazyListScrollFraction(listState: LazyListState): Double? {
 }
 
 @Composable
+@Suppress("LongParameterList")
 internal fun ReaderScrollProgressEffect(
     entry: InboxEntry,
     listState: LazyListState,
     isAwaitingContent: Boolean,
     pdfPageCount: Int = 0,
+    suppressAutoFinish: Boolean = false,
     onAction: (MainAction) -> Unit,
 ) {
     val bodyLengthBucket = readerBodyCharCount(entry) + pdfPageCount
@@ -629,7 +640,16 @@ internal fun ReaderScrollProgressEffect(
             derivedStateOf { listState.canScrollForward || listState.canScrollBackward }
         }
 
-    LaunchedEffect(entry.id, bodyLengthBucket, totalItems, canScroll, isAwaitingContent) {
+    LaunchedEffect(
+        entry.id,
+        entry.status,
+        entry.isFinished,
+        bodyLengthBucket,
+        totalItems,
+        canScroll,
+        isAwaitingContent,
+        suppressAutoFinish,
+    ) {
         if (!isAwaitingContent && totalItems > 0) {
             restoredBodyBucket =
                 syncReaderInitialOrFitScroll(
@@ -640,16 +660,17 @@ internal fun ReaderScrollProgressEffect(
                     totalItems = totalItems,
                     canScroll = canScroll,
                     hasUserScrolled = hasUserScrolled,
+                    suppressAutoFinish = suppressAutoFinish,
                     onAction = onAction,
                 )
         }
     }
 
-    LaunchedEffect(entry.id, listState.isScrollInProgress, canScroll) {
+    LaunchedEffect(entry.id, listState.isScrollInProgress, canScroll, suppressAutoFinish) {
         if (listState.isScrollInProgress) {
             hasUserScrolled = true
         } else if (hasUserScrolled && canScroll) {
-            maybeCommitScrolledProgress(entry, listState, onAction)
+            maybeCommitScrolledProgress(entry, listState, suppressAutoFinish, onAction)
         }
     }
 }
@@ -667,6 +688,7 @@ private suspend fun syncReaderInitialOrFitScroll(
     totalItems: Int,
     canScroll: Boolean,
     hasUserScrolled: Boolean,
+    suppressAutoFinish: Boolean,
     onAction: (MainAction) -> Unit,
 ): Int {
     if (canScroll && !hasUserScrolled && restoredBodyBucket != bodyLengthBucket) {
@@ -679,8 +701,9 @@ private suspend fun syncReaderInitialOrFitScroll(
         }
         return bodyLengthBucket
     }
-    if (shouldAutoCompleteViewportFit(entry, bodyLengthBucket, canScroll)) {
+    if (shouldAutoCompleteViewportFit(entry, bodyLengthBucket, canScroll, suppressAutoFinish)) {
         withFrameNanos {}
+        delay(SHORT_ARTICLE_DWELL_MS)
         val stillFitsViewport =
             listState.layoutInfo.totalItemsCount > 0 &&
                 !listState.canScrollForward &&
@@ -701,26 +724,47 @@ private fun shouldAutoCompleteViewportFit(
     entry: InboxEntry,
     bodyLengthBucket: Int,
     canScroll: Boolean,
+    suppressAutoFinish: Boolean,
 ): Boolean {
     val isReadableText =
         entry.contentType != ContentType.VIDEO &&
             entry.contentType != ContentType.AUDIO &&
-            !entry.isPlayableAudio
-    return isReadableText && bodyLengthBucket > 0 && !canScroll && entry.readProgress < 1.0
+            !entry.isPodcastEpisode
+    return entry.isNew &&
+        !suppressAutoFinish &&
+        isReadableText &&
+        bodyLengthBucket > 0 &&
+        !canScroll &&
+        entry.readProgress < AUTO_FINISH_SCROLL_THRESHOLD
 }
 
 private fun maybeCommitScrolledProgress(
     entry: InboxEntry,
     listState: LazyListState,
+    suppressAutoFinish: Boolean,
     onAction: (MainAction) -> Unit,
 ) {
-    if (entry.contentType == ContentType.VIDEO || entry.contentType == ContentType.AUDIO) return
+    if (
+        entry.contentType == ContentType.VIDEO ||
+            entry.contentType == ContentType.AUDIO ||
+            entry.isPodcastEpisode
+    ) {
+        return
+    }
     val rawProgress = computeLazyListScrollFraction(listState) ?: return
+    val effectiveProgress =
+        if (suppressAutoFinish && rawProgress >= AUTO_FINISH_SCROLL_THRESHOLD) {
+            SUPPRESSED_MAX_PROGRESS
+        } else {
+            rawProgress
+        }
     val crossedCompletion =
-        rawProgress >= ARCHIVE_COMPLETION_THRESHOLD &&
-            entry.readProgress < ARCHIVE_COMPLETION_THRESHOLD
-    if (crossedCompletion || abs(rawProgress - entry.readProgress) >= READ_PROGRESS_MIN_DELTA) {
-        onAction(MainAction.UpdateReadProgress(entry.id, rawProgress))
+        effectiveProgress >= AUTO_FINISH_SCROLL_THRESHOLD &&
+            entry.readProgress < AUTO_FINISH_SCROLL_THRESHOLD
+    if (
+        crossedCompletion || abs(effectiveProgress - entry.readProgress) >= READ_PROGRESS_MIN_DELTA
+    ) {
+        onAction(MainAction.UpdateReadProgress(entry.id, effectiveProgress))
     }
 }
 
@@ -743,22 +787,9 @@ internal fun computeLiveReaderProgress(
     }
 }
 
-private fun flushAndToggleReaderArchive(
-    entry: InboxEntry,
-    listState: LazyListState,
-    isAwaitingContent: Boolean,
-    onAction: (MainAction) -> Unit,
-) {
-    val live = computeLiveReaderProgress(entry, listState, isAwaitingContent)
-    onAction(MainAction.ToggleArchive(entry = entry, liveReadProgress = live))
-}
-
 @Composable
-@Suppress("LongParameterList")
 private fun ReaderTopToolbar(
     entry: InboxEntry,
-    listState: LazyListState,
-    isAwaitingContent: Boolean,
     backLabel: String,
     showTypographyDrawer: Boolean,
     onToggleTypography: () -> Unit,
@@ -788,9 +819,7 @@ private fun ReaderTopToolbar(
                 tagPrefix = "reader",
                 outlined = false,
                 onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
-                onToggleArchive = {
-                    flushAndToggleReaderArchive(entry, listState, isAwaitingContent, onAction)
-                },
+                onToggleArchive = { onAction(MainAction.ToggleArchive(entry = entry)) },
             )
             RocheIconActionButton(
                 contentDescription = "More entry actions",
@@ -1198,7 +1227,7 @@ private fun ReaderArticleBody(
         BoxWithConstraints(modifier = modifier.fillMaxSize()) {
             val horizontalPadding =
                 resolveReaderHorizontalPadding(maxWidth = maxWidth, isPdf = hasPdfPages)
-            val proseModifier = resolveReaderProseModifier(hasPdfPages, maxWidth)
+            val proseModifier = Modifier.readerProsePadding(hasPdfPages, maxWidth)
 
             LazyColumn(
                 state = listState,
@@ -1259,6 +1288,7 @@ private fun LazyListScope.readerFooterItem(
                 isLocalPdf = isLocalPdf,
                 onToggleArchive = callbacks.onToggleArchive,
                 onMarkFinished = callbacks.onMarkFinished,
+                onUnfinish = callbacks.onUnfinish,
                 onShare = callbacks.onShare,
                 onOpenExternalUrl = callbacks.onOpenExternalUrl,
             )
@@ -1306,6 +1336,8 @@ private fun LazyListScope.readerPreBodyItems(
                 entry = entry,
                 onWatchExternal = callbacks.onOpenExternalUrl,
                 onMarkFinished = callbacks.onMarkFinished,
+                onUnfinish = callbacks.onUnfinish,
+                onToggleDismiss = callbacks.onToggleArchive,
                 modifier = proseModifier,
             )
         }
@@ -1343,8 +1375,8 @@ private fun ReaderAudioBarSlot(
     )
 }
 
-private fun resolveReaderProseModifier(hasPdfPages: Boolean, maxWidth: Dp): Modifier =
-    if (hasPdfPages && maxWidth < 500.dp) Modifier.padding(horizontal = 10.dp) else Modifier
+private fun Modifier.readerProsePadding(hasPdfPages: Boolean, maxWidth: Dp): Modifier =
+    if (hasPdfPages && maxWidth < 500.dp) this.padding(horizontal = 10.dp) else this
 
 internal fun resolveReaderHorizontalPadding(maxWidth: Dp, isPdf: Boolean): Dp =
     if (isPdf) {
@@ -1484,10 +1516,10 @@ private fun ReaderHeaderItem(
 }
 
 private data class ReaderEndCardPresentation(
-    val showWantFinishCta: Boolean,
+    val showFinishCta: Boolean,
+    val showUnfinishCta: Boolean,
     val headingText: String,
-    val archiveLabel: String,
-    val archiveStyle: RocheButtonStyle,
+    val dismissLabel: String?,
     val externalUrl: String?,
 )
 
@@ -1496,37 +1528,38 @@ private fun resolveReaderEndCardModel(
     isLocalPdf: Boolean,
 ): ReaderEndCardPresentation {
     val isWantEntry = !entry.inFeedInbox
-    val showWantFinishCta =
-        isWantEntry && entry.contentType != ContentType.VIDEO && !entry.isArchived
-    val archiveLabel =
+    val headingText =
         when {
-            entry.isArchived && isWantEntry -> "Restore to Want"
-            entry.isArchived -> "Unarchive"
-            isWantEntry -> "Remove from Want"
-            else -> "Archive & Done"
+            entry.isFinished -> LABEL_FINISHED
+            entry.isDismissed -> "Dismissed"
+            else -> "Finished reading?"
         }
-    val archiveStyle =
-        if (entry.isArchived || isWantEntry) {
-            RocheButtonStyle.SECONDARY
-        } else {
-            RocheButtonStyle.PRIMARY
+    val dismissLabel =
+        when {
+            entry.isDismissed && isWantEntry -> "Restore to Want"
+            entry.isDismissed -> "Mark New"
+            entry.isFinished && isWantEntry -> null
+            isWantEntry -> "Remove from Want"
+            else -> "Dismiss"
         }
     return ReaderEndCardPresentation(
-        showWantFinishCta = showWantFinishCta,
-        headingText = if (entry.isArchived) "Archived" else "Finished reading?",
-        archiveLabel = archiveLabel,
-        archiveStyle = archiveStyle,
+        showFinishCta = !entry.isFinished,
+        showUnfinishCta = entry.isFinished,
+        headingText = headingText,
+        dismissLabel = dismissLabel,
         externalUrl = entry.url.takeIf { !isLocalPdf && it.isNotBlank() },
     )
 }
 
 @OptIn(ExperimentalLayoutApi::class)
+@Suppress("LongParameterList")
 @Composable
 private fun ReaderEndCard(
     entry: InboxEntry,
     isLocalPdf: Boolean,
     onToggleArchive: () -> Unit,
     onMarkFinished: () -> Unit,
+    onUnfinish: () -> Unit,
     onShare: () -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
@@ -1543,38 +1576,69 @@ private fun ReaderEndCard(
             ) {
                 Text(
                     text = presentation.headingText,
-                    color = colors.textSecondary,
+                    color = if (entry.isFinished) colors.accentVerdigris else colors.textSecondary,
                     fontSize = 13.sp,
-                    fontWeight = FontWeight.Normal,
+                    fontWeight = if (entry.isFinished) FontWeight.Medium else FontWeight.Normal,
                 )
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    if (presentation.showWantFinishCta) {
-                        HeaderActionButton(
-                            label = "✓ Finished",
-                            style = RocheButtonStyle.PRIMARY,
-                            onClick = onMarkFinished,
-                            modifier = Modifier.testTag("reader_end_finished_btn"),
-                        )
-                    }
-                    HeaderActionButton(
-                        label = presentation.archiveLabel,
-                        style = presentation.archiveStyle,
-                        onClick = onToggleArchive,
-                        modifier = Modifier.testTag("reader_end_archive_btn"),
-                    )
-                    HeaderActionButton(label = "Share", onClick = onShare)
-                    presentation.externalUrl?.let { url ->
-                        HeaderActionButton(
-                            label = "Original ↗",
-                            onClick = { onOpenExternalUrl(url) },
-                            modifier = Modifier.testTag("reader_end_original_btn"),
-                        )
-                    }
-                }
+                ReaderEndCardActionsRow(
+                    presentation = presentation,
+                    onToggleArchive = onToggleArchive,
+                    onMarkFinished = onMarkFinished,
+                    onUnfinish = onUnfinish,
+                    onShare = onShare,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                )
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Suppress("LongParameterList")
+@Composable
+private fun ReaderEndCardActionsRow(
+    presentation: ReaderEndCardPresentation,
+    onToggleArchive: () -> Unit,
+    onMarkFinished: () -> Unit,
+    onUnfinish: () -> Unit,
+    onShare: () -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        if (presentation.showFinishCta) {
+            HeaderActionButton(
+                label = LABEL_FINISHED,
+                style = RocheButtonStyle.PRIMARY,
+                onClick = onMarkFinished,
+                modifier = Modifier.testTag("reader_end_finished_btn"),
+            )
+        }
+        if (presentation.showUnfinishCta) {
+            HeaderActionButton(
+                label = "Undo Finished",
+                style = RocheButtonStyle.SECONDARY,
+                onClick = onUnfinish,
+                modifier = Modifier.testTag("reader_end_unfinish_btn"),
+            )
+        }
+        presentation.dismissLabel?.let { label ->
+            HeaderActionButton(
+                label = label,
+                style = RocheButtonStyle.SECONDARY,
+                onClick = onToggleArchive,
+                modifier = Modifier.testTag("reader_end_archive_btn"),
+            )
+        }
+        HeaderActionButton(label = "Share", onClick = onShare)
+        presentation.externalUrl?.let { url ->
+            HeaderActionButton(
+                label = "Original ↗",
+                onClick = { onOpenExternalUrl(url) },
+                modifier = Modifier.testTag("reader_end_original_btn"),
+            )
         }
     }
 }
@@ -1620,6 +1684,7 @@ internal fun ReaderArticleHeader(
             itemVerticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth(),
         ) {
+            ReaderStateBadgePill(entry = entry)
             ReaderBylineFeedChip(entry = entry, onSelectFeed = onSelectFeed)
             Text(
                 text = formatReaderByline(entry),
@@ -1647,6 +1712,24 @@ internal fun ReaderArticleHeader(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun ReaderStateBadgePill(entry: InboxEntry) {
+    val colors = LocalRocheColors.current
+    if (entry.isFinished) {
+        RocheMetaPill(
+            text = LABEL_FINISHED,
+            textColor = colors.accentVerdigris,
+            modifier = Modifier.testTag("reader_state_badge"),
+        )
+    } else if (entry.isDismissed) {
+        RocheMetaPill(
+            text = "✕ Dismissed",
+            textColor = colors.textMuted,
+            modifier = Modifier.testTag("reader_state_badge"),
+        )
     }
 }
 
@@ -1788,7 +1871,10 @@ private const val HEADER_ITEM_COUNT = 1
 private const val MAX_IN_FLIGHT_SCROLL_FRACTION = 0.999
 private const val MIN_PROGRESS = 0.08f
 private const val READ_PROGRESS_MIN_DELTA = 0.05
-private const val ARCHIVE_COMPLETION_THRESHOLD = 0.90
+private const val AUTO_FINISH_SCROLL_THRESHOLD = 0.98
+private const val SUPPRESSED_MAX_PROGRESS = 0.95
+private const val SHORT_ARTICLE_DWELL_MS = 4_000L
+private const val LABEL_FINISHED = "✓ Finished"
 private const val PERCENT_MULTIPLIER = 100
 private const val READER_SCALE_STEP = 0.10f
 private const val READER_SCALE_EPSILON = 0.005f

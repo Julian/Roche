@@ -1,12 +1,11 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use sqlx::QueryBuilder;
 use url::Url;
 
-use super::{ItemRepo, mutations::maybe_auto_log_feed_completion_in_tx};
-use crate::domain::{ActivityAction, ActivityEntityType, ArchiveBatchScope, EntryKind, InboxState};
+use super::ItemRepo;
+use crate::domain::{ActivityAction, ActivityEntityType, ArchiveBatchScope};
 
 impl ItemRepo<'_> {
     #[allow(clippy::too_many_lines)]
@@ -37,6 +36,10 @@ impl ItemRepo<'_> {
                          JOIN entries e ON e.id = es.entry_id
                          WHERE e.merged_into_id IS NULL
                            AND es.inbox_state = 'unread'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM consumption_log cl_f
+                               WHERE cl_f.entry_id = e.id AND cl_f.status = 'consumed'
+                           )
                            AND es.entry_id IN (",
                     );
                     let mut sep = qb.separated(", ");
@@ -58,16 +61,20 @@ impl ItemRepo<'_> {
             }
             ArchiveBatchScope::Feed { feed_id } => {
                 let max_batch = i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000);
-                sqlx::query_scalar!(
+                sqlx::query_scalar(
                     "SELECT es.entry_id FROM entry_state es
                      JOIN entries e ON e.id = es.entry_id
                      WHERE e.merged_into_id IS NULL
                        AND es.inbox_state = 'unread'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM consumption_log cl_f
+                           WHERE cl_f.entry_id = e.id AND cl_f.status = 'consumed'
+                       )
                        AND EXISTS (SELECT 1 FROM collection_entries ce WHERE ce.entry_id = es.entry_id AND ce.collection_id = ?)
                      LIMIT ?",
-                    feed_id,
-                    max_batch,
                 )
+                .bind(feed_id)
+                .bind(max_batch)
                 .fetch_all(self.pool)
                 .await?
             }
@@ -78,6 +85,10 @@ impl ItemRepo<'_> {
                      JOIN entries e ON e.id = es.entry_id
                      WHERE e.merged_into_id IS NULL
                        AND es.inbox_state = 'unread'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM consumption_log cl_f
+                           WHERE cl_f.entry_id = e.id AND cl_f.status = 'consumed'
+                       )
                        AND EXISTS (
                            SELECT 1 FROM collection_entries ce
                            JOIN feed_sources fs ON fs.collection_id = ce.collection_id
@@ -99,15 +110,13 @@ impl ItemRepo<'_> {
         let mut tx = crate::db::begin_write(self.pool).await?;
         let state_hlc = tx.next_hlc().await?;
         let mut archived_ids = Vec::with_capacity(candidate_ids.len());
-        let mut high_progress: Vec<(String, f64, Option<DateTime<Utc>>)> = Vec::new();
 
+        // Batch Dismiss strictly moves New feed items to Dismissed; it never logs `'consumed'`.
         for chunk in candidate_ids.chunks(CHUNK_SIZE) {
             let mut qb = QueryBuilder::new(
-                "UPDATE entry_state SET inbox_state = 'dismissed', read_at = COALESCE(read_at, ",
+                "UPDATE entry_state SET inbox_state = 'dismissed', read_at = NULL, interaction_updated_at = ",
             );
             qb.push_bind(now)
-                .push("), interaction_updated_at = ")
-                .push_bind(now)
                 .push(", updated_at = ")
                 .push_bind(now)
                 .push(", hlc = ")
@@ -117,15 +126,9 @@ impl ItemRepo<'_> {
             for id in chunk {
                 sep.push_bind(id.as_str());
             }
-            sep.push_unseparated(") RETURNING entry_id, progress, read_at");
-            let updated: Vec<(String, f64, Option<DateTime<Utc>>)> =
-                qb.build_query_as().fetch_all(tx.conn()).await?;
-            for (id, progress, read_at) in updated {
-                if progress >= 0.9 {
-                    high_progress.push((id.clone(), progress, read_at));
-                }
-                archived_ids.push(id);
-            }
+            sep.push_unseparated(") RETURNING entry_id");
+            let updated: Vec<String> = qb.build_query_scalar().fetch_all(tx.conn()).await?;
+            archived_ids.extend(updated);
         }
 
         for chunk in archived_ids.chunks(CHUNK_SIZE) {
@@ -137,41 +140,6 @@ impl ItemRepo<'_> {
             }
             sep.push_unseparated(")");
             qb.build().execute(tx.conn()).await?;
-        }
-
-        // Batch-archived items whose progress had already reached >= 0.9 are auto-logged,
-        // while unopened / skimmed bulk-archived items (progress < 0.9) never touch consumption_log.
-        if !high_progress.is_empty() {
-            let mut kind_map = std::collections::HashMap::with_capacity(high_progress.len());
-            for chunk in high_progress.chunks(CHUNK_SIZE) {
-                let mut qb = QueryBuilder::new("SELECT id, kind FROM entries WHERE id IN (");
-                let mut sep = qb.separated(", ");
-                for (id, _, _) in chunk {
-                    sep.push_bind(id.as_str());
-                }
-                sep.push_unseparated(")");
-                let kinds: Vec<(String, EntryKind)> =
-                    qb.build_query_as().fetch_all(tx.conn()).await?;
-                for (id, kind) in kinds {
-                    kind_map.insert(id, kind);
-                }
-            }
-            for (id, progress, read_at) in high_progress {
-                if let Some(&kind) = kind_map.get(&id) {
-                    maybe_auto_log_feed_completion_in_tx(
-                        &mut tx,
-                        &id,
-                        kind,
-                        kind.default_content_type(),
-                        false,
-                        InboxState::Dismissed,
-                        progress,
-                        None,
-                        read_at.unwrap_or(now),
-                    )
-                    .await?;
-                }
-            }
         }
 
         for chunk in archived_ids.chunks(CHUNK_SIZE) {

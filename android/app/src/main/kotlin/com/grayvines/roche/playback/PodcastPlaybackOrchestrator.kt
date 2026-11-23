@@ -157,10 +157,10 @@ class PodcastPlaybackOrchestrator(
             itemId = completedEntryId,
             progress = 1.0,
             recordPlayedTimestamp = true,
-            syncRemote = true,
+            syncRemote = false,
             fromAudioPlayback = true,
         )
-        repository.setArchiveStateWithSnapshot(itemId = completedEntryId, archived = true)
+        repository.markFeedItemFinished(completedEntryId)
         settingsRepository.update { current ->
             current.copy(queueItemIds = current.queueItemIds.filterNot { it == completedEntryId })
         }
@@ -182,7 +182,7 @@ class PodcastPlaybackOrchestrator(
             }
         } else {
             playerController.stopAndClear()
-            playerController.emitUiMessage("Finished episode · Archived & deleted download")
+            playerController.emitUiMessage("Finished episode")
         }
     }
 

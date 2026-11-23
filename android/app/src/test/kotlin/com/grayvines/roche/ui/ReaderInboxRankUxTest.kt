@@ -23,7 +23,7 @@ import org.junit.jupiter.api.Test
 class ReaderInboxRankUxTest {
     @Test
     fun `matchesScope applies active InboxFilter within feed and tag scopes`() {
-        val unreadPaper =
+        val newPaper =
             sampleEntry(
                 id = "p-unread",
                 feedId = "f-1",
@@ -31,16 +31,25 @@ class ReaderInboxRankUxTest {
                 status = ItemStatus.UNREAD,
                 tags = listOf("ml"),
             )
-        val readPaper =
+        val inProgressPaper =
             sampleEntry(
-                id = "p-read",
+                id = "p-progress",
                 feedId = "f-1",
                 contentType = ContentType.PDF,
                 status = ItemStatus.UNREAD,
                 readAt = "2026-11-20T00:00:00Z",
                 tags = listOf("ml"),
             )
-        val archivedPaper =
+        val finishedPaper =
+            sampleEntry(
+                    id = "p-finished",
+                    feedId = "f-1",
+                    contentType = ContentType.PDF,
+                    status = ItemStatus.ARCHIVED,
+                    tags = listOf("ml"),
+                )
+                .copy(isFinished = true)
+        val dismissedPaper =
             sampleEntry(
                 id = "p-archived",
                 feedId = "f-1",
@@ -49,14 +58,24 @@ class ReaderInboxRankUxTest {
                 tags = listOf("ml"),
             )
 
-        assertTrue(matchesScope(unreadPaper, InboxFilter.UNREAD, null, "f-1"))
-        assertFalse(matchesScope(readPaper, InboxFilter.UNREAD, null, "f-1"))
-        assertFalse(matchesScope(archivedPaper, InboxFilter.ALL, null, "f-1"))
-        assertTrue(matchesScope(archivedPaper, InboxFilter.ARCHIVED, null, "f-1"))
+        assertTrue(matchesScope(newPaper, InboxFilter.UNREAD, null, "f-1"))
+        assertTrue(matchesScope(inProgressPaper, InboxFilter.UNREAD, null, "f-1"))
+        assertFalse(matchesScope(finishedPaper, InboxFilter.UNREAD, null, "f-1"))
+        assertFalse(matchesScope(dismissedPaper, InboxFilter.UNREAD, null, "f-1"))
 
-        assertTrue(matchesScope(unreadPaper, InboxFilter.PAPERS, "ml", null))
-        assertFalse(matchesScope(unreadPaper, InboxFilter.PODCASTS, "ml", null))
-        assertTrue(matchesScope(archivedPaper, InboxFilter.ARCHIVED, "ml", null))
+        assertTrue(matchesScope(finishedPaper, InboxFilter.FINISHED, null, "f-1"))
+        assertFalse(matchesScope(dismissedPaper, InboxFilter.FINISHED, null, "f-1"))
+
+        assertTrue(matchesScope(dismissedPaper, InboxFilter.ARCHIVED, null, "f-1"))
+        assertFalse(matchesScope(finishedPaper, InboxFilter.ARCHIVED, null, "f-1"))
+
+        assertTrue(matchesScope(newPaper, InboxFilter.ALL, null, "f-1"))
+        assertTrue(matchesScope(finishedPaper, InboxFilter.ALL, null, "f-1"))
+        assertTrue(matchesScope(dismissedPaper, InboxFilter.ALL, null, "f-1"))
+
+        assertTrue(matchesScope(newPaper, InboxFilter.PAPERS, "ml", null))
+        assertFalse(matchesScope(newPaper, InboxFilter.PODCASTS, "ml", null))
+        assertTrue(matchesScope(dismissedPaper, InboxFilter.ARCHIVED, "ml", null))
     }
 
     @Test
@@ -86,7 +105,7 @@ class ReaderInboxRankUxTest {
                     ),
             )
         assertEquals(
-            listOf(InboxFilter.ALL, InboxFilter.UNREAD, InboxFilter.ARCHIVED),
+            listOf(InboxFilter.UNREAD, InboxFilter.FINISHED, InboxFilter.ARCHIVED, InboxFilter.ALL),
             resolveInboxStripFilters(podOnlyState),
         )
 

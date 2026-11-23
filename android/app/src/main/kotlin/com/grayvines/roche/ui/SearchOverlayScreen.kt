@@ -558,7 +558,7 @@ private fun SearchResultsList(
         if (results.isNotEmpty()) {
             if (hasUpperSections) {
                 item(key = "search_inbox_section_head") {
-                    SearchSectionLabelRow(title = "Inbox & Archive", count = results.size)
+                    SearchSectionLabelRow(title = "Feed Inbox", count = results.size)
                 }
             }
             items(items = results, key = { it.id }) { entry ->

@@ -101,7 +101,7 @@ private fun EntrySourceLeadingCluster(
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
-    val highlightFeed = emphasizeFeedTitleWhenUnread && entry.isUnread
+    val highlightFeed = emphasizeFeedTitleWhenUnread && entry.isNew
     Row(
         modifier = modifier,
         verticalAlignment = Alignment.CenterVertically,
@@ -145,7 +145,7 @@ private fun EntryLeadingStatusDots(
     showStarDot: Boolean,
 ) {
     val colors = LocalRocheColors.current
-    if (showUnreadDot && entry.isUnread) {
+    if (showUnreadDot && entry.isNew) {
         EntryUnreadDot(testTag = unreadDotTestTag)
     }
     if (showStarDot && entry.isFavorite) {
@@ -198,7 +198,7 @@ internal fun CompactStarAndArchiveButtons(
     val colors = LocalRocheColors.current
     val starTint = if (entry.isFavorite) colors.accentEcru else colors.textSecondary
     val starDesc = if (entry.isFavorite) "Remove Star" else "Star Entry"
-    val archiveDesc = if (entry.isArchived) "Unarchive to Inbox" else "Archive Entry"
+    val dismissDesc = if (entry.isDismissed) "Mark New" else "Dismiss Entry"
 
     Row(horizontalArrangement = Arrangement.spacedBy(if (outlined) 6.dp else 0.dp)) {
         RocheIconActionButton(
@@ -210,14 +210,14 @@ internal fun CompactStarAndArchiveButtons(
             StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 16.dp)
         }
         RocheIconActionButton(
-            contentDescription = archiveDesc,
+            contentDescription = dismissDesc,
             outlined = outlined,
             onClick = onToggleArchive,
             modifier = Modifier.testTag("${tagPrefix}_archive_btn"),
         ) {
-            FilingCabinetIcon(
+            DismissIcon(
                 tint = colors.textSecondary,
-                isArchived = entry.isArchived,
+                isDismissed = entry.isDismissed,
                 size = 16.dp,
             )
         }

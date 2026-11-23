@@ -407,35 +407,43 @@ class RocheCatalogAndSyncTest {
                 )
             )
 
-            // 1. Podcast playback reaching >= 0.98 auto-logs episode + parent podcast
+            // 1. Podcast playback reaching >= 0.98 auto-Finishes episode + parent podcast
             repository.updateReadProgress("ep-1", 0.99)
             val loggedAfterPod = dao.getAllConsumptionLogs().map { it.entryId }.toSet()
             assertTrue("ep-1" in loggedAfterPod)
             assertTrue("feed-pod" in loggedAfterPod)
 
-            // 2. Article read to >= 0.9 + archived auto-logs article + parent publication
-            repository.updateReadProgress("art-read", 0.92)
+            // 2. Article scrolled to 0.92 stays New; scrolling to >= 0.98 auto-Finishes article +
+            // parent publication
+            repository.updateReadProgress("art-read", 0.92, fromAudioPlayback = false)
             assertFalse(dao.getAllConsumptionLogs().any { it.entryId == "art-read" })
-            repository.setArchiveStateWithSnapshot("art-read", archived = true)
+            repository.updateReadProgress("art-read", 0.98, fromAudioPlayback = false)
             val loggedAfterArt = dao.getAllConsumptionLogs().map { it.entryId }.toSet()
             assertTrue("art-read" in loggedAfterArt)
             assertTrue("feed-blog" in loggedAfterArt)
+            assertTrue(dao.getItemStateById("art-read")!!.isFinished)
 
-            // 3. Swiping/archiving at < 0.9 and bulk-archiving NEVER log consumption
+            // 3. Dismissing (even at 95% progress) and batch Dismiss NEVER log consumption
             repository.setArchiveStateWithSnapshot("art-skimmed", archived = true)
             repository.archiveBatchWithSnapshots(entryIds = listOf("art-bulk"))
             val loggedAfterBulk = dao.getAllConsumptionLogs().map { it.entryId }.toSet()
             assertFalse("art-skimmed" in loggedAfterBulk)
             assertFalse("art-bulk" in loggedAfterBulk)
 
-            // 4. Video archiving NEVER auto-logs; explicit markFeedItemFinished logs video +
-            // channel
+            // 4. Video progress & Dismiss NEVER auto-Finish; explicit finish & unfinish toggle
+            // cleanly with tombstones
+            repository.updateReadProgress("vid-1", 1.0, fromAudioPlayback = false)
+            assertFalse(dao.getAllConsumptionLogs().any { it.entryId == "vid-1" })
             repository.setArchiveStateWithSnapshot("vid-1", archived = true)
             assertFalse(dao.getAllConsumptionLogs().any { it.entryId == "vid-1" })
             repository.markFeedItemFinished("vid-1")
             val loggedAfterVid = dao.getAllConsumptionLogs().map { it.entryId }.toSet()
             assertTrue("vid-1" in loggedAfterVid)
             assertTrue("feed-yt" in loggedAfterVid)
+            assertTrue(repository.unfinishFeedItem("vid-1"))
+            assertFalse(dao.getAllConsumptionLogs().any { it.entryId == "vid-1" })
+            assertTrue(dao.getAllTombstones().any { it.entityType == "consumption_log" })
+            assertTrue(dao.getItemStateById("vid-1")!!.status == "unread")
 
             // 5. Deleting an inbox item or feed NEVER erases consumed history
             repository.deleteItem("art-read")

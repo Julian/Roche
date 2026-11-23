@@ -324,7 +324,7 @@ private fun DiaryEmptyBody(
         CompanionEmptyCard(
             title = "Your consumption diary is empty",
             body =
-                "Finished podcasts, archived read articles, active list draws, and logged media appear here chronologically.",
+                "Finished articles, podcasts, videos, active list draws, and logged media appear here chronologically.",
             ctaLabel = "+ Log First Entry",
             onCta = onQuickLog,
         )

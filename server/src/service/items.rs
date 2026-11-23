@@ -7,14 +7,10 @@ use super::{ActiveRefreshGuard, AppError, RocheService};
 use crate::{
     content::{HtmlSanitizer, MAX_SUMMARY_CHARS, classify_url},
     db::{ConsumptionLogView, Db, Item, ItemFilter, ItemPage, ManualItemInput, Media, Tag},
-    domain::{
-        ArchiveBatchScope, ContentType, ItemStatus, ProgressSource, READER_AUTO_READ_THRESHOLD,
-        ReadAtPatch,
-    },
+    domain::{ArchiveBatchScope, ContentType, ItemStatus, ProgressSource, ReadAtPatch},
     feeds::ArxivParser,
     ingest::{FeedFetcher, FeedIngester},
     util::{
-        clock::now_utc,
         media_urls::{extract_arxiv_id, is_valid_arxiv_id, youtube_thumbnail_url},
         url_guard::validate_public_url,
     },
@@ -266,8 +262,9 @@ impl<'a> ItemService<'a> {
             .ok_or_else(|| AppError::not_found("Item not found"))
     }
 
-    /// Persists clamped reading/listening progress and marks `read_at` once progress reaches
-    /// `READER_AUTO_READ_THRESHOLD`.
+    /// Persists clamped reading/listening progress. Reaching `READER_AUTO_READ_THRESHOLD`
+    /// automatically marks eligible articles, papers, and audio as **Finished** (logging
+    /// `'consumed'` and clearing from New / Want queues); videos never auto-finish.
     pub async fn update_progress_with_auto_read_source(
         &self,
         id: &str,
@@ -275,32 +272,21 @@ impl<'a> ItemService<'a> {
         progress_source: Option<ProgressSource>,
     ) -> Result<ItemDetail, AppError> {
         let p = if raw_progress.is_finite() { raw_progress.clamp(0.0, 1.0) } else { 0.0 };
-        let patch = if p >= READER_AUTO_READ_THRESHOLD {
-            ReadAtPatch::MarkRead(now_utc())
-        } else {
-            ReadAtPatch::Unchanged
-        };
-        self.update_with_source(id, None, None, Some(p), patch, progress_source).await
+        self.update_with_source(id, None, None, Some(p), ReadAtPatch::Unchanged, progress_source)
+            .await
     }
 
-    /// Archives an item atomically while retaining at least `max(existing_progress, submitted_progress)`
-    /// when a finite progress value is supplied.
-    pub async fn archive_with_min_progress(
-        &self,
-        id: &str,
-        submitted_progress: Option<f64>,
-    ) -> Result<ItemDetail, AppError> {
-        if !self.service.db.items().archive_with_min_progress(id, submitted_progress).await? {
+    /// Strictly dismisses an item without logging `'consumed'` (deleting any existing `'consumed'`
+    /// logs if the item was previously Finished).
+    pub async fn dismiss(&self, id: &str) -> Result<ItemDetail, AppError> {
+        if !self.service.db.items().dismiss(id).await? {
             return Err(AppError::not_found("Item not found"));
         }
         self.get(id).await
     }
 
     pub async fn archive(&self, id: &str) -> Result<ItemDetail, AppError> {
-        if !self.service.db.items().archive(id).await? {
-            return Err(AppError::not_found("Item not found"));
-        }
-        self.get(id).await
+        self.dismiss(id).await
     }
 
     pub async fn archive_batch(

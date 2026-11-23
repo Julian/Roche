@@ -380,6 +380,7 @@ data class InboxItemRow(
     val audioUrl: String? = null,
     val inboxState: String = DEFAULT_INBOX_STATE,
     val entryKind: String = DEFAULT_ENTRY_KIND,
+    val isFinished: Boolean = false,
 )
 
 @Suppress("LongParameterList")
@@ -394,6 +395,7 @@ data class ItemStateRow(
     val audioUrl: String?,
     val inboxState: String = DEFAULT_INBOX_STATE,
     val entryKind: String = DEFAULT_ENTRY_KIND,
+    val isFinished: Boolean = false,
 )
 
 data class TagRow(

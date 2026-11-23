@@ -300,6 +300,38 @@ private fun buildEntryPrimaryActions(
     accentVerdigris: Color,
     onAction: (MainAction) -> Unit,
 ): List<ContextActionSpec> = buildList {
+    addEntryPlaybackActions(entry, isPlayableAudio, isAudioOnly, accentBlue, onAction)
+    addEntryTriageActions(entry, accentVerdigris, onAction)
+    add(
+        ContextActionSpec(
+            "Play Next in Queue",
+            { onAction(MainAction.AddToQueue(entry.id, playNext = true)) },
+        )
+    )
+    add(
+        ContextActionSpec(
+            if (isInQueue) "Remove from Queue" else "Add to Queue",
+            { onAction(MainAction.ToggleQueueMembership(entry.id)) },
+        )
+    )
+    add(
+        buildOfflineActionSpec(
+            entry = entry,
+            isAudio = isPlayableAudio,
+            isDownloadingOffline = isDownloadingOffline,
+            accentBlue = accentBlue,
+            onAction = onAction,
+        )
+    )
+}
+
+private fun MutableList<ContextActionSpec>.addEntryPlaybackActions(
+    entry: InboxEntry,
+    isPlayableAudio: Boolean,
+    isAudioOnly: Boolean,
+    accentBlue: Color,
+    onAction: (MainAction) -> Unit,
+) {
     if (isPlayableAudio) {
         val playLabel = if (entry.isPodcastEpisode) "Play Episode Now" else "Play Audio Now"
         add(
@@ -318,44 +350,39 @@ private fun buildEntryPrimaryActions(
             )
         )
     }
+}
+
+private fun MutableList<ContextActionSpec>.addEntryTriageActions(
+    entry: InboxEntry,
+    accentVerdigris: Color,
+    onAction: (MainAction) -> Unit,
+) {
+    if (entry.isFinished) {
+        add(
+            ContextActionSpec(
+                "Undo Finished (Mark New)",
+                { onAction(MainAction.UnfinishFeedEntry(entry.id)) },
+            )
+        )
+    } else {
+        add(
+            ContextActionSpec(
+                "✓ Mark Finished",
+                { onAction(MainAction.MarkFeedEntryFinished(entry.id, rankImmediately = false)) },
+                accentVerdigris,
+            )
+        )
+        add(
+            ContextActionSpec(
+                "Finish & Rank",
+                { onAction(MainAction.MarkFeedEntryFinished(entry.id, rankImmediately = true)) },
+            )
+        )
+    }
     add(
         ContextActionSpec(
-            "Finish & Log to Diary",
-            { onAction(MainAction.MarkFeedEntryFinished(entry.id, rankImmediately = false)) },
-            accentVerdigris,
-        )
-    )
-    add(
-        ContextActionSpec(
-            "Finish & Rank",
-            { onAction(MainAction.MarkFeedEntryFinished(entry.id, rankImmediately = true)) },
-        )
-    )
-    add(
-        ContextActionSpec(
-            "Play Next in Queue",
-            { onAction(MainAction.AddToQueue(entry.id, playNext = true)) },
-        )
-    )
-    add(
-        ContextActionSpec(
-            if (isInQueue) "Remove from Queue" else "Add to Queue",
-            { onAction(MainAction.ToggleQueueMembership(entry.id)) },
-        )
-    )
-    add(
-        ContextActionSpec(
-            if (entry.isRead) "Mark as Unread" else "Mark as Read",
-            { onAction(MainAction.ToggleReadState(entry.id)) },
-        )
-    )
-    add(
-        buildOfflineActionSpec(
-            entry = entry,
-            isAudio = isPlayableAudio,
-            isDownloadingOffline = isDownloadingOffline,
-            accentBlue = accentBlue,
-            onAction = onAction,
+            if (entry.isDismissed) "Mark New" else "Dismiss",
+            { onAction(MainAction.ToggleArchive(entry)) },
         )
     )
 }
@@ -764,20 +791,20 @@ private fun buildFeedPrimaryActions(
 ): List<ContextActionSpec> = buildList {
     add(
         ContextActionSpec(
-            label = "View Feed Items (${feed.unreadCount} unread)",
+            label = "View Feed Items (${feed.unreadCount} new)",
             onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
         )
     )
     if (feed.unreadCount > 0) {
         add(
             ContextActionSpec(
-                label = "Archive All Unread in Feed (${feed.unreadCount})",
+                label = "Dismiss All New in Feed (${feed.unreadCount})",
                 onClick = { onAction(MainAction.ArchiveFeedUnread(feed.id)) },
                 modifier = Modifier.testTag("feed_archive_unread_btn"),
             )
         )
     }
-    if (!feed.isArchived) {
+    if (!feed.isPaused) {
         add(
             ContextActionSpec(
                 label = "Refresh Feed Now",
@@ -799,7 +826,7 @@ private fun buildFeedPrimaryActions(
     )
     add(
         ContextActionSpec(
-            label = if (feed.isArchived) "Unarchive Feed" else "Archive Feed",
+            label = if (feed.isPaused) "Resume Feed" else "Pause Feed",
             onClick = { onAction(MainAction.ToggleFeedArchive(feed.id)) },
             modifier = Modifier.testTag("toggle_archive_feed_${feed.id}"),
         )

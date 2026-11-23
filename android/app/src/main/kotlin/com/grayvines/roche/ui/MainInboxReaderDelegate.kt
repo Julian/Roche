@@ -27,8 +27,7 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
 
     private suspend fun executeEntryMutation(action: MainAction.EntryMutation) {
         when (action) {
-            is MainAction.ToggleArchive ->
-                performToggleArchive(action.entry, action.liveReadProgress)
+            is MainAction.ToggleArchive -> performToggleArchive(action.entry)
             MainAction.UndoLastArchive -> performUndoArchive()
             MainAction.ArchiveVisibleEntries -> performArchiveVisibleEntries()
             is MainAction.ToggleStar -> performToggleStar(action.entryId)
@@ -305,31 +304,21 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         host.showStatusMessage(msg)
     }
 
-    private suspend fun performToggleArchive(
-        entry: InboxEntry,
-        liveReadProgress: Double?,
-    ) {
-        val targetArchived = !entry.isArchived
-        if (targetArchived) {
-            flushArchiveReadProgress(entry, liveReadProgress)
-        }
+    private suspend fun performToggleArchive(entry: InboxEntry) {
+        val targetDismiss = !entry.isDismissed
         val snapshot =
             host.repository.setArchiveStateWithSnapshot(
                 itemId = entry.id,
-                archived = targetArchived,
+                archived = targetDismiss,
             )
-        if (targetArchived) {
+        if (targetDismiss) {
             host.cleanupRemovedEntries(setOf(entry.id))
         }
         val previousStatus = snapshot?.previousStatus ?: entry.status
         val previousReadAt = snapshot?.previousReadAt ?: entry.readAt
-        val label =
-            when {
-                !entry.inFeedInbox && targetArchived -> "Removed from Want to Read"
-                !entry.inFeedInbox -> "Restored to Want to Read"
-                targetArchived -> "Archived"
-                else -> "Restored to Unread"
-            }
+        val wasFinished = snapshot?.wasFinished ?: entry.isFinished
+        val previousProgress = snapshot?.previousProgress ?: entry.readProgress
+        val label = resolveDismissSnackbarLabel(entry, targetDismiss, wasFinished)
         host.updateTransient { current ->
             val nextReaderId =
                 if (current.selectedReaderEntryId == entry.id) {
@@ -351,11 +340,26 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                                 itemId = entry.id,
                                 previousStatus = previousStatus,
                                 previousReadAt = previousReadAt,
+                                wasFinished = wasFinished,
+                                previousProgress = previousProgress,
                             ),
                     ),
             )
         }
     }
+
+    private fun resolveDismissSnackbarLabel(
+        entry: InboxEntry,
+        targetDismiss: Boolean,
+        wasFinished: Boolean,
+    ): String =
+        when {
+            !entry.inFeedInbox && targetDismiss -> "Dismissed from Want to Read"
+            !entry.inFeedInbox -> "Restored to Want to Read"
+            targetDismiss && wasFinished -> "Dismissed · Removed from Diary"
+            targetDismiss -> "Dismissed"
+            else -> "Marked new"
+        }
 
     private suspend fun performUndoArchive() {
         var pending: UndoActionEvent? = null
@@ -377,6 +381,8 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                     itemId = kind.itemId,
                     status = kind.previousStatus,
                     readAt = kind.previousReadAt,
+                    wasFinished = kind.wasFinished,
+                    previousProgress = kind.previousProgress,
                 )
                 host.showStatusMessage("Restored entry")
             }
@@ -421,11 +427,11 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                 selectedTag = local.selectedTag,
                 selectedFeedId = local.selectedFeedId,
             )
-        val unarchivedIds = visible.filter { !it.isArchived }.map { it.id }
-        if (unarchivedIds.isEmpty()) return
+        val newIds = visible.filter { it.isNew }.map { it.id }
+        if (newIds.isEmpty()) return
         val snapshots =
             host.repository.archiveBatchWithSnapshots(
-                entryIds = unarchivedIds,
+                entryIds = newIds,
                 feedId = local.selectedFeedId,
                 allUnread =
                     local.selectedFeedId == null &&
@@ -434,30 +440,16 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                         local.activeFilter == InboxFilter.UNREAD,
             )
         if (snapshots.isEmpty()) return
-        val archivedIds = snapshots.map { it.itemId }.toSet()
-        host.cleanupRemovedEntries(archivedIds)
-        val archivedCount = snapshots.size
-        val noun = entryCountNoun(archivedCount)
+        val dismissedIds = snapshots.map { it.itemId }.toSet()
+        host.cleanupRemovedEntries(dismissedIds)
+        val dismissedCount = snapshots.size
+        val noun = entryCountNoun(dismissedCount)
         host.showUndoAction(
             UndoActionEvent(
-                message = "Archived $archivedCount $noun",
+                message = "Dismissed $dismissedCount $noun",
                 kind = UndoActionKind.RestoreBatchArchive(snapshots),
             )
         )
-    }
-
-    private suspend fun flushArchiveReadProgress(entry: InboxEntry, liveReadProgress: Double?) {
-        if (liveReadProgress == null || liveReadProgress <= entry.readProgress) return
-        val activePlayer = host.playerController.state.value
-        val isAudioActiveForEntry =
-            activePlayer.currentEntryId == entry.id && activePlayer.hasActiveEpisode
-        if (!isAudioActiveForEntry) {
-            host.repository.updateReadProgress(
-                itemId = entry.id,
-                progress = liveReadProgress,
-                fromAudioPlayback = false,
-            )
-        }
     }
 
     private suspend fun performUpdateReadProgress(entryId: String, progress: Double) {

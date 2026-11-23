@@ -212,7 +212,7 @@ pub(super) fn rank_collection_href(slug: &str, want: bool) -> String {
     }
 }
 
-pub(super) const ARCHIVE_BOX_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"2\" y=\"2.5\" width=\"12\" height=\"3\" rx=\"0.75\"/><path d=\"M3 5.5v7a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-7\"/><path d=\"M6.25 8.75h3.5\"/></svg>";
+pub(super) const DISMISS_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.55\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 4l8 8\"/><path d=\"M12 4l-8 8\"/></svg>";
 
 pub(super) const RESTORE_BOX_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3 7.5a5 5 0 1 1 1.4 3.6\"/><path d=\"M3 4v3.5h3.5\"/></svg>";
 
@@ -758,7 +758,7 @@ fn render_shortcuts_dialog(out: &mut String) {
                <dl class=\"shortcuts-list\">\n\
                  <dt><kbd>j</kbd><kbd>k</kbd></dt><dd>Next / previous item</dd>\n\
                  <dt><kbd>Enter</kbd><kbd>o</kbd></dt><dd>Open selected item</dd>\n\
-                 <dt><kbd>e</kbd></dt><dd>Archive / restore item</dd>\n\
+                 <dt><kbd>e</kbd></dt><dd>Dismiss / mark new</dd>\n\
                  <dt><kbd>s</kbd></dt><dd>Toggle star</dd>\n\
                  <dt><kbd>q</kbd></dt><dd>Add to Queue</dd>\n\
                  <dt><kbd>[</kbd><kbd>]</kbd></dt><dd>Decrease / increase Reader text size</dd>\n\

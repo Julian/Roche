@@ -15,8 +15,8 @@ mod tests;
 pub use fts::SearchTerm;
 
 use super::{
-    ContentType, EntryKind, InboxState, ItemSortField, ItemStatus, ItemStatusFilter,
-    STARRED_COLLECTION_ID, SortOrder, WANT_TO_READ_COLLECTION_ID,
+    ContentType, EntryKind, EntryTriageState, InboxState, ItemSortField, ItemStatus,
+    ItemStatusFilter, STARRED_COLLECTION_ID, SortOrder, WANT_TO_READ_COLLECTION_ID,
 };
 
 /// Canonical SQL predicate defining the read-only `Item` projection boundary over unified `entries`.
@@ -112,6 +112,10 @@ pub(super) fn item_select_query_builder(proj: ItemContentProjection) -> QueryBui
        COALESCE(es.inbox_state, 'none') AS inbox_state,
        (ce_wtr.entry_id IS NOT NULL) AS in_want_to_read,
        (ce_fav.entry_id IS NOT NULL) AS is_favorite,
+       EXISTS (
+           SELECT 1 FROM consumption_log cl_fin
+           WHERE cl_fin.entry_id = i.id AND cl_fin.status = 'consumed'
+       ) AS is_finished,
        es.read_at,
        COALESCE(es.progress, 0.0) AS read_progress,
        es.interaction_updated_at,
@@ -204,6 +208,8 @@ pub struct Item {
     #[serde(default)]
     pub in_want_to_read: bool,
     pub is_favorite: bool,
+    #[serde(default)]
+    pub is_finished: bool,
     pub read_at: Option<DateTime<Utc>>,
     pub read_progress: f64,
     #[serde(default)]
@@ -227,6 +233,18 @@ impl Item {
     #[must_use]
     pub const fn is_podcast_episode(&self) -> bool {
         matches!(self.entry_kind, EntryKind::PodcastEpisode)
+    }
+
+    /// Canonical 3-state triage classification (`New`, `Finished`, or `Dismissed`).
+    #[must_use]
+    pub const fn triage_state(&self) -> EntryTriageState {
+        if self.is_finished {
+            EntryTriageState::Finished
+        } else if matches!(self.status, ItemStatus::Archived) {
+            EntryTriageState::Dismissed
+        } else {
+            EntryTriageState::New
+        }
     }
 }
 

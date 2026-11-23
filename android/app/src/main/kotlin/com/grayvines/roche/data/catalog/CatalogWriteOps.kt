@@ -161,6 +161,34 @@ private suspend fun ensureConsumedOnceInDao(
     }
 }
 
+internal suspend fun deleteConsumedLogsInDao(
+    dao: RocheDao,
+    entryId: String,
+    nowIso: String,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+): Int {
+    val resolvedId = followMergedIdInDao(dao, entryId) ?: entryId
+    val consumedLogs =
+        dao.getConsumptionLogsForEntry(resolvedId).filter {
+            ConsumptionStatus.fromWireValue(it.status) == ConsumptionStatus.CONSUMED
+        }
+    if (consumedLogs.isEmpty()) return 0
+    for (log in consumedLogs) {
+        val hlc = nextLocalHlc(dao, nodeId)
+        dao.deleteConsumptionLogById(log.id)
+        dao.upsertTombstone(
+            TombstoneEntity(
+                entityType = TOMBSTONE_ENTITY_CONSUMPTION_LOG,
+                naturalKey = log.id,
+                deletedAt = nowIso,
+                hlc = hlc,
+                isLocalDirty = true,
+            )
+        )
+    }
+    return consumedLogs.size
+}
+
 internal suspend fun upsertEntryInDao(
     dao: RocheDao,
     input: UpsertCatalogEntryInput,

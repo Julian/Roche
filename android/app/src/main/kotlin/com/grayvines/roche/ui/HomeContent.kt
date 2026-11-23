@@ -854,17 +854,18 @@ internal fun HomeInboxWidget(
     modifier: Modifier = Modifier,
     activeAudioEntryId: String? = null,
 ) {
-    val feedInboxEntries =
-        remember(state.allEntries) { state.allEntries.filter { it.inFeedInbox && !it.isArchived } }
-    val unreadEntries = remember(feedInboxEntries) { feedInboxEntries.filter { it.isUnread } }
-    val unreadCount = unreadEntries.size
+    val newFeedEntries =
+        remember(state.allEntries) { state.allEntries.filter { it.inFeedInbox && it.isNew } }
+    val recentFeedEntries =
+        remember(state.allEntries) { state.allEntries.filter { it.inFeedInbox } }
+    val newCount = newFeedEntries.size
     val previewEntries =
-        remember(unreadEntries, feedInboxEntries, maxItems) {
-            unreadEntries.ifEmpty { feedInboxEntries }.take(maxItems)
+        remember(newFeedEntries, recentFeedEntries, maxItems) {
+            newFeedEntries.ifEmpty { recentFeedEntries }.take(maxItems)
         }
     val headerBadge =
         when {
-            unreadCount > 0 -> formatIntegerCount(unreadCount)
+            newCount > 0 -> formatIntegerCount(newCount)
             previewEntries.isNotEmpty() -> "Caught up · Recent"
             else -> null
         }
@@ -974,7 +975,7 @@ private fun HomeInboxPreviewRow(
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text(
                 text = entry.title,
-                color = if (entry.isUnread) colors.textPrimary else colors.textSecondary,
+                color = if (entry.isNew) colors.textPrimary else colors.textSecondary,
                 fontFamily = headlineFamily,
                 fontSize = 14.5.sp,
                 lineHeight = 19.sp,

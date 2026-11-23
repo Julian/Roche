@@ -91,7 +91,7 @@ internal fun buildSnapshot(
 
     val unreadByFeedId =
         domainEntries
-            .filter { it.isUnread && it.feedId != null }
+            .filter { it.isNew && it.feedId != null }
             .groupingBy { it.feedId!! }
             .eachCount()
 
@@ -123,7 +123,7 @@ internal fun buildSnapshot(
 
     val unreadByTagName =
         domainEntries
-            .filter { it.isUnread }
+            .filter { it.isNew }
             .flatMap { entry -> entry.tags }
             .groupingBy { it }
             .eachCount()
@@ -176,6 +176,7 @@ internal fun toInboxEntry(entity: InboxItemRow, tags: List<String>): InboxEntry 
         audioUrl = entity.audioUrl,
         inFeedInbox = entity.feedId != null && !entity.inboxState.equals("none", ignoreCase = true),
         entryKind = EntryKind.fromWireValue(entity.entryKind),
+        isFinished = entity.isFinished,
     )
 
 internal fun createSavedItemEntity(

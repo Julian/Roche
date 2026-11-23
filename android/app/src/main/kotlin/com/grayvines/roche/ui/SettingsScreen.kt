@@ -403,8 +403,8 @@ private fun InboxAndHomeSettingsContent(
     HorizontalDivider(color = colors.border, thickness = 1.dp)
     Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
         SettingToggleRow(
-            title = "Swipe-Left to Archive",
-            subtitle = "Swipe rows in Inbox alongside the archive icon",
+            title = "Swipe-Left to Dismiss",
+            subtitle = "Swipe rows in Inbox alongside the dismiss icon",
             checked = state.settings.swipeToArchive,
             onCheckedChange = { onAction(MainAction.SetSwipeToArchive(it)) },
         )

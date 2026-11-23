@@ -689,12 +689,18 @@ class AudioPodcastDecouplingTest {
                         )
                     )
 
-                    // Scroll progress = 1.0 on UNREAD narrated article must NOT auto-log
+                    // Scroll progress = 0.95 stays New (no auto-Finish); >= 0.98 auto-Finishes
+                    // an Article; Dismiss deletes the consumed log and moves it to Dismissed.
+                    repo.updateReadProgress("i-narrated", 0.95, fromAudioPlayback = false)
+                    assertTrue(dao.getAllConsumptionLogs().none { it.entryId == "i-narrated" })
                     repo.updateReadProgress("i-narrated", 1.0, fromAudioPlayback = false)
+                    assertTrue(dao.getAllConsumptionLogs().any { it.entryId == "i-narrated" })
+                    assertEquals("article", dao.getEntryById("i-narrated")?.kind)
+                    repo.setArchiveStateWithSnapshot("i-narrated", archived = true)
                     assertTrue(dao.getAllConsumptionLogs().none { it.entryId == "i-narrated" })
 
                     // Scroll progress = 1.0 (fromAudioPlayback = false) on UNREAD podcast episode
-                    // must NOT auto-log
+                    // must NOT auto-log; audio playback >= 0.98 DOES auto-Finish.
                     dao.upsertFeed(
                         FeedRow(
                             id = "f-pod-prog",
@@ -731,7 +737,7 @@ class AudioPodcastDecouplingTest {
                     repo.updateReadProgress("i-pod-prog", 0.99, fromAudioPlayback = true)
                     assertTrue(dao.getAllConsumptionLogs().any { it.entryId == "i-pod-prog" })
 
-                    // Audio playback progress >= 0.98 DOES auto-log under EntryKind.ARTICLE
+                    // Audio playback progress >= 0.98 DOES auto-Finish under EntryKind.ARTICLE
                     repo.updateReadProgress("i-narrated", 0.99, fromAudioPlayback = true)
                     assertTrue(dao.getAllConsumptionLogs().any { it.entryId == "i-narrated" })
                     assertEquals("article", dao.getEntryById("i-narrated")?.kind)

@@ -328,7 +328,7 @@ fn render_feed_row(out: &mut String, f: &Feed, return_url: &str, csrf: &str) {
     render_feed_favicon_with_class(out, Some(f.url.as_str()), title, "feed-favicon-lg");
 
     let id_enc = urlencode(&f.id);
-    let feed_inbox_status = if f.unread_count > 0 { "unread" } else { "all" };
+    let feed_inbox_status = if f.unread_count > 0 { "new" } else { "all" };
     let _ = write!(
         out,
         "<div class=\"inbox-main\">\n\
@@ -346,11 +346,11 @@ fn render_feed_row(out: &mut String, f: &Feed, return_url: &str, csrf: &str) {
     if f.unread_count > 0 {
         let _ = write!(
             out,
-            "<span class=\"byline-item feed-row-unread\">{} unread</span>",
+            "<span class=\"byline-item feed-row-unread\">{} new</span>",
             f.unread_count,
         );
     } else {
-        out.push_str("<span class=\"byline-item\">0 unread</span>");
+        out.push_str("<span class=\"byline-item\">0 new</span>");
     }
     if !host.is_empty() {
         let _ = write!(out, "<span class=\"byline-item\">{}</span>", esc(host));

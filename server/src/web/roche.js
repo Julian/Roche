@@ -1,6 +1,6 @@
 /* Roche Web Client — Progressive Enhancement Script
    1. Persistent Podcast Player + seamless PJAX navigation while audio plays
-   2. Live Article / Paper scroll progress (>= 90% + archive auto-logs consumed)
+   2. Live Article / Paper scroll progress (>= 98% or 4s short-article dwell auto-Finishes; Dismiss never logs Finished)
    3. Interactive k-way Ranking (explicit tie-bucket model: j/k, J/K, 1-9, =, t, s, o, Enter + touch/mouse) */
 (() => {
   "use strict";
@@ -86,6 +86,86 @@
   let syncPlayButtonsFn = null;
   let isAudioActiveForItemFn = null;
   let navigateViaPjaxFn = null;
+
+  const markReaderUiFinished = (itemId, toastLabel = "Marked finished") => {
+    const root = document.querySelector(".js-reader-root[data-item-id]");
+    if (root && root.getAttribute("data-item-id") === itemId) {
+      root.setAttribute("data-finished", "1");
+      root.setAttribute("data-dismissed", "0");
+      const finishForm = root.querySelector(".js-finish-toggle-form");
+      const finishBtn = root.querySelector(".js-finish-toggle-btn");
+      if (finishForm && finishBtn) {
+        const unfinishAction = finishForm.getAttribute("data-unfinish-action");
+        if (unfinishAction) finishForm.setAttribute("action", unfinishAction);
+        finishForm.setAttribute(
+          "data-confirm",
+          "Undo Finished and remove this item from your Diary?"
+        );
+        finishBtn.classList.remove("btn-primary");
+        finishBtn.classList.add("btn-small", "btn-ghost", "is-done");
+        finishBtn.setAttribute("aria-pressed", "true");
+        finishBtn.setAttribute("title", "Marked finished — click to undo");
+        finishBtn.textContent = "✓ Finished";
+      }
+      const byline = root.querySelector(".js-reader-byline");
+      if (byline) {
+        let badge = byline.querySelector(".js-reader-state-badge");
+        if (!badge) {
+          badge = document.createElement("span");
+          badge.className = "badge badge-finished js-reader-state-badge";
+          byline.prepend(badge);
+        } else {
+          badge.className = "badge badge-finished js-reader-state-badge";
+        }
+        badge.textContent = "✓ Finished";
+      }
+    }
+    const unfinishUrl = `/web/items/${encodeURIComponent(itemId)}/unfinish`;
+    showToast(toastLabel, {
+      onUndo: () => {
+        const csrf = getCsrfToken();
+        const params = new URLSearchParams();
+        params.append("_csrf", csrf);
+        fetch(unfinishUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Roche-Csrf": csrf,
+          },
+          body: params.toString(),
+          credentials: "same-origin",
+        })
+          .then((resp) => {
+            if (!resp.ok || isLoginUrl(resp.url)) {
+              showToast("Could not undo Finished — please try again.", { isError: true });
+              return;
+            }
+            const curRoot = document.querySelector(".js-reader-root[data-item-id]");
+            if (curRoot && curRoot.getAttribute("data-item-id") === itemId) {
+              curRoot.setAttribute("data-finished", "0");
+              curRoot.setAttribute("data-suppress-auto-finish", "1");
+              const formEl = curRoot.querySelector(".js-finish-toggle-form");
+              const btnEl = curRoot.querySelector(".js-finish-toggle-btn");
+              if (formEl && btnEl) {
+                const finishAction = formEl.getAttribute("data-finish-action");
+                if (finishAction) formEl.setAttribute("action", finishAction);
+                formEl.removeAttribute("data-confirm");
+                btnEl.classList.remove("btn-small", "btn-ghost", "is-done");
+                btnEl.classList.add("btn-primary");
+                btnEl.setAttribute("aria-pressed", "false");
+                btnEl.setAttribute("title", "Mark this item as finished and log to Diary");
+                btnEl.textContent = "✓ Mark Finished";
+              }
+              curRoot.querySelector(".js-reader-state-badge")?.remove();
+            }
+            showToast("Undid Finished");
+          })
+          .catch(() => {
+            showToast("Network error while undoing Finished.", { isError: true });
+          });
+      },
+    });
+  };
 
   const showToast = (message, opts = {}) => {
     const region = document.getElementById("roche-toast-region");
@@ -326,6 +406,7 @@
       if (frac >= 0.98 && !completionSent) {
         completionSent = true;
         postProgress(activeItem.itemId, 1.0, true, "audio");
+        markReaderUiFinished(activeItem.itemId, `Finished "${activeItem.title || "episode"}"`);
         saveSession();
       } else if (now - lastSentAt >= 5000) {
         lastSentAt = now;
@@ -357,8 +438,11 @@
 
     audio.addEventListener("ended", () => {
       if (!activeItem) return;
-      completionSent = true;
-      postProgress(activeItem.itemId, 1.0, true, "audio");
+      if (!completionSent) {
+        completionSent = true;
+        postProgress(activeItem.itemId, 1.0, true, "audio");
+        markReaderUiFinished(activeItem.itemId, `Finished "${activeItem.title || "episode"}"`);
+      }
       saveSession();
       syncPlayButtons();
     });
@@ -819,12 +903,19 @@
     }
 
     const contentType = root.getAttribute("data-content-type") || "";
-    const hasAudio = root.getAttribute("data-has-audio") === "1";
 
     if ((kind === "article" || kind === "paper") && contentType !== "audio") {
       let best = Number.parseFloat(root.getAttribute("data-progress") || "0") || 0;
       let lastPosted = best;
       let timer = null;
+      let dwellTimer = null;
+      let autoFinishSent = root.getAttribute("data-finished") === "1";
+
+      const isSuppressedOrDone = () =>
+        autoFinishSent ||
+        root.getAttribute("data-finished") === "1" ||
+        root.getAttribute("data-dismissed") === "1" ||
+        root.getAttribute("data-suppress-auto-finish") === "1";
 
       const maxScrollablePixels = () =>
         Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
@@ -835,15 +926,45 @@
         return Math.max(0, Math.min(1, window.scrollY / maxScroll));
       };
 
-      const checkProgress = (forceFlush) => {
+      const cancelDwellTimer = () => {
+        if (dwellTimer) {
+          window.clearTimeout(dwellTimer);
+          dwellTimer = null;
+        }
+      };
+
+      const triggerAutoFinish = () => {
+        if (isSuppressedOrDone() || isAudioActiveForItemFn?.(itemId)) return;
+        autoFinishSent = true;
+        cancelDwellTimer();
+        lastPosted = 1.0;
+        postProgress(itemId, 1.0, false, "reader");
+        markReaderUiFinished(itemId, "Marked finished");
+      };
+
+      const scheduleShortArticleDwell = () => {
+        cancelDwellTimer();
+        if (document.hidden || isSuppressedOrDone() || maxScrollablePixels() > 8) return;
+        dwellTimer = window.setTimeout(() => {
+          dwellTimer = null;
+          if (!document.hidden && maxScrollablePixels() <= 8) {
+            triggerAutoFinish();
+          }
+        }, 4000);
+      };
+
+      const checkProgress = () => {
         if (isAudioActiveForItemFn?.(itemId)) return;
-        if (!forceFlush && maxScrollablePixels() <= 8) return;
+        if (maxScrollablePixels() <= 8) return;
         const frac = measureFraction();
         if (frac > best) best = frac;
-        const crossedNinety = lastPosted < 0.9 && best >= 0.9;
-        if (forceFlush || crossedNinety || best - lastPosted >= 0.05) {
+        if (best >= 0.98) {
+          triggerAutoFinish();
+          return;
+        }
+        if (!isSuppressedOrDone() && best - lastPosted >= 0.05) {
           lastPosted = best;
-          postProgress(itemId, best, Boolean(forceFlush), "reader");
+          postProgress(itemId, best, false, "reader");
         }
       };
 
@@ -851,24 +972,30 @@
         if (timer) return;
         timer = window.setTimeout(() => {
           timer = null;
-          checkProgress(false);
+          checkProgress();
         }, 350);
       };
 
+      const onVisibilityChange = () => {
+        if (document.hidden) {
+          cancelDwellTimer();
+        } else {
+          scheduleShortArticleDwell();
+        }
+      };
+
       window.addEventListener("scroll", onScroll, { passive: true });
+      document.addEventListener("visibilitychange", onVisibilityChange);
+      scheduleShortArticleDwell();
 
       const layoutScope = root.closest(".reader-layout") || document;
-      const archiveForms = Array.from(layoutScope.querySelectorAll(".js-reader-archive-form"));
-      const onArchiveSubmit = (ev) => {
-        if (isAudioActiveForItemFn?.(itemId)) return;
-        if (hasAudio && maxScrollablePixels() <= 8) return;
-        const formEl = ev.currentTarget;
-        const hiddenProg = formEl?.querySelector("input[name='progress']");
-        const live = Math.max(best, measureFraction());
-        if (hiddenProg) hiddenProg.value = live.toFixed(4);
+      const dismissForms = Array.from(layoutScope.querySelectorAll(".js-reader-dismiss-form"));
+      const onDismissSubmit = () => {
+        autoFinishSent = true;
+        cancelDwellTimer();
       };
-      for (const formEl of archiveForms) {
-        formEl.addEventListener("submit", onArchiveSubmit);
+      for (const formEl of dismissForms) {
+        formEl.addEventListener("submit", onDismissSubmit);
       }
 
       const resumeBtn = root.querySelector(".js-reader-resume-btn");
@@ -884,11 +1011,13 @@
 
       cleanups.push(() => {
         window.removeEventListener("scroll", onScroll);
-        for (const formEl of archiveForms) {
-          formEl.removeEventListener("submit", onArchiveSubmit);
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+        for (const formEl of dismissForms) {
+          formEl.removeEventListener("submit", onDismissSubmit);
         }
         resumeBtn?.removeEventListener("click", onResumeClick);
         if (timer) window.clearTimeout(timer);
+        cancelDwellTimer();
       });
     }
 
@@ -2314,11 +2443,13 @@
             return;
           }
           if (ev.key === "e") {
-            const archiveForm = document.querySelector(".js-reader-archive-form");
-            if (archiveForm) {
+            const dismissForm = document.querySelector(
+              ".js-reader-dismiss-form, .js-reader-archive-form"
+            );
+            if (dismissForm) {
               ev.preventDefault();
-              if (typeof archiveForm.requestSubmit === "function") archiveForm.requestSubmit();
-              else archiveForm.submit();
+              if (typeof dismissForm.requestSubmit === "function") dismissForm.requestSubmit();
+              else dismissForm.submit();
             }
             return;
           }
@@ -2382,14 +2513,14 @@
             return;
           }
           if (ev.key === "e") {
-            const archForm = activeRow.querySelector(
-              '.js-triage-form[data-triage-kind="archive"], .js-triage-form[data-triage-kind="unarchive"]'
+            const triageForm = activeRow.querySelector(
+              '.js-triage-form[data-triage-kind="dismiss"], .js-triage-form[data-triage-kind="mark-new"], .js-triage-form[data-triage-kind="archive"], .js-triage-form[data-triage-kind="unarchive"]'
             );
-            if (archForm) {
+            if (triageForm) {
               ev.preventDefault();
               const nextIdx = Math.min(rows.length - 2, curIdx);
-              if (typeof archForm.requestSubmit === "function") archForm.requestSubmit();
-              else archForm.submit();
+              if (typeof triageForm.requestSubmit === "function") triageForm.requestSubmit();
+              else triageForm.submit();
               window.requestAnimationFrame(() => {
                 const rem = Array.from(document.querySelectorAll(".js-kbd-row")).filter((r) => !r.hidden);
                 if (rem.length > 0 && nextIdx >= 0) {
@@ -2717,49 +2848,6 @@
       }
     }
 
-    // 5. Honest passive read-completion beacon at 92% scroll (never fakes Diary finish or rewrites form action)
-    const finishForm = root.querySelector(".js-finish-toggle-form");
-    const finishBtn = root.querySelector(".js-finish-toggle-btn, .js-proto-finish-toggle");
-    if (finishBtn && finishBtn.dataset.bound !== "1") {
-      finishBtn.dataset.bound = "1";
-      const suppressAutoRead = root.getAttribute("data-suppress-auto-finish") === "1";
-      const itemId = root.getAttribute("data-item-id") || "";
-      let postedEndRead = false;
-      const checkBottomRead = () => {
-        if (suppressAutoRead || postedEndRead || !document.body.contains(finishBtn)) return;
-        if (isAudioActiveForItemFn?.(itemId)) return;
-        const kind = root.getAttribute("data-kind") || "article";
-        const contentType = root.getAttribute("data-content-type") || "";
-        if ((kind !== "article" && kind !== "paper") || contentType === "audio") return;
-        const el = document.documentElement;
-        const scrollable = el.scrollHeight - el.clientHeight;
-        if (scrollable <= 8) return;
-        if (window.scrollY / scrollable >= 0.92 && !finishBtn.classList.contains("is-done")) {
-          postedEndRead = true;
-          if (itemId && finishForm) {
-            postProgress(itemId, 1.0, false, "reader");
-          }
-          const endRight = finishBtn.closest(".reader-end-right");
-          if (endRight && !endRight.querySelector(".js-reader-read-cue")) {
-            const cue = document.createElement("span");
-            cue.className = "meta js-reader-read-cue";
-            cue.textContent = "Read ·";
-            endRight.prepend(cue);
-          }
-        }
-      };
-      window.addEventListener("scroll", checkBottomRead, { passive: true });
-      cleanups.push(() => window.removeEventListener("scroll", checkBottomRead));
-      if (!finishForm) {
-        finishBtn.addEventListener("click", () => {
-          const next = !finishBtn.classList.contains("is-done");
-          finishBtn.classList.toggle("is-done", next);
-          finishBtn.setAttribute("aria-pressed", next ? "true" : "false");
-          finishBtn.textContent = next ? "✓ Finished" : "Mark Finished";
-        });
-      }
-    }
-
     readerExtrasCleanup = () => {
       for (const fn of cleanups) fn();
     };
@@ -2961,12 +3049,21 @@
         window.location.pathname === "/inbox"
           ? new URLSearchParams(window.location.search).get("status")
           : null;
-      if (!row || (inboxStatusParam === "all" && (kind === "archive" || kind === "unarchive"))) {
+      const isDismissAction = kind === "dismiss" || kind === "archive";
+      const isRestoreAction = kind === "mark-new" || kind === "unarchive";
+      if (!row || (inboxStatusParam === "all" && (isDismissAction || isRestoreAction))) {
         form.submit();
         return;
       }
 
-      const unreadDelta = kind === "archive" ? -1 : kind === "unarchive" ? 1 : 0;
+      const wasFinishedRow = row.classList.contains("is-finished");
+      const unreadDelta = isDismissAction
+        ? wasFinishedRow
+          ? 0
+          : -1
+        : isRestoreAction
+          ? 1
+          : 0;
       row.hidden = true;
       adjustUnreadCounters(unreadDelta);
 
@@ -2978,8 +3075,11 @@
             showToast("Action failed — please try again.", { isError: true });
             return;
           }
-          const verb =
-            kind === "archive" ? "Archived" : kind === "unarchive" ? "Restored" : "Marked finished";
+          const verb = isDismissAction
+            ? "Dismissed"
+            : isRestoreAction
+              ? "Marked new"
+              : "Marked finished";
           showToast(`${verb} "${title}"`, {
             onUndo: undoAction
               ? () => {

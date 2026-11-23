@@ -16,7 +16,7 @@ use super::{
     links::load_artist_id_by_lower_name,
 };
 use crate::{
-    domain::{ConsumptionStatus, ItemStatus},
+    domain::{ConsumptionStatus, EntryTriageState},
     service::{RocheService, WorkspaceSearchResults},
 };
 
@@ -138,7 +138,7 @@ fn render_search_jump_pills(out: &mut String, res: &WorkspaceSearchResults) {
         ("search-catalog", "Catalog", res.catalog_entries.len()),
         ("search-lists", "Lists", res.collections.len()),
         ("search-queue", "Queue", res.want_entries.len()),
-        ("search-inbox", "Inbox & Archive", res.inbox_items.len()),
+        ("search-inbox", "Feed Inbox", res.inbox_items.len()),
         ("search-diary", "Diary", res.diary_logs.len()),
     ] {
         if count > 0 {
@@ -275,7 +275,7 @@ fn render_search_inbox_section(out: &mut String, res: &WorkspaceSearchResults, r
     let _ = writeln!(
         out,
         "<section id=\"search-inbox\" class=\"search-group\">\n\
-           <div class=\"section-head\"><h3>Feed Inbox &amp; Archive ({})</h3>\
+           <div class=\"section-head\"><h3>Feed Inbox ({})</h3>\
              <a class=\"section-action\" href=\"/inbox?status=all&amp;q={}\">Filter in Inbox &rarr;</a></div>\n\
            <ul class=\"search-result-list\">",
         res.inbox_items.len(),
@@ -303,8 +303,16 @@ fn render_search_inbox_section(out: &mut String, res: &WorkspaceSearchResults, r
         if let Some(dt) = item.published_at {
             let _ = write!(out, "<span class=\"byline-item\">{}</span>", dt.format("%b %d, %Y"));
         }
-        let status_badge = if item.status == ItemStatus::Archived { "Archived" } else { "Unread" };
-        let _ = writeln!(out, "</div></div><span class=\"badge\">{status_badge}</span></li>");
+        let status_badge = match item.triage_state() {
+            EntryTriageState::Finished => {
+                "<span class=\"badge badge-finished\">&#10003; Finished</span>"
+            }
+            EntryTriageState::Dismissed => {
+                "<span class=\"badge badge-dismissed\">&times; Dismissed</span>"
+            }
+            EntryTriageState::New => "<span class=\"badge\">New</span>",
+        };
+        let _ = writeln!(out, "</div></div>{status_badge}</li>");
     }
     out.push_str("</ul>\n</section>\n");
 }

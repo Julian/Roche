@@ -849,6 +849,23 @@ class CatalogStore(
         }
     }
 
+    internal suspend fun deleteConsumedLogsForEntry(entryId: String): Int {
+        val deleted = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val nowIso = nowUtcIso()
+            val nodeId = resolveLocalPeerId()
+            var count = 0
+            dao.executeInTransaction {
+                count = deleteConsumedLogsInDao(dao, entryId, nowIso, nodeId)
+            }
+            count
+        }
+        if (deleted > 0) {
+            notifyLocalMutation()
+        }
+        return deleted
+    }
+
     internal suspend fun logFeedItemCompletion(itemId: String): String {
         val resolvedId = mutationMutex.withLock {
             ensureSystemSeeded()

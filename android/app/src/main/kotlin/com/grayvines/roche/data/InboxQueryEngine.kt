@@ -39,11 +39,12 @@ internal fun matchesScope(
 
 internal fun matchesInboxFilter(entry: InboxEntry, filter: InboxFilter): Boolean =
     when (filter) {
-        InboxFilter.ALL -> !entry.isArchived
-        InboxFilter.UNREAD -> entry.isUnread
+        InboxFilter.UNREAD -> entry.isNew
+        InboxFilter.FINISHED -> entry.isFinished
+        InboxFilter.ARCHIVED -> entry.isDismissed
+        InboxFilter.ALL -> true
         InboxFilter.STARRED -> entry.isFavorite
-        InboxFilter.ARCHIVED -> entry.isArchived
-        else -> !entry.isArchived && matchesActiveMediaFilter(entry, filter)
+        else -> entry.isNew && matchesActiveMediaFilter(entry, filter)
     }
 
 private fun matchesActiveMediaFilter(entry: InboxEntry, filter: InboxFilter): Boolean =
@@ -61,7 +62,7 @@ internal enum class SearchScopeFilter(val label: String) {
     CATALOG("Catalog"),
     LISTS("Lists"),
     DIARY("Diary"),
-    UNREAD("Unread"),
+    UNREAD("New"),
     STARRED("Starred"),
     ARTICLES("Articles"),
     PAPERS("Papers"),
@@ -86,7 +87,7 @@ internal fun matchesSearchScopeFilter(entry: InboxEntry, scope: SearchScopeFilte
         SearchScopeFilter.CATALOG,
         SearchScopeFilter.LISTS,
         SearchScopeFilter.DIARY -> false
-        SearchScopeFilter.UNREAD -> entry.isUnread
+        SearchScopeFilter.UNREAD -> entry.isNew
         SearchScopeFilter.STARRED -> entry.isFavorite
         SearchScopeFilter.ARTICLES -> entry.contentType == ContentType.ARTICLE
         SearchScopeFilter.PAPERS -> entry.contentType == ContentType.PDF

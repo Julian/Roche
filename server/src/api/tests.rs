@@ -2546,8 +2546,10 @@ async fn test_api_feed_type_toggle_item_audio_filters_and_progress_source() {
             .unwrap();
     assert_eq!(audio_json["items"].as_array().unwrap().len(), 2);
 
-    // 3. PATCH /api/v1/items/{id} progress_source="reader" does not auto-log narrated article
-    //    or podcast episode, whereas progress_source="audio" auto-logs even at same progress=1.0
+    // 3. PATCH /api/v1/items/{id}:
+    //    - progress_source="reader" does NOT auto-finish a podcast episode (show notes scroll)
+    //    - progress_source="reader" DOES auto-finish an article (>= 0.98)
+    //    - progress_source="audio" DOES auto-finish podcast episodes & narrated articles
     let pod_scroll_res = app
         .clone()
         .oneshot(
@@ -2564,6 +2566,31 @@ async fn test_api_feed_type_toggle_item_audio_filters_and_progress_source() {
     assert_eq!(pod_scroll_res.status(), StatusCode::OK);
     assert_eq!(db.catalog().get_entry_detail(&ep.id).await.unwrap().unwrap().log_history.len(), 0);
 
+    let pod_audio_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/items/{}", ep.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"read_progress":1.0,"progress_source":"audio"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pod_audio_res.status(), StatusCode::OK);
+    assert!(
+        db.catalog()
+            .get_entry_detail(&ep.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .log_history
+            .iter()
+            .any(|l| l.status == crate::domain::ConsumptionStatus::Consumed)
+    );
+
     let scroll_res = app
         .clone()
         .oneshot(
@@ -2578,6 +2605,29 @@ async fn test_api_feed_type_toggle_item_audio_filters_and_progress_source() {
         .await
         .unwrap();
     assert_eq!(scroll_res.status(), StatusCode::OK);
+    let after_scroll = db.catalog().get_entry_detail(&narrated.id).await.unwrap().unwrap();
+    assert_eq!(after_scroll.entry.kind, crate::domain::EntryKind::Article);
+    assert!(
+        after_scroll
+            .log_history
+            .iter()
+            .any(|l| l.status == crate::domain::ConsumptionStatus::Consumed)
+    );
+
+    // Dismissing a Finished item deletes its consumed log and moves it to Dismissed
+    let dismiss_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/items/{}/dismiss", narrated.id))
+                .header(header::AUTHORIZATION, &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dismiss_res.status(), StatusCode::OK);
     assert_eq!(
         db.catalog().get_entry_detail(&narrated.id).await.unwrap().unwrap().log_history.len(),
         0

@@ -605,3 +605,276 @@ async fn test_entry_has_catalog_history_escapes_like_wildcards() {
         "SQLite LIKE wildcards in custom entry IDs must not falsely match other comparison entries"
     );
 }
+
+#[tokio::test]
+async fn test_new_finished_dismissed_triage_semantics() {
+    use crate::domain::{ConsumptionStatus, EntryTriageState, ItemStatusFilter, ProgressSource};
+
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let items = db.items();
+    let feed_url = Url::parse("https://example.com/triage-feed.xml").unwrap();
+    let feed =
+        db.feeds().create(FeedType::Rss, &feed_url, Some("Triage Feed"), None).await.unwrap();
+
+    let url_a = Url::parse("https://example.com/triage/a").unwrap();
+    let item_a = items
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Article A",
+            url: &url_a,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+
+    let url_b = Url::parse("https://example.com/triage/b").unwrap();
+    let item_b = items
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Article B",
+            url: &url_b,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+
+    let url_c = Url::parse("https://example.com/triage/c").unwrap();
+    let item_c = items
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Episode C",
+            url: &url_c,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Audio,
+        })
+        .await
+        .unwrap();
+
+    let url_d = Url::parse("https://example.com/triage/d").unwrap();
+    let item_d = items
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Video D",
+            url: &url_d,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Video,
+        })
+        .await
+        .unwrap();
+
+    // All 4 start as New
+    assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().unread_count, 4);
+    assert_eq!(
+        items
+            .list_filtered(&ItemFilter {
+                status: Some(ItemStatusFilter::Unread),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+
+    // 1. Article A scrolled to 95% stays New; Dismiss never logs consumed
+    assert!(
+        items
+            .update_with_source(
+                &item_a.id,
+                None,
+                None,
+                Some(0.95),
+                ReadAtPatch::Unchanged,
+                Some(ProgressSource::Reader),
+            )
+            .await
+            .unwrap()
+    );
+    let a_mid = items.get(&item_a.id).await.unwrap().unwrap();
+    assert_eq!(a_mid.triage_state(), EntryTriageState::New);
+    assert!(!a_mid.is_finished);
+
+    assert!(items.dismiss(&item_a.id).await.unwrap());
+    let a_dismissed = items.get(&item_a.id).await.unwrap().unwrap();
+    assert_eq!(a_dismissed.triage_state(), EntryTriageState::Dismissed);
+    assert!(!a_dismissed.is_finished);
+    assert!(a_dismissed.read_at.is_none());
+    assert!(
+        !db.catalog()
+            .get_entry_detail(&item_a.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .log_history
+            .iter()
+            .any(|l| l.status == ConsumptionStatus::Consumed)
+    );
+
+    // 2. Article B scrolled to 98% auto-Finishes
+    assert!(
+        items
+            .update_with_source(
+                &item_b.id,
+                None,
+                None,
+                Some(0.98),
+                ReadAtPatch::Unchanged,
+                Some(ProgressSource::Reader),
+            )
+            .await
+            .unwrap()
+    );
+    let b_finished = items.get(&item_b.id).await.unwrap().unwrap();
+    assert_eq!(b_finished.triage_state(), EntryTriageState::Finished);
+    assert!(b_finished.is_finished);
+
+    // 3. Dismissing a Finished item deletes its consumed log (with tombstone) and moves to Dismissed
+    assert!(items.dismiss(&item_b.id).await.unwrap());
+    let b_after_dismiss = items.get(&item_b.id).await.unwrap().unwrap();
+    assert_eq!(b_after_dismiss.triage_state(), EntryTriageState::Dismissed);
+    assert!(!b_after_dismiss.is_finished);
+    assert!(b_after_dismiss.read_progress < 0.01);
+    assert!(
+        !db.catalog()
+            .get_entry_detail(&item_b.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .log_history
+            .iter()
+            .any(|l| l.status == ConsumptionStatus::Consumed)
+    );
+    let log_tombstones: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sync_tombstones WHERE entity_type = 'consumption_log'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(log_tombstones >= 1);
+
+    // 4. Podcast Episode C: reader scroll never auto-Finishes; audio playback >= 98% auto-Finishes
+    assert!(
+        items
+            .update_with_source(
+                &item_c.id,
+                None,
+                None,
+                Some(1.0),
+                ReadAtPatch::Unchanged,
+                Some(ProgressSource::Reader),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(items.get(&item_c.id).await.unwrap().unwrap().triage_state(), EntryTriageState::New);
+
+    assert!(
+        items
+            .update_with_source(
+                &item_c.id,
+                None,
+                None,
+                Some(0.98),
+                ReadAtPatch::Unchanged,
+                Some(ProgressSource::Audio),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        items.get(&item_c.id).await.unwrap().unwrap().triage_state(),
+        EntryTriageState::Finished
+    );
+
+    // 5. Video D: progress 1.0 never auto-Finishes; explicit finish + unfinish transitions cleanly
+    assert!(
+        items
+            .update_with_source(
+                &item_d.id,
+                None,
+                None,
+                Some(1.0),
+                ReadAtPatch::Unchanged,
+                Some(ProgressSource::Reader),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(items.get(&item_d.id).await.unwrap().unwrap().triage_state(), EntryTriageState::New);
+
+    assert!(items.finish_reader_item(&item_d.id, None).await.unwrap().is_some());
+    assert_eq!(
+        items.get(&item_d.id).await.unwrap().unwrap().triage_state(),
+        EntryTriageState::Finished
+    );
+    assert!(items.unfinish_reader_item(&item_d.id).await.unwrap());
+    let d_unfin = items.get(&item_d.id).await.unwrap().unwrap();
+    assert_eq!(d_unfin.triage_state(), EntryTriageState::New);
+    assert!(!d_unfin.is_finished);
+    assert!(d_unfin.read_progress < 0.01);
+
+    // 6. Filter partition: 1 New (D), 1 Finished (C), 2 Dismissed (A, B), 4 All
+    assert_eq!(
+        items
+            .list_filtered(&ItemFilter {
+                status: Some(ItemStatusFilter::Unread),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect::<Vec<_>>(),
+        vec![item_d.id.clone()]
+    );
+    assert_eq!(
+        items
+            .list_filtered(&ItemFilter {
+                status: Some(ItemStatusFilter::Finished),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect::<Vec<_>>(),
+        vec![item_c.id.clone()]
+    );
+    let dismissed_ids: std::collections::HashSet<_> = items
+        .list_filtered(&ItemFilter {
+            status: Some(ItemStatusFilter::Dismissed),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(dismissed_ids.len(), 2);
+    assert!(dismissed_ids.contains(&item_a.id));
+    assert!(dismissed_ids.contains(&item_b.id));
+    assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().unread_count, 1);
+
+    // 7. Batch Dismiss clears only remaining New items (D), never logs consumed, preserves Finished (C)
+    let scope = ArchiveBatchScope::from_request(&[], Some(&feed.id), true).unwrap();
+    assert_eq!(items.archive_batch(&scope).await.unwrap(), 1);
+    assert_eq!(
+        items.get(&item_d.id).await.unwrap().unwrap().triage_state(),
+        EntryTriageState::Dismissed
+    );
+    assert_eq!(
+        items.get(&item_c.id).await.unwrap().unwrap().triage_state(),
+        EntryTriageState::Finished
+    );
+    assert_eq!(db.feeds().get(&feed.id).await.unwrap().unwrap().unread_count, 0);
+}

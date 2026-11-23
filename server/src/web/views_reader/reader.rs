@@ -19,15 +19,14 @@ use crate::{
     content::{HtmlSanitizer, semantic_html},
     db::WANT_TO_READ_COLLECTION_ID,
     domain::{
-        ConsumptionStatus, ContentType, EntryKind, ItemStatus, MediaType, ProgressSource,
-        READER_AUTO_READ_THRESHOLD,
+        ConsumptionStatus, ContentType, EntryKind, EntryTriageState, MediaType, ProgressSource,
     },
     service::{AppError, ItemDetail, RocheService},
     web::{
         auth::WebSession,
         html::{
-            ARCHIVE_BOX_SVG, NavSection, PageShell, RESTORE_BOX_SVG, WebError, WithWebCsrf as _,
-            esc, format_audio_duration, parse_form_bool, redirect_see_other, redirect_with_flash,
+            DISMISS_SVG, NavSection, PageShell, RESTORE_BOX_SVG, WebError, WithWebCsrf as _, esc,
+            format_audio_duration, parse_form_bool, redirect_see_other, redirect_with_flash,
             render_feed_favicon, render_inline_csrf_form, render_inline_csrf_form_with_class,
             render_page, safe_local_redirect, urlencode,
         },
@@ -73,20 +72,22 @@ pub(in crate::web) async fn reader_get(
     } else {
         NavSection::Inbox
     };
-    let is_finished = is_consumed
-        || detail.item.read_at.is_some()
-        || detail.item.read_progress >= READER_AUTO_READ_THRESHOLD;
-    let suppress_auto_finish = session
-        .flash
-        .notice
-        .as_deref()
-        .is_some_and(|n| n.eq_ignore_ascii_case("Marked unfinished"));
+    let triage_state = if is_consumed || detail.item.is_finished {
+        EntryTriageState::Finished
+    } else {
+        detail.item.triage_state()
+    };
+    let suppress_auto_finish = session.flash.notice.as_deref().is_some_and(|n| {
+        n.eq_ignore_ascii_case("Marked unfinished")
+            || n.eq_ignore_ascii_case("Marked new")
+            || n.eq_ignore_ascii_case("Dismissed")
+    });
 
     let mut body = String::with_capacity(14_336);
     render_reader_article(
         &mut body,
         &detail,
-        is_finished,
+        triage_state,
         suppress_auto_finish,
         can_rank,
         rank_slug.as_deref(),
@@ -158,7 +159,7 @@ fn back_label_for_return_to(return_to: &str) -> &'static str {
 fn render_reader_article(
     out: &mut String,
     detail: &ItemDetail,
-    is_finished: bool,
+    triage_state: EntryTriageState,
     suppress_auto_finish: bool,
     can_rank: bool,
     rank_slug: Option<&str>,
@@ -167,6 +168,8 @@ fn render_reader_article(
 ) {
     let item = &detail.item;
     let entry_kind = item.entry_kind;
+    let is_finished = triage_state == EntryTriageState::Finished;
+    let is_dismissed = triage_state == EntryTriageState::Dismissed;
     let id_enc = urlencode(&item.id);
     let reader_path = if return_to == "/inbox" || return_to == "/queue" {
         format!("/reader/{id_enc}")
@@ -178,22 +181,59 @@ fn render_reader_article(
     let _ = writeln!(
         out,
         "<div class=\"reader-layout\">\n\
-         <article class=\"reader-article js-reader-root\" data-item-id=\"{}\" data-kind=\"{}\" data-content-type=\"{}\" data-has-audio=\"{}\" data-progress=\"{:.4}\" data-finished=\"{}\" data-back-href=\"{}\"{suppress_attr}>",
+         <article class=\"reader-article js-reader-root\" data-item-id=\"{}\" data-kind=\"{}\" data-content-type=\"{}\" data-has-audio=\"{}\" data-progress=\"{:.4}\" data-finished=\"{}\" data-dismissed=\"{}\" data-back-href=\"{}\"{suppress_attr}>",
         esc(&item.id),
         entry_kind.as_str(),
         item.content_type.as_str(),
         if item.has_audio() { "1" } else { "0" },
         item.read_progress.clamp(0.0, 1.0),
         if is_finished { "1" } else { "0" },
+        if is_dismissed { "1" } else { "0" },
         esc(return_to),
     );
 
-    render_reader_header(out, detail, &id_enc, &reader_path, return_to, rank_slug, csrf);
-    render_reader_media_and_prose(out, detail);
-    render_reader_end_card(out, detail, &id_enc, &reader_path, is_finished, can_rank, csrf);
+    render_reader_header(
+        out,
+        detail,
+        &id_enc,
+        &reader_path,
+        return_to,
+        triage_state,
+        rank_slug,
+        csrf,
+    );
+    render_reader_media_and_prose(
+        out,
+        detail,
+        &id_enc,
+        &reader_path,
+        return_to,
+        triage_state,
+        csrf,
+    );
+    render_reader_end_card(
+        out,
+        detail,
+        &id_enc,
+        &reader_path,
+        return_to,
+        triage_state,
+        can_rank,
+        rank_slug,
+        csrf,
+    );
     render_reader_tags(out, detail, &id_enc, csrf);
     out.push_str("</article>\n");
-    render_reader_rail(out, detail, &id_enc, &reader_path, return_to, rank_slug, csrf);
+    render_reader_rail(
+        out,
+        detail,
+        &id_enc,
+        &reader_path,
+        return_to,
+        is_dismissed,
+        rank_slug,
+        csrf,
+    );
     out.push_str("</div>\n");
 }
 
@@ -267,10 +307,13 @@ fn render_reader_header(
     id_enc: &str,
     reader_path: &str,
     return_to: &str,
+    triage_state: EntryTriageState,
     rank_slug: Option<&str>,
     csrf: &str,
 ) {
     let item = &detail.item;
+    let is_finished = triage_state == EntryTriageState::Finished;
+    let is_dismissed = triage_state == EntryTriageState::Dismissed;
     render_reader_crumb_row(out, detail, return_to);
     out.push_str("<div class=\"reader-header\">\n<div class=\"reader-title-row\">\n");
 
@@ -293,15 +336,24 @@ fn render_reader_header(
     );
     let _ = writeln!(
         out,
-        "<h2>{}</h2>\n</div>\n<div class=\"reader-meta-row\">\n<div class=\"item-byline\">",
+        "<h2>{}</h2>\n</div>\n<div class=\"reader-meta-row\">\n<div class=\"item-byline js-reader-byline\">",
         esc(&item.title),
     );
+    if is_finished {
+        out.push_str(
+            "<span class=\"badge badge-finished js-reader-state-badge\">&#10003; Finished</span>",
+        );
+    } else if is_dismissed {
+        out.push_str(
+            "<span class=\"badge badge-dismissed js-reader-state-badge\">&times; Dismissed</span>",
+        );
+    }
     if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
         let icon_url = item.feed_url.as_deref().or(Some(item.url.as_str()));
         if let Some(fid) = item.feed_id.as_deref() {
             let _ = write!(
                 out,
-                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=unread&amp;feed={}\">",
+                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=new&amp;feed={}\">",
                 esc(&urlencode(fid)),
             );
             render_feed_favicon(out, icon_url, ft, true);
@@ -340,21 +392,23 @@ fn render_reader_header(
         );
     }
     out.push_str("</div>\n</div>\n");
-    render_reader_mobile_tools(out, item, id_enc, return_to, rank_slug, csrf);
+    render_reader_mobile_tools(out, item, id_enc, return_to, is_dismissed, rank_slug, csrf);
     out.push_str("</div>\n");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_reader_mobile_tools(
     out: &mut String,
     item: &crate::db::Item,
     id_enc: &str,
     return_to: &str,
+    is_dismissed: bool,
     rank_slug: Option<&str>,
     csrf: &str,
 ) {
     out.push_str("<div class=\"reader-mobile-tools\">\n");
-    if item.feed_id.is_some() {
-        render_reader_archive_action(out, item, id_enc, return_to, csrf, false);
+    if item.feed_id.is_some() || item.in_want_to_read || is_dismissed {
+        render_reader_dismiss_action(out, item, id_enc, return_to, is_dismissed, csrf, false);
     }
     out.push_str(
         "<div class=\"reader-size-controls\">\n\
@@ -386,8 +440,19 @@ fn render_reader_mobile_tools(
     out.push_str("</div>\n</div>\n</details>\n</div>\n");
 }
 
-fn render_reader_media_and_prose(out: &mut String, detail: &ItemDetail) {
+#[allow(clippy::too_many_arguments)]
+fn render_reader_media_and_prose(
+    out: &mut String,
+    detail: &ItemDetail,
+    id_enc: &str,
+    reader_path: &str,
+    return_to: &str,
+    triage_state: EntryTriageState,
+    csrf: &str,
+) {
     let item = &detail.item;
+    let is_finished = triage_state == EntryTriageState::Finished;
+    let is_dismissed = triage_state == EntryTriageState::Dismissed;
     let mut has_local_video = false;
     let mut has_local_pdf = false;
     for m in &detail.media {
@@ -428,24 +493,16 @@ fn render_reader_media_and_prose(out: &mut String, detail: &ItemDetail) {
         && !has_local_video
         && let Some(ext_href) = sanitize_non_local_href(item.url.as_str())
     {
-        out.push_str("<div class=\"reader-video-hero\">\n");
-        if let Some(thumb) = item.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
-            let _ = writeln!(
-                out,
-                "<a class=\"reader-video-thumb-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\">\
-                   <img class=\"reader-video-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">\
-                   <span class=\"reader-video-play-badge\" aria-hidden=\"true\">&#9654;</span>\
-                 </a>",
-                esc(ext_href),
-                esc(thumb),
-            );
-        }
-        let _ = writeln!(
+        render_reader_video_hero(
             out,
-            "<div class=\"reader-video-actions\">\
-               <a class=\"btn btn-primary btn-small\" href=\"{}\" target=\"_blank\" rel=\"noopener\">Watch Original &#8599;</a>\
-             </div>\n</div>",
-            esc(ext_href),
+            item,
+            ext_href,
+            id_enc,
+            reader_path,
+            return_to,
+            is_finished,
+            is_dismissed,
+            csrf,
         );
     }
 
@@ -467,51 +524,103 @@ fn render_reader_media_and_prose(out: &mut String, detail: &ItemDetail) {
     out.push_str("</div>\n");
 }
 
-fn render_reader_end_card(
+#[allow(clippy::too_many_arguments)]
+fn render_reader_video_hero(
     out: &mut String,
-    _detail: &ItemDetail,
+    item: &crate::db::Item,
+    ext_href: &str,
     id_enc: &str,
     reader_path: &str,
+    return_to: &str,
     is_finished: bool,
-    can_rank: bool,
+    is_dismissed: bool,
     csrf: &str,
 ) {
-    let finish_action = format!("/web/items/{id_enc}/finish");
-    let unfinish_action = format!("/web/items/{id_enc}/unfinish");
-    out.push_str("<div class=\"reader-end-card\">\n<div class=\"reader-end-center\">\n");
-    if can_rank {
-        render_inline_csrf_form(
+    out.push_str("<div class=\"reader-video-hero\">\n");
+    if let Some(thumb) = item.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
+        let _ = writeln!(
             out,
-            &finish_action,
-            csrf,
-            &[("rank_after", "1")],
-            None,
-            "<button type=\"submit\" class=\"btn btn-primary reader-end-rank-btn\">Finish &amp; Rank</button>",
+            "<a class=\"reader-video-thumb-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\">\
+               <img class=\"reader-video-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">\
+               <span class=\"reader-video-play-badge\" aria-hidden=\"true\">&#9654;</span>\
+             </a>",
+            esc(ext_href),
+            esc(thumb),
         );
     }
-    out.push_str("\n</div>\n<div class=\"reader-end-right\">\n");
+    let _ = writeln!(
+        out,
+        "<div class=\"reader-video-actions\">\
+           <a class=\"btn btn-primary btn-small\" href=\"{}\" target=\"_blank\" rel=\"noopener\">Watch Original &#8599;</a>\
+           <div class=\"reader-video-triage\">",
+        esc(ext_href),
+    );
+    if is_finished {
+        render_inline_csrf_form(
+            out,
+            &format!("/web/items/{id_enc}/unfinish"),
+            csrf,
+            &[("return_to", reader_path)],
+            Some("Undo Finished and remove this item from your Diary?"),
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-finished is-done\">&#10003; Finished</button>",
+        );
+    } else {
+        render_inline_csrf_form(
+            out,
+            &format!("/web/items/{id_enc}/finish"),
+            csrf,
+            &[("return_to", return_to)],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">&#10003; Mark Finished</button>",
+        );
+    }
+    if item.feed_id.is_some() || item.in_want_to_read || is_dismissed {
+        render_reader_dismiss_action(out, item, id_enc, return_to, is_dismissed, csrf, false);
+    }
+    out.push_str("</div>\n</div>\n</div>\n");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_reader_end_card(
+    out: &mut String,
+    detail: &ItemDetail,
+    id_enc: &str,
+    reader_path: &str,
+    return_to: &str,
+    triage_state: EntryTriageState,
+    can_rank: bool,
+    rank_slug: Option<&str>,
+    csrf: &str,
+) {
+    let item = &detail.item;
+    let is_finished = triage_state == EntryTriageState::Finished;
+    let is_dismissed = triage_state == EntryTriageState::Dismissed;
+    let finish_action = format!("/web/items/{id_enc}/finish");
+    let unfinish_action = format!("/web/items/{id_enc}/unfinish");
+    out.push_str("<div class=\"reader-end-card\">\n<div class=\"reader-end-primary\">\n");
+
     let (toggle_action, btn_cls, pressed, label, title) = if is_finished {
         (
             unfinish_action.as_str(),
             "btn btn-small btn-ghost btn-finished is-done js-finish-toggle-btn",
             "true",
             "&#10003; Finished",
-            "Marked finished — click to unfinish",
+            "Marked finished — click to undo",
         )
     } else {
         (
             finish_action.as_str(),
-            "btn btn-small btn-ghost btn-finished js-finish-toggle-btn",
+            "btn btn-primary btn-finished js-finish-toggle-btn",
             "false",
-            "Mark Finished",
-            "Mark this item as finished",
+            "&#10003; Mark Finished",
+            "Mark this item as finished and log to Diary",
         )
     };
     let toggle_btn = format!(
         "<button type=\"submit\" class=\"{btn_cls}\" aria-pressed=\"{pressed}\" title=\"{title}\">{label}</button>"
     );
     let confirm_attr = if is_finished {
-        " data-confirm=\"Mark unfinished and delete any saved Diary log and notes for this item?\""
+        " data-confirm=\"Undo Finished and remove this item from your Diary?\""
     } else {
         ""
     };
@@ -528,6 +637,27 @@ fn render_reader_end_card(
         esc(csrf),
         esc(reader_path),
     );
+    if !is_finished && can_rank {
+        render_inline_csrf_form(
+            out,
+            &finish_action,
+            csrf,
+            &[("rank_after", "1")],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost reader-end-rank-btn\">Finish &amp; Rank</button>",
+        );
+    } else if is_finished && let Some(slug) = rank_slug {
+        let _ = writeln!(
+            out,
+            "<a class=\"btn btn-small btn-ghost\" href=\"/rank/{}?focus={}\">Compare &rarr;</a>",
+            esc(&urlencode(slug)),
+            esc(&urlencode(&item.id)),
+        );
+    }
+    out.push_str("</div>\n<div class=\"reader-end-secondary\">\n");
+    if item.feed_id.is_some() || item.in_want_to_read || is_dismissed {
+        render_reader_dismiss_action(out, item, id_enc, return_to, is_dismissed, csrf, false);
+    }
     out.push_str("</div>\n</div>\n");
 }
 
@@ -574,6 +704,7 @@ fn render_reader_rail(
     id_enc: &str,
     reader_path: &str,
     return_to: &str,
+    is_dismissed: bool,
     rank_slug: Option<&str>,
     csrf: &str,
 ) {
@@ -642,9 +773,9 @@ fn render_reader_rail(
         );
     }
 
-    if item.feed_id.is_some() {
+    if item.feed_id.is_some() || item.in_want_to_read || is_dismissed {
         out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>\n");
-        render_reader_archive_action(out, item, id_enc, return_to, csrf, true);
+        render_reader_dismiss_action(out, item, id_enc, return_to, is_dismissed, csrf, true);
     }
 
     let _ = writeln!(
@@ -665,37 +796,45 @@ fn render_reader_rail(
     out.push_str("</div>\n</div>\n");
 }
 
-fn render_reader_archive_action(
+fn render_reader_dismiss_action(
     out: &mut String,
     item: &crate::db::Item,
     id_enc: &str,
     return_to: &str,
+    is_dismissed: bool,
     csrf: &str,
     icon_only: bool,
 ) {
-    let (arch_action, arch_title, arch_label, icon_svg) = if item.status == ItemStatus::Unread {
-        ("archive", "Archive (mark read)", "Archive", ARCHIVE_BOX_SVG)
+    let is_feed = item.feed_id.is_some();
+    let (action_slug, title, label, icon_svg) = if is_dismissed {
+        if is_feed {
+            ("mark-new", "Mark New", "Mark New", RESTORE_BOX_SVG)
+        } else {
+            ("mark-new", "Restore to Queue", "Restore to Queue", RESTORE_BOX_SVG)
+        }
+    } else if is_feed {
+        let tip = if item.is_finished { "Dismiss (remove Finished log)" } else { "Dismiss" };
+        ("dismiss", tip, "Dismiss", DISMISS_SVG)
     } else {
-        ("unarchive", "Move back to Inbox", "Restore", RESTORE_BOX_SVG)
+        ("dismiss", "Dismiss from Queue", "Dismiss", DISMISS_SVG)
     };
-    let prog_str = format!("{:.4}", item.read_progress.clamp(0.0, 1.0));
-    let arch_btn = if icon_only {
+    let btn_html = if icon_only {
         format!(
-            "<button type=\"submit\" class=\"rail-icon-btn js-reader-archive-btn\" title=\"{arch_title}\" aria-label=\"{arch_title}\">{icon_svg}</button>"
+            "<button type=\"submit\" class=\"rail-icon-btn js-reader-dismiss-btn\" title=\"{title}\" aria-label=\"{title}\">{icon_svg}</button>"
         )
     } else {
         format!(
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost js-reader-archive-btn\" title=\"{arch_title}\" aria-label=\"{arch_title}\">{icon_svg} {arch_label}</button>"
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost js-reader-dismiss-btn\" title=\"{title}\" aria-label=\"{title}\">{icon_svg} {label}</button>"
         )
     };
     render_inline_csrf_form_with_class(
         out,
-        &format!("/web/items/{id_enc}/{arch_action}"),
+        &format!("/web/items/{id_enc}/{action_slug}"),
         csrf,
-        Some("js-reader-archive-form"),
-        &[("progress", &prog_str), ("return_to", return_to)],
+        Some("js-reader-dismiss-form"),
+        &[("return_to", return_to)],
         None,
-        &arch_btn,
+        &btn_html,
     );
 }
 

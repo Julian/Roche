@@ -448,7 +448,7 @@ internal fun MainBottomBarChrome(
         }
         val inboxUnreadCount =
             remember(state.allEntries) {
-                state.allEntries.count { it.inFeedInbox && !it.isArchived && it.isUnread }
+                state.allEntries.count { it.inFeedInbox && it.isNew }
             }
         RocheBottomBar(
             activeTab = activeTab,

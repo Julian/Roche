@@ -614,9 +614,9 @@ class MainViewModelTest {
                     state.archivedFeeds.any { it.id == "f-archive" } &&
                         state.activeFeeds.none { it.id == "f-archive" } &&
                         state.feedContextSheetId == null &&
-                        state.statusBanner?.startsWith("Archived feed") == true
+                        state.statusBanner?.startsWith("Paused feed") == true
                 }
-            assertTrue(feedArchived.statusBanner?.startsWith("Archived feed") == true)
+            assertTrue(feedArchived.statusBanner?.startsWith("Paused feed") == true)
             assertTrue(feedArchived.allEntries.any { it.id == "i-archive" })
 
             viewModel.dispatch(MainAction.ToggleFeedArchive("f-archive"))
@@ -624,9 +624,9 @@ class MainViewModelTest {
                 viewModel.uiState.first { state ->
                     state.activeFeeds.any { it.id == "f-archive" } &&
                         state.archivedFeeds.none { it.id == "f-archive" } &&
-                        state.statusBanner?.startsWith("Unarchived feed") == true
+                        state.statusBanner?.startsWith("Resumed feed") == true
                 }
-            assertTrue(feedUnarchived.statusBanner?.startsWith("Unarchived feed") == true)
+            assertTrue(feedUnarchived.statusBanner?.startsWith("Resumed feed") == true)
             collectJob.cancel()
         }
 
@@ -856,7 +856,8 @@ class MainViewModelTest {
             assertEquals(1.0, ep2History.readProgress, 1e-3)
             assertTrue(!ep1History.readAt.isNullOrBlank())
             assertTrue(!ep2History.readAt.isNullOrBlank())
-            assertEquals("Played now · Completed", ep2History.formattedListeningHistoryLabel)
+            assertTrue(ep2History.isFinished)
+            assertEquals("Played now · Finished", ep2History.formattedListeningHistoryLabel)
             assertEquals(listOf("art-mid", "ep-1"), afterEp2Completed.queueEntries.map { it.id })
 
             // Verify favoriting/starring a podcast episode adds it to starredEntries

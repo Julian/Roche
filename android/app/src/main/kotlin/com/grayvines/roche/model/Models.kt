@@ -74,19 +74,20 @@ enum class HeadlineFont {
 @kotlinx.serialization.Serializable
 enum class InboxFilter(val label: String) {
     ALL("All"),
-    UNREAD("Unread"),
+    UNREAD("New"),
+    FINISHED("Finished"),
     ARTICLES("Articles"),
     PAPERS("Papers"),
     VIDEOS("Videos"),
     PODCASTS("Podcasts"),
     AUDIO("Audio"),
     STARRED("Starred"),
-    ARCHIVED("Archived");
+    ARCHIVED("Dismissed");
 
     companion object {
         /** Filters shown in the Inbox strip (Starred lives on the dedicated Stars tab). */
         val inboxStripFilters: List<InboxFilter> =
-            listOf(ALL, UNREAD, ARTICLES, PAPERS, VIDEOS, PODCASTS, AUDIO, ARCHIVED)
+            listOf(UNREAD, FINISHED, ARCHIVED, ALL, ARTICLES, PAPERS, VIDEOS, PODCASTS, AUDIO)
     }
 }
 
@@ -158,12 +159,12 @@ enum class AppTab(val label: String) {
 
 enum class FeedSortOrder(val label: String) {
     ALPHABETICAL("Sort: A–Z"),
-    UNREAD_FIRST("Sort: Unread First"),
+    UNREAD_FIRST("Sort: New First"),
 }
 
 enum class FeedListFilter(val label: String) {
     ALL("All"),
-    UNREAD("Unread"),
+    UNREAD("New"),
     ERRORS("Errors"),
     RSS("RSS"),
     PODCAST("Podcasts"),
@@ -187,6 +188,7 @@ data class FeedItem(
     val autoDownloadEpisodes: Boolean = false,
     val customPlaybackSpeed: Float? = null,
 ) {
+    val isPaused: Boolean = !isActive
     val isArchived: Boolean = !isActive
 
     val displayDomain: String by
@@ -240,6 +242,7 @@ data class InboxEntry(
     val audioUrl: String? = null,
     val inFeedInbox: Boolean = feedId != null,
     val entryKind: EntryKind = EntryKind.ARTICLE,
+    val isFinished: Boolean = false,
 ) {
     val isPlayableAudio: Boolean
         get() = contentType == ContentType.AUDIO || !audioUrl.isNullOrBlank()
@@ -253,8 +256,14 @@ data class InboxEntry(
     val isArchived: Boolean
         get() = status == ItemStatus.ARCHIVED
 
+    val isDismissed: Boolean
+        get() = isArchived && !isFinished
+
+    val isNew: Boolean
+        get() = !isArchived && !isFinished
+
     val isUnread: Boolean
-        get() = status == ItemStatus.UNREAD && !isRead
+        get() = status == ItemStatus.UNREAD && !isRead && !isFinished
 
     val effectiveThumbnailUrl: String? by
         lazy(LazyThreadSafetyMode.PUBLICATION) {
@@ -284,13 +293,13 @@ data class InboxEntry(
     val formattedListeningHistoryLabel: String?
         get() {
             if (!isPlayableAudio) return null
-            val hasPlayed = !readAt.isNullOrBlank() || readProgress > 0.0 || isArchived
+            val hasPlayed = !readAt.isNullOrBlank() || readProgress > 0.0 || isFinished
             if (!hasPlayed) return null
             val whenLabel = formattedReadAtLabel
             val pct = (readProgress * PERCENT_SCALE).toInt().coerceIn(1, MAX_PARTIAL_PCT)
             return when {
-                readProgress >= COMPLETED_PROGRESS_THRESHOLD || isArchived ->
-                    whenLabel?.let { "Played $it · Completed" } ?: "Completed"
+                isFinished || readProgress >= COMPLETED_PROGRESS_THRESHOLD ->
+                    whenLabel?.let { "Played $it · Finished" } ?: "Finished"
                 readProgress > 0.0 ->
                     whenLabel?.let { "Played $it · $pct% listened" } ?: "$pct% listened"
                 whenLabel != null -> "Played $whenLabel"

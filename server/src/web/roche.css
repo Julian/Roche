@@ -2729,9 +2729,14 @@ ul.inbox-list li.inbox-row {
   text-decoration-color: var(--accent);
 }
 
-.inbox-row.is-archived .inbox-title a {
+.inbox-row.is-archived .inbox-title a,
+.inbox-row.is-dismissed .inbox-title a {
   color: var(--ink-soft);
   font-weight: 400;
+}
+
+.inbox-row.is-dismissed .item-excerpt {
+  color: var(--ink-faint);
 }
 
 .item-byline {
@@ -2873,6 +2878,17 @@ a.badge {
 .badge-warn {
   color: var(--accent);
   border-color: var(--accent);
+}
+
+.badge-finished {
+  color: var(--tier-A);
+  border-color: var(--tier-A);
+  font-weight: 600;
+}
+
+.badge-dismissed {
+  color: var(--ink-faint);
+  border-color: var(--rule);
 }
 
 /* --- Reader View --- */
@@ -3291,37 +3307,28 @@ article.reader-article {
   background: var(--paper-deep);
   border: 1px solid var(--rule);
   border-radius: 2px;
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: space-between;
   gap: 0.75rem;
 }
 
-.reader-end-center {
-  grid-column: 2;
-  justify-self: center;
+.reader-end-primary,
+.reader-end-secondary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
 }
 
 .reader-end-rank-btn {
-  min-width: 8.5rem;
-  padding: 0.44rem 1.45rem;
-  font-size: 0.88rem;
-}
-
-.reader-end-right {
-  grid-column: 3;
-  justify-self: end;
+  padding: 0.36rem 0.9rem;
 }
 
 @media (max-width: 520px) {
   .reader-end-card {
-    grid-template-columns: 1fr;
-    justify-items: center;
-  }
-  .reader-end-center,
-  .reader-end-right {
-    grid-column: 1;
-    justify-self: center;
+    justify-content: center;
   }
 }
 
@@ -6349,6 +6356,13 @@ body.has-player-bar .roche-toast-region {
   justify-content: space-between;
   gap: 0.65rem;
   padding: 0.75rem 0.95rem;
+}
+
+.reader-video-triage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 @media (max-width: 1020px) {

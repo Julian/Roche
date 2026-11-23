@@ -435,6 +435,53 @@ private fun populateStarPath(path: Path, width: Float, height: Float) {
 }
 
 /**
+ * Crisp dismiss (`×`) icon for clearing entries without logging Finished, plus an upward-tray
+ * restore icon when viewing Dismissed entries.
+ */
+@Composable
+fun DismissIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    isDismissed: Boolean = false,
+    size: Dp = 18.dp,
+) {
+    val pathA = remember { Path() }
+    val pathB = remember { Path() }
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        if (!isDismissed) {
+            val start = this.size.minDimension * 0.26f
+            val end = this.size.minDimension * 0.74f
+            drawLine(
+                color = tint,
+                start = Offset(start, start),
+                end = Offset(end, end),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round,
+            )
+            drawLine(
+                color = tint,
+                start = Offset(end, start),
+                end = Offset(start, end),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round,
+            )
+        } else {
+            drawArrowTray(
+                trayPath = pathA,
+                chevronPath = pathB,
+                tint = tint,
+                stroke = stroke,
+                strokeWidth = strokeWidth,
+                arrowTipY = ARROW_TOP_Y,
+                chevronWingY = CHEVRON_WING_Y,
+            )
+        }
+    }
+}
+
+/**
  * Custom two-drawer filing cabinet icon for archiving entries, plus an upward-tray unarchive icon
  * when viewing the Archived filter.
  */

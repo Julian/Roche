@@ -11,7 +11,7 @@ use crate::{
 };
 
 /// Reader scroll / playback progress threshold (`>= 0.98`) at which an item is automatically
-/// marked read (and playable audio items auto-log completion).
+/// marked Finished (logging `'consumed'` and clearing it from New / Want queues).
 pub const READER_AUTO_READ_THRESHOLD: f64 = 0.98;
 
 /// Origin of a reading or playback progress update so audio playback completion can be
@@ -125,10 +125,28 @@ impl ArchiveBatchScope {
     }
 }
 
+/// Mutually exclusive 3-state triage lifecycle for reader/feed entries.
+///
+/// Derived without schema changes from `entry_state` + `consumption_log`:
+/// - `Finished`: has a `'consumed'` row in `consumption_log`.
+/// - `Dismissed`: cleared from New / Want queue without being `'consumed'`.
+/// - `New`: unseen / active in Feed Inbox or Want queue.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryTriageState {
+    #[default]
+    New,
+    Finished,
+    Dismissed,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ItemStatusFilter {
+    #[serde(alias = "new")]
     Unread,
+    Finished,
+    Dismissed,
     Archived,
     #[default]
     All,
@@ -139,8 +157,8 @@ impl ItemStatusFilter {
     pub const fn into_status(self) -> Option<ItemStatus> {
         match self {
             Self::Unread => Some(ItemStatus::Unread),
-            Self::Archived => Some(ItemStatus::Archived),
-            Self::All => None,
+            Self::Archived | Self::Dismissed => Some(ItemStatus::Archived),
+            Self::Finished | Self::All => None,
         }
     }
 }

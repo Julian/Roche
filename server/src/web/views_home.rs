@@ -14,7 +14,7 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        ARCHIVE_BOX_SVG, CreatorYearStyle, NavSection, PageShell, WebError, WithWebCsrf as _, esc,
+        CreatorYearStyle, DISMISS_SVG, NavSection, PageShell, WebError, WithWebCsrf as _, esc,
         format_audio_duration, item_kind_badge, parse_form_bool, redirect_with_flash,
         render_creator_year_meta, render_diary_row_with_tier, render_feed_favicon,
         render_inline_csrf_form, render_page, render_triage_form, safe_local_redirect, urlencode,
@@ -388,7 +388,7 @@ fn render_in_progress_section(out: &mut String, in_progress_items: &[Item], csrf
             if let Some(fid) = item.feed_id.as_deref() {
                 let _ = write!(
                     out,
-                    "<a class=\"byline-item\" href=\"/inbox?status=unread&amp;feed={}\">{}</a>",
+                    "<a class=\"byline-item\" href=\"/inbox?status=new&amp;feed={}\">{}</a>",
                     esc(&urlencode(fid)),
                     esc(ft)
                 );
@@ -416,19 +416,19 @@ fn render_in_progress_section(out: &mut String, in_progress_items: &[Item], csrf
         );
         render_audio_play_button(out, item);
         if item.feed_id.is_some() {
-            let arch_btn = format!(
-                "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Archive (mark read)\" aria-label=\"Archive {}\">{ARCHIVE_BOX_SVG}</button>",
+            let dismiss_btn = format!(
+                "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Dismiss\" aria-label=\"Dismiss {}\">{DISMISS_SVG}</button>",
                 esc(&item.title),
             );
             render_triage_form(
                 out,
-                &format!("/web/items/{id_enc}/archive"),
+                &format!("/web/items/{id_enc}/dismiss"),
                 csrf,
                 &[("return_to", "/")],
-                "archive",
+                "dismiss",
                 &item.title,
-                &format!("/web/items/{id_enc}/unarchive"),
-                &arch_btn,
+                &format!("/web/items/{id_enc}/mark-new"),
+                &dismiss_btn,
             );
         } else {
             let done_btn = format!(
@@ -564,7 +564,7 @@ fn render_unread_summary_section(out: &mut String, items: &[&Item], total_unread
     if usize::try_from(total_unread.max(0)).unwrap_or(0) > shown {
         let _ = writeln!(
             out,
-            "<div class=\"section-more\"><a href=\"/inbox\">View all {total_unread} unread &rarr;</a></div>"
+            "<div class=\"section-more\"><a href=\"/inbox\">View all {total_unread} new &rarr;</a></div>"
         );
     }
 }
@@ -621,7 +621,7 @@ fn render_home_inbox_row(out: &mut String, item: &Item, csrf: &str) {
         if let Some(fid) = item.feed_id.as_deref() {
             let _ = write!(
                 out,
-                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=unread&amp;feed={}\">",
+                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=new&amp;feed={}\">",
                 esc(&urlencode(fid)),
             );
             render_feed_favicon(out, icon_url, ft, true);
@@ -720,19 +720,19 @@ fn render_home_inbox_controls(out: &mut String, item: &Item, id_enc: &str, csrf:
         );
     }
     out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>");
-    let arch_btn = format!(
-        "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Archive (mark read)\" aria-label=\"Archive {}\">{ARCHIVE_BOX_SVG}</button>",
+    let dismiss_btn = format!(
+        "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Dismiss\" aria-label=\"Dismiss {}\">{DISMISS_SVG}</button>",
         esc(&item.title),
     );
     render_triage_form(
         out,
-        &format!("/web/items/{id_enc}/archive"),
+        &format!("/web/items/{id_enc}/dismiss"),
         csrf,
         &[("return_to", "/")],
-        "archive",
+        "dismiss",
         &item.title,
-        &format!("/web/items/{id_enc}/unarchive"),
-        &arch_btn,
+        &format!("/web/items/{id_enc}/mark-new"),
+        &dismiss_btn,
     );
     out.push_str("</div>");
 }

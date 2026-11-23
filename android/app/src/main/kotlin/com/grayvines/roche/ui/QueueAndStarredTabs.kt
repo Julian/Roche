@@ -60,9 +60,9 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.extractCleanDomain
 import com.grayvines.roche.ui.components.CatalogCoverThumbnail
+import com.grayvines.roche.ui.components.DismissIcon
 import com.grayvines.roche.ui.components.EntrySourceMetadataRow
 import com.grayvines.roche.ui.components.EntryThumbnailPreview
-import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
@@ -1462,7 +1462,7 @@ private fun QueueCompactOverflowMenuItems(
         onDismiss()
         onToggleStar()
     }
-    QueueOverflowOption(if (entry.isArchived) "Unarchive" else "Archive", colors.textPrimary) {
+    QueueOverflowOption(if (entry.isDismissed) "Mark New" else "Dismiss", colors.textPrimary) {
         onDismiss()
         onToggleArchive()
     }
@@ -1517,12 +1517,13 @@ private fun QueueEntryTrailingActions(
             Text("✕", color = colors.textMuted, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
         }
         RocheIconActionButton(
-            contentDescription = "Archive ${entry.title}",
+            contentDescription =
+                if (entry.isDismissed) "Mark ${entry.title} new" else "Dismiss ${entry.title}",
             onClick = onToggleArchive,
             outlined = false,
             modifier = Modifier.testTag("queue_archive_btn_${entry.id}"),
         ) {
-            FilingCabinetIcon(tint = colors.textMuted, isArchived = entry.isArchived, size = 17.dp)
+            DismissIcon(tint = colors.textMuted, isDismissed = entry.isDismissed, size = 17.dp)
         }
     }
 }

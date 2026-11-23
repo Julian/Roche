@@ -66,47 +66,49 @@ use crate::{
     util::{clock::now_utc, media_urls::extract_arxiv_id},
 };
 
-/// Auto-logs feed / reader completion (`consumed`) when:
-/// - a `podcast_episode` or audio-only item reaches playback completion
-///   (`progress >= READER_AUTO_READ_THRESHOLD`, or archived/finished with `>= 0.9`),
-/// - an `article` or `paper` with playable audio reaches `>= READER_AUTO_READ_THRESHOLD`
-///   from audio playback (`progress_source == Some(ProgressSource::Audio)`), or
-/// - an `article` or `paper` is archived/finished with `progress >= 0.9`.
+/// Returns whether reaching `progress` from `progress_source` should automatically mark
+/// the entry **Finished** (logging `'consumed'` and clearing it from New / Want queues).
 ///
-/// Delegates to `CatalogRepo::ensure_auto_consumed_with_parents_in_tx` so auto-completion uses
-/// `deterministic_auto_consumption_log_id`, removes from `Want` queues, engages parent
-/// `podcast`/`publication`/`channel` collections, and records sync activity without duplicate SQL.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn maybe_auto_log_feed_completion_in_tx(
-    tx: &mut WriteTx<'_>,
-    entry_id: &str,
+/// Rules:
+/// - Must reach `progress >= READER_AUTO_READ_THRESHOLD` (`0.98`).
+/// - **Videos** NEVER auto-finish (explicit Finish only).
+/// - **Podcast episodes** and audio-only items auto-finish on audio playback (`Audio` or `None`),
+///   never from scrolling show notes (`Reader`).
+/// - **Articles / Papers** auto-finish on reader scroll (`Reader` / `None`) or audio playback (`Audio` when playable).
+/// - **Dismiss** never calls this — dismissing an item never logs `'consumed'`.
+pub(super) fn should_auto_finish_from_progress(
     entry_kind: EntryKind,
     content_type: ContentType,
     has_audio_media: bool,
-    inbox_state: InboxState,
     progress: f64,
     progress_source: Option<ProgressSource>,
-    ts: DateTime<Utc>,
-) -> std::result::Result<(), sqlx::Error> {
-    let is_dismissed_or_done = matches!(inbox_state, InboxState::Dismissed | InboxState::None);
+) -> bool {
+    if !progress.is_finite() || progress < READER_AUTO_READ_THRESHOLD {
+        return false;
+    }
+    if entry_kind == EntryKind::Video || content_type == ContentType::Video {
+        return false;
+    }
     let is_audio_only = content_type == ContentType::Audio;
     let has_audio = is_audio_only || has_audio_media;
-    let allow_audio_auto_complete = match progress_source {
-        Some(ProgressSource::Reader) => false,
-        Some(ProgressSource::Audio) => has_audio,
-        None => matches!(entry_kind, EntryKind::PodcastEpisode) || is_audio_only,
-    };
-    let should_log = match entry_kind {
-        EntryKind::PodcastEpisode | EntryKind::Article | EntryKind::Paper => {
-            (allow_audio_auto_complete && progress >= READER_AUTO_READ_THRESHOLD)
-                || (is_dismissed_or_done && progress >= 0.9)
+    match entry_kind {
+        EntryKind::PodcastEpisode => {
+            has_audio && !matches!(progress_source, Some(ProgressSource::Reader))
         }
+        EntryKind::Article | EntryKind::Paper => match progress_source {
+            Some(ProgressSource::Audio) => has_audio,
+            Some(ProgressSource::Reader) => !is_audio_only,
+            None => !is_audio_only || has_audio,
+        },
         _ => false,
-    };
-    if !should_log {
-        return Ok(());
     }
+}
 
+async fn ensure_auto_finished_in_tx(
+    tx: &mut WriteTx<'_>,
+    entry_id: &str,
+    ts: DateTime<Utc>,
+) -> std::result::Result<(), sqlx::Error> {
     match CatalogRepo::ensure_auto_consumed_with_parents_in_tx(tx, entry_id, None, ts, ts).await {
         Ok(_) => Ok(()),
         Err(CatalogError::Db(e)) => Err(e),
@@ -221,6 +223,7 @@ impl ItemRepo<'_> {
             inbox_state: InboxState::Unread,
             in_want_to_read: false,
             is_favorite: false,
+            is_finished: false,
             read_at: None,
             read_progress: 0.0,
             interaction_updated_at: None,
@@ -714,46 +717,29 @@ impl ItemRepo<'_> {
         Ok(Some(next))
     }
 
-    /// Atomically archives a live item while retaining `max(existing_progress, submitted_progress)`
-    /// inside one write transaction so concurrent progress updates are never regressed.
-    pub async fn archive_with_min_progress(
-        &self,
-        id: &str,
-        submitted_progress: Option<f64>,
-    ) -> Result<bool> {
+    /// Strictly dismisses a live reader item without ever logging `'consumed'`.
+    ///
+    /// If the item was previously Finished, deletes its `'consumed'` diary logs (recording
+    /// sync tombstones) and resets `progress = 0.0` so it moves cleanly into **Dismissed**.
+    /// Feed items move to `inbox_state = 'dismissed'` with `read_at = NULL`; saved `Want to Read`
+    /// items are removed from `Want to Read`.
+    pub async fn dismiss(&self, id: &str) -> Result<bool> {
         let now = now_utc();
-        let clean_sub = submitted_progress.filter(|p| p.is_finite()).map(|p| p.clamp(0.0, 1.0));
         let mut tx = crate::db::begin_write(self.pool).await?;
-        let merged_prog = if let Some(sub) = clean_sub {
-            let mut qb = QueryBuilder::<Sqlite>::new(
-                "SELECT COALESCE(es.progress, 0.0)
-                 FROM entries i
-                 LEFT JOIN entry_state es ON es.entry_id = i.id
-                 LEFT JOIN entry_content ec ON ec.entry_id = i.id
-                 WHERE i.id = ",
-            );
-            qb.push_bind(id).push(" AND i.merged_into_id IS NULL AND ").push(IS_LIVE_ITEM_SQL);
-            let Some(existing_prog): Option<f64> =
-                qb.build_query_scalar().fetch_optional(tx.conn()).await?
-            else {
-                return Ok(false);
-            };
-            let safe_existing =
-                if existing_prog.is_finite() { existing_prog.clamp(0.0, 1.0) } else { 0.0 };
-            Some(safe_existing.max(sub))
-        } else {
-            None
-        };
+        let deleted_logs = CatalogRepo::delete_consumed_logs_for_entry_in_tx(&mut tx, id, now)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let progress_patch = (deleted_logs > 0).then_some(0.0);
         let found = Self::update_in_tx(
             &mut tx,
             id,
             Some(ItemStatus::Archived),
             None,
-            merged_prog,
-            ReadAtPatch::Unchanged,
+            progress_patch,
+            ReadAtPatch::MarkUnread,
             None,
             now,
-            true,
+            false,
         )
         .await?;
         if !found {
@@ -842,14 +828,27 @@ impl ItemRepo<'_> {
         } else {
             ItemStatus::Unread
         };
-        let target_status = status.unwrap_or(current_status);
+        let auto_finish = allow_auto_log
+            && status.is_none()
+            && read_at != ReadAtPatch::MarkUnread
+            && read_progress.is_some_and(|p| {
+                should_auto_finish_from_progress(
+                    entry_kind,
+                    content_type,
+                    has_audio_media,
+                    p,
+                    progress_source,
+                )
+            });
+        let effective_status = if auto_finish { Some(ItemStatus::Archived) } else { status };
+        let target_status = effective_status.unwrap_or(current_status);
         let target_inbox = if cur_inbox == InboxState::None {
             InboxState::None
         } else {
             InboxState::from(target_status)
         };
         let target_in_wtr = if cur_inbox == InboxState::None {
-            match status {
+            match effective_status {
                 Some(ItemStatus::Archived) => false,
                 Some(ItemStatus::Unread) => true,
                 None => current_in_wtr,
@@ -860,7 +859,20 @@ impl ItemRepo<'_> {
         let target_read_at = match target_status {
             ItemStatus::Archived => match read_at {
                 ReadAtPatch::MarkRead(explicit_ts) => Some(explicit_ts),
-                ReadAtPatch::MarkUnread | ReadAtPatch::Unchanged => current_read_at.or(Some(now)),
+                ReadAtPatch::MarkUnread => {
+                    if cur_inbox == InboxState::None && status == Some(ItemStatus::Archived) {
+                        current_read_at.or(Some(now))
+                    } else {
+                        None
+                    }
+                }
+                ReadAtPatch::Unchanged => {
+                    if auto_finish || cur_inbox == InboxState::None {
+                        current_read_at.or(Some(now))
+                    } else {
+                        current_read_at
+                    }
+                }
             },
             ItemStatus::Unread => match read_at {
                 ReadAtPatch::MarkRead(explicit_ts) => Some(explicit_ts),
@@ -868,8 +880,6 @@ impl ItemRepo<'_> {
                 ReadAtPatch::Unchanged => {
                     if current_status == ItemStatus::Archived {
                         None
-                    } else if read_progress.is_some_and(|p| p >= READER_AUTO_READ_THRESHOLD) {
-                        current_read_at.or(Some(now))
                     } else {
                         current_read_at
                     }
@@ -887,27 +897,8 @@ impl ItemRepo<'_> {
 
         if !status_changed && !wtr_changed && !read_at_changed && !fav_changed && !progress_changed
         {
-            if allow_auto_log
-                && progress_source == Some(ProgressSource::Audio)
-                && target_progress >= READER_AUTO_READ_THRESHOLD
-            {
-                let completion_signal = if target_status == ItemStatus::Archived {
-                    InboxState::Dismissed
-                } else {
-                    InboxState::Unread
-                };
-                maybe_auto_log_feed_completion_in_tx(
-                    tx,
-                    id,
-                    entry_kind,
-                    content_type,
-                    has_audio_media,
-                    completion_signal,
-                    target_progress,
-                    progress_source,
-                    target_read_at.unwrap_or(now),
-                )
-                .await?;
+            if auto_finish {
+                ensure_auto_finished_in_tx(tx, id, target_read_at.unwrap_or(now)).await?;
             }
             return Ok(true);
         }
@@ -945,24 +936,8 @@ impl ItemRepo<'_> {
             .await?;
         }
 
-        if allow_auto_log {
-            let completion_signal = if target_status == ItemStatus::Archived {
-                InboxState::Dismissed
-            } else {
-                InboxState::Unread
-            };
-            maybe_auto_log_feed_completion_in_tx(
-                tx,
-                id,
-                entry_kind,
-                content_type,
-                has_audio_media,
-                completion_signal,
-                target_progress,
-                progress_source,
-                target_read_at.unwrap_or(now),
-            )
-            .await?;
+        if auto_finish {
+            ensure_auto_finished_in_tx(tx, id, target_read_at.unwrap_or(now)).await?;
         }
 
         if status_changed {
@@ -994,11 +969,33 @@ impl ItemRepo<'_> {
     }
 
     pub async fn archive(&self, id: &str) -> Result<bool> {
-        self.update(id, Some(ItemStatus::Archived), None, None, ReadAtPatch::Unchanged).await
+        self.dismiss(id).await
     }
 
     pub async fn unarchive(&self, id: &str) -> Result<bool> {
-        self.update(id, Some(ItemStatus::Unread), None, None, ReadAtPatch::Unchanged).await
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        let deleted_logs = CatalogRepo::delete_consumed_logs_for_entry_in_tx(&mut tx, id, now)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let progress_patch = (deleted_logs > 0).then_some(0.0);
+        let found = Self::update_in_tx(
+            &mut tx,
+            id,
+            Some(ItemStatus::Unread),
+            None,
+            progress_patch,
+            ReadAtPatch::MarkUnread,
+            None,
+            now,
+            false,
+        )
+        .await?;
+        if !found {
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub(crate) async fn entry_has_catalog_history_in_tx(

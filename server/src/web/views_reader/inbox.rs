@@ -11,13 +11,13 @@ use url::Url;
 use super::{ArchiveBatchForm, InboxQuery, ItemReturnForm, SaveUrlForm, render_audio_play_button};
 use crate::{
     db::{Feed, Item, ItemFilter, WANT_TO_READ_COLLECTION_ID},
-    domain::{ContentType, ItemStatus, ItemStatusFilter},
+    domain::{ContentType, EntryTriageState, ItemStatusFilter},
     service::RocheService,
     web::{
         auth::WebSession,
         html::{
-            ARCHIVE_BOX_SVG, NavSection, PageShell, RESTORE_BOX_SVG, WebError, WithWebCsrf as _,
-            esc, format_audio_duration, item_kind_badge, parse_csv_list, redirect_see_other,
+            DISMISS_SVG, NavSection, PageShell, RESTORE_BOX_SVG, WebError, WithWebCsrf as _, esc,
+            format_audio_duration, item_kind_badge, parse_csv_list, redirect_see_other,
             redirect_with_flash, render_feed_favicon, render_inline_csrf_form, render_page,
             render_triage_form, safe_local_redirect, urlencode,
         },
@@ -88,13 +88,15 @@ pub(in crate::web) async fn inbox_get(
 ) -> Result<Response, WebError> {
     let status_filter = match q.status.as_deref() {
         Some("all") => ItemStatusFilter::All,
-        Some("archived") => ItemStatusFilter::Archived,
+        Some("finished") => ItemStatusFilter::Finished,
+        Some("dismissed" | "archived") => ItemStatusFilter::Dismissed,
         _ => ItemStatusFilter::Unread,
     };
     let status_slug = match status_filter {
         ItemStatusFilter::All => "all",
-        ItemStatusFilter::Archived => "archived",
-        ItemStatusFilter::Unread => "unread",
+        ItemStatusFilter::Finished => "finished",
+        ItemStatusFilter::Dismissed | ItemStatusFilter::Archived => "dismissed",
+        ItemStatusFilter::Unread => "new",
     };
     let parsed_kind = parse_inbox_kind_filter(q.kind.as_deref());
     let clean_kind = parsed_kind.slug;
@@ -319,9 +321,10 @@ fn render_inbox_sidebar(
            <ul class=\"sidebar-list\">\n",
     );
     for (slug, label, count_opt) in [
-        ("unread", "Unread", Some(total_unread)),
-        ("all", "All Items", None),
-        ("archived", "Archived", None),
+        ("new", "New", Some(total_unread)),
+        ("finished", "Finished", None),
+        ("dismissed", "Dismissed", None),
+        ("all", "All", None),
     ] {
         let is_active = p.status == slug && p.feed.is_none();
         let attrs = if is_active { " class=\"is-active\" aria-current=\"true\"" } else { "" };
@@ -376,7 +379,7 @@ fn render_inbox_sidebar(
         let next_status = if is_cur {
             p.status
         } else if feed.unread_count > 0 {
-            "unread"
+            "new"
         } else {
             "all"
         };
@@ -409,7 +412,9 @@ fn render_inbox_sidebar(
 
 fn render_inbox_mobile_pills(out: &mut String, p: &InboxNavParams<'_>, feeds: &[Feed]) {
     out.push_str("<div class=\"inbox-mobile-filters pill-bar\">\n");
-    for (slug, label) in [("unread", "Unread"), ("all", "All"), ("archived", "Archived")] {
+    for (slug, label) in
+        [("new", "New"), ("finished", "Finished"), ("dismissed", "Dismissed"), ("all", "All")]
+    {
         let attrs = if p.status == slug {
             "class=\"pill is-active\" aria-current=\"true\""
         } else {
@@ -448,7 +453,7 @@ fn render_inbox_mobile_pills(out: &mut String, p: &InboxNavParams<'_>, feeds: &[
         for feed in feeds {
             let label =
                 feed.title.as_deref().filter(|s| !s.is_empty()).unwrap_or(feed.url.as_str());
-            let next_status = if feed.unread_count > 0 { "unread" } else { "all" };
+            let next_status = if feed.unread_count > 0 { "new" } else { "all" };
             let feed_href = build_inbox_href(&InboxNavParams {
                 status: next_status,
                 feed: Some(feed.id.as_str()),
@@ -487,8 +492,9 @@ fn render_inbox_toolbar(
 ) {
     let heading = feed_label.unwrap_or(match p.status {
         "all" => "All Items",
-        "archived" => "Archived",
-        _ => "Unread",
+        "finished" => "Finished",
+        "dismissed" => "Dismissed",
+        _ => "New",
     });
     let _ = write!(
         out,
@@ -498,14 +504,14 @@ fn render_inbox_toolbar(
         esc(heading),
     );
     let count_text = if feed_label.is_none()
-        && p.status == "unread"
+        && p.status == "new"
         && p.kind.is_none()
         && p.tag.is_none()
         && p.q.is_none()
     {
         if total_unread == 1 { "1 item".to_owned() } else { format!("{total_unread} items") }
     } else if let Some(feed_unread) = selected_feed_unread
-        && p.status == "unread"
+        && p.status == "new"
         && p.kind.is_none()
         && p.tag.is_none()
         && p.q.is_none()
@@ -521,7 +527,9 @@ fn render_inbox_toolbar(
     let _ = write!(out, "<span class=\"inbox-toolbar-count\">{count_text}</span>");
     if p.feed.is_some() {
         out.push_str("<div class=\"inbox-feed-status-toggle pill-bar\" role=\"group\" aria-label=\"Feed status filter\">");
-        for (slug, label) in [("unread", "Unread"), ("all", "All"), ("archived", "Archived")] {
+        for (slug, label) in
+            [("new", "New"), ("finished", "Finished"), ("dismissed", "Dismissed"), ("all", "All")]
+        {
             let attrs = if p.status == slug {
                 "class=\"pill is-active\" aria-current=\"true\""
             } else {
@@ -641,37 +649,45 @@ fn render_inbox_batch_controls(
     return_to: &str,
 ) {
     let has_narrowing = p.kind.is_some() || p.tag.is_some() || p.q.is_some();
-    let unread_ids: Vec<&str> =
-        items.iter().filter(|i| i.status == ItemStatus::Unread).map(|i| i.id.as_str()).collect();
-    if p.status == "archived" || unread_ids.is_empty() {
+    let new_ids: Vec<&str> = items
+        .iter()
+        .filter(|i| i.triage_state() == EntryTriageState::New)
+        .map(|i| i.id.as_str())
+        .collect();
+    if matches!(p.status, "finished" | "dismissed") || new_ids.is_empty() {
         return;
     }
     if has_narrowing {
-        let joined = unread_ids.join(",");
+        let joined = new_ids.join(",");
         let btn = format!(
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Shown Unread ({})</button>",
-            unread_ids.len()
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Dismiss Shown New ({})</button>",
+            new_ids.len()
         );
         render_inline_csrf_form(
             out,
-            "/web/items/archive-batch",
+            "/web/items/dismiss-batch",
             csrf,
             &[("ids", &joined), ("return_to", return_to)],
-            Some(&format!("Archive {} shown unread item(s)?", unread_ids.len())),
+            Some(&format!(
+                "Dismiss {} shown new item(s)? They will not be logged as Finished.",
+                new_ids.len()
+            )),
             &btn,
         );
     } else if let Some(fid) = p.feed {
         let count = selected_feed_unread
             .and_then(|c| usize::try_from(c).ok())
             .filter(|&c| c > 0)
-            .unwrap_or(unread_ids.len());
-        let confirm = format!("Archive all {count} unread item(s) in this feed?");
+            .unwrap_or(new_ids.len());
+        let confirm = format!(
+            "Dismiss all {count} new item(s) in this feed? They will not be logged as Finished."
+        );
         let btn = format!(
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Feed Unread ({count})</button>"
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Dismiss Feed New ({count})</button>"
         );
         render_inline_csrf_form(
             out,
-            "/web/items/archive-batch",
+            "/web/items/dismiss-batch",
             csrf,
             &[("feed_id", fid), ("return_to", return_to)],
             Some(&confirm),
@@ -680,11 +696,11 @@ fn render_inbox_batch_controls(
     } else {
         render_inline_csrf_form(
             out,
-            "/web/items/archive-batch",
+            "/web/items/dismiss-batch",
             csrf,
             &[("return_to", return_to)],
-            Some("Archive all unread items in your inbox?"),
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive All Unread</button>",
+            Some("Dismiss all new items in your inbox? They will not be logged as Finished."),
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Dismiss All New</button>",
         );
     }
 }
@@ -785,10 +801,12 @@ fn render_single_inbox_row(
     return_to: &str,
     tag_id_by_lower_name: &HashMap<String, String>,
 ) {
-    let row_cls = if item.status == ItemStatus::Archived {
-        "inbox-row js-triage-row js-kbd-row is-archived"
-    } else {
-        "inbox-row js-triage-row js-kbd-row"
+    let row_cls = match item.triage_state() {
+        EntryTriageState::New => "inbox-row js-triage-row js-kbd-row",
+        EntryTriageState::Finished => "inbox-row js-triage-row js-kbd-row is-finished",
+        EntryTriageState::Dismissed => {
+            "inbox-row js-triage-row js-kbd-row is-dismissed is-archived"
+        }
     };
     let id_enc = urlencode(&item.id);
     let reader_href = format!("/reader/{id_enc}?return_to={}", urlencode(return_to));
@@ -853,6 +871,15 @@ fn render_inbox_row_byline(
     tag_id_by_lower_name: &HashMap<String, String>,
 ) {
     out.push_str("<div class=\"item-byline\">");
+    match item.triage_state() {
+        EntryTriageState::Finished => {
+            out.push_str("<span class=\"badge badge-finished\">&#10003; Finished</span>");
+        }
+        EntryTriageState::Dismissed => {
+            out.push_str("<span class=\"badge badge-dismissed\">&times; Dismissed</span>");
+        }
+        EntryTriageState::New => {}
+    }
     if let Some((badge_cls, label)) = item_kind_badge(item) {
         let _ = write!(out, "<span class=\"badge badge-kind{badge_cls}\">{}</span>", esc(label));
     }
@@ -861,7 +888,7 @@ fn render_inbox_row_byline(
         if let Some(fid) = item.feed_id.as_deref() {
             let _ = write!(
                 out,
-                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=unread&amp;feed={}\">",
+                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=new&amp;feed={}\">",
                 esc(&urlencode(fid)),
             );
             render_feed_favicon(out, icon_url, ft, true);
@@ -954,36 +981,55 @@ fn render_inbox_row_controls(
     }
     out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>");
 
-    if item.status == ItemStatus::Unread {
-        let arch_btn = format!(
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Archive (mark read)\" aria-label=\"Archive {}\">{ARCHIVE_BOX_SVG}</button>",
-            esc(&item.title),
-        );
-        render_triage_form(
-            out,
-            &format!("/web/items/{id_enc}/archive"),
-            csrf,
-            &[("return_to", return_to)],
-            "archive",
-            &item.title,
-            &format!("/web/items/{id_enc}/unarchive"),
-            &arch_btn,
-        );
-    } else {
-        let restore_btn = format!(
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\" title=\"Restore to Unread\" aria-label=\"Restore {}\">{RESTORE_BOX_SVG} Restore</button>",
-            esc(&item.title),
-        );
-        render_triage_form(
-            out,
-            &format!("/web/items/{id_enc}/unarchive"),
-            csrf,
-            &[("return_to", return_to)],
-            "unarchive",
-            &item.title,
-            &format!("/web/items/{id_enc}/archive"),
-            &restore_btn,
-        );
+    match item.triage_state() {
+        EntryTriageState::New => {
+            let dismiss_btn = format!(
+                "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Dismiss\" aria-label=\"Dismiss {}\">{DISMISS_SVG}</button>",
+                esc(&item.title),
+            );
+            render_triage_form(
+                out,
+                &format!("/web/items/{id_enc}/dismiss"),
+                csrf,
+                &[("return_to", return_to)],
+                "dismiss",
+                &item.title,
+                &format!("/web/items/{id_enc}/mark-new"),
+                &dismiss_btn,
+            );
+        }
+        EntryTriageState::Finished => {
+            let dismiss_btn = format!(
+                "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Dismiss (remove Finished log)\" aria-label=\"Dismiss {}\">{DISMISS_SVG}</button>",
+                esc(&item.title),
+            );
+            render_triage_form(
+                out,
+                &format!("/web/items/{id_enc}/dismiss"),
+                csrf,
+                &[("return_to", return_to)],
+                "dismiss",
+                &item.title,
+                &format!("/web/items/{id_enc}/finish"),
+                &dismiss_btn,
+            );
+        }
+        EntryTriageState::Dismissed => {
+            let restore_btn = format!(
+                "<button type=\"submit\" class=\"btn btn-small btn-ghost\" title=\"Mark New\" aria-label=\"Mark {} new\">{RESTORE_BOX_SVG} Mark New</button>",
+                esc(&item.title),
+            );
+            render_triage_form(
+                out,
+                &format!("/web/items/{id_enc}/mark-new"),
+                csrf,
+                &[("return_to", return_to)],
+                "mark-new",
+                &item.title,
+                &format!("/web/items/{id_enc}/dismiss"),
+                &restore_btn,
+            );
+        }
     }
     out.push_str("\n</div>\n");
 }
@@ -1043,7 +1089,8 @@ pub(in crate::web) async fn post_item_archive_batch(
     }
     .web_err(&session)?;
     let base = safe_local_redirect(form.return_to.as_deref(), "/inbox");
-    Ok(redirect_with_flash(&base, "notice", &format!("Archived {count} unread items")))
+    let noun = if count == 1 { "item" } else { "items" };
+    Ok(redirect_with_flash(&base, "notice", &format!("Dismissed {count} new {noun}")))
 }
 
 pub(in crate::web) async fn post_item_star(
@@ -1062,8 +1109,7 @@ pub(in crate::web) async fn post_item_archive(
     Path(id): Path<String>,
     Form(form): Form<ItemReturnForm>,
 ) -> Result<Response, WebError> {
-    let _ =
-        service.items().archive_with_min_progress(&id, form.progress).await.web_err(&session)?;
+    let _ = service.items().dismiss(&id).await.web_err(&session)?;
     Ok(redirect_see_other(&safe_local_redirect(form.return_to.as_deref(), "/inbox")))
 }
 

@@ -105,11 +105,14 @@ private fun extractYoutubeUriVideoId(uri: URI): String? {
 }
 
 @Composable
+@Suppress("LongParameterList")
 internal fun ReaderVideoHeroCard(
     entry: InboxEntry,
     onWatchExternal: (String) -> Unit,
     onMarkFinished: () -> Unit,
     modifier: Modifier = Modifier,
+    onUnfinish: () -> Unit = {},
+    onToggleDismiss: () -> Unit = {},
 ) {
     val externalUrl = entry.url.takeIf { it.isNotBlank() }
     Column(
@@ -122,9 +125,12 @@ internal fun ReaderVideoHeroCard(
             onWatchExternal = onWatchExternal,
         )
         VideoHeroActionRow(
+            entry = entry,
             externalUrl = externalUrl,
             onWatchExternal = onWatchExternal,
             onMarkFinished = onMarkFinished,
+            onUnfinish = onUnfinish,
+            onToggleDismiss = onToggleDismiss,
         )
     }
 }
@@ -238,11 +244,15 @@ private fun VideoHeroPlaceholderBackdrop() {
 }
 
 @OptIn(ExperimentalLayoutApi::class)
+@Suppress("LongParameterList")
 @Composable
 private fun VideoHeroActionRow(
+    entry: InboxEntry,
     externalUrl: String?,
     onWatchExternal: (String) -> Unit,
     onMarkFinished: () -> Unit,
+    onUnfinish: () -> Unit,
+    onToggleDismiss: () -> Unit,
 ) {
     FlowRow(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -256,16 +266,31 @@ private fun VideoHeroActionRow(
                 modifier = Modifier.testTag("reader_watch_video_btn"),
             )
         }
+        if (entry.isFinished) {
+            HeaderActionButton(
+                label = "Undo Finished",
+                style = RocheButtonStyle.SECONDARY,
+                onClick = onUnfinish,
+                modifier = Modifier.testTag("reader_video_unfinish_btn"),
+            )
+        } else {
+            HeaderActionButton(
+                label = "✓ Finished",
+                style =
+                    if (externalUrl == null) {
+                        RocheButtonStyle.PRIMARY
+                    } else {
+                        RocheButtonStyle.SECONDARY
+                    },
+                onClick = onMarkFinished,
+                modifier = Modifier.testTag("reader_video_finished_btn"),
+            )
+        }
         HeaderActionButton(
-            label = "✓ Finished",
-            style =
-                if (externalUrl == null) {
-                    RocheButtonStyle.PRIMARY
-                } else {
-                    RocheButtonStyle.SECONDARY
-                },
-            onClick = onMarkFinished,
-            modifier = Modifier.testTag("reader_video_finished_btn"),
+            label = if (entry.isDismissed) "Mark New" else "Dismiss",
+            style = RocheButtonStyle.SECONDARY,
+            onClick = onToggleDismiss,
+            modifier = Modifier.testTag("reader_video_dismiss_btn"),
         )
     }
 }

@@ -67,9 +67,9 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.reader.extractInboxSnippet
+import com.grayvines.roche.ui.components.DismissIcon
 import com.grayvines.roche.ui.components.DownloadTrayIcon
 import com.grayvines.roche.ui.components.EntrySourceMetadataRow
-import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.FilterFunnelIcon
 import com.grayvines.roche.ui.components.HeaderActionButton
@@ -307,7 +307,7 @@ private fun InboxHeaderSection(
     onAction: (MainAction) -> Unit,
 ) {
     val hasScopeFilter = selectedFeedId != null || selectedTag != null
-    val unarchivedCount = entries.count { !it.isArchived }
+    val unarchivedCount = entries.count { it.isNew }
     var showArchiveAllConfirm by rememberSaveable { mutableStateOf(false) }
     val title = resolveInboxHeaderTitle(state, selectedFeedId, selectedTag)
     val badgeText =
@@ -432,12 +432,12 @@ internal fun InboxHeaderActions(
     }
     if (unarchivedCount > 0) {
         RocheIconActionButton(
-            contentDescription = "Archive All",
+            contentDescription = "Dismiss All",
             outlined = false,
             onClick = onShowArchiveConfirm,
             modifier = Modifier.testTag("archive_all_btn"),
         ) {
-            FilingCabinetIcon(tint = colors.textSecondary, isArchived = false, size = 17.dp)
+            DismissIcon(tint = colors.textSecondary, isDismissed = false, size = 17.dp)
         }
     }
     RocheIconActionButton(
@@ -505,12 +505,12 @@ private fun ArchiveAllConfirmDialog(
     val colors = LocalRocheColors.current
     val noun = if (unarchivedCount == 1) "entry" else "entries"
     RocheAlertDialog(
-        title = "Archive $unarchivedCount $noun?",
+        title = "Dismiss $unarchivedCount new $noun?",
         onDismissRequest = onDismiss,
         text = {
             Text(
                 text =
-                    "This will archive all $unarchivedCount visible $noun in \"$scopeTitle\" and mark them as read.",
+                    "This clears $unarchivedCount visible new $noun in \"$scopeTitle\" from New without logging them as Finished.",
                 color = colors.textSecondary,
                 fontSize = 14.sp,
             )
@@ -520,7 +520,7 @@ private fun ArchiveAllConfirmDialog(
                 onClick = onConfirm,
                 modifier = Modifier.testTag("confirm_archive_all_btn"),
             ) {
-                Text("Archive All", color = colors.accentVerdigris)
+                Text("Dismiss All", color = colors.accentVerdigris)
             }
         },
         dismissButton = {
@@ -590,7 +590,8 @@ internal fun resolveInboxStripFilters(
             .take(2)
             .count()
     if (distinctShapes > 1) return InboxFilter.inboxStripFilters
-    val base = listOf(InboxFilter.ALL, InboxFilter.UNREAD, InboxFilter.ARCHIVED)
+    val base =
+        listOf(InboxFilter.UNREAD, InboxFilter.FINISHED, InboxFilter.ARCHIVED, InboxFilter.ALL)
     return if (state.activeFilter in base) base else base + state.activeFilter
 }
 
@@ -674,7 +675,7 @@ private fun InboxSwipeableRowWrapper(
     content: @Composable () -> Unit,
 ) {
     val dismissState = rememberSwipeToDismissBoxState()
-    LaunchedEffect(dismissState.currentValue, entry.status) {
+    LaunchedEffect(dismissState.currentValue, entry.status, entry.isFinished) {
         if (dismissState.currentValue != SwipeToDismissBoxValue.Settled) {
             dismissState.snapTo(SwipeToDismissBoxValue.Settled)
         }
@@ -688,13 +689,13 @@ private fun InboxSwipeableRowWrapper(
                 onToggleArchive()
             }
         },
-        backgroundContent = { InboxSwipeArchiveBackground(isArchived = entry.isArchived) },
+        backgroundContent = { InboxSwipeArchiveBackground(isDismissed = entry.isDismissed) },
         content = { content() },
     )
 }
 
 @Composable
-private fun InboxSwipeArchiveBackground(isArchived: Boolean) {
+private fun InboxSwipeArchiveBackground(isDismissed: Boolean) {
     val colors = LocalRocheColors.current
     Row(
         modifier =
@@ -705,12 +706,12 @@ private fun InboxSwipeArchiveBackground(isArchived: Boolean) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            text = if (isArchived) "Restore" else "Archive",
+            text = if (isDismissed) "Mark New" else "Dismiss",
             color = colors.accentVerdigris,
             fontSize = 12.5.sp,
             fontWeight = FontWeight.Medium,
         )
-        FilingCabinetIcon(tint = colors.accentVerdigris, isArchived = isArchived)
+        DismissIcon(tint = colors.accentVerdigris, isDismissed = isDismissed)
     }
 }
 
@@ -868,8 +869,9 @@ private fun buildInboxRowStateLabel(
         isQueuedNextAudio -> add("Queued next")
     }
     when {
-        entry.isArchived -> add("Archived")
-        entry.isUnread -> add("Unread")
+        entry.isFinished -> add("Finished")
+        entry.isDismissed -> add("Dismissed")
+        entry.isNew -> add("New")
     }
     if (entry.isFavorite) add("Starred")
 }
@@ -916,8 +918,8 @@ private fun EntryTrailingActionButtons(
         entry.isPlayableAudio && !entry.isCachedOffline && onDownloadOffline != null
     if (!showInlinePlay && !showAudioDownload && !showArchiveButton) return
 
-    val archiveDescription =
-        if (entry.isArchived) "Unarchive ${entry.title}" else "Archive ${entry.title}"
+    val dismissDescription =
+        if (entry.isDismissed) "Mark ${entry.title} new" else "Dismiss ${entry.title}"
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -939,14 +941,14 @@ private fun EntryTrailingActionButtons(
         }
         if (showArchiveButton) {
             RocheIconActionButton(
-                contentDescription = archiveDescription,
+                contentDescription = dismissDescription,
                 onClick = onToggleArchive,
                 outlined = false,
                 modifier = Modifier.testTag("archive_btn_${entry.id}"),
             ) {
-                FilingCabinetIcon(
+                DismissIcon(
                     tint = colors.textMuted,
-                    isArchived = entry.isArchived,
+                    isDismissed = entry.isDismissed,
                     size = 16.dp,
                 )
             }
@@ -1020,14 +1022,20 @@ private fun InboxEntryTextColumn(
 
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(3.dp)) {
         InboxEntryHeadlineRow(entry = entry, ultraDense = ultraDense)
-        val audioBadge =
-            if (entry.contentType != ContentType.AUDIO && entry.isPlayableAudio) "AUDIO" else null
+        val (trailingBadge, trailingBadgeColor) =
+            when {
+                entry.isFinished -> "✓ Finished" to colors.accentVerdigris
+                entry.isDismissed -> "✕ Dismissed" to colors.textMuted
+                entry.contentType != ContentType.AUDIO && entry.isPlayableAudio ->
+                    "AUDIO" to colors.accentBlue
+                else -> null to colors.accentBlue
+            }
         EntrySourceMetadataRow(
             entry = entry,
             trailingMetaText = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
             trailingMetaFontSize = 11.sp,
-            trailingBadge = audioBadge,
-            trailingBadgeColor = colors.accentBlue,
+            trailingBadge = trailingBadge,
+            trailingBadgeColor = trailingBadgeColor,
             showOfflineIndicator = true,
             showStarDot = showCompactStarDot && entry.isFavorite,
         )
@@ -1062,7 +1070,12 @@ private fun InboxEntryTextColumn(
 private fun InboxEntryHeadlineRow(entry: InboxEntry, ultraDense: Boolean) {
     val colors = LocalRocheColors.current
     val headlineFamily = currentHeadlineFontFamily()
-    val titleColor = if (entry.isUnread) colors.textPrimary else colors.textSecondary
+    val titleColor =
+        when {
+            entry.isNew -> colors.textPrimary
+            entry.isDismissed -> colors.textMuted
+            else -> colors.textSecondary
+        }
     val (titleSize, titleLineHeight, maxTitleLines) =
         if (ultraDense) Triple(14.sp, 19.sp, 1) else Triple(15.sp, 20.sp, 2)
 
@@ -1070,7 +1083,7 @@ private fun InboxEntryHeadlineRow(entry: InboxEntry, ultraDense: Boolean) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        if (entry.isUnread) {
+        if (entry.isNew) {
             Box(
                 modifier =
                     Modifier.size(6.dp)

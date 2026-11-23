@@ -70,8 +70,6 @@ pub(super) struct ArchiveBatchForm {
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ItemReturnForm {
     #[serde(default)]
-    pub progress: Option<f64>,
-    #[serde(default)]
     pub return_to: Option<String>,
 }
 

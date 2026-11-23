@@ -334,7 +334,7 @@ private fun FeedsSortMenuButton(
                 },
             )
             FeedSortMenuOption(
-                label = "Unread first",
+                label = "New first",
                 selected = sortOrder == FeedSortOrder.UNREAD_FIRST,
                 testTag = "feeds_sort_unread",
                 onClick = {
@@ -461,7 +461,7 @@ private fun FeedsFilterDrawer(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 FilterChipPill(
-                    label = "Show archived ($archivedCount)",
+                    label = "Show paused ($archivedCount)",
                     selected = showArchived,
                     onClick = onToggleShowArchived,
                     role = Role.Checkbox,
@@ -478,7 +478,7 @@ private fun FeedsFilterDrawer(
         }
         if (archivedCount == 0 && tags.isEmpty()) {
             Text(
-                text = "No archived feeds or tags yet.",
+                text = "No paused feeds or tags yet.",
                 color = colors.textMuted,
                 fontSize = 12.5.sp,
             )
@@ -657,7 +657,7 @@ private fun ArchivedFeedsCardSection(
     val colors = LocalRocheColors.current
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(
-            text = "ARCHIVED FEEDS (${feeds.size})",
+            text = "PAUSED FEEDS (${feeds.size})",
             color = colors.textMuted,
             fontSize = 10.5.sp,
             fontWeight = FontWeight.Medium,
@@ -699,11 +699,10 @@ private fun FeedsEmptyState(
     val archivedOnly = !hasActiveFeeds && archivedCount > 0 && !showArchived
     val emptyMessage =
         when {
-            archivedOnly ->
-                "No active feeds. Enable Show archived in Filter to view archived feeds."
+            archivedOnly -> "No active feeds. Enable Show paused in Filter to view paused feeds."
             !hasActiveFeeds && archivedCount == 0 ->
                 "No subscribed feeds yet. Tap + to subscribe to RSS, arXiv, or YouTube."
-            activeFilter == FeedListFilter.UNREAD -> "No feeds with unread items."
+            activeFilter == FeedListFilter.UNREAD -> "No feeds with new items."
             activeFilter == FeedListFilter.ERRORS -> "All active feeds are healthy."
             else -> "No matching feeds."
         }
@@ -720,7 +719,7 @@ private fun FeedsEmptyState(
         )
         if (archivedOnly) {
             HeaderActionButton(
-                label = "Show archived ($archivedCount)",
+                label = "Show paused ($archivedCount)",
                 onClick = onShowArchived,
                 modifier = Modifier.testTag("empty_show_archived_btn"),
             )
@@ -739,7 +738,7 @@ private fun ArchivedFeedRow(
     val colors = LocalRocheColors.current
     val subtitle =
         if (feed.unreadCount > 0) {
-            "${feed.displayDomain} · ${feed.unreadCount} unread"
+            "${feed.displayDomain} · ${feed.unreadCount} new"
         } else {
             feed.displayDomain
         }
@@ -763,7 +762,7 @@ private fun ArchivedFeedRow(
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
             HeaderActionButton(
-                label = "Unarchive",
+                label = "Resume",
                 onClick = onUnarchive,
                 modifier = Modifier.testTag("unarchive_feed_${feed.id}"),
             )
@@ -921,7 +920,7 @@ private fun ArchivedFeedBadge() {
                 .padding(horizontal = 5.dp, vertical = 1.dp),
     ) {
         Text(
-            text = "Archived",
+            text = "Paused",
             color = colors.textMuted,
             fontFamily = FontFamily.Monospace,
             fontSize = 9.5.sp,

@@ -138,7 +138,7 @@ class MainScreenTest {
         composeRule.onNodeWithTag("feeds_show_archived_chip").assertExists().performClick()
 
         composeRule.onNodeWithTag("archived_feed_row_feed-archived-1").assertExists()
-        composeRule.onNodeWithText("legacy.example.com · 1 unread").assertExists()
+        composeRule.onNodeWithText("legacy.example.com · 1 new").assertExists()
         composeRule.onNodeWithTag("unarchive_feed_feed-archived-1").performClick()
         org.junit.Assert.assertTrue(
             dispatched.contains(MainAction.ToggleFeedArchive("feed-archived-1"))
@@ -490,9 +490,7 @@ class MainScreenTest {
         }
 
         composeRule
-            .onNodeWithText(
-                "No active feeds. Enable Show archived in Filter to view archived feeds."
-            )
+            .onNodeWithText("No active feeds. Enable Show paused in Filter to view paused feeds.")
             .assertExists()
         composeRule.onNodeWithTag("empty_show_archived_btn").assertExists().performClick()
         composeRule.onNodeWithTag("archived_feed_row_feed-archived-only").assertExists()

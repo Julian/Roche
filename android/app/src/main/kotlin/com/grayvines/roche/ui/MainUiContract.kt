@@ -97,6 +97,8 @@ sealed interface UndoActionKind {
         val itemId: String,
         val previousStatus: ItemStatus,
         val previousReadAt: String? = null,
+        val wasFinished: Boolean = false,
+        val previousProgress: Double = 0.0,
     ) : UndoActionKind
 
     data class RestoreBatchArchive(val batchSnapshots: List<ArchiveStateSnapshot>) : UndoActionKind
@@ -132,7 +134,7 @@ data class UndoActionEvent(
 
 data class MainUiState(
     val activeTab: AppTab = AppTab.HOME,
-    val activeFilter: InboxFilter = InboxFilter.ALL,
+    val activeFilter: InboxFilter = InboxFilter.UNREAD,
     val isSearchOpen: Boolean = false,
     val searchQuery: String = "",
     val selectedTag: String? = null,
@@ -656,6 +658,8 @@ sealed interface MainAction {
         val rankImmediately: Boolean = false,
     ) : CatalogMutation
 
+    data class UnfinishFeedEntry(val entryId: String) : CatalogMutation
+
     data class SubmitQuickLog(
         val kind: EntryKind,
         val title: String,
@@ -703,7 +707,7 @@ sealed interface MainAction {
 
 internal data class TransientUiState(
     val activeTab: AppTab = AppTab.HOME,
-    val activeFilter: InboxFilter = InboxFilter.ALL,
+    val activeFilter: InboxFilter = InboxFilter.UNREAD,
     val isSearchOpen: Boolean = false,
     val searchQuery: String = "",
     val deepSearchQuery: String = "",
@@ -756,7 +760,7 @@ internal data class TransientUiState(
 @Serializable
 internal data class SavedNavigationUiState(
     val activeTab: AppTab = AppTab.HOME,
-    val activeFilter: InboxFilter = InboxFilter.ALL,
+    val activeFilter: InboxFilter = InboxFilter.UNREAD,
     val isSearchOpen: Boolean = false,
     val searchQuery: String = "",
     val selectedTag: String? = null,

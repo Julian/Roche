@@ -64,6 +64,7 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                 performAddCatalogEntryToList(action.collectionId, action.entryId)
             is MainAction.MarkFeedEntryFinished ->
                 performMarkFeedEntryFinished(action.entryId, action.rankImmediately)
+            is MainAction.UnfinishFeedEntry -> performUnfinishFeedEntry(action.entryId)
             is MainAction.SubmitQuickLog -> performSubmitQuickLog(action)
             is MainAction.CreateCustomCatalogList -> performCreateCustomList(action.title)
             is MainAction.CompleteWantEntry ->
@@ -270,6 +271,16 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
             }
         } else {
             host.showStatusMessage("Marked finished & logged to Diary")
+        }
+    }
+
+    private suspend fun performUnfinishFeedEntry(entryId: String) {
+        val updated = host.repository.unfinishFeedItem(entryId)
+        host.updateTransient { it.copy(contextSheetEntryId = null) }
+        if (updated) {
+            host.showStatusMessage("Undid Finished · Marked new")
+        } else {
+            host.showStatusMessage("Entry not found")
         }
     }
 

@@ -129,23 +129,46 @@ impl ItemRepo<'_> {
             qb.push(IS_LIVE_ITEM_SQL);
         }
 
-        if let Some(s) = filter.status.and_then(ItemStatusFilter::into_status) {
-            if filter.inbox_only == Some(true) {
-                qb.push(" AND es.inbox_state = ").push_bind(InboxState::from(s));
-            } else {
-                match s {
-                    ItemStatus::Unread => {
-                        qb.push(
-                            " AND (es.inbox_state = 'unread' OR (COALESCE(es.inbox_state, 'none') = 'none' AND (es.read_at IS NULL OR ce_wtr.entry_id IS NOT NULL)))",
-                        );
-                    }
-                    ItemStatus::Archived => {
-                        qb.push(
-                            " AND (es.inbox_state = 'dismissed' OR (COALESCE(es.inbox_state, 'none') = 'none' AND es.read_at IS NOT NULL AND ce_wtr.entry_id IS NULL))",
-                        );
-                    }
+        match filter.status {
+            Some(ItemStatusFilter::Unread) => {
+                if filter.inbox_only == Some(true) {
+                    qb.push(" AND es.inbox_state = 'unread'");
+                } else {
+                    qb.push(
+                        " AND (es.inbox_state = 'unread' OR (COALESCE(es.inbox_state, 'none') = 'none' AND (es.read_at IS NULL OR ce_wtr.entry_id IS NOT NULL)))",
+                    );
+                }
+                qb.push(
+                    " AND NOT EXISTS (SELECT 1 FROM consumption_log cl_f WHERE cl_f.entry_id = i.id AND cl_f.status = 'consumed')",
+                );
+            }
+            Some(ItemStatusFilter::Finished) => {
+                qb.push(
+                    " AND EXISTS (SELECT 1 FROM consumption_log cl_f WHERE cl_f.entry_id = i.id AND cl_f.status = 'consumed')",
+                );
+            }
+            Some(ItemStatusFilter::Dismissed) => {
+                if filter.inbox_only == Some(true) {
+                    qb.push(" AND es.inbox_state = 'dismissed'");
+                } else {
+                    qb.push(
+                        " AND (es.inbox_state = 'dismissed' OR (COALESCE(es.inbox_state, 'none') = 'none' AND es.read_at IS NOT NULL AND ce_wtr.entry_id IS NULL))",
+                    );
+                }
+                qb.push(
+                    " AND NOT EXISTS (SELECT 1 FROM consumption_log cl_f WHERE cl_f.entry_id = i.id AND cl_f.status = 'consumed')",
+                );
+            }
+            Some(ItemStatusFilter::Archived) => {
+                if filter.inbox_only == Some(true) {
+                    qb.push(" AND es.inbox_state = 'dismissed'");
+                } else {
+                    qb.push(
+                        " AND (es.inbox_state = 'dismissed' OR (COALESCE(es.inbox_state, 'none') = 'none' AND es.read_at IS NOT NULL AND ce_wtr.entry_id IS NULL))",
+                    );
                 }
             }
+            Some(ItemStatusFilter::All) | None => {}
         }
         if let Some(is_read) = filter.is_read {
             if is_read {
@@ -286,21 +309,37 @@ impl ItemRepo<'_> {
 
     pub async fn count_by_status(&self, status: ItemStatus) -> Result<i64> {
         let inbox_state = InboxState::from(status);
-        Ok(sqlx::query_scalar(
-            "SELECT COUNT(*)
-             FROM entry_state es
-             JOIN entries e ON e.id = es.entry_id
-             WHERE e.merged_into_id IS NULL
-               AND es.inbox_state = ?
-               AND EXISTS (
-                   SELECT 1 FROM collection_entries ce_f
-                   JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
-                   WHERE ce_f.entry_id = e.id
-               )",
-        )
-        .bind(inbox_state)
-        .fetch_one(self.pool)
-        .await?)
+        let sql = match status {
+            ItemStatus::Unread => {
+                "SELECT COUNT(*)
+                 FROM entry_state es
+                 JOIN entries e ON e.id = es.entry_id
+                 WHERE e.merged_into_id IS NULL
+                   AND es.inbox_state = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM consumption_log cl_f
+                       WHERE cl_f.entry_id = e.id AND cl_f.status = 'consumed'
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM collection_entries ce_f
+                       JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
+                       WHERE ce_f.entry_id = e.id
+                   )"
+            }
+            ItemStatus::Archived => {
+                "SELECT COUNT(*)
+                 FROM entry_state es
+                 JOIN entries e ON e.id = es.entry_id
+                 WHERE e.merged_into_id IS NULL
+                   AND es.inbox_state = ?
+                   AND EXISTS (
+                       SELECT 1 FROM collection_entries ce_f
+                       JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
+                       WHERE ce_f.entry_id = e.id
+                   )"
+            }
+        };
+        Ok(sqlx::query_scalar(sql).bind(inbox_state).fetch_one(self.pool).await?)
     }
 
     pub async fn count_unread(&self) -> Result<i64> {

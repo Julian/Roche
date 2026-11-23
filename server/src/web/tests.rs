@@ -482,6 +482,7 @@ async fn test_web_collection_generator_finish_rank_and_abandon_flows() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_web_feed_completion_auto_logging_podcast_and_article() {
     let (db, app) = setup_web_app(Config::default()).await;
     let (cookie, csrf) = login_browser(&db, &app).await;
@@ -552,21 +553,34 @@ async fn test_web_feed_completion_auto_logging_podcast_and_article() {
         .await
         .unwrap();
 
+    // Scrolling an article to >= 0.98 auto-Finishes it (logs consumed + clears from New)
     assert_eq!(
         post_form(
             &app,
-            &format!("/web/items/{}/archive", read_article.id),
+            &format!("/web/items/{}/progress", read_article.id),
             &cookie,
-            &[("_csrf", &csrf), ("progress", "0.95")],
+            &[("_csrf", &csrf), ("progress", "0.99"), ("source", "reader")],
         )
         .await
         .status(),
-        StatusCode::SEE_OTHER
+        StatusCode::NO_CONTENT
+    );
+    // Dismissing an article NEVER logs consumed, even if progress had previously reached 0.95
+    assert_eq!(
+        post_form(
+            &app,
+            &format!("/web/items/{}/progress", unread_article.id),
+            &cookie,
+            &[("_csrf", &csrf), ("progress", "0.95"), ("source", "reader")],
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
     );
     assert_eq!(
         post_form(
             &app,
-            &format!("/web/items/{}/archive", unread_article.id),
+            &format!("/web/items/{}/dismiss", unread_article.id),
             &cookie,
             &[("_csrf", &csrf)],
         )
@@ -581,6 +595,32 @@ async fn test_web_feed_completion_auto_logging_podcast_and_article() {
     );
     assert!(diary.iter().any(|d| d.entry.id == read_article.id));
     assert!(!diary.iter().any(|d| d.entry.id == unread_article.id));
+
+    // Verify 3-state Inbox filter partitioning: New / Finished / Dismissed / All
+    let new_html = read_body_html(get_authed(&app, "/inbox?status=new", &cookie).await).await;
+    assert!(!new_html.contains("Episode 1: Storage Engines"));
+    let fin_html = read_body_html(get_authed(&app, "/inbox?status=finished", &cookie).await).await;
+    assert!(fin_html.contains("Episode 1: Storage Engines"));
+    assert!(fin_html.contains("badge-finished"));
+
+    // Dismissing a Finished item deletes its consumed log and moves it to Dismissed
+    assert_eq!(
+        post_form(
+            &app,
+            &format!("/web/items/{}/dismiss", ep_item.id),
+            &cookie,
+            &[("_csrf", &csrf)],
+        )
+        .await
+        .status(),
+        StatusCode::SEE_OTHER
+    );
+    let diary_after_dismiss = db.catalog().list_diary(None, None, 20).await.unwrap();
+    assert!(!diary_after_dismiss.iter().any(|d| d.entry.id == ep_item.id));
+    let dismissed_html =
+        read_body_html(get_authed(&app, "/inbox?status=dismissed", &cookie).await).await;
+    assert!(dismissed_html.contains("Episode 1: Storage Engines"));
+    assert!(dismissed_html.contains("badge-dismissed"));
 }
 
 #[tokio::test]
@@ -1983,7 +2023,7 @@ async fn test_web_filters_labels_and_destructive_confirmations() {
     assert!(inbox_html.contains(">PDF</span>"));
     assert!(inbox_html.contains("aria-label=\"Filter stream\""));
     assert!(inbox_html.contains("aria-pressed=\"false\""));
-    assert!(inbox_html.contains("data-confirm=\"Archive all "));
+    assert!(inbox_html.contains("data-confirm=\"Dismiss all "));
 
     let filtered_inbox = read_body_html(
         get_authed(&app, &format!("/inbox?feed={}&kind=article", feed.id), &cookie).await,
@@ -2548,16 +2588,22 @@ async fn test_round2_web_ux_panels_pills_and_roche_js_guards() {
     assert!(!bogus_kind_html.contains("active-filters"));
     assert!(!bogus_kind_html.contains("Kind: bogus"));
     assert!(!bogus_kind_html.contains("name=\"kind\" value=\"bogus\""));
-    assert!(bogus_kind_html.contains("Archive All Unread"));
+    assert!(bogus_kind_html.contains("Dismiss All New"));
 
     // 3. Active filter pills on `/inbox` and `/diary` carry `aria-current="true"`
     let valid_kind_html =
         read_body_html(get_authed(&app, "/inbox?kind=article", &cookie).await).await;
     assert!(valid_kind_html.contains(
-        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/inbox?status=unread&amp;kind=article\">Unread</a>"
+        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/inbox?status=new&amp;kind=article\">New</a>"
     ));
     assert!(valid_kind_html.contains(
-        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/inbox?status=unread\">Articles</a>"
+        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/inbox?status=new\">Articles</a>"
+    ));
+    assert!(valid_kind_html.contains(
+        "<a class=\"pill\" href=\"/inbox?status=finished&amp;kind=article\">Finished</a>"
+    ));
+    assert!(valid_kind_html.contains(
+        "<a class=\"pill\" href=\"/inbox?status=dismissed&amp;kind=article\">Dismissed</a>"
     ));
     assert!(
         valid_kind_html
@@ -3117,7 +3163,7 @@ async fn test_web_inbox_and_reader_regressions() {
     .await;
     assert!(inbox_html.contains(r#"<html lang="en" data-theme="dark">"#));
     assert!(inbox_html.contains("kind=pdf"));
-    assert!(inbox_html.contains(&format!("status=unread&amp;feed={}", feed.id)));
+    assert!(inbox_html.contains(&format!("status=new&amp;feed={}", feed.id)));
     assert!(inbox_html.contains(&format!("/inbox?status=all&amp;tag={}", tag.id)));
 
     let pdf_inbox_html =
@@ -4165,8 +4211,9 @@ async fn test_web_audio_podcast_decoupling_filters_feed_toggle_and_progress_sour
     assert!(narrated_reader.contains("data-has-audio=\"1\""));
     assert!(narrated_reader.contains("js-play-audio"));
 
-    // 5. Progress source guard on narrated article:
-    //    Reader scroll to 1.0 while unread must NOT auto-log; Audio playback at 0.99 DOES auto-log as Article!
+    // 5. Progress source on narrated article vs podcast episode:
+    //    Reader scroll to 1.0 on narrated article auto-Finishes as Article;
+    //    Dismissing removes Finished; Audio playback at 0.99 also auto-Finishes as Article!
     let reader_prog = post_form(
         &app,
         &format!("/web/items/{}/progress", narrated.id),
@@ -4177,8 +4224,23 @@ async fn test_web_audio_podcast_decoupling_filters_feed_toggle_and_progress_sour
     assert_eq!(reader_prog.status(), StatusCode::NO_CONTENT);
     let detail_after_scroll = db.catalog().get_entry_detail(&narrated.id).await.unwrap().unwrap();
     assert!(
-        detail_after_scroll.log_history.is_empty(),
-        "passive reader scroll on unread narrated article must not auto-log consumed"
+        detail_after_scroll.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed),
+        "reader scroll >= 98% on narrated article must auto-Finish under Article kind"
+    );
+    assert_eq!(
+        post_form(
+            &app,
+            &format!("/web/items/{}/dismiss", narrated.id),
+            &cookie,
+            &[("_csrf", &csrf)]
+        )
+        .await
+        .status(),
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(
+        db.catalog().get_entry_detail(&narrated.id).await.unwrap().unwrap().log_history.len(),
+        0
     );
 
     let audio_prog = post_form(

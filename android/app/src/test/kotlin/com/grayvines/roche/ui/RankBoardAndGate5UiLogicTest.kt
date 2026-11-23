@@ -315,22 +315,21 @@ class RankBoardAndGate5UiLogicTest {
     }
 
     @Test
-    fun `ToggleArchive flushes liveReadProgress sequentially before archiving`() = runTest {
+    fun `ToggleArchive dismisses entry without flushing progress or logging Finished`() = runTest {
         database.dao().upsertItem(sampleItem("i-flush", "Reader Article"))
         val collectJob = collectInBackground(viewModel.uiState)
         val loaded = viewModel.uiState.first { it.allEntries.any { e -> e.id == "i-flush" } }
         val target = loaded.allEntries.first { it.id == "i-flush" }
 
-        viewModel.dispatch(MainAction.ToggleArchive(entry = target, liveReadProgress = 0.82))
-        val archived =
+        viewModel.dispatch(MainAction.ToggleArchive(entry = target, liveReadProgress = 0.99))
+        val dismissed =
             viewModel.uiState.first { state ->
-                state.allEntries.first { it.id == "i-flush" }.isArchived
+                state.allEntries.first { it.id == "i-flush" }.isDismissed
             }
-        assertEquals(
-            0.82,
-            archived.allEntries.first { it.id == "i-flush" }.readProgress,
-            1e-6,
-        )
+        val entry = dismissed.allEntries.first { it.id == "i-flush" }
+        assertTrue(entry.isDismissed)
+        assertFalse(entry.isFinished)
+        assertEquals(0.0, entry.readProgress, 1e-6)
         collectJob.cancel()
     }
 

@@ -26,7 +26,9 @@ import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.attachEntryIdentifiers
+import com.grayvines.roche.data.catalog.deleteConsumedLogsInDao
 import com.grayvines.roche.data.catalog.hasYoutubeAlbumBrowseId
+import com.grayvines.roche.data.catalog.logFeedItemConsumedInDao
 import com.grayvines.roche.data.enrichment.AlbumStreamingResolver
 import com.grayvines.roche.data.enrichment.withResolvedStreamingIds
 import com.grayvines.roche.data.feeds.LocalFeedPoller
@@ -138,6 +140,8 @@ data class ArchiveStateSnapshot(
     val itemId: String,
     val previousStatus: ItemStatus,
     val previousReadAt: String?,
+    val wasFinished: Boolean = false,
+    val previousProgress: Double = 0.0,
 )
 
 data class ReaderItemContent(
@@ -394,15 +398,19 @@ class RocheRepository(
         dao.executeInTransaction {
             val current = dao.getItemStateById(itemId)
             if (current != null) {
-                val transition = buildArchiveTransition(current, archived)
+                val nowIso = nowUtcIso()
+                val nodeId = currentLocalPeerId()
+                val deletedLogs = deleteConsumedLogsInDao(dao, itemId, nowIso, nodeId)
+                val wasFinished = current.isFinished || deletedLogs > 0
+                val transition = buildArchiveTransition(current, archived, wasFinished)
                 dao.setItemStatusAndReadAt(
                     itemId,
                     transition.newStatus.wireValue,
                     transition.newReadAt,
-                    currentLocalPeerId(),
+                    nodeId,
                 )
-                if (archived) {
-                    maybeAutoLogFeedItemCompletion(itemId)
+                if (wasFinished) {
+                    dao.setItemReadProgress(itemId, MIN_READ_PROGRESS, null, nodeId)
                 }
                 result = transition.snapshot to transition.shouldEvictAudio
             }
@@ -420,24 +428,26 @@ class RocheRepository(
     private fun buildArchiveTransition(
         current: com.grayvines.roche.data.local.ItemStateRow,
         archived: Boolean,
+        wasFinished: Boolean,
     ): ArchiveTransition {
         val snapshot =
             ArchiveStateSnapshot(
                 itemId = current.id,
                 previousStatus = ItemStatus.fromWireValue(current.status),
                 previousReadAt = current.readAt,
+                wasFinished = wasFinished,
+                previousProgress = current.readProgress,
             )
         val newStatus = if (archived) ItemStatus.ARCHIVED else ItemStatus.UNREAD
         val isAudioItem =
             current.contentType.equals(AUDIO_CONTENT_TYPE, ignoreCase = true) ||
                 !current.audioUrl.isNullOrBlank()
+        val isNonFeed = current.inboxState.equals("none", ignoreCase = true)
         val newReadAt =
-            if (!archived) {
-                null
-            } else if (isAudioItem) {
-                nowUtcIso()
-            } else {
+            if (archived && isNonFeed) {
                 current.readAt?.takeIf { it.isNotBlank() } ?: nowUtcIso()
+            } else {
+                null
             }
         return ArchiveTransition(
             snapshot = snapshot,
@@ -451,8 +461,18 @@ class RocheRepository(
         itemId: String,
         status: ItemStatus,
         readAt: String? = null,
+        wasFinished: Boolean = false,
+        previousProgress: Double = 0.0,
     ) {
-        val updated = itemMutationMutex.withLock { restoreStatusLocked(itemId, status, readAt) }
+        val updated = itemMutationMutex.withLock {
+            restoreStatusLocked(
+                itemId = itemId,
+                status = status,
+                readAt = readAt,
+                wasFinished = wasFinished,
+                previousProgress = previousProgress,
+            )
+        }
         if (updated) {
             triggerBackgroundSync()
         }
@@ -467,6 +487,8 @@ class RocheRepository(
                         itemId = snapshot.itemId,
                         status = snapshot.previousStatus,
                         readAt = snapshot.previousReadAt,
+                        wasFinished = snapshot.wasFinished,
+                        previousProgress = snapshot.previousProgress,
                     )
                 ) {
                     anyUpdated = true
@@ -482,18 +504,36 @@ class RocheRepository(
         itemId: String,
         status: ItemStatus,
         readAt: String?,
+        wasFinished: Boolean,
+        previousProgress: Double,
     ): Boolean {
-        val current = dao.getItemStateById(itemId) ?: return false
-        val targetReadAt =
-            if (status == ItemStatus.ARCHIVED) {
-                readAt?.takeIf { it.isNotBlank() }
-                    ?: current.readAt?.takeIf { it.isNotBlank() }
-                    ?: nowUtcIso()
-            } else {
-                readAt?.takeIf { it.isNotBlank() }
+        var restored = false
+        dao.executeInTransaction {
+            val current = dao.getItemStateById(itemId)
+            if (current != null) {
+                val nowIso = nowUtcIso()
+                val nodeId = currentLocalPeerId()
+                val isNonFeed = current.inboxState.equals("none", ignoreCase = true)
+                val targetReadAt =
+                    if (status == ItemStatus.ARCHIVED && (wasFinished || isNonFeed)) {
+                        readAt?.takeIf { it.isNotBlank() } ?: nowIso
+                    } else {
+                        readAt?.takeIf { it.isNotBlank() }
+                    }
+                dao.setItemStatusAndReadAt(itemId, status.wireValue, targetReadAt, nodeId)
+                if (wasFinished) {
+                    logFeedItemConsumedInDao(dao, itemId, nowIso, nodeId)
+                    dao.setItemReadProgress(
+                        itemId,
+                        previousProgress.coerceIn(MIN_READ_PROGRESS, MAX_READ_PROGRESS),
+                        null,
+                        nodeId,
+                    )
+                }
+                restored = true
             }
-        dao.setItemStatusAndReadAt(itemId, status.wireValue, targetReadAt, currentLocalPeerId())
-        return true
+        }
+        return restored
     }
 
     suspend fun setReadState(itemId: String, isRead: Boolean) {
@@ -607,33 +647,9 @@ class RocheRepository(
             if (unarchivedItems.isEmpty()) {
                 emptyList()
             } else {
-                val nowIso = nowUtcIso()
-                val nodeId = currentLocalPeerId()
-                val batchSnapshots = unarchivedItems.map { item ->
-                    val isAudio =
-                        item.contentType.equals(AUDIO_CONTENT_TYPE, ignoreCase = true) ||
-                            !item.audioUrl.isNullOrBlank()
-                    if (item.isCachedOffline && isAudio) {
-                        audioIdsToEvict.add(item.id)
-                    }
-                    ArchiveStateSnapshot(
-                        itemId = item.id,
-                        previousStatus = ItemStatus.fromWireValue(item.status),
-                        previousReadAt = item.readAt,
-                    )
+                collectBatchDismissSnapshots(unarchivedItems, audioIdsToEvict).also {
+                    commitBatchDismissInDao(unarchivedItems, nowUtcIso(), currentLocalPeerId())
                 }
-                dao.executeInTransaction {
-                    for (item in unarchivedItems) {
-                        val nextReadAt = item.readAt?.takeIf { it.isNotBlank() } ?: nowIso
-                        dao.setItemStatusAndReadAt(
-                            item.id,
-                            ItemStatus.ARCHIVED.wireValue,
-                            nextReadAt,
-                            nodeId,
-                        )
-                    }
-                }
-                batchSnapshots
             }
         }
         if (snapshots.isEmpty()) return emptyList()
@@ -642,6 +658,49 @@ class RocheRepository(
         }
         triggerBackgroundSync()
         return snapshots
+    }
+
+    private fun collectBatchDismissSnapshots(
+        items: List<com.grayvines.roche.data.local.ItemStateRow>,
+        audioIdsToEvict: MutableList<String>,
+    ): List<ArchiveStateSnapshot> = items.map { item ->
+        val isAudio =
+            item.contentType.equals(AUDIO_CONTENT_TYPE, ignoreCase = true) ||
+                !item.audioUrl.isNullOrBlank()
+        if (item.isCachedOffline && isAudio) {
+            audioIdsToEvict.add(item.id)
+        }
+        ArchiveStateSnapshot(
+            itemId = item.id,
+            previousStatus = ItemStatus.fromWireValue(item.status),
+            previousReadAt = item.readAt,
+            wasFinished = item.isFinished,
+            previousProgress = item.readProgress,
+        )
+    }
+
+    private suspend fun commitBatchDismissInDao(
+        items: List<com.grayvines.roche.data.local.ItemStateRow>,
+        nowIso: String,
+        nodeId: String,
+    ) {
+        dao.executeInTransaction {
+            for (item in items) {
+                val isNonFeed = item.inboxState.equals("none", ignoreCase = true)
+                val nextReadAt =
+                    if (isNonFeed) {
+                        item.readAt?.takeIf { it.isNotBlank() } ?: nowIso
+                    } else {
+                        null
+                    }
+                dao.setItemStatusAndReadAt(
+                    item.id,
+                    ItemStatus.ARCHIVED.wireValue,
+                    nextReadAt,
+                    nodeId,
+                )
+            }
+        }
     }
 
     suspend fun setFeedAutoDownload(feedId: String, enabled: Boolean) {
@@ -729,7 +788,7 @@ class RocheRepository(
                 val clamped = progress.coerceIn(MIN_READ_PROGRESS, MAX_READ_PROGRESS)
                 val explicitReadAt = if (recordPlayedTimestamp) nowUtcIso() else null
                 dao.setItemReadProgress(itemId, clamped, explicitReadAt, currentLocalPeerId())
-                maybeAutoLogFeedItemCompletion(itemId, fromAudioPlayback = fromAudioPlayback)
+                maybeAutoFinishFromProgress(itemId, clamped, fromAudioPlayback)
                 true
             }
         }
@@ -1922,26 +1981,50 @@ class RocheRepository(
 
     internal suspend fun markFeedItemFinished(itemId: String): String? {
         var evictAudioCache = false
-        var archivedNow = false
         val result =
             itemMutationMutex.withLock {
-                dao.getItemById(itemId)?.let { item ->
-                    if (ItemStatus.fromWireValue(item.status) != ItemStatus.ARCHIVED) {
-                        val (snap, shouldEvict) =
-                            archiveWithSnapshotLocked(itemId = itemId, archived = true)
-                        archivedNow = snap != null
-                        evictAudioCache = shouldEvict
-                    }
+                dao.getItemStateById(itemId)?.let { state ->
+                    val isAudioItem =
+                        state.contentType.equals(AUDIO_CONTENT_TYPE, ignoreCase = true) ||
+                            !state.audioUrl.isNullOrBlank()
+                    evictAudioCache = state.isCachedOffline && isAudioItem
+                    val finishTs = state.readAt?.takeIf { it.isNotBlank() } ?: nowUtcIso()
+                    dao.setItemStatusAndReadAt(
+                        itemId,
+                        ItemStatus.ARCHIVED.wireValue,
+                        finishTs,
+                        currentLocalPeerId(),
+                    )
                     catalog.logFeedItemCompletion(itemId)
                 }
             } ?: return null
         if (evictAudioCache) {
             offlineCacheManager.setOfflineCacheState(itemId = itemId, enabled = false)
         }
-        if (archivedNow) {
+        triggerBackgroundSync()
+        return result
+    }
+
+    internal suspend fun unfinishFeedItem(itemId: String): Boolean {
+        val updated = itemMutationMutex.withLock {
+            var didUpdate = false
+            dao.executeInTransaction {
+                val state = dao.getItemStateById(itemId)
+                if (state != null) {
+                    val nowIso = nowUtcIso()
+                    val nodeId = currentLocalPeerId()
+                    deleteConsumedLogsInDao(dao, itemId, nowIso, nodeId)
+                    dao.setItemStatusAndReadAt(itemId, ItemStatus.UNREAD.wireValue, null, nodeId)
+                    dao.setItemReadProgress(itemId, MIN_READ_PROGRESS, null, nodeId)
+                    didUpdate = true
+                }
+            }
+            didUpdate
+        }
+        if (updated) {
             triggerBackgroundSync()
         }
-        return result
+        return updated
     }
 
     internal suspend fun prepareFeedItemForRank(itemId: String): Pair<String, EntryKind>? {
@@ -1953,33 +2036,39 @@ class RocheRepository(
         return resolvedId to kind
     }
 
-    private suspend fun maybeAutoLogFeedItemCompletion(
+    private suspend fun maybeAutoFinishFromProgress(
         itemId: String,
+        progress: Double,
         fromAudioPlayback: Boolean? = null,
     ) {
+        if (progress < AUTO_FINISH_PROGRESS_THRESHOLD) return
         val state = dao.getItemStateById(itemId) ?: return
+        if (!shouldAutoFinishState(state, fromAudioPlayback)) return
+        val finishTs = state.readAt?.takeIf { it.isNotBlank() } ?: nowUtcIso()
+        dao.setItemStatusAndReadAt(
+            itemId,
+            ItemStatus.ARCHIVED.wireValue,
+            finishTs,
+            currentLocalPeerId(),
+        )
+        catalog.logItemCompletionIfUnlogged(itemId)
+    }
+
+    private fun shouldAutoFinishState(
+        state: com.grayvines.roche.data.local.ItemStateRow,
+        fromAudioPlayback: Boolean?,
+    ): Boolean {
         val isPodcastOrAudioOnly =
             state.entryKind.equals(ENTRY_KIND_PODCAST_EPISODE, ignoreCase = true) ||
                 state.contentType.equals(AUDIO_CONTENT_TYPE, ignoreCase = true)
         val hasAudio = isPodcastOrAudioOnly || !state.audioUrl.isNullOrBlank()
         val isVideo = !hasAudio && state.contentType.equals("video", ignoreCase = true)
-        if (isVideo) return
-        val isArchived = ItemStatus.fromWireValue(state.status) == ItemStatus.ARCHIVED
-        val allowAudioAutoComplete =
-            when (fromAudioPlayback) {
-                false -> false
-                true -> hasAudio
-                null -> isPodcastOrAudioOnly
-            }
-        val shouldLog =
-            if (allowAudioAutoComplete) {
-                state.readProgress >= AUDIO_COMPLETE_PROGRESS_THRESHOLD ||
-                    isArchived && state.readProgress >= ARCHIVE_COMPLETE_PROGRESS_THRESHOLD
-            } else {
-                isArchived && state.readProgress >= ARCHIVE_COMPLETE_PROGRESS_THRESHOLD
-            }
-        if (!shouldLog) return
-        catalog.logItemCompletionIfUnlogged(itemId)
+        return when {
+            isVideo -> false
+            fromAudioPlayback == true -> hasAudio
+            fromAudioPlayback == false -> !isPodcastOrAudioOnly
+            else -> true
+        }
     }
 
     companion object {
@@ -2012,8 +2101,7 @@ private const val HTTP_FORBIDDEN = 403
 private const val AUDIO_CONTENT_TYPE = "audio"
 private const val MIN_READ_PROGRESS = 0.0
 private const val MAX_READ_PROGRESS = 1.0
-private const val ARCHIVE_COMPLETE_PROGRESS_THRESHOLD = 0.9
-private const val AUDIO_COMPLETE_PROGRESS_THRESHOLD = 0.98
+private const val AUTO_FINISH_PROGRESS_THRESHOLD = 0.98
 
 internal fun isAuthFailure(error: Throwable): Boolean =
     when (error) {
@@ -2039,9 +2127,7 @@ internal suspend fun resolveArchiveBatchTargetIds(
     if (entryIds.isNotEmpty()) return entryIds.toSet()
     if (!feedId.isNullOrBlank()) return dao.getUnarchivedItemIdsForFeed(feedId).toSet()
     if (allUnread) {
-        return dao.getUnarchivedItemStates()
-            .filter { it.readAt.isNullOrBlank() }
-            .mapTo(HashSet()) { it.id }
+        return dao.getUnarchivedItemStates().mapTo(HashSet()) { it.id }
     }
     return emptySet()
 }

@@ -208,6 +208,7 @@ internal data class InboxInputStamp(
     val entriesStamp: Long,
     val specsStamp: Long,
     val membersStamp: Long,
+    val logsStamp: Long,
     val statesStamp: Long,
     val contentsStamp: Long,
     val feedsStamp: Long,
@@ -244,6 +245,7 @@ internal data class InboxProjectionContext(
     val statesById: Map<String, EntryStateEntity>,
     val contentPreviewsById: Map<String, EntryContentPreviewRow>,
     val membershipsByEntry: Map<String, List<CollectionEntryEntity>>,
+    val consumedEntryIds: Set<String> = emptySet(),
 )
 
 internal fun RepositoryStampRow.toInboxInputStamp(): InboxInputStamp =
@@ -251,6 +253,7 @@ internal fun RepositoryStampRow.toInboxInputStamp(): InboxInputStamp =
         entriesStamp = entriesStamp,
         specsStamp = specsStamp,
         membersStamp = membersStamp,
+        logsStamp = logsStamp,
         statesStamp = statesStamp,
         contentsStamp = contentsStamp,
         feedsStamp = feedsStamp,
@@ -271,6 +274,11 @@ internal fun projectInboxTables(
         catalogTables.memberships
             .sortedWith(compareBy<CollectionEntryEntity> { it.addedAt }.thenBy { it.collectionId })
             .groupBy { it.entryId }
+    val consumedEntryIds =
+        catalogTables.logs
+            .asSequence()
+            .filter { it.status.equals(STATUS_CONSUMED, ignoreCase = true) }
+            .mapTo(HashSet()) { it.entryId }
     val ctx =
         InboxProjectionContext(
             allEntriesById = allEntriesById,
@@ -279,6 +287,7 @@ internal fun projectInboxTables(
             statesById = statesById,
             contentPreviewsById = contentPreviewsById,
             membershipsByEntry = membershipsByEntry,
+            consumedEntryIds = consumedEntryIds,
         )
     val tags = projectTagRows(catalogTables.specs, activeEntriesById)
     val activeTagIds = tags.mapTo(HashSet(tags.size)) { it.id }
@@ -420,6 +429,7 @@ internal fun buildProjectedInboxItem(
         audioUrl = content?.audioUrl,
         inboxState = inboxState,
         entryKind = entry.kind,
+        isFinished = entry.id in ctx.consumedEntryIds,
     )
 }
 
@@ -487,6 +497,7 @@ private const val STATE_UNREAD = "unread"
 private const val INBOX_STATE_DISMISSED = "dismissed"
 private const val INBOX_STATE_DELETED = "deleted"
 private const val STATUS_ARCHIVED = "archived"
+private const val STATUS_CONSUMED = "consumed"
 private const val FALLBACK_FEED_TITLE = "Saved Link"
 private const val KIND_ARTICLE = "article"
 private const val KIND_PAPER = "paper"

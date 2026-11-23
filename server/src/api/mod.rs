@@ -101,12 +101,15 @@ impl ApiRoutes {
                 .route("/api/v1/items", get(items::items_list))
                 .route("/api/v1/items/save", post(items::items_save))
                 .route("/api/v1/items/archive-batch", post(items::items_archive_batch))
+                .route("/api/v1/items/dismiss-batch", post(items::items_archive_batch))
                 .route(
                     "/api/v1/items/{id}",
                     get(items::items_get).patch(items::items_update).delete(items::items_delete),
                 )
                 .route("/api/v1/items/{id}/archive", post(items::items_archive))
+                .route("/api/v1/items/{id}/dismiss", post(items::items_archive))
                 .route("/api/v1/items/{id}/unarchive", post(items::items_unarchive))
+                .route("/api/v1/items/{id}/mark-new", post(items::items_unarchive))
                 .route("/api/v1/items/{id}/tags", post(items::items_add_tag))
                 .route("/api/v1/items/{id}/tags/{tag_id}", delete(items::items_remove_tag))
                 .route("/api/v1/items/{id}/media", get(items::items_media_list))

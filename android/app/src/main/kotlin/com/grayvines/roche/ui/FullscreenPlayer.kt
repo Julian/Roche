@@ -375,10 +375,10 @@ fun FullscreenPodcastPlayer(
         )
     } else if (pendingDownloadConfirm == CONFIRM_ARCHIVE_DOWNLOAD) {
         PlayerConfirmDownloadDialog(
-            title = "Archive & delete download?",
+            title = "Dismiss & delete download?",
             body =
-                "Archive \"${entry.title}\" and delete its downloaded audio file from this device?",
-            confirmLabel = "Archive & Delete",
+                "Dismiss \"${entry.title}\" and delete its downloaded audio file from this device?",
+            confirmLabel = "Dismiss & Delete",
             confirmTestTag = "player_confirm_archive_delete_btn",
             onDismiss = { pendingDownloadConfirm = null },
             onConfirm = {
@@ -631,19 +631,42 @@ private fun PlayerOverflowMenuButton(
                     },
                 )
             }
-            DropdownMenuItem(
-                text = { Text("Finish & Rank Episode") },
-                onClick = {
-                    showOverflowMenu = false
-                    onAction(MainAction.CloseFullscreenPlayer)
-                    onAction(
-                        MainAction.MarkFeedEntryFinished(
-                            entryId = entry.id,
-                            rankImmediately = true,
+            if (entry.isFinished) {
+                DropdownMenuItem(
+                    text = { Text("Undo Finished") },
+                    onClick = {
+                        showOverflowMenu = false
+                        onAction(MainAction.UnfinishFeedEntry(entry.id))
+                    },
+                )
+            } else {
+                DropdownMenuItem(
+                    text = { Text("✓ Mark Finished", color = colors.accentVerdigris) },
+                    onClick = {
+                        showOverflowMenu = false
+                        onAction(MainAction.CloseFullscreenPlayer)
+                        onAction(
+                            MainAction.MarkFeedEntryFinished(
+                                entryId = entry.id,
+                                rankImmediately = false,
+                            )
                         )
-                    )
-                },
-            )
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text("Finish & Rank Episode") },
+                    onClick = {
+                        showOverflowMenu = false
+                        onAction(MainAction.CloseFullscreenPlayer)
+                        onAction(
+                            MainAction.MarkFeedEntryFinished(
+                                entryId = entry.id,
+                                rankImmediately = true,
+                            )
+                        )
+                    },
+                )
+            }
             DropdownMenuItem(
                 text = { Text("Visit Episode Website ↗") },
                 onClick = {
@@ -683,12 +706,12 @@ private fun PlayerOverflowMenuButton(
                     Text(
                         text =
                             when {
-                                entry.isArchived -> "Unarchive Episode"
-                                entry.isCachedOffline -> "Archive & Delete Download"
-                                else -> "Archive Episode"
+                                entry.isDismissed -> "Mark New"
+                                entry.isCachedOffline -> "Dismiss & Delete Download"
+                                else -> "Dismiss Episode"
                             },
                         color =
-                            if (entry.isArchived) {
+                            if (entry.isDismissed) {
                                 colors.textPrimary
                             } else {
                                 colors.accentIndianRed
@@ -697,10 +720,10 @@ private fun PlayerOverflowMenuButton(
                 },
                 onClick = {
                     showOverflowMenu = false
-                    if (!entry.isArchived && entry.isCachedOffline) {
+                    if (!entry.isDismissed && entry.isCachedOffline) {
                         onRequestArchiveDeleteDownload()
                     } else {
-                        if (!entry.isArchived) {
+                        if (!entry.isDismissed) {
                             onAction(MainAction.CloseFullscreenPlayer)
                         }
                         onAction(MainAction.ToggleArchive(entry))

@@ -1385,7 +1385,7 @@ async fn test_offline_peer_write_propagates_across_sync_seq_regardless_of_wall_c
 
 #[tokio::test]
 async fn test_deleting_inbox_item_or_feed_preserves_diary_and_rankings() {
-    use crate::db::{ReadAtPatch, UpsertEntryInput};
+    use crate::db::UpsertEntryInput;
 
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let feed_url = Url::parse("https://example.com/podcast.xml").unwrap();
@@ -1422,18 +1422,7 @@ async fn test_deleting_inbox_item_or_feed_preserves_diary_and_rankings() {
         .await
         .unwrap();
 
-    assert!(
-        db.items()
-            .update(
-                &ep_consumed.id,
-                Some(ItemStatus::Archived),
-                None,
-                Some(1.0),
-                ReadAtPatch::Unchanged
-            )
-            .await
-            .unwrap()
-    );
+    assert!(db.items().finish_reader_item(&ep_consumed.id, None).await.unwrap().is_some());
 
     let other_ep = db
         .catalog()

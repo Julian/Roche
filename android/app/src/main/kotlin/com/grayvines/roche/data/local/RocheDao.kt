@@ -55,6 +55,10 @@ private const val IS_FAVORITE_EXPR =
         "WHERE ce_fav.collectionId = '$STARRED_COLLECTION_ID' " +
         "AND ce_fav.entryId = e.id)"
 
+private const val IS_FINISHED_EXPR =
+    "EXISTS (SELECT 1 FROM consumption_log cl_fin " +
+        "WHERE cl_fin.entryId = e.id AND LOWER(cl_fin.status) = 'consumed')"
+
 private const val STATUS_EXPR =
     "CASE WHEN es.inboxState = 'dismissed' " +
         "OR (COALESCE(es.inboxState, 'none') = 'none' AND es.readAt IS NOT NULL AND NOT EXISTS (" +
@@ -111,7 +115,8 @@ private const val INBOX_SELECT_LIST_PREFIX =
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
         "ec.audioUrl AS audioUrl, " +
         "COALESCE(es.inboxState, 'none') AS inboxState, " +
-        "e.kind AS entryKind " +
+        "e.kind AS entryKind, " +
+        "$IS_FINISHED_EXPR AS isFinished " +
         INBOX_FROM_WHERE
 
 private const val INBOX_SELECT_FULL_PREFIX =
@@ -139,7 +144,8 @@ private const val INBOX_SELECT_FULL_PREFIX =
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
         "ec.audioUrl AS audioUrl, " +
         "COALESCE(es.inboxState, 'none') AS inboxState, " +
-        "e.kind AS entryKind " +
+        "e.kind AS entryKind, " +
+        "$IS_FINISHED_EXPR AS isFinished " +
         INBOX_FROM_WHERE
 
 private const val INBOX_SELECT_SEARCH_PREFIX =
@@ -167,7 +173,8 @@ private const val INBOX_SELECT_SEARCH_PREFIX =
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
         "ec.audioUrl AS audioUrl, " +
         "COALESCE(es.inboxState, 'none') AS inboxState, " +
-        "e.kind AS entryKind " +
+        "e.kind AS entryKind, " +
+        "$IS_FINISHED_EXPR AS isFinished " +
         INBOX_FROM_WHERE
 
 private const val CATALOG_STAMP_SELECT =
@@ -420,7 +427,8 @@ interface RocheDao {
             "COALESCE(es.progress, 0.0) AS readProgress, " +
             "ec.audioUrl AS audioUrl, " +
             "COALESCE(es.inboxState, 'none') AS inboxState, " +
-            "e.kind AS entryKind " +
+            "e.kind AS entryKind, " +
+            "$IS_FINISHED_EXPR AS isFinished " +
             "$INBOX_FROM_WHERE AND e.id = :id LIMIT 1"
     )
     suspend fun getItemStateById(id: String): ItemStateRow?
@@ -435,11 +443,12 @@ interface RocheDao {
             "es.progress AS readProgress, " +
             "ec.audioUrl AS audioUrl, " +
             "es.inboxState AS inboxState, " +
-            "e.kind AS entryKind " +
+            "e.kind AS entryKind, " +
+            "$IS_FINISHED_EXPR AS isFinished " +
             "FROM entries e " +
             "INNER JOIN entry_state es ON es.entryId = e.id " +
             "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
-            "WHERE e.mergedIntoId IS NULL AND es.inboxState = 'unread'"
+            "WHERE e.mergedIntoId IS NULL AND es.inboxState = 'unread' AND NOT $IS_FINISHED_EXPR"
     )
     suspend fun getUnarchivedItemStates(): List<ItemStateRow>
 
@@ -448,7 +457,7 @@ interface RocheDao {
             "INNER JOIN entry_state es ON es.entryId = ce.entryId " +
             "INNER JOIN entries e ON e.id = ce.entryId " +
             "WHERE ce.collectionId = :feedId AND e.mergedIntoId IS NULL " +
-            "AND es.inboxState = 'unread'"
+            "AND es.inboxState = 'unread' AND NOT $IS_FINISHED_EXPR"
     )
     suspend fun getUnarchivedItemIdsForFeed(feedId: String): List<String>
 
@@ -460,6 +469,7 @@ interface RocheDao {
             "INNER JOIN entry_state es ON es.entryId = e.id " +
             "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
             "WHERE e.mergedIntoId IS NULL AND es.inboxState = 'unread' " +
+            "AND NOT $IS_FINISHED_EXPR " +
             "AND (es.readAt IS NULL OR es.readAt = '') AND es.isCachedOffline = 0 " +
             "AND (LOWER(COALESCE(ec.contentType, '')) = 'audio' " +
             "OR (ec.audioUrl IS NOT NULL AND ec.audioUrl != '')) " +

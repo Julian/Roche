@@ -66,7 +66,11 @@ macro_rules! feed_select_sql {
         JOIN entries ie ON ie.id = ce.entry_id
         WHERE ce.collection_id = fs.collection_id
           AND ie.merged_into_id IS NULL
-          AND es.inbox_state = 'unread') AS unread_count
+          AND es.inbox_state = 'unread'
+          AND NOT EXISTS (
+              SELECT 1 FROM consumption_log cl_f
+              WHERE cl_f.entry_id = ie.id AND cl_f.status = 'consumed'
+          )) AS unread_count
 FROM feed_sources fs
 JOIN entries e ON e.id = fs.collection_id ",
             $suffix

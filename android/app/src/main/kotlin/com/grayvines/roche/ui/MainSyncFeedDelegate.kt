@@ -182,18 +182,17 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
     }
 
     private suspend fun performArchiveFeedUnread(feedId: String) {
-        val unreadIds =
-            host.latestEntries().filter { it.feedId == feedId && !it.isArchived }.map { it.id }
-        if (unreadIds.isEmpty()) return
+        val newIds = host.latestEntries().filter { it.feedId == feedId && it.isNew }.map { it.id }
+        if (newIds.isEmpty()) return
         val snapshots =
             host.repository.archiveBatchWithSnapshots(
-                entryIds = unreadIds,
+                entryIds = newIds,
                 feedId = feedId,
                 allUnread = false,
             )
         if (snapshots.isEmpty()) return
-        val archivedIds = snapshots.map { it.itemId }.toSet()
-        host.cleanupRemovedEntries(archivedIds)
+        val dismissedIds = snapshots.map { it.itemId }.toSet()
+        host.cleanupRemovedEntries(dismissedIds)
         val count = snapshots.size
         val noun = entryCountNoun(count)
         host.updateTransient {
@@ -203,7 +202,7 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
                 messageSequence = it.messageSequence + 1,
                 undoEvent =
                     UndoActionEvent(
-                        message = "Archived $count $noun in feed",
+                        message = "Dismissed $count $noun in feed",
                         kind = UndoActionKind.RestoreBatchArchive(snapshots),
                     ),
             )
@@ -214,7 +213,7 @@ internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
         host.repository
             .toggleFeedArchive(feedId)
             .onSuccess { (title, isArchived) ->
-                val verb = if (isArchived) "Archived feed" else "Unarchived feed"
+                val verb = if (isArchived) "Paused feed" else "Resumed feed"
                 host.updateTransient { current ->
                     current.copy(
                         feedContextSheetId =
