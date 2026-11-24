@@ -6261,3 +6261,317 @@ async fn test_migration_022_simplifies_collection_specs_and_accepts_legacy_wire_
     assert!(!parsed.is_dynamic());
     assert_eq!(parsed.color.as_deref(), Some("#abcdef"));
 }
+
+#[tokio::test]
+async fn test_peer_sync_edited_hlc_lww_clears_fields_reconciles_identifiers_and_protects_edits() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let paper = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Paper),
+            title: "subnlogn.pdf".to_owned(),
+            creators: vec!["Placeholder Author".to_owned()],
+            url: Some("https://example.org/subnlogn.pdf".to_owned()),
+            summary: Some("Initial long auto-extracted summary text".to_owned()),
+            release_year: Some(2020),
+            identifiers: vec![crate::db::EntryIdentifier {
+                scheme: "doi".to_owned(),
+                value: "10.1000/old-doi".to_owned(),
+            }],
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+
+    // 1. Incoming edited peer record clears creators, summary, year, and replaces DOI
+    let edit_ts = Utc::now() + chrono::Duration::seconds(10);
+    let edit_hlc = HlcTimestamp::from_datetime(edit_ts, "peer-android").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-android".to_owned(),
+            entries: vec![SyncEntryRecord {
+                id: paper.id.clone(),
+                kind: EntryKind::Article,
+                title: "Integer multiplication in time O(n log n)".to_owned(),
+                creators: Vec::new(),
+                url: Some("https://example.org/subnlogn.pdf".to_owned()),
+                published_at: None,
+                release_year: None,
+                summary: None,
+                thumbnail_url: None,
+                metadata: Some(serde_json::json!({ "edited_hlc": edit_hlc })),
+                identifiers: vec![crate::db::EntryIdentifier {
+                    scheme: "doi".to_owned(),
+                    value: "10.1000/new-doi".to_owned(),
+                }],
+                merged_into_id: None,
+                created_at: Some(paper.created_at),
+                updated_at: Some(edit_ts),
+                hlc: edit_hlc.clone(),
+                content: None,
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let after_edit = db.catalog().get_entry_detail(&paper.id).await.unwrap().unwrap().entry;
+    assert_eq!(after_edit.kind, EntryKind::Article);
+    assert_eq!(after_edit.title, "Integer multiplication in time O(n log n)");
+    assert_eq!(after_edit.creators, Vec::<String>::new());
+    assert_eq!(after_edit.summary, None);
+    assert_eq!(after_edit.release_year, None);
+    assert_eq!(after_edit.identifier("doi"), Some("10.1000/new-doi"));
+
+    // 2. Unedited peer with higher entries.hlc (e.g. feed poll) MUST NOT overwrite user edit
+    let poll_ts = Utc::now() + chrono::Duration::seconds(30);
+    let poll_hlc = HlcTimestamp::from_datetime(poll_ts, "peer-stale").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-stale".to_owned(),
+            entries: vec![SyncEntryRecord {
+                id: paper.id.clone(),
+                kind: EntryKind::Paper,
+                title: "subnlogn.pdf".to_owned(),
+                creators: vec!["Resurrected Author".to_owned()],
+                url: Some("https://example.org/subnlogn.pdf".to_owned()),
+                published_at: None,
+                release_year: Some(2020),
+                summary: Some("Resurrected summary".to_owned()),
+                thumbnail_url: None,
+                metadata: Some(serde_json::json!({})),
+                identifiers: vec![crate::db::EntryIdentifier {
+                    scheme: "doi".to_owned(),
+                    value: "10.1000/old-doi".to_owned(),
+                }],
+                merged_into_id: None,
+                created_at: Some(paper.created_at),
+                updated_at: Some(poll_ts),
+                hlc: poll_hlc,
+                content: None,
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let protected = db.catalog().get_entry_detail(&paper.id).await.unwrap().unwrap().entry;
+    assert_eq!(protected.kind, EntryKind::Article);
+    assert_eq!(protected.title, "Integer multiplication in time O(n log n)");
+    assert_eq!(protected.creators, Vec::<String>::new());
+    assert_eq!(protected.summary, None);
+    assert_eq!(protected.identifier("doi"), Some("10.1000/new-doi"));
+
+    // 3. Unedited placeholder title is upgraded even when incoming entries.hlc is older
+    let placeholder_paper = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Paper),
+            title: "draft.pdf".to_owned(),
+            url: Some("https://example.org/draft.pdf".to_owned()),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let older_ts = Utc::now() - chrono::Duration::seconds(60);
+    let older_hlc = HlcTimestamp::from_datetime(older_ts, "peer-enricher").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-enricher".to_owned(),
+            entries: vec![SyncEntryRecord {
+                id: placeholder_paper.id.clone(),
+                kind: EntryKind::Paper,
+                title: "A Real Paper Title".to_owned(),
+                creators: vec!["Jane Doe".to_owned()],
+                url: Some("https://example.org/draft.pdf".to_owned()),
+                published_at: None,
+                release_year: Some(2025),
+                summary: None,
+                thumbnail_url: None,
+                metadata: Some(serde_json::json!({})),
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(older_ts),
+                updated_at: Some(older_ts),
+                hlc: older_hlc,
+                content: None,
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let upgraded =
+        db.catalog().get_entry_detail(&placeholder_paper.id).await.unwrap().unwrap().entry;
+    assert_eq!(upgraded.title, "A Real Paper Title");
+    assert_eq!(upgraded.creators, vec!["Jane Doe"]);
+}
+
+#[tokio::test]
+async fn test_peer_sync_equal_edited_hlc_thumbnail_preservation_and_date_harmonization() {
+    use crate::db::{CatalogError, UpdateEntryInput};
+
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let arxiv_url = "https://arxiv.org/abs/2301.07041";
+    let paper = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Paper),
+            title: "Original Paper".to_owned(),
+            creators: vec!["Author One".to_owned()],
+            url: Some(arxiv_url.to_owned()),
+            published_at: Some(
+                DateTime::parse_from_rfc3339("2023-01-17T12:00:00Z").unwrap().with_timezone(&Utc),
+            ),
+            release_year: Some(2023),
+            thumbnail_url: Some("https://cdn.example.org/cover.jpg".to_owned()),
+            identifiers: vec![crate::db::EntryIdentifier {
+                scheme: "arxiv".to_owned(),
+                value: "2301.07041".to_owned(),
+            }],
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+
+    // 1. IncomingEdit with thumbnail_url: None preserves existing thumbnail, and with empty
+    //    identifiers does NOT resurrect deleted `arxiv` identifier from URL.
+    let edit_ts = Utc::now() + chrono::Duration::seconds(15);
+    let edit_hlc = HlcTimestamp::from_datetime(edit_ts, "peer-a").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-a".to_owned(),
+            entries: vec![SyncEntryRecord {
+                id: paper.id.clone(),
+                kind: EntryKind::Paper,
+                title: "Edited Title".to_owned(),
+                creators: vec!["Curated Author".to_owned()],
+                url: Some(arxiv_url.to_owned()),
+                published_at: None,
+                release_year: Some(2024),
+                summary: None,
+                thumbnail_url: None,
+                metadata: Some(serde_json::json!({ "edited_hlc": edit_hlc })),
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(paper.created_at),
+                updated_at: Some(edit_ts),
+                hlc: edit_hlc.clone(),
+                content: None,
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let after_edit = db.catalog().get_entry_detail(&paper.id).await.unwrap().unwrap().entry;
+    assert_eq!(after_edit.title, "Edited Title");
+    assert_eq!(after_edit.thumbnail_url.as_deref(), Some("https://cdn.example.org/cover.jpg"));
+    assert_eq!(
+        after_edit.identifier("arxiv"),
+        None,
+        "deleted arxiv identifier must not be resurrected from URL on IncomingEdit"
+    );
+
+    // 2. Equal edited_hlc re-sync must preserve curated edits (never revert to unedited heuristics)
+    let newer_generic_hlc =
+        HlcTimestamp::from_datetime(edit_ts + chrono::Duration::seconds(5), "peer-b").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-b".to_owned(),
+            entries: vec![SyncEntryRecord {
+                id: paper.id.clone(),
+                kind: EntryKind::Paper,
+                title: "Different Title Same Edit HLC".to_owned(),
+                creators: vec!["Other Author".to_owned()],
+                url: Some(arxiv_url.to_owned()),
+                published_at: None,
+                release_year: Some(2019),
+                summary: Some("Unexpected summary".to_owned()),
+                thumbnail_url: None,
+                metadata: Some(serde_json::json!({ "edited_hlc": edit_hlc })),
+                identifiers: vec![crate::db::EntryIdentifier {
+                    scheme: "doi".to_owned(),
+                    value: "10.1000/sneaky".to_owned(),
+                }],
+                merged_into_id: None,
+                created_at: Some(paper.created_at),
+                updated_at: Some(edit_ts),
+                hlc: newer_generic_hlc,
+                content: None,
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let after_equal = db.catalog().get_entry_detail(&paper.id).await.unwrap().unwrap().entry;
+    assert_eq!(after_equal.title, "Edited Title");
+    assert_eq!(after_equal.summary, None);
+    assert_eq!(after_equal.identifier("doi"), None);
+
+    // 3. update_entry date/year harmonization & strict identifier validation
+    let d1 = DateTime::parse_from_rfc3339("2025-05-10T12:00:00Z").unwrap().with_timezone(&Utc);
+    let updated_date = db
+        .catalog()
+        .update_entry(
+            &paper.id,
+            &UpdateEntryInput {
+                published_at: Some(Some(d1)),
+                release_year: Some(Some(2024)), // stale pre-filled year while date changed
+                ..UpdateEntryInput::default()
+            },
+        )
+        .await
+        .unwrap()
+        .entry;
+    assert_eq!(updated_date.release_year, Some(2025));
+    assert_eq!(
+        updated_date.published_at.map(|d| d.format("%Y-%m-%d").to_string()).as_deref(),
+        Some("2025-05-10")
+    );
+
+    // Changing only pre-filled Year while Date stays identical clears mismatched Date
+    let updated_year = db
+        .catalog()
+        .update_entry(
+            &paper.id,
+            &UpdateEntryInput {
+                published_at: Some(Some(d1)),
+                release_year: Some(Some(2021)),
+                ..UpdateEntryInput::default()
+            },
+        )
+        .await
+        .unwrap()
+        .entry;
+    assert_eq!(updated_year.release_year, Some(2021));
+    assert_eq!(updated_year.published_at, None);
+
+    // Invalid DOI fails with InvalidInput instead of silently clearing
+    let bad_doi = db
+        .catalog()
+        .update_entry(
+            &paper.id,
+            &UpdateEntryInput {
+                identifier_updates: vec![("doi".to_owned(), Some("not-a-doi".to_owned()))],
+                ..UpdateEntryInput::default()
+            },
+        )
+        .await;
+    assert!(matches!(bad_doi, Err(CatalogError::InvalidInput(_))));
+}

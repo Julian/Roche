@@ -15,6 +15,7 @@ import com.grayvines.roche.core.feedNaturalKey
 import com.grayvines.roche.core.inferFeedTypeWireValue
 import com.grayvines.roche.core.isLikelyFeedUrl
 import com.grayvines.roche.core.isLocalPdfUrl
+import com.grayvines.roche.core.isPlaceholderEntryTitle
 import com.grayvines.roche.core.isSyncableItemUrl
 import com.grayvines.roche.core.isSyncablePublicUrl
 import com.grayvines.roche.core.itemNaturalKey
@@ -58,6 +59,7 @@ import com.grayvines.roche.data.feeds.buildLocalOpmlXml
 import com.grayvines.roche.data.feeds.canonicalizeFeedUrl
 import com.grayvines.roche.data.feeds.copySharedPdfStreamToCache
 import com.grayvines.roche.data.feeds.discoverFeedFromUrl
+import com.grayvines.roche.data.feeds.enrichDocumentEntryOnDevice
 import com.grayvines.roche.data.feeds.enrichWantToReadItemOnDevice
 import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
 import com.grayvines.roche.data.feeds.validateEditedFeedUrl
@@ -1130,25 +1132,54 @@ class RocheRepository(
         withContext(Dispatchers.Default) {
             runSuspendCatching {
                 val cleanId = entryId.trim()
-                val currentSettings = settings.settings.first()
-                val canEnrich =
-                    cleanId.isNotEmpty() &&
-                        currentSettings.serverUrl.isNotBlank() &&
-                        currentSettings.bearerToken.isNotBlank() &&
-                        isServerSyncAllowedByTransport(currentSettings.serverUrl)
-                if (canEnrich) {
-                    serverApi.enrichCatalogEntry(
-                        serverUrl = currentSettings.serverUrl,
-                        token = currentSettings.bearerToken,
-                        entryId = cleanId,
-                    )
-                    syncWithServer().getOrThrow()
-                    true
-                } else {
+                if (cleanId.isEmpty()) {
                     false
+                } else {
+                    enrichEntryOnlineInternal(cleanId)
                 }
             }
         }
+
+    private suspend fun enrichEntryOnlineInternal(cleanId: String): Boolean {
+        val currentSettings = settings.settings.first()
+        val localEntry = dao.getEntryById(cleanId)
+        val isLocalOnlyPdf = localEntry?.url?.let(::isLocalPdfUrl) == true
+        val canCallServer =
+            !isLocalOnlyPdf &&
+                currentSettings.serverUrl.isNotBlank() &&
+                currentSettings.bearerToken.isNotBlank() &&
+                isServerSyncAllowedByTransport(currentSettings.serverUrl)
+        var enriched = false
+        if (canCallServer) {
+            val serverOk = runSuspendCatching {
+                serverApi.enrichCatalogEntry(
+                    serverUrl = currentSettings.serverUrl,
+                    token = currentSettings.bearerToken,
+                    entryId = cleanId,
+                )
+                syncWithServer().getOrThrow()
+            }
+                .isSuccess
+            if (serverOk) {
+                enriched = true
+            }
+        }
+        val deviceEnriched =
+            enrichDocumentEntryOnDevice(
+                dao = dao,
+                publicWebFetcher = publicWebFetcher,
+                entryId = cleanId,
+                cacheDir = cacheDir,
+                forceRefresh = true,
+                nodeId = currentLocalPeerId(),
+                writeLock = database.writeLock,
+            )
+        if (deviceEnriched) {
+            enriched = true
+            triggerBackgroundSync()
+        }
+        return enriched
+    }
 
     suspend fun deleteItem(itemId: String): Result<String> =
         withContext(Dispatchers.Default) {
@@ -1260,7 +1291,9 @@ class RocheRepository(
             launchWantToReadEnrichment(
                 itemId = persisted.row.id,
                 url = normalizedUrl,
-                hasUserTitleOverride = cleanTitleOverride != null,
+                hasUserTitleOverride =
+                    cleanTitleOverride != null &&
+                        !isPlaceholderEntryTitle(cleanTitleOverride, normalizedUrl),
                 pdfInputStream = remainingPdfStream,
             )
             SaveUrlResult(title = persisted.row.title, kind = SavedResourceKind.ITEM)
@@ -1451,6 +1484,7 @@ class RocheRepository(
                         hasUserTitleOverride = hasUserTitleOverride,
                         nodeId = currentLocalPeerId(),
                         writeLock = database.writeLock,
+                        cacheDir = cacheDir,
                     )
                 }
                     .onFailure { err ->

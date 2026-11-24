@@ -8,7 +8,8 @@ use super::error::{ApiError, ProblemJson, ProblemPath, ProblemQuery};
 use crate::{
     db::{
         CatalogBatchInput, CatalogBatchResult, CatalogEntry, CollectionGeneratorState,
-        CollectionSummary, ComparisonRecord, ConsumptionLogView, EntryDetailView, UpsertEntryInput,
+        CollectionSummary, ComparisonRecord, ConsumptionLogView, EntryDetailView, UpdateEntryInput,
+        UpsertEntryInput,
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::Score,
@@ -251,6 +252,124 @@ pub(super) async fn catalog_entry_get(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("Entry '{id}' not found")))?;
     Ok(Json(detail))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct UpdateEntryRequest {
+    #[serde(default)]
+    kind: Option<EntryKind>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    creators: Option<Vec<String>>,
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_string")]
+    url: Option<Option<String>>,
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_datetime")]
+    published_at: Option<Option<DateTime<Utc>>>,
+    /// Optional human-friendly date string (e.g. `"2026-10-20"`, `"2026-10"`, `"2026"`) when callers
+    /// prefer date strings over RFC3339 `published_at`.
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_string")]
+    published_date: Option<Option<String>>,
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_i32")]
+    release_year: Option<Option<i32>>,
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_string")]
+    summary: Option<Option<String>>,
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_string")]
+    thumbnail_url: Option<Option<String>>,
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_string")]
+    doi: Option<Option<String>>,
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_string")]
+    isbn: Option<Option<String>>,
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_string")]
+    arxiv_id: Option<Option<String>>,
+}
+
+#[allow(clippy::option_option)]
+fn deserialize_optional_nullable_i32<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<i32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i32>::deserialize(deserializer).map(Some)
+}
+
+#[allow(clippy::option_option)]
+fn deserialize_optional_nullable_datetime<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<DateTime<Utc>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<DateTime<Utc>>::deserialize(deserializer).map(Some)
+}
+
+pub(super) async fn catalog_entry_update(
+    State(service): State<Arc<RocheService>>,
+    ProblemPath(id): ProblemPath<String>,
+    ProblemJson(req): ProblemJson<UpdateEntryRequest>,
+) -> Result<Json<EntryDetailView>, ApiError> {
+    let mut published_at = req.published_at;
+    let mut release_year = req.release_year;
+    if published_at.is_none()
+        && let Some(date_opt) = req.published_date
+    {
+        match date_opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => {
+                published_at = Some(None);
+            }
+            Some(raw) => {
+                let parsed = roche_core::document_meta::parse_publication_date_str(raw)
+                    .ok_or_else(|| {
+                        ApiError::bad_request(format!("Invalid publication date '{raw}'"))
+                    })?;
+                if let Some(dt) = parsed.published_at {
+                    published_at = Some(Some(dt));
+                } else {
+                    published_at = Some(None);
+                }
+                if release_year.is_none()
+                    && let Some(yr) = parsed.release_year
+                {
+                    release_year = Some(Some(yr));
+                }
+            }
+        }
+    }
+
+    let mut identifier_updates = Vec::new();
+    if let Some(doi) = req.doi {
+        identifier_updates.push(("doi".to_owned(), doi));
+    }
+    if let Some(isbn) = req.isbn {
+        identifier_updates.push(("isbn".to_owned(), isbn));
+    }
+    if let Some(arxiv) = req.arxiv_id {
+        identifier_updates.push(("arxiv".to_owned(), arxiv));
+    }
+
+    let input = UpdateEntryInput {
+        kind: req.kind,
+        title: req.title,
+        creators: req.creators,
+        url: req.url,
+        published_at,
+        release_year,
+        summary: req.summary,
+        thumbnail_url: req.thumbnail_url,
+        identifier_updates,
+    };
+    let updated = service.catalog().update_entry(&id, &input).await?;
+    Ok(Json(updated))
 }
 
 #[derive(Debug, Deserialize)]

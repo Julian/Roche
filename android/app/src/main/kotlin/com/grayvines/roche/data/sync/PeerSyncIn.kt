@@ -4,6 +4,9 @@ package com.grayvines.roche.data.sync
 
 import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
 import com.grayvines.roche.core.PROTECTED_SYSTEM_COLLECTION_IDS
+import com.grayvines.roche.core.SCHEME_ARXIV
+import com.grayvines.roche.core.SCHEME_DOI
+import com.grayvines.roche.core.SCHEME_ISBN
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.STARRED_SLUG
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
@@ -25,9 +28,12 @@ import com.grayvines.roche.core.deterministicItemId
 import com.grayvines.roche.core.deterministicTagId
 import com.grayvines.roche.core.encodeCreatorsJson
 import com.grayvines.roche.core.extractArxivIdentifier
+import com.grayvines.roche.core.extractEntryEditedHlc
+import com.grayvines.roche.core.extractYearPrefix
 import com.grayvines.roche.core.feedNaturalKey
 import com.grayvines.roche.core.formatDurationSecondsLabel
 import com.grayvines.roche.core.isLocalPollNewer
+import com.grayvines.roche.core.isPlaceholderEntryTitle
 import com.grayvines.roche.core.itemNaturalKey
 import com.grayvines.roche.core.mergeEntryMetadataJson
 import com.grayvines.roche.core.newerIsoTimestamp
@@ -945,13 +951,7 @@ private suspend fun mergeSingleIncomingEntry(
         return null
     }
     val targetId =
-        resolveIncomingTargetEntryId(
-            dao = dao,
-            rec = rec,
-            resolvedKind = resolvedKind,
-            cleanTitle = cleanTitle,
-            feedSourceIdByCanonUrl = ctx.feedSourceIdByCanonUrl,
-        )
+        resolveIncomingTargetEntryId(dao, rec, resolvedKind, cleanTitle, ctx.feedSourceIdByCanonUrl)
     val rawId = rec.id.trim()
     if (rawId.isNotEmpty() && rawId != targetId) {
         ctx.idRemap[rawId] = targetId
@@ -959,8 +959,8 @@ private suspend fun mergeSingleIncomingEntry(
     val mergedInto = rec.mergedIntoId?.trim()?.takeIf { it.isNotEmpty() && it != targetId }
 
     val existingEntry = dao.getEntryById(targetId)
-    val entryIncomingWins =
-        shouldIncomingWinHlc(entryHlc, existingEntry?.hlc, existingEntry?.isLocalDirty == true)
+    val editAuthority = resolveEditMergeAuthority(existingEntry, rec.metadata as? JsonObject)
+    val entryIncomingWins = resolveEntryIncomingWins(editAuthority, entryHlc, existingEntry)
     val updatedEntry =
         buildMergedEntryEntity(
             rec,
@@ -970,23 +970,35 @@ private suspend fun mergeSingleIncomingEntry(
             mergedInto,
             entryHlc,
             existingEntry,
+            editAuthority,
             ctx.nowIso,
         )
     dao.upsertEntry(updatedEntry)
     mergeIncomingEntrySubtables(
-        dao = dao,
-        targetId = targetId,
-        mergedInto = mergedInto,
-        resolvedKind = resolvedKind,
-        rec = rec,
-        updatedEntry = updatedEntry,
-        entryHlc = entryHlc,
-        entryIncomingWins = entryIncomingWins,
-        itemAction = itemAction,
-        ctx = ctx,
+        dao,
+        targetId,
+        mergedInto,
+        EntryKind.fromWireValue(updatedEntry.kind),
+        rec,
+        existingEntry,
+        updatedEntry,
+        entryHlc,
+        entryIncomingWins,
+        editAuthority,
+        itemAction,
+        ctx,
     )
     return mergedInto?.let { targetId to it }
 }
+
+private fun resolveEntryIncomingWins(
+    editAuthority: EditMergeAuthority,
+    entryHlc: String,
+    existingEntry: EntryEntity?,
+): Boolean =
+    editAuthority == EditMergeAuthority.INCOMING_EDIT ||
+        editAuthority != EditMergeAuthority.EXISTING_EDIT &&
+            shouldIncomingWinHlc(entryHlc, existingEntry?.hlc, existingEntry?.isLocalDirty == true)
 
 @Suppress("LongParameterList")
 private suspend fun mergeIncomingEntrySubtables(
@@ -995,9 +1007,11 @@ private suspend fun mergeIncomingEntrySubtables(
     mergedInto: String?,
     resolvedKind: EntryKind,
     rec: SyncEntryRecordDto,
+    existingEntry: EntryEntity?,
     updatedEntry: EntryEntity,
     entryHlc: String,
     entryIncomingWins: Boolean,
+    editAuthority: EditMergeAuthority,
     itemAction: ItemTombstoneAction,
     ctx: IncomingEntriesMergeCtx,
 ) {
@@ -1026,7 +1040,15 @@ private suspend fun mergeIncomingEntrySubtables(
             ctx.nowMs,
         )
     }
-    mergeIncomingIdentifiersInDao(dao, targetId, mergedInto, resolvedKind, rec)
+    mergeIncomingIdentifiersInDao(
+        dao = dao,
+        targetId = targetId,
+        mergedInto = mergedInto,
+        resolvedKind = resolvedKind,
+        rec = rec,
+        existingUrl = existingEntry?.url,
+        editAuthority = editAuthority,
+    )
 }
 
 private suspend fun resolveEntrySuppression(
@@ -1315,6 +1337,29 @@ private suspend fun matchCanonicalUrlOwnerId(
     return resolved?.takeIf { dao.getEntryById(it)?.kind == resolvedKind.wireValue }
 }
 
+private enum class EditMergeAuthority {
+    INCOMING_EDIT,
+    EXISTING_EDIT,
+    EQUAL_EDIT,
+    UNEDITED,
+}
+
+private fun resolveEditMergeAuthority(
+    existing: EntryEntity?,
+    incomingMeta: JsonObject?,
+): EditMergeAuthority {
+    val exEdit = extractEntryEditedHlc(existing?.metadataJson)
+    val incEdit = extractEntryEditedHlc(incomingMeta)
+    return when {
+        incEdit != null && (exEdit == null || compareHlc(incEdit, exEdit) > 0) ->
+            EditMergeAuthority.INCOMING_EDIT
+        exEdit != null && (incEdit == null || compareHlc(exEdit, incEdit) > 0) ->
+            EditMergeAuthority.EXISTING_EDIT
+        exEdit != null && incEdit != null -> EditMergeAuthority.EQUAL_EDIT
+        else -> EditMergeAuthority.UNEDITED
+    }
+}
+
 @Suppress("LongParameterList")
 private fun buildMergedEntryEntity(
     rec: SyncEntryRecordDto,
@@ -1324,9 +1369,10 @@ private fun buildMergedEntryEntity(
     mergedInto: String?,
     entryHlc: String,
     existing: EntryEntity?,
+    editAuthority: EditMergeAuthority,
     nowIso: String,
 ): EntryEntity {
-    val incomingWins = shouldIncomingWinHlc(entryHlc, existing?.hlc, existing?.isLocalDirty == true)
+    val incomingWins = resolveEntryIncomingWins(editAuthority, entryHlc, existing)
     val richerSummary =
         pickRicherString(existing?.summary, rec.summary)?.take(MAX_SQLITE_SUMMARY_CHARS)
     val mergedMetadataJson =
@@ -1335,31 +1381,107 @@ private fun buildMergedEntryEntity(
             incomingMeta = rec.metadata as? JsonObject,
             incomingWins = incomingWins,
         )
-    if (existing != null && !incomingWins) {
-        return mergePassiveEntryFields(existing, rec, richerSummary, mergedMetadataJson, mergedInto)
+    return when {
+        editAuthority == EditMergeAuthority.INCOMING_EDIT ->
+            buildIncomingEditedEntryEntity(
+                rec = rec,
+                targetId = targetId,
+                resolvedKind = resolvedKind,
+                cleanTitle = cleanTitle,
+                mergedInto = mergedInto,
+                entryHlc = entryHlc,
+                existing = existing,
+                metadataJson = mergedMetadataJson,
+                nowIso = nowIso,
+            )
+        (editAuthority == EditMergeAuthority.EXISTING_EDIT ||
+            editAuthority == EditMergeAuthority.EQUAL_EDIT) && existing != null ->
+            existing.copy(
+                metadataJson = mergedMetadataJson,
+                mergedIntoId = mergedInto ?: existing.mergedIntoId,
+                hlc = maxHlc(entryHlc, existing.hlc),
+            )
+        existing != null && !incomingWins ->
+            mergePassiveEntryFields(
+                existing,
+                rec,
+                cleanTitle,
+                richerSummary,
+                mergedMetadataJson,
+                mergedInto,
+            )
+        else ->
+            buildWinningEntryEntity(
+                rec = rec,
+                targetId = targetId,
+                resolvedKind = resolvedKind,
+                cleanTitle = cleanTitle,
+                mergedInto = mergedInto,
+                entryHlc = entryHlc,
+                existing = existing,
+                richerSummary = richerSummary,
+                metadataJson = mergedMetadataJson,
+                incomingWins = incomingWins,
+                nowIso = nowIso,
+            )
     }
-    return buildWinningEntryEntity(
-        rec = rec,
-        targetId = targetId,
-        resolvedKind = resolvedKind,
-        cleanTitle = cleanTitle,
-        mergedInto = mergedInto,
-        entryHlc = entryHlc,
-        existing = existing,
-        richerSummary = richerSummary,
-        metadataJson = mergedMetadataJson,
-        incomingWins = incomingWins,
-        nowIso = nowIso,
+}
+
+@Suppress("LongParameterList")
+private fun buildIncomingEditedEntryEntity(
+    rec: SyncEntryRecordDto,
+    targetId: String,
+    resolvedKind: EntryKind,
+    cleanTitle: String,
+    mergedInto: String?,
+    entryHlc: String,
+    existing: EntryEntity?,
+    metadataJson: String,
+    nowIso: String,
+): EntryEntity {
+    val canChangeKind =
+        existing == null ||
+            EntryKind.fromWireValue(existing.kind) != EntryKind.COLLECTION &&
+                resolvedKind != EntryKind.COLLECTION &&
+                rec.collectionSpec == null &&
+                rec.feedSource == null
+    val effectiveKind = if (canChangeKind) resolvedKind.wireValue else existing.kind
+    val effectiveTitle = cleanTitle.ifEmpty {
+        existing?.title ?: rec.feedSource?.feedUrl ?: targetId
+    }
+    val cleanUrl = rec.url?.trim()?.takeIf { it.isNotEmpty() }
+    val cleanPub = rec.publishedAt?.trim()?.takeIf { it.isNotEmpty() }
+    val cleanSummary =
+        rec.summary?.trim()?.takeIf { it.isNotEmpty() }?.take(MAX_SQLITE_SUMMARY_CHARS)
+    return EntryEntity(
+        id = targetId,
+        kind = effectiveKind,
+        title = effectiveTitle,
+        creatorsJson = encodeCreatorsJson(rec.creators),
+        url = cleanUrl,
+        publishedAt = cleanPub,
+        releaseYear = rec.releaseYear ?: extractYearPrefix(cleanPub),
+        summary = cleanSummary,
+        thumbnailUrl = sanitizeHttpUrl(rec.thumbnailUrl) ?: existing?.thumbnailUrl,
+        metadataJson = metadataJson,
+        mergedIntoId = mergedInto ?: existing?.mergedIntoId,
+        createdAt = nonBlankOrFallback(rec.createdAt, existing?.createdAt) ?: nowIso,
+        updatedAt = nonBlankOrFallback(rec.updatedAt, existing?.updatedAt) ?: nowIso,
+        hlc = maxHlc(entryHlc, existing?.hlc),
+        isLocalDirty = false,
     )
 }
 
+@Suppress("LongParameterList")
 private fun mergePassiveEntryFields(
     existing: EntryEntity,
     rec: SyncEntryRecordDto,
+    cleanTitle: String,
     richerSummary: String?,
     metadataJson: String,
     mergedInto: String?,
 ): EntryEntity {
+    val nextTitle = resolveUneditedMergedTitle(existing.title, existing.url, cleanTitle, rec.url)
     val creatorsJson =
         when {
             existing.creatorsJson != "[]" -> existing.creatorsJson
@@ -1369,6 +1491,7 @@ private fun mergePassiveEntryFields(
     val cleanUrl = rec.url?.trim()?.takeIf { it.isNotEmpty() }
     val cleanPub = rec.publishedAt?.trim()?.takeIf { it.isNotEmpty() }
     return existing.copy(
+        title = nextTitle,
         creatorsJson = creatorsJson,
         url = existing.url ?: cleanUrl,
         publishedAt = existing.publishedAt ?: cleanPub,
@@ -1378,6 +1501,18 @@ private fun mergePassiveEntryFields(
         metadataJson = metadataJson,
         mergedIntoId = mergedInto ?: existing.mergedIntoId,
     )
+}
+
+private fun resolveUneditedMergedTitle(
+    existingTitle: String,
+    existingUrl: String?,
+    incomingTitle: String,
+    incomingUrl: String?,
+): String {
+    if (incomingTitle.isEmpty()) return existingTitle
+    val existingIsPlaceholder = isPlaceholderEntryTitle(existingTitle, existingUrl)
+    val incomingIsPlaceholder = isPlaceholderEntryTitle(incomingTitle, incomingUrl ?: existingUrl)
+    return if (existingIsPlaceholder && !incomingIsPlaceholder) incomingTitle else existingTitle
 }
 
 @Suppress("LongParameterList")
@@ -1394,9 +1529,7 @@ private fun buildWinningEntryEntity(
     incomingWins: Boolean,
     nowIso: String,
 ): EntryEntity {
-    val effectiveTitle = cleanTitle.ifEmpty {
-        existing?.title ?: rec.feedSource?.feedUrl ?: targetId
-    }
+    val effectiveTitle = resolveWinningEntryTitle(existing, cleanTitle, rec, targetId)
     val creatorsJson =
         if (rec.creators.isNotEmpty()) {
             encodeCreatorsJson(rec.creators)
@@ -1420,6 +1553,24 @@ private fun buildWinningEntryEntity(
         hlc = maxHlc(entryHlc, existing?.hlc),
         isLocalDirty = existing?.isLocalDirty == true && !incomingWins,
     )
+}
+
+private fun resolveWinningEntryTitle(
+    existing: EntryEntity?,
+    cleanTitle: String,
+    rec: SyncEntryRecordDto,
+    targetId: String,
+): String {
+    val keepExistingNonPlaceholder =
+        existing != null &&
+            cleanTitle.isNotEmpty() &&
+            isPlaceholderEntryTitle(cleanTitle, rec.url ?: existing.url) &&
+            !isPlaceholderEntryTitle(existing.title, existing.url)
+    return if (keepExistingNonPlaceholder) {
+        existing.title
+    } else {
+        cleanTitle.ifEmpty { existing?.title ?: rec.feedSource?.feedUrl ?: targetId }
+    }
 }
 
 private fun nonBlankOrFallback(primary: String?, fallback: String?): String? =
@@ -2204,37 +2355,108 @@ private fun resolveSyncedContentDuration(
         fallbackTextSource = contentText ?: contentHtml ?: summary.orEmpty(),
     )
 
+@Suppress("LongParameterList")
 private suspend fun mergeIncomingIdentifiersInDao(
     dao: RocheDao,
     targetId: String,
     mergedInto: String?,
     resolvedKind: EntryKind,
     rec: SyncEntryRecordDto,
+    existingUrl: String?,
+    editAuthority: EditMergeAuthority,
 ) {
     val identOwner = mergedInto?.takeIf { dao.getEntryById(it) != null } ?: targetId
-    val rows = ArrayList<EntryIdentifierEntity>()
-    for (ident in rec.identifiers) {
-        val s = normalizeIdentifierScheme(ident.scheme)
-        if (s in RESERVED_SYNC_IDENT_SCHEMES) continue
-        val v = normalizeIdentifierValue(resolvedKind, s, ident.value)
-        if (s.isNotEmpty() && v.isNotEmpty()) {
-            rows.add(EntryIdentifierEntity(s, v, identOwner))
-        }
-    }
     val cleanUrl = rec.url?.trim()?.takeIf { it.isNotEmpty() }
-    if (cleanUrl != null && rec.feedSource == null && rec.collectionSpec == null) {
-        val canon = canonicalizeSyncUrl(cleanUrl)
-        if (canon.isNotEmpty()) {
-            rows.add(EntryIdentifierEntity("url", canon, identOwner))
-        }
-        extractArxivIdentifier(cleanUrl)?.let { arxiv ->
-            rows.add(EntryIdentifierEntity("arxiv", arxiv, identOwner))
-        }
+    val isPlainEntry = rec.feedSource == null && rec.collectionSpec == null
+    if (editAuthority == EditMergeAuthority.INCOMING_EDIT && isPlainEntry) {
+        clearEditedIdentifiersInDao(dao, identOwner, existingUrl, cleanUrl)
     }
+    val rows =
+        collectIncomingIdentRows(
+            identOwner,
+            resolvedKind,
+            rec,
+            cleanUrl,
+            editAuthority,
+            isPlainEntry,
+        )
     if (rows.isNotEmpty()) {
         dao.insertEntryIdentifiersIgnore(rows.distinctBy { it.scheme to it.value })
     }
 }
+
+private suspend fun clearEditedIdentifiersInDao(
+    dao: RocheDao,
+    identOwner: String,
+    existingUrl: String?,
+    cleanUrl: String?,
+) {
+    dao.deleteEntryIdentifiersByScheme(SCHEME_DOI, identOwner)
+    dao.deleteEntryIdentifiersByScheme(SCHEME_ISBN, identOwner)
+    dao.deleteEntryIdentifiersByScheme(SCHEME_ARXIV, identOwner)
+    if (cleanUrl != existingUrl) {
+        dao.deleteEntryIdentifiersByScheme("url", identOwner)
+    }
+}
+
+@Suppress("LongParameterList")
+private fun collectIncomingIdentRows(
+    identOwner: String,
+    resolvedKind: EntryKind,
+    rec: SyncEntryRecordDto,
+    cleanUrl: String?,
+    editAuthority: EditMergeAuthority,
+    isPlainEntry: Boolean,
+): List<EntryIdentifierEntity> = buildList {
+    val protectEdited =
+        editAuthority == EditMergeAuthority.EXISTING_EDIT ||
+            editAuthority == EditMergeAuthority.EQUAL_EDIT
+    for (ident in rec.identifiers) {
+        toValidIncomingIdentRow(identOwner, resolvedKind, ident, protectEdited)?.let(::add)
+    }
+    if (!protectEdited && isPlainEntry && cleanUrl != null) {
+        appendUrlDerivedIdents(
+            identOwner = identOwner,
+            cleanUrl = cleanUrl,
+            includeArxiv = editAuthority != EditMergeAuthority.INCOMING_EDIT,
+            out = this,
+        )
+    }
+}
+
+private fun toValidIncomingIdentRow(
+    identOwner: String,
+    resolvedKind: EntryKind,
+    ident: EntryIdentifierDto,
+    protectEdited: Boolean,
+): EntryIdentifierEntity? {
+    val scheme = normalizeIdentifierScheme(ident.scheme)
+    val blocked =
+        scheme.isEmpty() ||
+            scheme in RESERVED_SYNC_IDENT_SCHEMES ||
+            protectEdited && scheme in EDITABLE_IDENT_SCHEMES
+    if (blocked) return null
+    val value = normalizeIdentifierValue(resolvedKind, scheme, ident.value)
+    return value.takeIf { it.isNotEmpty() }?.let { EntryIdentifierEntity(scheme, it, identOwner) }
+}
+
+private fun appendUrlDerivedIdents(
+    identOwner: String,
+    cleanUrl: String,
+    includeArxiv: Boolean,
+    out: MutableList<EntryIdentifierEntity>,
+) {
+    canonicalizeSyncUrl(cleanUrl)
+        .takeIf { it.isNotEmpty() }
+        ?.let { out.add(EntryIdentifierEntity("url", it, identOwner)) }
+    if (includeArxiv) {
+        extractArxivIdentifier(cleanUrl)?.let {
+            out.add(EntryIdentifierEntity(SCHEME_ARXIV, it, identOwner))
+        }
+    }
+}
+
+private val EDITABLE_IDENT_SCHEMES = setOf(SCHEME_DOI, SCHEME_ISBN, SCHEME_ARXIV, "url")
 
 internal fun shouldIncomingWinHlc(
     incomingHlc: String,

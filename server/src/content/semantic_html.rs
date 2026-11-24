@@ -543,6 +543,65 @@ pub fn preprocess_semantic_html(
     out
 }
 
+/// Allowlists strictly safe presentation `MathML` tags and non-URL layout attributes on an
+/// `ammonia::Builder`, while ensuring `<annotation>` / `<annotation-xml>` subtrees are stripped.
+pub fn configure_safe_mathml(builder: &mut ammonia::Builder<'_>) {
+    const MATHML_TAGS: [&str; 22] = [
+        "math",
+        "mi",
+        "mn",
+        "mo",
+        "mtext",
+        "mspace",
+        "mrow",
+        "msup",
+        "msub",
+        "msubsup",
+        "mfrac",
+        "msqrt",
+        "mroot",
+        "mover",
+        "munder",
+        "munderover",
+        "mtable",
+        "mtr",
+        "mtd",
+        "mstyle",
+        "mpadded",
+        "semantics",
+    ];
+    builder.add_clean_content_tags(["annotation", "annotation-xml"]);
+    builder.add_tags(MATHML_TAGS);
+    builder.add_tag_attributes("math", ["display"]);
+    builder.add_tag_attributes("mi", ["mathvariant"]);
+    builder.add_tag_attributes("mn", ["mathvariant"]);
+    builder.add_tag_attributes("mtext", ["mathvariant"]);
+    builder.add_tag_attributes("mstyle", ["mathvariant"]);
+    builder.add_tag_attributes(
+        "mo",
+        [
+            "mathvariant",
+            "stretchy",
+            "lspace",
+            "rspace",
+            "fence",
+            "separator",
+            "accent",
+            "largeop",
+            "movablelimits",
+            "symmetric",
+        ],
+    );
+    builder.add_tag_attributes("mspace", ["width"]);
+    builder.add_tag_attributes("mfrac", ["linethickness"]);
+    builder.add_tag_attributes("mover", ["accent"]);
+    builder.add_tag_attributes("munder", ["accentunder"]);
+    builder.add_tag_attributes("munderover", ["accent", "accentunder"]);
+    builder.add_tag_attributes("mtable", ["columnalign", "rowalign"]);
+    builder.add_tag_attributes("mtr", ["columnalign", "rowalign"]);
+    builder.add_tag_attributes("mtd", ["columnalign", "rowalign", "columnspan", "rowspan"]);
+}
+
 fn run_structural_pre_pass(raw_html: &str, include_page_chrome_tags: bool) -> String {
     let mut builder = ammonia::Builder::default();
     builder.add_tags([
@@ -563,9 +622,23 @@ fn run_structural_pre_pass(raw_html: &str, include_page_chrome_tags: bool) -> St
         builder.add_tags(["nav", "form"]);
     }
     builder.add_clean_content_tags([
-        "head", "title", "script", "style", "noscript", "template", "svg", "math", "iframe",
-        "object", "embed",
+        "head",
+        "title",
+        "script",
+        "style",
+        "noscript",
+        "template",
+        "svg",
+        "iframe",
+        "object",
+        "embed",
+        "noembed",
+        "noframes",
+        "xmp",
+        "textarea",
+        "plaintext",
     ]);
+    configure_safe_mathml(&mut builder);
     builder.add_generic_attributes(["class", "style", "id", "hidden", "role", "itemprop"]);
     builder.url_relative(ammonia::UrlRelative::PassThrough);
     builder.link_rel(None);
@@ -739,6 +812,11 @@ fn is_page_boilerplate_element(el: &DomElement, inside_blockquote: bool) -> bool
                     | "widget-area"
                     | "breadcrumb"
                     | "breadcrumbs"
+                    | "ltx_page_logo"
+                    | "ltx_page_header"
+                    | "ltx_page_footer"
+                    | "ltx_pagination"
+                    | "ar5iv-footer"
             ) {
                 return true;
             }
@@ -835,10 +913,38 @@ fn transform_node(
         return;
     }
 
+    // Preserve presentation MathML subtrees untouched; `ammonia` sanitizes tags & attributes downstream.
+    if el.tag == "math" {
+        el.remove_attrs(&["class", "style", "hidden", "role", "itemprop"]);
+        out.push(DomNode::Element(el));
+        return;
+    }
+
     let mut effective = inherited;
     effective.merge_over(own);
 
+    let preserved_class = match el.tag.as_str() {
+        "figure"
+            if el
+                .attr("class")
+                .is_some_and(|c| c.split_whitespace().any(|t| t == "paper-equation")) =>
+        {
+            Some("paper-equation")
+        }
+        "span"
+            if el
+                .attr("class")
+                .is_some_and(|c| c.split_whitespace().any(|t| t == "paper-eqno")) =>
+        {
+            Some("paper-eqno")
+        }
+        _ => None,
+    };
+
     el.remove_attrs(&["class", "style", "hidden", "role", "itemprop"]);
+    if let Some(cls) = preserved_class {
+        el.attrs.push(("class".to_owned(), cls.to_owned()));
+    }
 
     if is_void_tag(&el.tag) {
         out.push(DomNode::Element(el));

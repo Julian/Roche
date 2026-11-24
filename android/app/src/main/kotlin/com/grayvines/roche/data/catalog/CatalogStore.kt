@@ -233,6 +233,30 @@ class CatalogStore(
         return entryId
     }
 
+    suspend fun updateEntry(
+        entryId: String,
+        input: UpdateCatalogEntryInput,
+    ): CatalogEntryItem {
+        val updated = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val nodeId = resolveLocalPeerId()
+            var result: CatalogEntryItem? = null
+            dao.executeInTransaction {
+                result =
+                    updateEntryInDao(
+                        dao = dao,
+                        entryId = entryId,
+                        input = input,
+                        nowIso = nowUtcIso(),
+                        nodeId = nodeId,
+                    )
+            }
+            checkNotNull(result)
+        }
+        notifyLocalMutation()
+        return updated
+    }
+
     suspend fun logEntry(
         input: UpsertCatalogEntryInput,
         status: ConsumptionStatus,

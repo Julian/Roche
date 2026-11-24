@@ -1,3 +1,4 @@
+mod document;
 mod itunes;
 mod spotify;
 mod wikipedia;
@@ -13,6 +14,11 @@ use std::{
 use serde_json::Value;
 use url::Url;
 
+pub use self::document::{
+    FeedFetcherTextAdapter, can_refresh_document_metadata, discover_pdf_metadata_from_bytes,
+    enrich_document_detail_with_fetcher, extract_paper_reader_html, fetch_arxiv_html5,
+    lookup_external_document_metadata, should_auto_enrich_document,
+};
 pub use self::itunes::{
     AlbumTrack, DiscographyAlbum, extract_album_tracks, extract_artist_discography,
     normalize_album_match_key,
@@ -38,6 +44,7 @@ const MAX_SUMMARY_CHARS: usize = 600;
 const MAX_ENRICH_ATTEMPT_CACHE: usize = 4_096;
 pub const MAX_CONCURRENT_ENRICH_TASKS: usize = 4;
 const ON_DEMAND_ENRICH_COOLDOWN: Duration = Duration::from_secs(60);
+const LAZY_PDF_REFLOW_COOLDOWN: Duration = Duration::from_secs(300);
 
 pub trait ArtistMetadataFetcher: Send + Sync {
     fn fetch_text<'a>(
@@ -105,6 +112,7 @@ impl EnrichAttemptCache {
 pub struct ArtistEnricher {
     enabled: bool,
     http_client: Option<SafeHttpClient>,
+    doc_http_client: Option<SafeHttpClient>,
     attempt_cache: Mutex<EnrichAttemptCache>,
     semaphore: Arc<tokio::sync::Semaphore>,
 }
@@ -114,9 +122,12 @@ impl ArtistEnricher {
     pub fn new(enabled: bool) -> Self {
         let http_client =
             if enabled { SafeHttpClient::new(Duration::from_millis(2_500)).ok() } else { None };
+        let doc_http_client =
+            if enabled { SafeHttpClient::new(Duration::from_secs(12)).ok() } else { None };
         Self {
             enabled,
             http_client,
+            doc_http_client,
             attempt_cache: Mutex::new(EnrichAttemptCache::default()),
             semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ENRICH_TASKS)),
         }
@@ -125,6 +136,22 @@ impl ArtistEnricher {
     #[must_use]
     pub fn default_for_runtime() -> Self {
         Self::new(!cfg!(test))
+    }
+
+    #[must_use]
+    pub const fn active_http_client(&self) -> Option<&SafeHttpClient> {
+        if self.enabled { self.http_client.as_ref() } else { None }
+    }
+
+    #[must_use]
+    pub const fn active_doc_http_client(&self) -> Option<&SafeHttpClient> {
+        if self.enabled { self.doc_http_client.as_ref() } else { None }
+    }
+
+    pub fn clear_attempt_key(&self, key: &str) {
+        if let Ok(mut guard) = self.attempt_cache.lock() {
+            guard.entries.remove(key);
+        }
     }
 
     #[must_use]
@@ -162,32 +189,98 @@ pub struct EnrichService<'a> {
 }
 
 impl EnrichService<'_> {
-    /// Returns `true` when on-demand enrichment is enabled, `detail` is an Artist or Album with
-    /// missing enrichable metadata, and no enrichment attempt was made within the cooldown window.
+    /// Returns `true` when on-demand auto-enrichment should run on page open (`Artist`, `Album`,
+    /// or a `Paper` with a placeholder title / missing bibliographic metadata).
     #[must_use]
     pub fn needs_enrichment(&self, detail: &EntryDetailView) -> bool {
         let enricher = &self.service.artist_enricher;
-        if !enricher.enabled || enricher.http_client.is_none() {
-            return false;
-        }
         let key = match detail.entry.kind {
-            EntryKind::Artist if should_attempt_enrichment(detail) => {
+            EntryKind::Artist
+                if enricher.enabled
+                    && enricher.http_client.is_some()
+                    && should_attempt_enrichment(detail) =>
+            {
                 format!("on-demand|artist|{}", detail.entry.id)
             }
-            EntryKind::Album if should_attempt_album_tracklist_enrichment(detail) => {
+            EntryKind::Album
+                if enricher.enabled
+                    && enricher.http_client.is_some()
+                    && should_attempt_album_tracklist_enrichment(detail) =>
+            {
                 format!("on-demand|album|{}", detail.entry.id)
+            }
+            EntryKind::Paper if enricher.enabled && should_auto_enrich_document(detail) => {
+                format!("on-demand|document|{}", detail.entry.id)
             }
             _ => return false,
         };
         !enricher.has_recent_attempt(&key, Instant::now(), ON_DEMAND_ENRICH_COOLDOWN)
     }
 
-    /// Triggers bounded on-demand metadata enrichment for an `Artist` (bio, portrait, Spotify/Wikipedia
-    /// links, iTunes discography) or `Album` (tracklist) and returns the refreshed [`EntryDetailView`].
-    ///
-    /// Rate-limited by [`ArtistEnricher`]'s concurrency semaphore and cooldown cache so repeated
-    /// client requests (from Android or Web) return immediately without hammering upstream APIs.
+    /// Returns `true` when the entry supports an explicit user-triggered "Refresh Metadata" action.
+    #[must_use]
+    pub fn can_manual_refresh(detail: &EntryDetailView) -> bool {
+        match detail.entry.kind {
+            EntryKind::Artist => should_attempt_enrichment(detail),
+            EntryKind::Album => should_attempt_album_tracklist_enrichment(detail),
+            EntryKind::Paper | EntryKind::Article | EntryKind::Book => {
+                can_refresh_document_metadata(detail)
+            }
+            _ => false,
+        }
+    }
+
+    /// Triggers bounded on-demand metadata enrichment for an `Artist`, `Album`, `Paper`, `Article`,
+    /// or `Book` and returns the refreshed [`EntryDetailView`].
     pub async fn enrich_entry_now(&self, id: &str) -> Result<EntryDetailView, AppError> {
+        self.enrich_entry_with_options(id, false).await
+    }
+
+    /// Triggers an explicit user-initiated metadata refresh (bypassing the 60s auto-enrichment
+    /// cooldown and allowing blank/placeholder fields to be populated even on previously edited
+    /// entries).
+    pub async fn refresh_entry_metadata_now(&self, id: &str) -> Result<EntryDetailView, AppError> {
+        self.enrich_entry_with_options(id, true).await
+    }
+
+    /// Lazily extracts reflowed HTML + `MathML` for a paper with a cached local PDF (preferring
+    /// official arXiv HTML5 when an arXiv ID is present), persisting it if `entry_content` has no
+    /// body HTML yet.
+    ///
+    /// Bounded by the enricher concurrency semaphore and a per-entry cooldown cache (including
+    /// negative/empty results for image-only scanned PDFs) so repeated opens cannot stampede.
+    pub async fn ensure_paper_reader_html(
+        &self,
+        entry_id: &str,
+        arxiv_id: Option<&str>,
+        strip_title: Option<&str>,
+    ) -> Option<String> {
+        let enricher = &self.service.artist_enricher;
+        let attempt_key = format!("pdf-reflow|{entry_id}");
+        let _permit =
+            enricher.try_reserve_slot(attempt_key, Instant::now(), LAZY_PDF_REFLOW_COOLDOWN)?;
+        let client_opt = enricher.active_doc_http_client();
+        let extracted = tokio::time::timeout(
+            Duration::from_secs(15),
+            extract_paper_reader_html(self.service, entry_id, arxiv_id, strip_title, client_opt),
+        )
+        .await
+        .ok()
+        .flatten()?;
+        let _ = self
+            .service
+            .db
+            .items()
+            .save_extracted_content_html_if_empty(entry_id, &extracted)
+            .await;
+        Some(extracted)
+    }
+
+    async fn enrich_entry_with_options(
+        &self,
+        id: &str,
+        force_refresh: bool,
+    ) -> Result<EntryDetailView, AppError> {
         let mut detail = self
             .service
             .catalog()
@@ -196,38 +289,57 @@ impl EnrichService<'_> {
             .ok_or_else(|| AppError::not_found("Entry not found"))?;
 
         let enricher = &self.service.artist_enricher;
-        if !enricher.enabled {
-            return Ok(detail);
-        }
-        let Some(client) = enricher.http_client.as_ref() else {
-            return Ok(detail);
-        };
+        let client_opt = enricher.enabled.then_some(enricher.http_client.as_ref()).flatten();
 
         match detail.entry.kind {
             EntryKind::Artist if should_attempt_enrichment(&detail) => {
-                let attempt_key = format!("on-demand|artist|{}", detail.entry.id);
-                if let Some(_permit) = enricher.try_reserve_slot(
-                    attempt_key,
-                    Instant::now(),
-                    ON_DEMAND_ENRICH_COOLDOWN,
-                ) {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(6),
-                        enrich_artist_detail_with_fetcher(self.service, &mut detail, client),
-                    )
-                    .await;
+                if let Some(client) = client_opt {
+                    let attempt_key = format!("on-demand|artist|{}", detail.entry.id);
+                    let ttl =
+                        if force_refresh { Duration::ZERO } else { ON_DEMAND_ENRICH_COOLDOWN };
+                    if let Some(_permit) =
+                        enricher.try_reserve_slot(attempt_key, Instant::now(), ttl)
+                    {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(6),
+                            enrich_artist_detail_with_fetcher(self.service, &mut detail, client),
+                        )
+                        .await;
+                    }
                 }
             }
             EntryKind::Album if should_attempt_album_tracklist_enrichment(&detail) => {
-                let attempt_key = format!("on-demand|album|{}", detail.entry.id);
-                if let Some(_permit) = enricher.try_reserve_slot(
-                    attempt_key,
-                    Instant::now(),
-                    ON_DEMAND_ENRICH_COOLDOWN,
-                ) {
+                if let Some(client) = client_opt {
+                    let attempt_key = format!("on-demand|album|{}", detail.entry.id);
+                    let ttl =
+                        if force_refresh { Duration::ZERO } else { ON_DEMAND_ENRICH_COOLDOWN };
+                    if let Some(_permit) =
+                        enricher.try_reserve_slot(attempt_key, Instant::now(), ttl)
+                    {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(6),
+                            enrich_album_tracklist_with_fetcher(self.service, &mut detail, client),
+                        )
+                        .await;
+                    }
+                }
+            }
+            EntryKind::Paper | EntryKind::Article | EntryKind::Book => {
+                if force_refresh {
+                    enricher.clear_attempt_key(&format!("pdf-reflow|{}", detail.entry.id));
+                }
+                let doc_client_opt = enricher.active_doc_http_client();
+                let attempt_key = format!("on-demand|document|{}", detail.entry.id);
+                let ttl = if force_refresh { Duration::ZERO } else { ON_DEMAND_ENRICH_COOLDOWN };
+                if let Some(_permit) = enricher.try_reserve_slot(attempt_key, Instant::now(), ttl) {
                     let _ = tokio::time::timeout(
-                        Duration::from_secs(6),
-                        enrich_album_tracklist_with_fetcher(self.service, &mut detail, client),
+                        Duration::from_secs(20),
+                        enrich_document_detail_with_fetcher(
+                            self.service,
+                            &mut detail,
+                            doc_client_opt,
+                            force_refresh,
+                        ),
                     )
                     .await;
                 }

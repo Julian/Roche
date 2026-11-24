@@ -60,6 +60,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.data.CatalogSearchMatch
 import com.grayvines.roche.data.CatalogSearchResult
 import com.grayvines.roche.data.SearchScopeFilter
@@ -856,7 +857,7 @@ private fun SearchCatalogMatchRow(
         CatalogCoverThumbnail(thumbnailUrl = entry.thumbnailUrl, kind = entry.kind, size = 38.dp)
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
-                text = entry.title,
+                text = remember(entry.title) { formatInlineMathAnnotated(entry.title) },
                 color = colors.textPrimary,
                 fontFamily = currentHeadlineFontFamily(),
                 fontSize = 14.5.sp,

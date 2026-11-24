@@ -365,7 +365,7 @@ fn render_diary_page_row(
         "<div class=\"diary-entry-text\">\
            <div class=\"diary-entry-title-line\"><a class=\"diary-entry-title\" href=\"{}\">{}</a>",
         esc(&entry_href),
-        esc(&row.entry.title),
+        roche_core::document_meta::render_inline_math_html(&row.entry.title),
     );
     if !row.entry.creators.is_empty() {
         out.push_str(" <span class=\"diary-entry-by\">&mdash; ");
@@ -414,7 +414,7 @@ fn render_diary_page_row(
                <button type=\"submit\" class=\"btn btn-primary btn-small\">Save</button>\
              </form>\
            </details>",
-        title = esc(&row.entry.title),
+        title = esc(&roche_core::document_meta::strip_inline_math_delimiters(&row.entry.title)),
         csrf = esc(csrf),
         ret = esc(return_to),
         note_esc = esc(note_str),
@@ -576,7 +576,7 @@ pub(in crate::web) async fn queue_get(
     if let Some((undo_id, undo_title, undo_queue)) = &undo_banner {
         let toggle_action = format!("/web/entries/{}/queue-toggle", urlencode(undo_id));
         body.push_str("<div class=\"undo-banner\" role=\"status\"><span>Removed <strong>");
-        let _ = write!(body, "{}", esc(undo_title));
+        let _ = write!(body, "{}", roche_core::document_meta::render_inline_math_html(undo_title));
         body.push_str("</strong> from Queue.</span>");
         render_inline_csrf_form(
             &mut body,
@@ -724,7 +724,7 @@ fn render_want_queue_section(
                    <div class=\"queue-item-meta\">",
             idx + 1,
             esc(&title_href),
-            esc(&row.entry.title),
+            roche_core::document_meta::render_inline_math_html(&row.entry.title),
         );
         if !row.entry.creators.is_empty() {
             out.push_str("<span class=\"byline-item\">");

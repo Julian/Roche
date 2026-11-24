@@ -323,6 +323,26 @@ data class UpsertCatalogEntryInput(
     val identifiers: List<EntryIdentifierDto> = emptyList(),
 )
 
+data class UpdateCatalogEntryInput(
+    val kind: EntryKind? = null,
+    val title: String? = null,
+    val creators: List<String>? = null,
+    val url: String? = null,
+    val clearUrl: Boolean = false,
+    val publishedAt: String? = null,
+    val clearPublishedAt: Boolean = false,
+    val releaseYear: Int? = null,
+    val clearReleaseYear: Boolean = false,
+    val summary: String? = null,
+    val clearSummary: Boolean = false,
+    val doi: String? = null,
+    val clearDoi: Boolean = false,
+    val arxivId: String? = null,
+    val clearArxivId: Boolean = false,
+    val isbn: String? = null,
+    val clearIsbn: Boolean = false,
+)
+
 data class RankSettlementSummary(
     val entryId: String,
     val title: String,

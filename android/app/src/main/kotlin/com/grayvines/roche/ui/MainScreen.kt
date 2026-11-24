@@ -655,6 +655,30 @@ internal fun MainOverlaySheets(
         )
     }
 
+    MainCatalogOverlaySheets(
+        state = state,
+        onAction = onAction,
+        onOpenCollectionDraw = onOpenCollectionDraw,
+        onPlayMusicTrack = onPlayMusicTrack,
+        onOpenExternalUrl = onOpenExternalUrl,
+    )
+
+    MainBoardOverlaySheets(
+        state = state,
+        onAction = onAction,
+        onShareEntry = onShareEntry,
+        onOpenExternalUrl = onOpenExternalUrl,
+    )
+}
+
+@Composable
+private fun MainCatalogOverlaySheets(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+    onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
     val drawDialog = state.drawNoteDialog
     if (drawDialog != null) {
         CollectionDrawNoteModalSheet(
@@ -685,6 +709,15 @@ internal fun MainOverlaySheets(
         )
     }
 
+    val editingEntryId = state.editingCatalogEntryId
+    if (editingEntryId != null) {
+        EditEntryBottomSheet(
+            entryId = editingEntryId,
+            state = state,
+            onAction = onAction,
+        )
+    }
+
     if (state.isQuickLogSheetOpen) {
         QuickLogBottomSheet(
             defaultToWant = state.quickLogDefaultWant,
@@ -698,7 +731,15 @@ internal fun MainOverlaySheets(
             onAction = onAction,
         )
     }
+}
 
+@Composable
+private fun MainBoardOverlaySheets(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    onShareEntry: (InboxEntry) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
     if (state.isAddBoardSheetOpen) {
         AddBoardBottomSheet(
             existingBoards = state.boards,
@@ -798,6 +839,7 @@ private fun MainReaderDestination(
                 settings = state.settings,
                 isHydrating = state.isReaderHydrating,
                 isDownloadingOffline = targetEntry.id in state.inFlightOfflineEntryIds,
+                catalogReleaseYear = state.catalog.entriesById[targetEntry.id]?.releaseYear,
                 playerStateFlow = playerStateFlow,
                 onAction = onAction,
                 onShareEntry = onShareEntry,

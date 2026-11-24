@@ -3,7 +3,12 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
+use chrono::{DateTime, Datelike, Utc};
 use quick_xml::{Reader, events::Event};
+use roche_core::document_meta::{
+    ParsedPublicationDate, extract_doi_from_text, normalize_doi, normalize_isbn,
+    parse_publication_date_str, split_author_names,
+};
 use url::Url;
 
 use super::{semantic_html, xml_util};
@@ -20,9 +25,30 @@ pub struct HtmlSanitizer;
 pub struct ExtractedSnapshot {
     pub title: Option<String>,
     pub author: Option<String>,
+    pub authors: Vec<String>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub release_year: Option<i32>,
+    pub doi: Option<String>,
+    pub isbn: Option<String>,
     pub summary: Option<String>,
     pub content_html: String,
     pub thumbnail_url: Option<String>,
+}
+
+#[derive(Default)]
+struct HtmlMetaAccumulator {
+    citation_title: Option<String>,
+    title: Option<String>,
+    og_title: Option<String>,
+    citation_authors: Vec<String>,
+    meta_authors: Vec<String>,
+    meta_desc: Option<String>,
+    meta_image: Option<String>,
+    citation_date: Option<ParsedPublicationDate>,
+    meta_date: Option<ParsedPublicationDate>,
+    time_date: Option<ParsedPublicationDate>,
+    doi: Option<String>,
+    isbn: Option<String>,
 }
 
 impl HtmlSanitizer {
@@ -43,7 +69,24 @@ impl HtmlSanitizer {
 
         let mut builder = ammonia::Builder::default();
         builder.url_schemes(HashSet::from(["http", "https", "mailto"]));
-        builder.add_clean_content_tags(["head", "title", "noscript", "template", "svg", "math"]);
+        builder.add_clean_content_tags([
+            "head",
+            "title",
+            "noscript",
+            "template",
+            "svg",
+            "iframe",
+            "object",
+            "embed",
+            "noembed",
+            "noframes",
+            "xmp",
+            "textarea",
+            "plaintext",
+        ]);
+        semantic_html::configure_safe_mathml(&mut builder);
+        builder.add_allowed_classes("figure", ["paper-equation"]);
+        builder.add_allowed_classes("span", ["paper-eqno"]);
         builder.add_generic_attributes(["id"]);
         builder.set_tag_attribute_value("img", "referrerpolicy", "no-referrer");
         builder.set_tag_attribute_value("img", "loading", "lazy");
@@ -55,9 +98,69 @@ impl HtmlSanitizer {
             if attribute.eq_ignore_ascii_case("id") {
                 return semantic_html::normalize_prose_id(value);
             }
+            match Self::filter_mathml_layout_attr(element, attribute, value) {
+                MathMlAttrFilter::Keep(v) => return Some(v),
+                MathMlAttrFilter::Drop => return None,
+                MathMlAttrFilter::NotHandled => {}
+            }
             Self::filter_sanitized_url_attr(element, attribute, value, filter_base.as_ref())
         });
         builder.clean(html).to_string()
+    }
+
+    fn filter_mathml_layout_attr<'a>(
+        element: &str,
+        attribute: &str,
+        value: &'a str,
+    ) -> MathMlAttrFilter<'a> {
+        let attr = attribute.to_ascii_lowercase();
+        let trimmed = value.trim();
+        let filtered: Option<Cow<'a, str>> = match attr.as_str() {
+            "display" if element.eq_ignore_ascii_case("math") => {
+                matches!(trimmed.to_ascii_lowercase().as_str(), "block" | "inline")
+                    .then(|| Cow::Owned(trimmed.to_ascii_lowercase()))
+            }
+            "mathvariant" => matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "normal"
+                    | "bold"
+                    | "italic"
+                    | "bold-italic"
+                    | "double-struck"
+                    | "script"
+                    | "fraktur"
+                    | "sans-serif"
+                    | "monospace"
+            )
+            .then(|| Cow::Owned(trimmed.to_ascii_lowercase())),
+            "stretchy" | "fence" | "separator" | "accent" | "accentunder" | "largeop"
+            | "movablelimits" | "symmetric" => {
+                matches!(trimmed.to_ascii_lowercase().as_str(), "true" | "false")
+                    .then(|| Cow::Owned(trimmed.to_ascii_lowercase()))
+            }
+            "columnalign" => trimmed
+                .split_whitespace()
+                .all(|tok| matches!(tok, "left" | "center" | "right"))
+                .then_some(Cow::Borrowed(trimmed))
+                .filter(|s| !s.is_empty() && s.len() <= 64),
+            "rowalign" => trimmed
+                .split_whitespace()
+                .all(|tok| matches!(tok, "top" | "bottom" | "center" | "baseline" | "axis"))
+                .then_some(Cow::Borrowed(trimmed))
+                .filter(|s| !s.is_empty() && s.len() <= 64),
+            "columnspan" | "rowspan" => trimmed
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| (1..=32).contains(&n))
+                .map(|n| Cow::Owned(n.to_string())),
+            "width" | "lspace" | "rspace" | "linethickness"
+                if matches!(element.to_ascii_lowercase().as_str(), "mspace" | "mo" | "mfrac") =>
+            {
+                is_safe_mathml_length(trimmed).then_some(Cow::Borrowed(trimmed))
+            }
+            _ => return MathMlAttrFilter::NotHandled,
+        };
+        filtered.map_or(MathMlAttrFilter::Drop, MathMlAttrFilter::Keep)
     }
 
     fn filter_sanitized_url_attr<'a>(
@@ -256,25 +359,46 @@ impl HtmlSanitizer {
 
     #[must_use]
     pub fn extract_snapshot_with_base(raw_html: &str, base_url: Option<&Url>) -> ExtractedSnapshot {
-        // Normalize <title> and <meta> tags through html5ever (via ammonia) so inline <script>if (a < b)</script>,
-        // <svg><title>, unquoted attributes, and bare ampersands are parsed per HTML5 spec.
+        // Normalize <title>, <meta>, and <time> tags through html5ever (via ammonia) so inline
+        // <script>if (a < b)</script>, <svg><title>, unquoted attributes, and bare ampersands are
+        // parsed per HTML5 spec.
         let mut meta_builder = ammonia::Builder::new();
         meta_builder
-            .tags(HashSet::from(["title", "meta"]))
+            .tags(HashSet::from(["title", "meta", "time"]))
             .clean_content_tags(HashSet::from([
                 "script", "style", "svg", "noscript", "template", "math",
             ]))
-            .add_tag_attributes("meta", &["name", "property", "content"]);
+            .add_tag_attributes("meta", &["name", "property", "content"])
+            .add_tag_attributes("time", &["datetime"]);
         let normalized_meta_html = meta_builder.clean(raw_html).to_string();
 
-        let (title, author, meta_desc, meta_image) =
-            Self::parse_title_and_meta(&normalized_meta_html, base_url);
+        let mut acc = Self::parse_title_and_meta(&normalized_meta_html, base_url);
+        let jsonld = Self::extract_jsonld_metadata(raw_html);
+
+        let title = acc.citation_title.or(acc.title).or(acc.og_title).or(jsonld.title);
+        let authors = if !acc.citation_authors.is_empty() {
+            dedup_preserve_order(acc.citation_authors)
+        } else if !acc.meta_authors.is_empty() {
+            dedup_preserve_order(acc.meta_authors)
+        } else {
+            dedup_preserve_order(jsonld.authors)
+        };
+        let author = (!authors.is_empty()).then(|| authors.join(", "));
+
+        let best_date = acc.citation_date.or(acc.meta_date).or(jsonld.date).or(acc.time_date);
+        let published_at = best_date.and_then(|d| d.published_at);
+        let release_year =
+            best_date.and_then(|d| d.release_year).or_else(|| published_at.map(|dt| dt.year()));
+        let doi = acc.doi.take().or(jsonld.doi);
+        let isbn = acc.isbn.take().or(jsonld.isbn);
+
         let css_rules = semantic_html::parse_stylesheet_typographic_rules(raw_html);
         let prepared_body = semantic_html::preprocess_semantic_html(raw_html, &css_rules, true);
         let content_html = Self::sanitize_prepared_html(&prepared_body, base_url);
         let thumbnail_url =
-            meta_image.or_else(|| Self::extract_first_image_url_with_base(raw_html, base_url));
-        let summary = meta_desc
+            acc.meta_image.or_else(|| Self::extract_first_image_url_with_base(raw_html, base_url));
+        let summary = acc
+            .meta_desc
             .map(|desc| Self::plain_text_truncate(&desc, MAX_SUMMARY_CHARS))
             .filter(|s| !s.is_empty())
             .or_else(|| {
@@ -288,7 +412,18 @@ impl HtmlSanitizer {
                 (!fallback.is_empty()).then_some(fallback)
             });
 
-        ExtractedSnapshot { title, author, summary, content_html, thumbnail_url }
+        ExtractedSnapshot {
+            title,
+            author,
+            authors,
+            published_at,
+            release_year,
+            doi,
+            isbn,
+            summary,
+            content_html,
+            thumbnail_url,
+        }
     }
 
     /// Scans HTML for the first valid raster `<img src="...">` URL (resolving relative URLs against `base_url`),
@@ -384,18 +519,11 @@ impl HtmlSanitizer {
         Self::resolve_and_validate_thumbnail_url(src.as_deref()?, base_url)
     }
 
-    fn parse_title_and_meta(
-        normalized_html: &str,
-        base_url: Option<&Url>,
-    ) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+    fn parse_title_and_meta(normalized_html: &str, base_url: Option<&Url>) -> HtmlMetaAccumulator {
         let mut reader = Reader::from_str(normalized_html);
         reader.config_mut().check_end_names = false;
 
-        let mut title: Option<String> = None;
-        let mut og_title: Option<String> = None;
-        let mut meta_author: Option<String> = None;
-        let mut meta_desc: Option<String> = None;
-        let mut meta_image: Option<String> = None;
+        let mut acc = HtmlMetaAccumulator::default();
         let mut in_title = false;
         let mut current_buf = String::new();
 
@@ -404,29 +532,23 @@ impl HtmlSanitizer {
                 Ok(Event::Start(tag)) => {
                     let name = tag.name();
                     let name_bytes = name.as_ref();
-                    if name_bytes.eq_ignore_ascii_case("title") && title.is_none() {
+                    if name_bytes.eq_ignore_ascii_case("title") && acc.title.is_none() {
                         in_title = true;
                         current_buf.clear();
                     } else if name_bytes.eq_ignore_ascii_case("meta") {
-                        Self::inspect_meta_tag(
-                            &tag,
-                            base_url,
-                            &mut og_title,
-                            &mut meta_author,
-                            &mut meta_desc,
-                            &mut meta_image,
-                        );
+                        Self::inspect_meta_tag(&tag, base_url, &mut acc);
+                    } else if name_bytes.eq_ignore_ascii_case("time") && acc.time_date.is_none() {
+                        Self::inspect_time_tag(&tag, &mut acc);
                     }
                 }
-                Ok(Event::Empty(tag)) if tag.name().as_ref().eq_ignore_ascii_case("meta") => {
-                    Self::inspect_meta_tag(
-                        &tag,
-                        base_url,
-                        &mut og_title,
-                        &mut meta_author,
-                        &mut meta_desc,
-                        &mut meta_image,
-                    );
+                Ok(Event::Empty(tag)) => {
+                    let name = tag.name();
+                    let name_bytes = name.as_ref();
+                    if name_bytes.eq_ignore_ascii_case("meta") {
+                        Self::inspect_meta_tag(&tag, base_url, &mut acc);
+                    } else if name_bytes.eq_ignore_ascii_case("time") && acc.time_date.is_none() {
+                        Self::inspect_time_tag(&tag, &mut acc);
+                    }
                 }
                 Ok(Event::Text(text)) if in_title => {
                     current_buf.push_str(&xml_util::decode_text(&text));
@@ -440,7 +562,7 @@ impl HtmlSanitizer {
                     in_title = false;
                     let trimmed = current_buf.trim();
                     if !trimmed.is_empty() {
-                        title = Some(trimmed.to_owned());
+                        acc.title = Some(trimmed.to_owned());
                     }
                 }
                 Ok(Event::Eof) | Err(_) => break,
@@ -448,7 +570,113 @@ impl HtmlSanitizer {
             }
         }
 
-        (title.or(og_title), meta_author, meta_desc, meta_image)
+        acc
+    }
+
+    fn inspect_time_tag(tag: &quick_xml::events::BytesStart<'_>, acc: &mut HtmlMetaAccumulator) {
+        if let Some(dt_attr) = xml_util::find_attr_ignore_ascii_case(tag, "datetime")
+            && let Some(parsed) = parse_publication_date_str(&dt_attr)
+        {
+            acc.time_date = Some(parsed);
+        }
+    }
+
+    fn extract_jsonld_metadata(raw_html: &str) -> JsonLdMetadata {
+        let mut out = JsonLdMetadata::default();
+        if !raw_html.as_bytes().windows(7).any(|w| w.eq_ignore_ascii_case(b"ld+json")) {
+            return out;
+        }
+        let lower = raw_html.to_ascii_lowercase();
+        let mut cursor = 0usize;
+        let mut inspected = 0usize;
+        while inspected < 12
+            && let Some(rel_start) = lower[cursor..].find("<script")
+        {
+            let tag_start = cursor + rel_start;
+            let Some(rel_gt) = lower[tag_start..].find('>') else {
+                break;
+            };
+            let open_end = tag_start + rel_gt + 1;
+            let open_tag = &lower[tag_start..open_end];
+            let Some(rel_close) = lower[open_end..].find("</script") else {
+                break;
+            };
+            let body_end = open_end + rel_close;
+            cursor = body_end + 8;
+
+            if !open_tag.contains("ld+json") {
+                continue;
+            }
+            inspected += 1;
+            let json_text = raw_html[open_end..body_end].trim();
+            if json_text.is_empty() || json_text.len() > 256_000 {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_text) {
+                Self::collect_jsonld_value(&val, &mut out, 0);
+            }
+        }
+        out
+    }
+
+    fn collect_jsonld_value(val: &serde_json::Value, out: &mut JsonLdMetadata, depth: usize) {
+        if depth > 4 {
+            return;
+        }
+        match val {
+            serde_json::Value::Array(arr) => {
+                for item in arr.iter().take(24) {
+                    Self::collect_jsonld_value(item, out, depth + 1);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if let Some(graph) = map.get("@graph") {
+                    Self::collect_jsonld_value(graph, out, depth + 1);
+                }
+                if out.title.is_none() {
+                    for key in ["headline", "name"] {
+                        if let Some(raw_title) = map.get(key).and_then(serde_json::Value::as_str) {
+                            let clean = raw_title.split_whitespace().collect::<Vec<_>>().join(" ");
+                            if !clean.is_empty() {
+                                out.title = Some(clean);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if out.date.is_none() {
+                    for key in ["datePublished", "dateCreated"] {
+                        if let Some(raw_date) = map.get(key).and_then(serde_json::Value::as_str)
+                            && let Some(parsed) = parse_publication_date_str(raw_date)
+                        {
+                            out.date = Some(parsed);
+                            break;
+                        }
+                    }
+                }
+                if out.authors.is_empty()
+                    && let Some(author_val) = map.get("author")
+                {
+                    collect_jsonld_authors(author_val, &mut out.authors);
+                }
+                if out.isbn.is_none()
+                    && let Some(raw_isbn) = map.get("isbn").and_then(serde_json::Value::as_str)
+                {
+                    out.isbn = normalize_isbn(raw_isbn);
+                }
+                if out.doi.is_none() {
+                    for key in ["doi", "identifier", "sameAs"] {
+                        if let Some(val) = map.get(key)
+                            && let Some(doi) = extract_jsonld_doi(val)
+                        {
+                            out.doi = Some(doi);
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn extract_first_paragraph(clean_body_html: &str) -> Option<String> {
@@ -495,10 +723,7 @@ impl HtmlSanitizer {
     fn inspect_meta_tag(
         tag: &quick_xml::events::BytesStart<'_>,
         base_url: Option<&Url>,
-        og_title: &mut Option<String>,
-        meta_author: &mut Option<String>,
-        meta_desc: &mut Option<String>,
-        meta_image: &mut Option<String>,
+        acc: &mut HtmlMetaAccumulator,
     ) {
         let mut attr_name: Option<String> = None;
         let mut attr_content: Option<String> = None;
@@ -517,27 +742,72 @@ impl HtmlSanitizer {
             return;
         };
 
-        if meta_desc.is_none()
-            && (name.eq_ignore_ascii_case("description")
-                || name.eq_ignore_ascii_case("og:description"))
-        {
-            *meta_desc = Some(content);
-        } else if og_title.is_none() && name.eq_ignore_ascii_case("og:title") {
-            *og_title = Some(content);
-        } else if meta_author.is_none()
-            && (name.eq_ignore_ascii_case("author")
-                || name.eq_ignore_ascii_case("article:author")
-                || name.eq_ignore_ascii_case("dc.creator")
-                || name.eq_ignore_ascii_case("byl"))
-            && !content.starts_with("http://")
-            && !content.starts_with("https://")
-        {
-            *meta_author = Some(content);
-        } else if meta_image.is_none()
-            && (name.eq_ignore_ascii_case("og:image") || name.eq_ignore_ascii_case("twitter:image"))
-            && let Some(valid_url) = Self::resolve_and_validate_thumbnail_url(&content, base_url)
-        {
-            *meta_image = Some(valid_url);
+        let lower = name.to_ascii_lowercase();
+        match lower.as_str() {
+            "citation_title" if acc.citation_title.is_none() => {
+                acc.citation_title = Some(content);
+            }
+            "og:title" if acc.og_title.is_none() => {
+                acc.og_title = Some(content);
+            }
+            "citation_abstract" | "description" | "og:description" | "twitter:description"
+                if acc.meta_desc.is_none() =>
+            {
+                acc.meta_desc = Some(content);
+            }
+            "citation_author" => {
+                if !content.starts_with("http://") && !content.starts_with("https://") {
+                    acc.citation_authors.push(content);
+                }
+            }
+            "author" | "article:author" | "dc.creator" | "dcterms.creator" | "byl" => {
+                if !content.starts_with("http://") && !content.starts_with("https://") {
+                    let parsed = split_author_names(&content);
+                    if parsed.is_empty() {
+                        acc.meta_authors.push(content);
+                    } else {
+                        acc.meta_authors.extend(parsed);
+                    }
+                }
+            }
+            "citation_publication_date" | "citation_date" | "citation_online_date"
+                if acc.citation_date.is_none() =>
+            {
+                acc.citation_date = parse_publication_date_str(&content);
+            }
+            "article:published_time"
+            | "og:article:published_time"
+            | "pubdate"
+            | "publishdate"
+            | "publish_date"
+            | "datepublished"
+            | "dc.date"
+            | "dc.date.issued"
+            | "dcterms.issued"
+            | "dcterms.created"
+            | "sailthru.date"
+            | "date"
+                if acc.meta_date.is_none() =>
+            {
+                acc.meta_date = parse_publication_date_str(&content);
+            }
+            "citation_doi" | "prism.doi" | "doi" if acc.doi.is_none() => {
+                acc.doi = normalize_doi(&content);
+            }
+            "dc.identifier" | "dcterms.identifier" if acc.doi.is_none() => {
+                acc.doi = normalize_doi(&content).or_else(|| extract_doi_from_text(&content));
+            }
+            "citation_isbn" | "book:isbn" | "isbn" if acc.isbn.is_none() => {
+                acc.isbn = normalize_isbn(&content);
+            }
+            "og:image" | "twitter:image" if acc.meta_image.is_none() => {
+                if let Some(valid_url) =
+                    Self::resolve_and_validate_thumbnail_url(&content, base_url)
+                {
+                    acc.meta_image = Some(valid_url);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -724,6 +994,110 @@ impl HtmlSanitizer {
             anchor_links.push(resolved);
         }
     }
+}
+
+enum MathMlAttrFilter<'a> {
+    Keep(Cow<'a, str>),
+    Drop,
+    NotHandled,
+}
+
+#[derive(Default)]
+struct JsonLdMetadata {
+    title: Option<String>,
+    date: Option<ParsedPublicationDate>,
+    authors: Vec<String>,
+    doi: Option<String>,
+    isbn: Option<String>,
+}
+
+fn is_safe_mathml_length(raw: &str) -> bool {
+    if matches!(
+        raw,
+        "thin"
+            | "medium"
+            | "thick"
+            | "verythinmathspace"
+            | "thinmathspace"
+            | "mediummathspace"
+            | "thickmathspace"
+            | "verythickmathspace"
+            | "0"
+    ) {
+        return true;
+    }
+    if raw.is_empty() || raw.len() > 16 {
+        return false;
+    }
+    let unit = ["em", "ex", "px", "pt", "%"].iter().find(|&&u| raw.ends_with(u));
+    let Some(&u) = unit else {
+        return false;
+    };
+    let num_str = &raw[..raw.len() - u.len()];
+    let Ok(val) = num_str.parse::<f32>() else {
+        return false;
+    };
+    if !val.is_finite() {
+        return false;
+    }
+    match u {
+        "em" | "ex" => (-4.0..=12.0).contains(&val),
+        "px" | "pt" => (-32.0..=96.0).contains(&val),
+        "%" => (0.0..=300.0).contains(&val),
+        _ => false,
+    }
+}
+
+fn extract_jsonld_doi(val: &serde_json::Value) -> Option<String> {
+    match val {
+        serde_json::Value::String(s) => normalize_doi(s).or_else(|| extract_doi_from_text(s)),
+        serde_json::Value::Object(obj) => obj
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| normalize_doi(s).or_else(|| extract_doi_from_text(s))),
+        serde_json::Value::Array(arr) => arr.iter().take(16).find_map(extract_jsonld_doi),
+        _ => None,
+    }
+}
+
+fn collect_jsonld_authors(val: &serde_json::Value, out: &mut Vec<String>) {
+    match val {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if !trimmed.is_empty()
+                && !trimmed.starts_with("http://")
+                && !trimmed.starts_with("https://")
+            {
+                out.extend(split_author_names(trimmed));
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            if let Some(name) = obj.get("name").and_then(serde_json::Value::as_str) {
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_owned());
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter().take(24) {
+                collect_jsonld_authors(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dedup_preserve_order(items: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for item in items {
+        let trimmed = item.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_lowercase()) {
+            out.push(trimmed.to_owned());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -959,5 +1333,169 @@ mod tests {
         assert!(snap.content_html.contains("<p>Body text.</p>"));
         assert!(!snap.content_html.contains("Sidebar comment noise"));
         assert!(!snap.content_html.contains("Share this:"));
+    }
+
+    #[test]
+    fn test_extract_snapshot_extracts_bibliographic_citation_jsonld_and_time_metadata() {
+        let scholar_base = Url::parse("https://journal.example.org/papers/42").unwrap();
+        let scholar_html = r#"<!DOCTYPE html>
+        <html>
+          <head>
+            <title>Journal Wrapper Title</title>
+            <meta name="citation_title" content="Integer multiplication in time O(n log n)" />
+            <meta name="citation_author" content="David Harvey" />
+            <meta name="citation_author" content="Joris van der Hoeven" />
+            <meta name="citation_publication_date" content="2021/03/15" />
+            <meta name="citation_doi" content="https://doi.org/10.4007/ANNALS.2021.193.2.4" />
+            <meta name="citation_isbn" content="978-0-306-40615-7" />
+            <meta name="citation_abstract" content="We prove that n-bit integers can be multiplied in O(n log n) bit operations." />
+          </head>
+          <body><article><p>Paper landing page.</p></article></body>
+        </html>"#;
+        let snap = HtmlSanitizer::extract_snapshot_with_base(scholar_html, Some(&scholar_base));
+        assert_eq!(snap.title.as_deref(), Some("Integer multiplication in time O(n log n)"));
+        assert_eq!(snap.authors, vec!["David Harvey", "Joris van der Hoeven"]);
+        assert_eq!(snap.author.as_deref(), Some("David Harvey, Joris van der Hoeven"));
+        assert_eq!(snap.release_year, Some(2021));
+        assert_eq!(
+            snap.published_at.map(|dt| dt.format("%Y-%m-%d").to_string()).as_deref(),
+            Some("2021-03-15")
+        );
+        assert_eq!(snap.doi.as_deref(), Some("10.4007/annals.2021.193.2.4"));
+        assert_eq!(snap.isbn.as_deref(), Some("9780306406157"));
+        assert!(snap.summary.as_deref().unwrap_or("").contains("O(n log n)"));
+
+        let ld_base = Url::parse("https://blog.example.org/posts/distributed-clocks").unwrap();
+        let ld_html = r#"<!DOCTYPE html>
+        <html>
+          <head>
+            <title>Logical Clocks</title>
+            <script type="application/ld+json">
+              {
+                "@context": "https://schema.org",
+                "@graph": [
+                  {
+                    "@type": "ScholarlyArticle",
+                    "headline": "Time, Clocks, and the Ordering of Events",
+                    "author": [{"@type": "Person", "name": "Leslie Lamport"}],
+                    "datePublished": "1978-07-01",
+                    "identifier": "doi:10.1145/359545.359563"
+                  }
+                ]
+              }
+            </script>
+          </head>
+          <body>
+            <article>
+              <time datetime="1978-07-01">July 1, 1978</time>
+              <p>Distributed systems essay body.</p>
+            </article>
+          </body>
+        </html>"#;
+        let ld_snap = HtmlSanitizer::extract_snapshot_with_base(ld_html, Some(&ld_base));
+        assert_eq!(ld_snap.authors, vec!["Leslie Lamport"]);
+        assert_eq!(ld_snap.release_year, Some(1978));
+        assert_eq!(
+            ld_snap.published_at.map(|dt| dt.format("%Y-%m-%d").to_string()).as_deref(),
+            Some("1978-07-01")
+        );
+        assert_eq!(ld_snap.doi.as_deref(), Some("10.1145/359545.359563"));
+    }
+
+    #[test]
+    fn test_clean_preserves_safe_mathml_and_strips_annotations_and_scripts() {
+        let dirty = r#"
+            <p>Complexity <math class="ltx_Math" display="inline" href="javascript:alert(1)">
+              <semantics>
+                <mrow><mi>o</mi><mo stretchy="false">(</mo><mi>n</mi><mo lspace="0.167em">log</mo><mi>n</mi><mo stretchy="false">)</mo></mrow>
+                <annotation-xml encoding="MathML-Content"><ci>secret</ci></annotation-xml>
+                <annotation encoding="application/x-tex">o(n\log n)</annotation>
+              </semantics>
+              <script>alert(1)</script>
+            </math>.</p>
+            <figure class="paper-equation"><math display="block"><mfrac><msup><mi>x</mi><mn>2</mn></msup><mn>2</mn></mfrac></math><span class="paper-eqno">(1)</span></figure>
+        "#;
+        let cleaned = HtmlSanitizer::clean(dirty);
+        assert!(cleaned.contains("<math display=\"inline\">"));
+        assert!(cleaned.contains("<mi>o</mi>"));
+        assert!(cleaned.contains("<mo stretchy=\"false\">(</mo>"));
+        assert!(cleaned.contains("<figure class=\"paper-equation\"><math display=\"block\">"));
+        assert!(cleaned.contains("<span class=\"paper-eqno\">(1)</span>"));
+        assert!(!cleaned.contains("javascript:"));
+        assert!(!cleaned.contains("alert(1)"));
+        assert!(!cleaned.contains("annotation"));
+        assert!(!cleaned.contains("secret"));
+        assert!(!cleaned.contains(r"o(n\log n)"));
+        // Idempotent
+        assert_eq!(cleaned, HtmlSanitizer::clean(&cleaned));
+    }
+
+    #[test]
+    fn test_clean_clamps_mathml_attributes_and_strips_embedded_containers() {
+        let dirty = r#"
+            <p>Safe <math display="block">
+              <mspace width="0.167em"></mspace>
+              <mspace width="verythickmathspace"></mspace>
+              <mo lspace="verythinmathspace">+</mo>
+              <mspace width="99999em"></mspace>
+              <mspace width="1000px"></mspace>
+              <mi mathvariant="normal">log</mi>
+              <mi mathvariant="javascript:alert(1)">x</mi>
+              <mtable><mtr><mtd columnspan="2">a</mtd><mtd columnspan="999">b</mtd></mtr></mtable>
+            </math></p>
+            <math display="evil"><mi>y</mi></math>
+            <iframe src="https://evil.example">iframe_secret</iframe>
+            <textarea>textarea_secret</textarea>
+            <object data="https://evil.example">object_secret</object>
+        "#;
+        let cleaned = HtmlSanitizer::clean(dirty);
+        assert!(cleaned.contains(r#"display="block""#));
+        assert!(cleaned.contains(r#"width="0.167em""#));
+        assert!(cleaned.contains(r#"width="verythickmathspace""#));
+        assert!(cleaned.contains(r#"lspace="verythinmathspace""#));
+        assert!(cleaned.contains(r#"mathvariant="normal""#));
+        assert!(cleaned.contains(r#"columnspan="2""#));
+        assert!(!cleaned.contains("99999em"));
+        assert!(!cleaned.contains("1000px"));
+        assert!(!cleaned.contains(r#"columnspan="999""#));
+        assert!(!cleaned.contains(r#"display="evil""#));
+        assert!(!cleaned.contains("javascript:"));
+        assert!(!cleaned.contains("iframe_secret"));
+        assert!(!cleaned.contains("textarea_secret"));
+        assert!(!cleaned.contains("object_secret"));
+    }
+
+    #[test]
+    fn test_extract_snapshot_jsonld_headline_array_identifier_and_same_as_doi() {
+        let base = Url::parse("https://journal.example.org/p/99").unwrap();
+        let html = r#"<!DOCTYPE html>
+        <html>
+          <head>
+            <script type="application/ld+json">
+              {
+                "@context": "https://schema.org",
+                "@type": "ScholarlyArticle",
+                "headline": "Fast Matrix Multiplication Revisited",
+                "author": [{"@type": "Person", "name": "Volker Strassen"}],
+                "datePublished": "2024-05-10",
+                "identifier": ["urn:custom:1", {"@type": "PropertyValue", "value": "https://doi.org/10.1000/array-doi"}],
+                "sameAs": "https://doi.org/10.1000/fallback-doi"
+              }
+            </script>
+          </head>
+          <body><article><p>Article body text.</p></article></body>
+        </html>"#;
+        let snap = HtmlSanitizer::extract_snapshot_with_base(html, Some(&base));
+        assert_eq!(snap.title.as_deref(), Some("Fast Matrix Multiplication Revisited"));
+        assert_eq!(snap.authors, vec!["Volker Strassen"]);
+        assert_eq!(snap.doi.as_deref(), Some("10.1000/array-doi"));
+
+        let same_as_html = r#"<!DOCTYPE html>
+        <html><head><script type="application/ld+json">
+          {"@type": "Article", "name": "SameAs Fallback", "sameAs": ["https://doi.org/10.1000/sameas-doi"]}
+        </script></head><body><article><p>Body.</p></article></body></html>"#;
+        let snap2 = HtmlSanitizer::extract_snapshot_with_base(same_as_html, Some(&base));
+        assert_eq!(snap2.title.as_deref(), Some("SameAs Fallback"));
+        assert_eq!(snap2.doi.as_deref(), Some("10.1000/sameas-doi"));
     }
 }

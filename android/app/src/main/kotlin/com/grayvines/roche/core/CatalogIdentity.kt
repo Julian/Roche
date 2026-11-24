@@ -50,15 +50,16 @@ internal const val TIDAL_LISTEN_ALBUM_PREFIX = "https://listen.tidal.com/album/"
 internal val WANT_TO_READ_BASE_SLUGS: Set<String> =
     setOf("read", "article", "articles", "paper", "papers")
 
+internal const val SCHEME_DOI = "doi"
+internal const val SCHEME_ARXIV = "arxiv"
+internal const val SCHEME_ISBN = "isbn"
 private const val ROLE_LIST = "list"
 private const val ROLE_WANT = "want"
 private const val WANT_SLUG_PREFIX = "want:"
 private const val DOI_PREFIX = "doi:"
-private const val SCHEME_ARXIV = "arxiv"
 private const val SCHEME_FEED_URL = "feed_url"
 private const val SCHEME_TMDB_MOVIE = "tmdb_movie"
 private const val SCHEME_TMDB_TV = "tmdb_tv"
-private const val SCHEME_ISBN = "isbn"
 private const val SCHEME_OPENLIBRARY = "openlibrary"
 private const val SCHEME_MUSICBRAINZ_RELEASE = "musicbrainz_release"
 private const val SCHEME_MUSICBRAINZ_ARTIST = "musicbrainz_artist"
@@ -95,6 +96,7 @@ internal val PREFERRED_IDENTIFIER_SCHEMES: List<String> =
         SCHEME_OPENLIBRARY,
         SCHEME_IGDB,
         SCHEME_ARXIV,
+        SCHEME_DOI,
         SCHEME_WIKIPEDIA,
         SCHEME_FEED_URL,
         "url",
@@ -197,19 +199,31 @@ internal fun normalizeIdentifierValueRaw(
 ): String {
     val trimmed = rawValue.trim()
     if (trimmed.isEmpty()) return ""
-    return when (normalizeIdentifierScheme(scheme)) {
+    val normalizedScheme = normalizeIdentifierScheme(scheme)
+    return when (normalizedScheme) {
         "url",
         SCHEME_FEED_URL -> canonicalizeSyncUrl(trimmed)
         "slug",
         "tag" -> trimmed.lowercase()
+        else -> normalizeTypedIdentifier(kindWireValue, normalizedScheme, trimmed)
+    }
+}
+
+private fun normalizeTypedIdentifier(
+    kindWireValue: String,
+    normalizedScheme: String,
+    trimmed: String,
+): String =
+    when (normalizedScheme) {
         SCHEME_SPOTIFY -> normalizeSpotifyIdentifier(kindWireValue, trimmed)
         "imdb" -> normalizeImdbIdentifier(trimmed)
         SCHEME_WIKIPEDIA -> normalizeWikipediaIdentifier(trimmed)
         SCHEME_ARXIV -> extractArxivIdentifier(trimmed) ?: trimmed
+        SCHEME_DOI -> normalizeDoi(trimmed) ?: trimmed
+        SCHEME_ISBN -> normalizeIsbn(trimmed) ?: trimmed
         SCHEME_HACKER_NEWS -> extractHackerNewsItemId(trimmed) ?: trimmed
         else -> trimmed
     }
-}
 
 internal fun extractSpotifyEntityAndId(raw: String): Pair<String, String>? {
     val trimmed = raw.trim()
@@ -622,6 +636,8 @@ internal fun externalIdentifierLabel(scheme: String): String =
     when (normalizeIdentifierScheme(scheme)) {
         SCHEME_HACKER_NEWS -> "Hacker News"
         SCHEME_ARXIV -> "arXiv"
+        SCHEME_DOI -> "DOI"
+        SCHEME_ISBN -> "ISBN"
         SCHEME_WIKIPEDIA -> "Wikipedia"
         SCHEME_YOUTUBE -> "YouTube"
         SCHEME_SPOTIFY -> "Spotify"

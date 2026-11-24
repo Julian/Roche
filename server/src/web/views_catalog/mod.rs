@@ -18,8 +18,9 @@ pub(super) use diary_queue::{
     post_want_remove, queue_get,
 };
 pub(super) use entry::{
-    entry_detail_get, post_artist_add_album, post_entry_enrich, post_entry_list_add,
-    post_entry_log, post_entry_merge, post_entry_queue_toggle,
+    entry_detail_get, post_artist_add_album, post_entry_edit, post_entry_enrich,
+    post_entry_list_add, post_entry_log, post_entry_merge, post_entry_queue_toggle,
+    post_entry_refresh_metadata,
 };
 pub(super) use lists::{
     list_detail_get, lists_get, post_list_add_entry, post_list_create, post_list_remove_entry,
@@ -52,6 +53,38 @@ pub(super) struct DiaryFilterQuery {
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct EntryDetailQuery {
     pub merge_preview: Option<String>,
+    pub edit: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct EntryEditForm {
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub creators: Option<String>,
+    #[serde(default)]
+    pub published_date: Option<String>,
+    #[serde(default)]
+    pub release_year: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub doi: Option<String>,
+    #[serde(default)]
+    pub arxiv_id: Option<String>,
+    #[serde(default)]
+    pub isbn: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct EntryRefreshMetadataForm {
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -195,6 +228,36 @@ const LOGGABLE_KINDS: [EntryKind; 10] = [
 pub(super) fn render_kind_options(selected: EntryKind) -> String {
     let mut out = String::with_capacity(512);
     for k in LOGGABLE_KINDS {
+        let sel = if k == selected { " selected" } else { "" };
+        let _ = write!(
+            out,
+            "<option value=\"{}\"{sel}>{}</option>",
+            k.as_str(),
+            esc(k.display_label())
+        );
+    }
+    out
+}
+
+pub(super) fn render_editable_kind_options(selected: EntryKind) -> String {
+    const EDITABLE_KINDS: [EntryKind; 14] = [
+        EntryKind::Paper,
+        EntryKind::Article,
+        EntryKind::Book,
+        EntryKind::Video,
+        EntryKind::PodcastEpisode,
+        EntryKind::Movie,
+        EntryKind::Tv,
+        EntryKind::Album,
+        EntryKind::Song,
+        EntryKind::Game,
+        EntryKind::Artist,
+        EntryKind::Podcast,
+        EntryKind::Publication,
+        EntryKind::Channel,
+    ];
+    let mut out = String::with_capacity(640);
+    for k in EDITABLE_KINDS {
         let sel = if k == selected { " selected" } else { "" };
         let _ = write!(
             out,

@@ -857,17 +857,25 @@ impl BoardService<'_> {
             {
                 let body_html = (!snapshot.content_html.trim().is_empty())
                     .then_some(snapshot.content_html.as_str());
+                let doc_meta = roche_core::document_meta::ExtractedDocumentMetadata {
+                    title: snapshot.title,
+                    authors: snapshot.authors,
+                    published_at: snapshot.published_at,
+                    release_year: snapshot.release_year,
+                    summary: snapshot.summary,
+                    doi: snapshot.doi,
+                    arxiv_id: None,
+                    isbn: snapshot.isbn,
+                };
                 let _ = service
                     .db
                     .items()
-                    .apply_background_enrichment(
+                    .apply_document_enrichment(
                         entry_id,
-                        snapshot.title.as_deref(),
-                        snapshot.author.as_slice(),
-                        None,
-                        snapshot.summary.as_deref(),
+                        &doc_meta,
                         snapshot.thumbnail_url.as_deref(),
                         body_html,
+                        false,
                     )
                     .await;
             }

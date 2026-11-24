@@ -134,6 +134,38 @@ class PublicWebFetcher(internal val transport: HttpTransport = PinnedPublicHttpT
     }
         .getOrNull()
 
+    internal suspend fun fetchPdfBytes(
+        pdfUrl: String,
+        maxBytes: Int = MAX_PUBLIC_PDF_BYTES,
+    ): ByteArray? = runSuspendCatching {
+        val trimmed = pdfUrl.trim()
+        PublicUrlValidator.ensurePublicUrlSyntax(trimmed)
+        val boundedMax = maxBytes.coerceIn(1, MAX_PUBLIC_PDF_BYTES)
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_GET_PUBLIC,
+                    url = trimmed,
+                    headers =
+                        mapOf(
+                            HEADER_USER_AGENT to EXTERNAL_BROWSER_USER_AGENT,
+                            HEADER_ACCEPT to PUBLIC_PDF_ACCEPT,
+                        ),
+                    expectBinary = true,
+                    requirePublicIp = true,
+                    maxResponseBytes = boundedMax,
+                )
+            )
+        val bytes =
+            if (response.statusCode in HTTP_OK_START..HTTP_OK_END) {
+                response.bodyBytes ?: response.body.toByteArray(Charsets.ISO_8859_1)
+            } else {
+                null
+            }
+        bytes?.takeIf { it.size in MIN_PDF_BYTES..boundedMax && hasPdfMagicHeader(it) }
+    }
+        .getOrNull()
+
     internal suspend fun streamBinaryToFile(
         fileUrl: String,
         targetFile: File,
@@ -157,11 +189,31 @@ class PublicWebFetcher(internal val transport: HttpTransport = PinnedPublicHttpT
         .getOrDefault(false)
 }
 
+internal fun hasPdfMagicHeader(bytes: ByteArray): Boolean {
+    val limit = minOf(bytes.size - PDF_MAGIC.size, PDF_MAGIC_SCAN_LIMIT)
+    if (limit < 0) return false
+    for (offset in 0..limit) {
+        var matched = true
+        for (idx in PDF_MAGIC.indices) {
+            if (bytes[offset + idx] != PDF_MAGIC[idx]) {
+                matched = false
+                break
+            }
+        }
+        if (matched) return true
+    }
+    return false
+}
+
 private const val METHOD_GET_PUBLIC = "GET"
 private const val METHOD_POST_PUBLIC = "POST"
 internal const val MAX_PUBLIC_FEED_BYTES = 10 * 1024 * 1024
 internal const val MAX_PUBLIC_HTML_BYTES = 5 * 1024 * 1024
 internal const val MAX_PUBLIC_JSON_BYTES = 5 * 1024 * 1024
+internal const val MAX_PUBLIC_PDF_BYTES = 25 * 1024 * 1024
+private const val MIN_PDF_BYTES = 5
+private const val PDF_MAGIC_SCAN_LIMIT = 1024
+private val PDF_MAGIC = byteArrayOf(0x25, 0x50, 0x44, 0x46, 0x2D)
 private const val PUBLIC_FEED_ACCEPT =
     "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5"
 private const val PUBLIC_HTML_ACCEPT =
@@ -169,3 +221,4 @@ private const val PUBLIC_HTML_ACCEPT =
 private const val PUBLIC_JSON_ACCEPT = "application/json, */*;q=0.5"
 private const val PUBLIC_IMAGE_ACCEPT =
     "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8"
+private const val PUBLIC_PDF_ACCEPT = "application/pdf, application/octet-stream;q=0.8, */*;q=0.5"

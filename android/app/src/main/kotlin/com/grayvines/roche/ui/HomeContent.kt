@@ -61,6 +61,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.DiaryEntryItem
@@ -974,7 +975,7 @@ private fun HomeInboxPreviewRow(
         }
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text(
-                text = entry.title,
+                text = remember(entry.title) { formatInlineMathAnnotated(entry.title) },
                 color = if (entry.isNew) colors.textPrimary else colors.textSecondary,
                 fontFamily = headlineFamily,
                 fontSize = 14.5.sp,

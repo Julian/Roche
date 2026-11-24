@@ -1035,8 +1035,12 @@
       let dwellTimer = null;
       let autoFinishSent = root.getAttribute("data-finished") === "1";
 
+      const isPdfOnlyMode = () =>
+        document.querySelector(".js-reader-layout")?.getAttribute("data-pdf-mode") === "pdf";
+
       const isSuppressedOrDone = () =>
         autoFinishSent ||
+        isPdfOnlyMode() ||
         root.getAttribute("data-finished") === "1" ||
         root.getAttribute("data-dismissed") === "1" ||
         root.getAttribute("data-suppress-auto-finish") === "1";
@@ -1117,6 +1121,10 @@
       };
 
       const checkProgress = () => {
+        if (isPdfOnlyMode()) {
+          cancelDwellTimer();
+          return;
+        }
         if (itemId && isAudioActiveForItemFn?.(itemId)) return;
         if (maxScrollablePixels() <= 8) return;
         const frac = measureFraction();
@@ -1147,7 +1155,17 @@
         }
       };
 
+      const onResize = () => {
+        if (isPdfOnlyMode()) {
+          cancelDwellTimer();
+        } else {
+          checkProgress();
+          scheduleShortArticleDwell();
+        }
+      };
+
       window.addEventListener("scroll", onScroll, { passive: true });
+      window.addEventListener("resize", onResize, { passive: true });
       document.addEventListener("visibilitychange", onVisibilityChange);
       scheduleShortArticleDwell();
 
@@ -1174,6 +1192,7 @@
 
       cleanups.push(() => {
         window.removeEventListener("scroll", onScroll);
+        window.removeEventListener("resize", onResize);
         document.removeEventListener("visibilitychange", onVisibilityChange);
         for (const formEl of dismissForms) {
           formEl.removeEventListener("submit", onDismissSubmit);
@@ -2180,7 +2199,9 @@
     }
     const curMain = document.getElementById("roche-main");
     if (!curMain) return false;
-    if (curMain.querySelector("details[open]:not([data-default-open])")) return true;
+    if (curMain.querySelector("details[open]:not([data-default-open]), .entry-hero.is-editing")) {
+      return true;
+    }
     for (const el of curMain.querySelectorAll("input, textarea, select")) {
       if (el.type === "hidden" || el.type === "submit" || el.type === "button") continue;
       if (el.type === "checkbox" || el.type === "radio") {
@@ -4085,11 +4106,159 @@
     }
   };
 
+  const initEntryInlineEdit = () => {
+    const hero = document.querySelector(".entry-hero");
+    if (!hero || hero.dataset.inlineEditBound === "1") return;
+    const toggleBtn = hero.querySelector(".js-entry-edit-toggle");
+    const form = hero.querySelector(".js-entry-inline-edit");
+    if (!toggleBtn || !form) return;
+    hero.dataset.inlineEditBound = "1";
+
+    const setEditing = (editing, { resetForm = false } = {}) => {
+      if (!editing && resetForm) {
+        form.reset();
+      }
+      hero.classList.toggle("is-editing", editing);
+      toggleBtn.setAttribute("aria-expanded", editing ? "true" : "false");
+      if (editing) {
+        const titleInput = form.querySelector("#edit-entry-title");
+        if (titleInput) {
+          titleInput.focus();
+          const len = titleInput.value.length;
+          try {
+            titleInput.setSelectionRange(len, len);
+          } catch {}
+        }
+      } else {
+        try {
+          const url = new URL(window.location.href);
+          if (url.searchParams.has("edit")) {
+            url.searchParams.delete("edit");
+            window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+          }
+        } catch {}
+        toggleBtn.focus();
+      }
+    };
+
+    const onToggleActivate = (ev) => {
+      if (ev.type === "keydown" && ev.key !== " ") return;
+      if (ev.type === "click" && (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0)) {
+        return;
+      }
+      ev.preventDefault();
+      const next = !hero.classList.contains("is-editing");
+      setEditing(next, { resetForm: !next });
+    };
+    toggleBtn.addEventListener("click", onToggleActivate);
+    toggleBtn.addEventListener("keydown", onToggleActivate);
+
+    for (const cancelEl of form.querySelectorAll(".js-entry-edit-cancel")) {
+      const onCancel = (ev) => {
+        if (ev.type === "keydown" && ev.key !== " ") return;
+        if (ev.type === "click" && (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0)) {
+          return;
+        }
+        ev.preventDefault();
+        setEditing(false, { resetForm: true });
+      };
+      cancelEl.addEventListener("click", onCancel);
+      cancelEl.addEventListener("keydown", onCancel);
+    }
+
+    // Keep pre-filled Published Date and Year inputs aligned when user edits one of them
+    const dateInput = form.querySelector("#edit-entry-date");
+    const yearInput = form.querySelector("#edit-entry-year");
+    if (dateInput && yearInput) {
+      dateInput.addEventListener("change", () => {
+        const m = /^(\d{4})-\d{2}-\d{2}$/.exec(dateInput.value.trim());
+        if (m) yearInput.value = m[1];
+      });
+      yearInput.addEventListener("input", () => {
+        const y = yearInput.value.trim();
+        const dm = /^(\d{4})-\d{2}-\d{2}$/.exec(dateInput.value.trim());
+        if (dm && /^\d{4}$/.test(y) && dm[1] !== y) {
+          dateInput.value = "";
+        }
+      });
+    }
+
+    form.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        setEditing(false, { resetForm: true });
+      }
+    });
+  };
+
+  const initPdfReaderModeSwitch = () => {
+    const layout = document.querySelector(".js-reader-layout[data-pdf-mode]");
+    if (!layout || layout.dataset.pdfModeBound === "1") return;
+    const buttons = Array.from(layout.querySelectorAll(".js-pdf-mode-btn[data-pdf-mode-target]"));
+    if (buttons.length === 0) return;
+    layout.dataset.pdfModeBound = "1";
+
+    const hydratePdfFrame = (mode) => {
+      if (mode !== "pdf" && mode !== "split") return;
+      const frame = layout.querySelector(".js-reader-pdf-frame");
+      if (frame && !frame.getAttribute("src") && frame.dataset.src) {
+        frame.setAttribute("src", frame.dataset.src);
+      }
+    };
+
+    const syncControlsForMode = (mode) => {
+      const isPdfOnly = mode === "pdf";
+      const tocGroup = document.getElementById("roche-reader-toc-group");
+      const tocList = document.getElementById("roche-reader-toc");
+      if (tocGroup && tocList && tocList.children.length > 0) {
+        tocGroup.hidden = isPdfOnly;
+      }
+      const mobileTocGroup = layout.querySelector(".js-reader-mobile-toc-group");
+      const mobileTocList = layout.querySelector(".js-reader-mobile-toc");
+      if (mobileTocGroup && mobileTocList && mobileTocList.children.length > 0) {
+        mobileTocGroup.hidden = isPdfOnly;
+      }
+      for (const fontBtn of layout.querySelectorAll(".js-font-dec, .js-font-inc")) {
+        fontBtn.disabled = isPdfOnly;
+      }
+      hydratePdfFrame(mode);
+    };
+
+    syncControlsForMode(layout.getAttribute("data-pdf-mode") || "extracted");
+
+    for (const btn of buttons) {
+      btn.addEventListener("click", (ev) => {
+        if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+        const targetMode = btn.getAttribute("data-pdf-mode-target");
+        if (!targetMode) return;
+        if (layout.getAttribute("data-pdf-unextracted") === "1" && targetMode !== "pdf") {
+          return;
+        }
+        ev.preventDefault();
+        layout.setAttribute("data-pdf-mode", targetMode);
+        for (const other of buttons) {
+          const isCur = other === btn;
+          other.classList.toggle("is-active", isCur);
+          if (isCur) other.setAttribute("aria-current", "true");
+          else other.removeAttribute("aria-current");
+        }
+        syncControlsForMode(targetMode);
+        window.dispatchEvent(new Event("resize"));
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.set("view", targetMode);
+          window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+        } catch {}
+      });
+    }
+  };
+
   const initPageWidgets = () => {
     scrollActiveNavIntoView();
     syncPlayButtonsFn?.();
     initReaderProgress();
     initReaderExtras();
+    initPdfReaderModeSwitch();
     initRankBoard();
     initOpmlFileHelper();
     initRefreshBanner();
@@ -4102,6 +4271,7 @@
     initListsViewToggle();
     initDiaryFilter();
     initEntryEnrichment();
+    initEntryInlineEdit();
     initLogStatusRankSync();
     initCopyButtons();
     initFaviconFallbacks();

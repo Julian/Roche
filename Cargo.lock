@@ -2343,6 +2343,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "feed-rs",
+ "flate2",
  "ip_network",
  "quick-xml",
  "rand",

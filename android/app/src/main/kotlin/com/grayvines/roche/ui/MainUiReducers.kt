@@ -209,6 +209,12 @@ private fun reduceCatalogSheetUiAction(
         MainAction.PopCatalogDetailSheet ->
             state.copy(catalogDetailStack = state.catalogDetailStack.dropLast(1))
         MainAction.CloseCatalogDetailSheet -> state.copy(catalogDetailStack = emptyList())
+        is MainAction.OpenEditEntrySheet ->
+            state.copy(
+                editingCatalogEntryId = action.entryId,
+                contextSheetEntryId = null,
+            )
+        MainAction.CloseEditEntrySheet -> state.copy(editingCatalogEntryId = null)
         is MainAction.OpenQuickLogSheet ->
             state.copy(
                 catalogDetailStack = emptyList(),

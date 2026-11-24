@@ -143,6 +143,11 @@ pub fn router(service: Arc<RocheService>) -> Router<Arc<RocheService>> {
         .route("/web/lists/{slug}/add", post(views_catalog::post_list_add_entry))
         .route("/web/lists/{slug}/remove/{entry_id}", post(views_catalog::post_list_remove_entry))
         .route("/entries/{id}", get(views_catalog::entry_detail_get))
+        .route("/web/entries/{id}/edit", post(views_catalog::post_entry_edit))
+        .route(
+            "/web/entries/{id}/refresh-metadata",
+            post(views_catalog::post_entry_refresh_metadata),
+        )
         .route("/web/entries/{id}/log", post(views_catalog::post_entry_log))
         .route("/web/entries/{id}/list-add", post(views_catalog::post_entry_list_add))
         .route("/web/entries/{id}/queue-toggle", post(views_catalog::post_entry_queue_toggle))

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 #[cfg(test)]
 use url::Url;
@@ -35,8 +35,10 @@ struct EntryMetadataBackfill<'a> {
     title: Option<&'a str>,
     creators_json: Option<String>,
     published_at: Option<DateTime<Utc>>,
+    release_year: Option<i32>,
     summary: Option<&'a str>,
     thumbnail_url: Option<&'a str>,
+    respect_user_edits: bool,
 }
 
 impl EntryMetadataBackfill<'_> {
@@ -44,9 +46,22 @@ impl EntryMetadataBackfill<'_> {
         self.title.is_none()
             && self.creators_json.is_none()
             && self.published_at.is_none()
+            && self.release_year.is_none()
             && self.summary.is_none()
             && self.thumbnail_url.is_none()
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct EntryBackfillSnapshot {
+    title: String,
+    url: Option<String>,
+    creators_json: String,
+    published_at: Option<DateTime<Utc>>,
+    release_year: Option<i32>,
+    summary: Option<String>,
+    thumbnail_url: Option<String>,
+    metadata_json: String,
 }
 #[cfg(test)]
 use crate::domain::FeedType;
@@ -250,6 +265,7 @@ impl ItemRepo<'_> {
                 creators_json,
                 url: Some(new_item.url.as_str()),
                 published_at: new_item.published_at,
+                release_year: new_item.published_at.map(|dt| dt.year()),
                 summary: new_item.summary,
                 ..EntryInsertParams::minimal(id, entry_kind, new_item.title, now, now)
             },
@@ -444,21 +460,27 @@ impl ItemRepo<'_> {
         .await?;
 
         let url_str = input.url.as_str();
-        let has_explicit_non_url_title = !trimmed_title.is_empty() && trimmed_title != url_str;
+        let existing_title_row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT title, url FROM entries WHERE id = ?")
+                .bind(existing_id)
+                .fetch_optional(tx.conn())
+                .await?;
+        let existing_is_placeholder = existing_title_row.as_ref().is_some_and(|(t, u)| {
+            roche_core::document_meta::is_placeholder_entry_title(t, u.as_deref().or(Some(url_str)))
+        });
+        let has_explicit_non_placeholder_title = !trimmed_title.is_empty()
+            && !roche_core::document_meta::is_placeholder_entry_title(trimmed_title, Some(url_str));
+        let replace_title = has_explicit_non_placeholder_title
+            && (existing_id == det_item_id || existing_is_placeholder);
         let entry_hlc = tx.next_hlc().await?;
         sqlx::query(
             "UPDATE entries
-             SET title = CASE
-                     WHEN ? = ? AND ? THEN ?
-                     WHEN title = url AND ? != '' THEN ?
-                     ELSE title
-                 END,
+             SET title = CASE WHEN ? THEN ? ELSE title END,
                  summary = COALESCE(summary, ?),
                  thumbnail_url = COALESCE(thumbnail_url, ?),
                  updated_at = ?,
                  hlc = CASE
-                     WHEN (? = ? AND ? AND title IS NOT ?)
-                       OR (title = url AND ? != '' AND title IS NOT ?)
+                     WHEN (? AND title IS NOT ?)
                        OR (summary IS NULL AND ? IS NOT NULL)
                        OR (thumbnail_url IS NULL AND ? IS NOT NULL)
                      THEN ?
@@ -466,20 +488,12 @@ impl ItemRepo<'_> {
                  END
              WHERE id = ?",
         )
-        .bind(existing_id)
-        .bind(det_item_id)
-        .bind(has_explicit_non_url_title)
-        .bind(input.title)
-        .bind(trimmed_title)
+        .bind(replace_title)
         .bind(input.title)
         .bind(input.summary)
         .bind(input.thumbnail_url)
         .bind(now)
-        .bind(existing_id)
-        .bind(det_item_id)
-        .bind(has_explicit_non_url_title)
-        .bind(input.title)
-        .bind(trimmed_title)
+        .bind(replace_title)
         .bind(input.title)
         .bind(input.summary)
         .bind(input.thumbnail_url)
@@ -1271,42 +1285,93 @@ impl ItemRepo<'_> {
         if backfill.is_empty() {
             return Ok(false);
         }
-        let creators_ref = backfill.creators_json.as_deref();
+        let Some(existing) = sqlx::query_as::<_, EntryBackfillSnapshot>(
+            "SELECT title, url, creators_json, published_at, release_year,
+                    summary, thumbnail_url, metadata_json
+             FROM entries WHERE id = ? AND merged_into_id IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(tx.conn())
+        .await?
+        else {
+            return Ok(false);
+        };
+
+        let user_edited = roche_core::crdt::is_entry_user_edited(&existing.metadata_json);
+        if backfill.respect_user_edits && user_edited {
+            return Ok(false);
+        }
+
+        let new_title = backfill
+            .title
+            .filter(|cand| {
+                !roche_core::document_meta::is_placeholder_entry_title(
+                    cand,
+                    existing.url.as_deref(),
+                ) && roche_core::document_meta::is_placeholder_entry_title(
+                    &existing.title,
+                    existing.url.as_deref(),
+                )
+            })
+            .map_or_else(|| existing.title.clone(), str::to_owned);
+
+        let new_creators_json = if existing.creators_json == "[]" {
+            backfill.creators_json.clone().unwrap_or_else(|| existing.creators_json.clone())
+        } else {
+            existing.creators_json.clone()
+        };
+
+        let new_published_at = existing.published_at.or(backfill.published_at);
+        let candidate_year =
+            backfill.release_year.or_else(|| backfill.published_at.map(|dt| dt.year()));
+        let new_release_year = existing.release_year.or(candidate_year);
+        let new_summary = existing.summary.clone().or_else(|| backfill.summary.map(str::to_owned));
+        let new_thumb =
+            existing.thumbnail_url.clone().or_else(|| backfill.thumbnail_url.map(str::to_owned));
+
+        let changed = new_title != existing.title
+            || new_creators_json != existing.creators_json
+            || new_published_at != existing.published_at
+            || new_release_year != existing.release_year
+            || new_summary != existing.summary
+            || new_thumb != existing.thumbnail_url;
+        if !changed {
+            return Ok(false);
+        }
+
         let entry_hlc = tx.next_hlc().await?;
-        let entry_res = sqlx::query(
+        let next_metadata_json = if user_edited {
+            roche_core::crdt::stamp_entry_edited_hlc(&existing.metadata_json, &entry_hlc)
+        } else {
+            existing.metadata_json
+        };
+
+        sqlx::query(
             "UPDATE entries
-             SET title = CASE WHEN title = url AND ? IS NOT NULL THEN ? ELSE title END,
-                 creators_json = CASE WHEN creators_json = '[]' AND ? IS NOT NULL THEN ? ELSE creators_json END,
-                 published_at = COALESCE(published_at, ?),
-                 summary = COALESCE(summary, ?),
-                 thumbnail_url = COALESCE(thumbnail_url, ?),
+             SET title = ?,
+                 creators_json = ?,
+                 published_at = ?,
+                 release_year = ?,
+                 summary = ?,
+                 thumbnail_url = ?,
+                 metadata_json = ?,
                  updated_at = ?,
                  hlc = ?
-             WHERE id = ?
-               AND ((title = url AND ? IS NOT NULL)
-                    OR (creators_json = '[]' AND ? IS NOT NULL)
-                    OR (published_at IS NULL AND ? IS NOT NULL)
-                    OR (summary IS NULL AND ? IS NOT NULL)
-                    OR (thumbnail_url IS NULL AND ? IS NOT NULL))",
+             WHERE id = ?",
         )
-        .bind(backfill.title)
-        .bind(backfill.title)
-        .bind(creators_ref)
-        .bind(creators_ref)
-        .bind(backfill.published_at)
-        .bind(backfill.summary)
-        .bind(backfill.thumbnail_url)
+        .bind(&new_title)
+        .bind(&new_creators_json)
+        .bind(new_published_at)
+        .bind(new_release_year)
+        .bind(new_summary.as_deref())
+        .bind(new_thumb.as_deref())
+        .bind(&next_metadata_json)
         .bind(now)
         .bind(&entry_hlc)
         .bind(id)
-        .bind(backfill.title)
-        .bind(creators_ref)
-        .bind(backfill.published_at)
-        .bind(backfill.summary)
-        .bind(backfill.thumbnail_url)
         .execute(tx.conn())
         .await?;
-        Ok(entry_res.rows_affected() > 0)
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1324,8 +1389,10 @@ impl ItemRepo<'_> {
             title: title.map(str::trim).filter(|s| !s.is_empty()),
             creators_json: crate::db::serialize_creators_json(authors),
             published_at,
+            release_year: published_at.map(|dt| dt.year()),
             summary: summary.map(str::trim).filter(|s| !s.is_empty()),
             thumbnail_url: thumbnail_url.map(str::trim).filter(|s| !s.is_empty()),
+            respect_user_edits: true,
         };
         let clean_html = content_html.filter(|s| !s.trim().is_empty());
         if backfill.is_empty() && clean_html.is_none() {
@@ -1384,6 +1451,165 @@ impl ItemRepo<'_> {
         Ok(())
     }
 
+    /// Applies auto-discovered bibliographic metadata (title, authors, publication date/year,
+    /// summary, DOI, arXiv ID, ISBN, and optional reader HTML) to any live non-collection entry.
+    ///
+    /// Only fills missing fields and upgrades placeholder titles (filenames, raw URLs, etc.).
+    /// When `force_refresh` is `false`, skips entries carrying an explicit user `"edited_hlc"`.
+    /// Returns `true` if any field or identifier was updated.
+    #[allow(clippy::too_many_lines)]
+    pub async fn apply_document_enrichment(
+        &self,
+        id: &str,
+        meta: &roche_core::document_meta::ExtractedDocumentMetadata,
+        thumbnail_url: Option<&str>,
+        content_html: Option<&str>,
+        force_refresh: bool,
+    ) -> Result<bool> {
+        let backfill = EntryMetadataBackfill {
+            title: meta.title.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            creators_json: crate::db::serialize_creators_json(&meta.authors),
+            published_at: meta.published_at,
+            release_year: meta.release_year.or_else(|| meta.published_at.map(|dt| dt.year())),
+            summary: meta.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            thumbnail_url: thumbnail_url.map(str::trim).filter(|s| !s.is_empty()),
+            respect_user_edits: !force_refresh,
+        };
+        let clean_html = content_html.filter(|s| !s.trim().is_empty());
+        let has_idents = meta.doi.is_some() || meta.arxiv_id.is_some() || meta.isbn.is_some();
+        if backfill.is_empty() && clean_html.is_none() && !has_idents {
+            return Ok(false);
+        }
+
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
+
+        let Some(canon_id) = CatalogRepo::follow_merged_id_in_tx(tx.conn(), id).await? else {
+            return Ok(false);
+        };
+        let existing_kind: Option<EntryKind> =
+            sqlx::query_scalar("SELECT kind FROM entries WHERE id = ? AND merged_into_id IS NULL")
+                .bind(&canon_id)
+                .fetch_optional(tx.conn())
+                .await?;
+        let Some(entry_kind) = existing_kind.filter(|&k| k != EntryKind::Collection) else {
+            return Ok(false);
+        };
+
+        let mut mutated =
+            Self::backfill_entry_fields_in_tx(&mut tx, &canon_id, &backfill, now).await?;
+
+        // Attach newly discovered DOI / arXiv / ISBN identifiers without overwriting existing owners
+        let mut ident_added = false;
+        let ident_pairs: [(&str, Option<&str>); 3] = [
+            ("doi", meta.doi.as_deref()),
+            ("arxiv", meta.arxiv_id.as_deref()),
+            ("isbn", meta.isbn.as_deref()),
+        ];
+        for (scheme, raw_val) in ident_pairs {
+            if let Some(val) = raw_val.map(str::trim).filter(|s| !s.is_empty()) {
+                let norm = crate::db::normalize_identifier_value(entry_kind, scheme, val);
+                if !norm.is_empty() {
+                    let res = sqlx::query(
+                        "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
+                         VALUES (?, ?, ?)",
+                    )
+                    .bind(scheme)
+                    .bind(&norm)
+                    .bind(&canon_id)
+                    .execute(tx.conn())
+                    .await?;
+                    if res.rows_affected() > 0 {
+                        ident_added = true;
+                    }
+                }
+            }
+        }
+        if ident_added && !mutated {
+            let entry_hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET updated_at = ?, hlc = ? WHERE id = ?")
+                .bind(now)
+                .bind(&entry_hlc)
+                .bind(&canon_id)
+                .execute(tx.conn())
+                .await?;
+            mutated = true;
+        }
+
+        if let Some(html) = clean_html {
+            let content_res = if force_refresh {
+                sqlx::query("UPDATE entry_content SET content_html = ? WHERE entry_id = ?")
+                    .bind(html)
+                    .bind(&canon_id)
+                    .execute(tx.conn())
+                    .await?
+            } else {
+                sqlx::query(
+                    "UPDATE entry_content
+                     SET content_html = ?
+                     WHERE entry_id = ? AND (content_html IS NULL OR content_html = '')",
+                )
+                .bind(html)
+                .bind(&canon_id)
+                .execute(tx.conn())
+                .await?
+            };
+            if content_res.rows_affected() > 0 {
+                sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(&canon_id)
+                    .execute(tx.conn())
+                    .await?;
+                mutated = true;
+            }
+        }
+
+        if mutated {
+            SyncRepo::record_activity(
+                tx.conn(),
+                ActivityEntityType::Entry,
+                &canon_id,
+                ActivityAction::Update,
+                now,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(mutated)
+    }
+
+    /// Saves lazily extracted reader HTML (e.g. reflowed PDF prose + `MathML`) when `entry_content`
+    /// does not already store body HTML. Does not modify bibliographic metadata or `edited_hlc`.
+    pub async fn save_extracted_content_html_if_empty(&self, id: &str, html: &str) -> Result<bool> {
+        if html.trim().is_empty() {
+            return Ok(false);
+        }
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
+        let Some(canon_id) = CatalogRepo::follow_merged_id_in_tx(tx.conn(), id).await? else {
+            return Ok(false);
+        };
+        let res = sqlx::query(
+            "UPDATE entry_content
+             SET content_html = ?
+             WHERE entry_id = ? AND (content_html IS NULL OR content_html = '')",
+        )
+        .bind(html)
+        .bind(&canon_id)
+        .execute(tx.conn())
+        .await?;
+        let saved = res.rows_affected() > 0;
+        if saved {
+            sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(&canon_id)
+                .execute(tx.conn())
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(saved)
+    }
+
     pub async fn backfill_metadata(
         &self,
         id: &str,
@@ -1398,8 +1624,10 @@ impl ItemRepo<'_> {
                 .filter(|s| !s.is_empty())
                 .and_then(|a| serde_json::to_string(&[a]).ok()),
             published_at: None,
+            release_year: None,
             summary: summary.map(str::trim).filter(|s| !s.is_empty()),
             thumbnail_url: None,
+            respect_user_edits: true,
         };
         if backfill.is_empty() {
             return Ok(());

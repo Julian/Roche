@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use chrono::{DateTime, SubsecRound, Utc};
+use chrono::{DateTime, Datelike, SubsecRound, Utc};
 use sqlx::SqliteConnection;
 
 use super::super::{
@@ -1478,7 +1478,7 @@ impl SyncRepo<'_> {
         };
 
         let inc_newer = target.entry_hlc > existing.hlc.as_str();
-        let (merged, changed) = compute_merged_entry_row(&existing, prep, target);
+        let (merged, changed, authority) = compute_merged_entry_row(&existing, prep, target);
         if changed {
             sqlx::query(
                 "UPDATE entries
@@ -1511,9 +1511,40 @@ impl SyncRepo<'_> {
             .await?;
         }
 
+        // Reconcile editable document identifiers when an explicit user edit wins LWW
+        if authority == EditMergeAuthority::IncomingEdit {
+            sqlx::query(
+                "DELETE FROM entry_identifiers
+                 WHERE entry_id = ? AND scheme IN ('doi', 'isbn', 'arxiv')",
+            )
+            .bind(existing_id)
+            .execute(&mut *tx)
+            .await?;
+            if merged.url != existing.url
+                && let Some(ref old_url) = existing.url
+            {
+                let old_norm = crate::db::normalize_identifier_value(existing.kind, "url", old_url);
+                if !old_norm.is_empty() {
+                    sqlx::query(
+                        "DELETE FROM entry_identifiers
+                         WHERE entry_id = ? AND scheme = 'url' AND value = ?",
+                    )
+                    .bind(existing_id)
+                    .bind(&old_norm)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
+
         for ident in idents {
             let scheme = crate::db::normalize_identifier_scheme(&ident.scheme);
             if matches!(scheme.as_str(), "slug" | "tag" | "feed_url") {
+                continue;
+            }
+            if matches!(authority, EditMergeAuthority::ExistingEdit | EditMergeAuthority::EqualEdit)
+                && matches!(scheme.as_str(), "doi" | "isbn" | "arxiv" | "url")
+            {
                 continue;
             }
             let val = crate::db::normalize_identifier_value(merged.kind, &scheme, &ident.value);
@@ -1522,8 +1553,16 @@ impl SyncRepo<'_> {
             }
             entries_core::upsert_entry_identifier_in_tx(tx, existing_id, &scheme, &val).await?;
         }
-        Ok(inc_newer)
+        Ok(inc_newer || authority == EditMergeAuthority::IncomingEdit)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditMergeAuthority {
+    IncomingEdit,
+    ExistingEdit,
+    EqualEdit,
+    Unedited,
 }
 
 fn build_inserted_item_candidate(
@@ -1555,61 +1594,119 @@ fn build_inserted_item_candidate(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 fn compute_merged_entry_row(
     existing: &ExistingEntryRow,
     prep: &PreparedSyncEntry,
     target: &WorkMergeTarget<'_>,
-) -> (ExistingEntryRow, bool) {
+) -> (ExistingEntryRow, bool, EditMergeAuthority) {
     let rec = &prep.record;
     let inc_newer = target.entry_hlc > existing.hlc.as_str();
-    let kind = if inc_newer
-        && existing.kind.is_reader_openable()
-        && target.target_kind.is_reader_openable()
-    {
-        target.target_kind
-    } else {
-        existing.kind
+    let ex_edit = roche_core::crdt::extract_entry_edited_hlc(&existing.metadata_json);
+    let inc_edit = roche_core::crdt::extract_entry_edited_hlc_from_value(rec.metadata.as_ref());
+    let authority = match (ex_edit.as_deref(), inc_edit) {
+        (Some(ex_e), Some(inc_e)) if inc_e > ex_e => EditMergeAuthority::IncomingEdit,
+        (None, Some(_)) => EditMergeAuthority::IncomingEdit,
+        (Some(ex_e), Some(inc_e)) if ex_e > inc_e => EditMergeAuthority::ExistingEdit,
+        (Some(_), None) => EditMergeAuthority::ExistingEdit,
+        (Some(_), Some(_)) => EditMergeAuthority::EqualEdit,
+        (None, None) => EditMergeAuthority::Unedited,
     };
-    let title = roche_core::crdt::compute_merged_entry_title(
-        &existing.title,
-        existing.url.as_deref(),
-        rec.url.as_deref(),
-        target.target_kind,
-        target.final_title,
-        inc_newer,
-    );
 
     let clean_creators: Vec<String> =
         rec.creators.iter().map(|c| c.trim().to_owned()).filter(|c| !c.is_empty()).collect();
     let inc_creators_json =
         serde_json::to_string(&clean_creators).unwrap_or_else(|_| "[]".to_owned());
-    let creators_json =
-        if (existing.creators_json == "[]" || inc_newer) && inc_creators_json != "[]" {
-            inc_creators_json
-        } else {
-            existing.creators_json.clone()
-        };
-
     let clean_inc_url = rec.url.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let url = if inc_newer && clean_inc_url.is_some() {
-        clean_inc_url.map(str::to_owned)
-    } else {
-        existing.url.clone().or_else(|| clean_inc_url.map(str::to_owned))
-    };
     let clamped_published =
         rec.published_at.map(|ts| clamp_incoming_upper_timestamp(ts, target.now));
-    let published_at = existing.published_at.or(clamped_published);
-    let release_year = if inc_newer && rec.release_year.is_some() {
-        rec.release_year
-    } else {
-        existing.release_year.or(rec.release_year)
-    };
-    let summary = roche_core::crdt::pick_richer_text(
-        existing.summary.as_deref(),
-        prep.clean_summary.as_deref(),
-    )
-    .map(str::to_owned);
-    let thumbnail_url = existing.thumbnail_url.clone().or_else(|| prep.clean_thumb.clone());
+
+    let (kind, title, creators_json, url, published_at, release_year, summary, thumbnail_url) =
+        match authority {
+            EditMergeAuthority::IncomingEdit => {
+                let next_kind = if existing.kind != EntryKind::Collection
+                    && target.target_kind != EntryKind::Collection
+                {
+                    target.target_kind
+                } else {
+                    existing.kind
+                };
+                let next_year = rec.release_year.or_else(|| clamped_published.map(|dt| dt.year()));
+                (
+                    next_kind,
+                    target.final_title.to_owned(),
+                    inc_creators_json,
+                    clean_inc_url.map(str::to_owned),
+                    clamped_published,
+                    next_year,
+                    prep.clean_summary.clone(),
+                    prep.clean_thumb.clone().or_else(|| existing.thumbnail_url.clone()),
+                )
+            }
+            EditMergeAuthority::ExistingEdit | EditMergeAuthority::EqualEdit => (
+                existing.kind,
+                existing.title.clone(),
+                existing.creators_json.clone(),
+                existing.url.clone(),
+                existing.published_at,
+                existing.release_year,
+                existing.summary.clone(),
+                existing.thumbnail_url.clone(),
+            ),
+            EditMergeAuthority::Unedited => {
+                let next_kind = if inc_newer
+                    && existing.kind.is_reader_openable()
+                    && target.target_kind.is_reader_openable()
+                {
+                    target.target_kind
+                } else {
+                    existing.kind
+                };
+                let next_title = roche_core::crdt::compute_merged_entry_title(
+                    &existing.title,
+                    existing.url.as_deref(),
+                    rec.url.as_deref(),
+                    target.target_kind,
+                    target.final_title,
+                    inc_newer,
+                );
+                let next_creators =
+                    if (existing.creators_json == "[]" || inc_newer) && inc_creators_json != "[]" {
+                        inc_creators_json
+                    } else {
+                        existing.creators_json.clone()
+                    };
+                let next_url = if inc_newer && clean_inc_url.is_some() {
+                    clean_inc_url.map(str::to_owned)
+                } else {
+                    existing.url.clone().or_else(|| clean_inc_url.map(str::to_owned))
+                };
+                let next_published = existing.published_at.or(clamped_published);
+                let next_year = if inc_newer && rec.release_year.is_some() {
+                    rec.release_year
+                } else {
+                    existing.release_year.or(rec.release_year)
+                };
+                let next_summary = roche_core::crdt::pick_richer_text(
+                    existing.summary.as_deref(),
+                    prep.clean_summary.as_deref(),
+                )
+                .map(str::to_owned);
+                let next_thumb =
+                    existing.thumbnail_url.clone().or_else(|| prep.clean_thumb.clone());
+                (
+                    next_kind,
+                    next_title,
+                    next_creators,
+                    next_url,
+                    next_published,
+                    next_year,
+                    next_summary,
+                    next_thumb,
+                )
+            }
+        };
+
     let metadata_json = roche_core::crdt::merge_entry_metadata_json(
         &existing.metadata_json,
         rec.metadata.as_ref(),
@@ -1642,6 +1739,7 @@ fn compute_merged_entry_row(
             hlc,
         },
         changed,
+        authority,
     )
 }
 
@@ -1705,7 +1803,13 @@ fn build_work_identifiers(prep: &PreparedSyncEntry) -> Vec<EntryIdentifier> {
     {
         idents.push(EntryIdentifier { scheme: "url".to_owned(), value: c_url.clone() });
     }
-    if let Some(ref aid) = prep.arxiv_id
+    // Only auto-derive `arxiv` from URL for unedited records; explicit user edits carry the
+    // authoritative `identifiers` list so deleting an `arxiv` ID never resurrects on sync.
+    let is_incoming_edited =
+        roche_core::crdt::extract_entry_edited_hlc_from_value(prep.record.metadata.as_ref())
+            .is_some();
+    if !is_incoming_edited
+        && let Some(ref aid) = prep.arxiv_id
         && !idents.iter().any(|i| crate::db::normalize_identifier_scheme(&i.scheme) == "arxiv")
     {
         idents.push(EntryIdentifier { scheme: "arxiv".to_owned(), value: aid.clone() });

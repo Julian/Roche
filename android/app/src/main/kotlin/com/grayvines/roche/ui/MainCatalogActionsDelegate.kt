@@ -4,6 +4,7 @@ import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.UpdateCatalogEntryInput
 import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
 import com.grayvines.roche.ranking.EpRankingEngine
 import com.grayvines.roche.ranking.RankClusterCandidate
@@ -62,6 +63,8 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
             is MainAction.ToggleCatalogWant -> performToggleCatalogWant(action.entryId)
             is MainAction.AddCatalogEntryToList ->
                 performAddCatalogEntryToList(action.collectionId, action.entryId)
+            is MainAction.UpdateCatalogEntry ->
+                performUpdateCatalogEntry(action.entryId, action.input)
             is MainAction.MarkFeedEntryFinished ->
                 performMarkFeedEntryFinished(action.entryId, action.rankImmediately)
             is MainAction.UnfinishFeedEntry -> performUnfinishFeedEntry(action.entryId)
@@ -220,6 +223,20 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
             }
     }
 
+    private suspend fun performUpdateCatalogEntry(
+        entryId: String,
+        input: UpdateCatalogEntryInput,
+    ) {
+        runSuspendCatching { host.repository.catalog.updateEntry(entryId, input) }
+            .onSuccess { updated ->
+                host.updateTransient { it.copy(editingCatalogEntryId = null) }
+                host.showStatusMessage("Updated \"${updated.title.take(SNACKBAR_TITLE_LIMIT)}\"")
+            }
+            .onFailure { err ->
+                host.showStatusMessage("Could not update entry (${err.message ?: "error"})")
+            }
+    }
+
     private suspend fun performRefreshCatalogMetadata(entryId: String) {
         val cleanId = entryId.trim()
         if (cleanId.isEmpty() || cleanId in host.currentTransientState().enrichingCatalogEntryIds) {
@@ -234,9 +251,9 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                 .onSuccess { enriched ->
                     val msg =
                         if (enriched) {
-                            "Refreshed metadata from server"
+                            "Refreshed metadata"
                         } else {
-                            "Server unavailable for online refresh"
+                            "No additional metadata found"
                         }
                     host.showStatusMessage(msg)
                 }

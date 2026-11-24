@@ -1317,3 +1317,127 @@ async fn test_internal_schemes_batch_caps_diary_crud_and_fts_search() {
     assert_eq!(db.items().toggle_star(&want_article.id).await.unwrap(), Some(true));
     assert_eq!(db.items().toggle_star(&want_article.id).await.unwrap(), Some(false));
 }
+
+#[tokio::test]
+async fn test_update_entry_edits_metadata_harmonizes_dates_identifiers_and_protects_collections() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    let paper = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Paper),
+            title: "subnlogn.pdf".to_owned(),
+            url: Some(
+                "https://web.maths.unsw.edu.au/~davidharvey/research/subnlogn.pdf".to_owned(),
+            ),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+
+    let pub_dt = chrono::DateTime::parse_from_rfc3339("2026-10-20T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let edited = catalog
+        .update_entry(
+            &paper.id,
+            &crate::db::UpdateEntryInput {
+                title: Some("Integer multiplication in time O(n log n)".to_owned()),
+                creators: Some(vec!["David Harvey".to_owned(), "Joris van der Hoeven".to_owned()]),
+                published_at: Some(Some(pub_dt)),
+                summary: Some(Some("Fast integer multiplication algorithm.".to_owned())),
+                identifier_updates: vec![
+                    (
+                        "doi".to_owned(),
+                        Some("https://doi.org/10.4007/annals.2021.193.2.4".to_owned()),
+                    ),
+                    ("arxiv".to_owned(), Some("https://arxiv.org/abs/1903.00001".to_owned())),
+                    ("isbn".to_owned(), Some("ISBN-13: 978-0-262-03384-8".to_owned())),
+                ],
+                ..crate::db::UpdateEntryInput::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(edited.entry.title, "Integer multiplication in time O(n log n)");
+    assert_eq!(edited.entry.creators, vec!["David Harvey", "Joris van der Hoeven"]);
+    assert_eq!(edited.entry.published_at, Some(pub_dt));
+    assert_eq!(edited.entry.release_year, Some(2026));
+    assert_eq!(edited.entry.identifier("doi"), Some("10.4007/annals.2021.193.2.4"));
+    assert_eq!(edited.entry.identifier("arxiv"), Some("1903.00001"));
+    assert_eq!(edited.entry.identifier("isbn"), Some("9780262033848"));
+    assert!(roche_core::crdt::is_entry_user_edited(
+        &serde_json::to_string(&edited.entry.metadata).unwrap()
+    ));
+
+    // Updating release_year to a conflicting year clears stale published_at
+    let reyear = catalog
+        .update_entry(
+            &paper.id,
+            &crate::db::UpdateEntryInput {
+                release_year: Some(Some(2021)),
+                ..crate::db::UpdateEntryInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reyear.entry.published_at, None);
+    assert_eq!(reyear.entry.release_year, Some(2021));
+
+    // Clearing creators, summary, DOI, and changing kind works cleanly
+    let cleared = catalog
+        .update_entry(
+            &paper.id,
+            &crate::db::UpdateEntryInput {
+                kind: Some(EntryKind::Article),
+                creators: Some(Vec::new()),
+                summary: Some(None),
+                identifier_updates: vec![("doi".to_owned(), None)],
+                ..crate::db::UpdateEntryInput::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.entry.kind, EntryKind::Article);
+    assert_eq!(cleared.entry.creators, Vec::<String>::new());
+    assert_eq!(cleared.entry.summary, None);
+    assert_eq!(cleared.entry.identifier("doi"), None);
+
+    // Duplicate DOI owned by another entry is rejected
+    let other = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Paper),
+            title: "Other Paper".to_owned(),
+            identifiers: vec![EntryIdentifier {
+                scheme: "doi".to_owned(),
+                value: "10.1000/taken".to_owned(),
+            }],
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(other.identifier("doi"), Some("10.1000/taken"));
+    let conflict = catalog
+        .update_entry(
+            &paper.id,
+            &crate::db::UpdateEntryInput {
+                identifier_updates: vec![("doi".to_owned(), Some("10.1000/taken".to_owned()))],
+                ..crate::db::UpdateEntryInput::default()
+            },
+        )
+        .await;
+    assert!(matches!(conflict, Err(CatalogError::Conflict(_))));
+
+    // System collections and manual lists cannot be edited via update_entry
+    let sys_err = catalog
+        .update_entry(
+            crate::db::STARRED_COLLECTION_ID,
+            &crate::db::UpdateEntryInput {
+                title: Some("Hacked".to_owned()),
+                ..crate::db::UpdateEntryInput::default()
+            },
+        )
+        .await;
+    assert!(matches!(sys_err, Err(CatalogError::Conflict(_))));
+}

@@ -216,6 +216,8 @@ pub(super) const DISMISS_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" 
 
 pub(super) const RESTORE_BOX_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3 7.5a5 5 0 1 1 1.4 3.6\"/><path d=\"M3 4v3.5h3.5\"/></svg>";
 
+pub(super) const PENCIL_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M11.6 2.4a1.6 1.6 0 0 1 2.26 2.26L6.2 12.32 3 13l.68-3.2 7.92-7.4Z\"/><path d=\"m10.2 3.8 2 2\"/></svg>";
+
 pub(super) const REFRESH_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><path d=\"M13.5 8a5.5 5.5 0 1 1-1.4-3.7\" stroke-linecap=\"round\"/><path d=\"M13.5 2.5v2.8h-2.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
 
 #[must_use]
@@ -482,7 +484,7 @@ pub(super) fn render_diary_row_with_tier(
            <span class=\"diary-title\"><a href=\"/entries/{}\">{}</a>",
         row.ts.format("%b %d"),
         esc(&urlencode(&row.entry.id)),
-        esc(&row.entry.title),
+        roche_core::document_meta::render_inline_math_html(&row.entry.title),
     );
     render_creator_year_meta(
         out,

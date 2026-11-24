@@ -8,6 +8,9 @@ import com.grayvines.roche.core.ENTRY_KIND_PODCAST_EPISODE
 import com.grayvines.roche.core.FLAG_LOCAL_HLC
 import com.grayvines.roche.core.HlcClock
 import com.grayvines.roche.core.HlcTimestamp
+import com.grayvines.roche.core.SCHEME_ARXIV
+import com.grayvines.roche.core.SCHEME_DOI
+import com.grayvines.roche.core.SCHEME_ISBN
 import com.grayvines.roche.core.SEED_EPOCH_ISO
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.STARRED_SLUG
@@ -30,12 +33,17 @@ import com.grayvines.roche.core.extractYearPrefix
 import com.grayvines.roche.core.feedNaturalKey
 import com.grayvines.roche.core.formatArticleMinutes
 import com.grayvines.roche.core.inferContentTypeWireValue
+import com.grayvines.roche.core.isEntryUserEdited
 import com.grayvines.roche.core.isLocalPdfUrl
+import com.grayvines.roche.core.isPlaceholderEntryTitle
 import com.grayvines.roche.core.isSyncableItemUrl
 import com.grayvines.roche.core.normalizeConsecutiveFailures
+import com.grayvines.roche.core.normalizeDoi
+import com.grayvines.roche.core.normalizeIsbn
 import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.core.nowUtcIso
 import com.grayvines.roche.core.resolveArticleDuration
+import com.grayvines.roche.core.stampEntryEditedHlc
 import com.grayvines.roche.data.sync.compareHlc
 import com.grayvines.roche.model.ContentType
 
@@ -738,6 +746,23 @@ internal suspend fun RocheDao.removeItemTag(
     }
 }
 
+internal data class DocumentEnrichmentPatch(
+    val entryId: String,
+    val title: String? = null,
+    val hasUserTitleOverride: Boolean = false,
+    val authors: List<String> = emptyList(),
+    val summary: String? = null,
+    val publishedAt: String? = null,
+    val releaseYear: Int? = null,
+    val thumbnailUrl: String? = null,
+    val contentHtml: String? = null,
+    val doi: String? = null,
+    val arxivId: String? = null,
+    val isbn: String? = null,
+    val forceRefresh: Boolean = false,
+    val nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+)
+
 @Suppress("LongParameterList")
 internal suspend fun RocheDao.enrichEntryMetadataIfPresent(
     itemId: String,
@@ -750,83 +775,154 @@ internal suspend fun RocheDao.enrichEntryMetadataIfPresent(
     contentHtml: String? = null,
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
-    executeInTransaction {
-        val existingEntry = getEntryById(itemId)
-        val existingContent = getEntryContentById(itemId)
-        if (existingEntry != null && existingContent != null) {
-            val nowIso = nowUtcIso()
-            val markDirty = existingEntry.url?.let(::isSyncableItemUrl) == true
-            val hlc = if (markDirty) nextLocalHlc(this, nodeId) else existingEntry.hlc
-            val nextSummary =
-                existingEntry.summary?.takeIf { it.isNotBlank() }
-                    ?: summary?.take(MAX_SQLITE_SUMMARY_CHARS)
-            upsertEntry(
-                buildEnrichedEntryRow(
-                    existing = existingEntry,
-                    title = title,
-                    hasUserTitleOverride = hasUserTitleOverride,
-                    author = author,
-                    summary = nextSummary,
-                    publishedAt = publishedAt,
-                    thumbnailUrl = thumbnailUrl,
-                    nowIso = nowIso,
-                    hlc = hlc,
-                    markDirty = markDirty,
-                )
-            )
-            val nextHtml =
-                existingContent.contentHtml?.takeIf { it.isNotBlank() }
-                    ?: contentHtml?.take(MAX_SQLITE_HTML_CHARS)
-            val nextDuration = resolveEnrichedDuration(existingContent, nextHtml, nextSummary)
-            if (
-                nextHtml != existingContent.contentHtml || nextDuration != existingContent.duration
-            ) {
-                upsertEntryContent(
-                    existingContent.copy(contentHtml = nextHtml, duration = nextDuration)
-                )
-            }
-        }
-    }
+    applyDocumentEnrichment(
+        DocumentEnrichmentPatch(
+            entryId = itemId,
+            title = title,
+            hasUserTitleOverride = hasUserTitleOverride,
+            authors = listOfNotNull(author?.trim()?.takeIf { it.isNotEmpty() }),
+            summary = summary,
+            publishedAt = publishedAt,
+            thumbnailUrl = thumbnailUrl,
+            contentHtml = contentHtml,
+            nodeId = nodeId,
+        )
+    )
 }
 
-@Suppress("LongParameterList")
+internal suspend fun RocheDao.applyDocumentEnrichment(patch: DocumentEnrichmentPatch): Boolean {
+    var changed = false
+    executeInTransaction {
+        val existingEntry = getEntryById(patch.entryId)
+        val isEditableKind =
+            existingEntry != null &&
+                !existingEntry.kind.equals(ENTRY_KIND_COLLECTION, ignoreCase = true)
+        val userEdited = existingEntry != null && isEntryUserEdited(existingEntry.metadataJson)
+        if (isEditableKind && (!userEdited || patch.forceRefresh)) {
+            changed = applyDocumentEnrichmentInTx(existingEntry, patch, userEdited)
+        }
+    }
+    return changed
+}
+
+private suspend fun RocheDao.applyDocumentEnrichmentInTx(
+    existingEntry: EntryEntity,
+    patch: DocumentEnrichmentPatch,
+    userEdited: Boolean,
+): Boolean {
+    val nowIso = nowUtcIso()
+    val markDirty = existingEntry.url?.let(::isSyncableItemUrl) != false
+    val candidate = buildEnrichedEntryRow(existingEntry, patch, nowIso)
+    val entryChanged = hasEnrichedEntryChanges(existingEntry, candidate)
+    val attachedIdents = attachEnrichedIdentsInTx(existingEntry.id, patch)
+    val contentChanged = applyEnrichedContentInTx(existingEntry.id, patch, candidate.summary)
+    if (!entryChanged && !attachedIdents) return contentChanged
+
+    val hlc = if (markDirty) nextLocalHlc(this, patch.nodeId) else existingEntry.hlc
+    val nextMeta =
+        if (userEdited && patch.forceRefresh && markDirty) {
+            stampEntryEditedHlc(existingEntry.metadataJson, hlc)
+        } else {
+            existingEntry.metadataJson
+        }
+    upsertEntry(
+        candidate.copy(
+            metadataJson = nextMeta,
+            updatedAt = if (markDirty) nowIso else existingEntry.updatedAt,
+            hlc = hlc,
+            isLocalDirty = markDirty || existingEntry.isLocalDirty,
+        )
+    )
+    return true
+}
+
+private fun hasEnrichedEntryChanges(existing: EntryEntity, candidate: EntryEntity): Boolean =
+    candidate.title != existing.title ||
+        candidate.creatorsJson != existing.creatorsJson ||
+        candidate.publishedAt != existing.publishedAt ||
+        candidate.releaseYear != existing.releaseYear ||
+        candidate.summary != existing.summary ||
+        candidate.thumbnailUrl != existing.thumbnailUrl
+
+private suspend fun RocheDao.attachEnrichedIdentsInTx(
+    entryId: String,
+    patch: DocumentEnrichmentPatch,
+): Boolean {
+    val existingPairs = getIdentifiersForEntry(entryId).map { it.scheme to it.value }.toHashSet()
+    val toInsert = buildList {
+        patch.doi?.let(::normalizeDoi)?.let { add(EntryIdentifierEntity(SCHEME_DOI, it, entryId)) }
+        patch.arxivId?.let(::extractArxivIdentifier)?.let {
+            add(EntryIdentifierEntity(SCHEME_ARXIV, it, entryId))
+        }
+        patch.isbn?.let(::normalizeIsbn)?.let {
+            add(EntryIdentifierEntity(SCHEME_ISBN, it, entryId))
+        }
+    }
+        .distinctBy { it.scheme to it.value }
+        .filter { it.scheme to it.value !in existingPairs }
+    if (toInsert.isEmpty()) return false
+    insertEntryIdentifiersIgnore(toInsert)
+    return getIdentifiersForEntry(entryId).size > existingPairs.size
+}
+
+private suspend fun RocheDao.applyEnrichedContentInTx(
+    entryId: String,
+    patch: DocumentEnrichmentPatch,
+    nextSummary: String?,
+): Boolean {
+    val existingContent = getEntryContentById(entryId) ?: return false
+    val nextHtml =
+        existingContent.contentHtml?.takeIf { it.isNotBlank() }
+            ?: patch.contentHtml?.take(MAX_SQLITE_HTML_CHARS)
+    val nextDuration = resolveEnrichedDuration(existingContent, nextHtml, nextSummary)
+    if (nextHtml == existingContent.contentHtml && nextDuration == existingContent.duration) {
+        return false
+    }
+    upsertEntryContent(existingContent.copy(contentHtml = nextHtml, duration = nextDuration))
+    return true
+}
+
 private fun buildEnrichedEntryRow(
     existing: EntryEntity,
-    title: String?,
-    hasUserTitleOverride: Boolean,
-    author: String?,
-    summary: String?,
-    publishedAt: String?,
-    thumbnailUrl: String?,
+    patch: DocumentEnrichmentPatch,
     nowIso: String,
-    hlc: String,
-    markDirty: Boolean,
 ): EntryEntity {
+    val cleanNewTitle = patch.title?.trim()?.takeIf { it.isNotEmpty() }
+    val canUpgradeTitle =
+        !patch.hasUserTitleOverride || isPlaceholderEntryTitle(existing.title, existing.url)
     val nextTitle =
-        if (hasUserTitleOverride) {
-            existing.title
+        if (
+            canUpgradeTitle &&
+                cleanNewTitle != null &&
+                !isPlaceholderEntryTitle(cleanNewTitle, existing.url)
+        ) {
+            cleanNewTitle
         } else {
-            title?.trim()?.takeIf { it.isNotEmpty() } ?: existing.title
+            existing.title
         }
+    val cleanAuthors = patch.authors.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
     val nextCreators =
         if (existing.creatorsJson != "[]" && existing.creatorsJson.isNotBlank()) {
             existing.creatorsJson
+        } else if (cleanAuthors.isNotEmpty()) {
+            encodeCreatorsJson(cleanAuthors)
         } else {
-            author?.trim()?.takeIf { it.isNotEmpty() }?.let { encodeCreatorsJson(listOf(it)) }
-                ?: existing.creatorsJson
+            existing.creatorsJson
         }
-    val nextPub = existing.publishedAt ?: publishedAt
-    val nextThumb = existing.thumbnailUrl?.takeIf { it.isNotBlank() } ?: thumbnailUrl
+    val nextPub = existing.publishedAt ?: patch.publishedAt?.trim()?.takeIf { it.isNotEmpty() }
+    val nextYear = existing.releaseYear ?: patch.releaseYear ?: extractYearPrefix(nextPub)
+    val nextSummary =
+        existing.summary?.takeIf { it.isNotBlank() }
+            ?: patch.summary?.trim()?.takeIf { it.isNotEmpty() }?.take(MAX_SQLITE_SUMMARY_CHARS)
+    val nextThumb = existing.thumbnailUrl?.takeIf { it.isNotBlank() } ?: patch.thumbnailUrl
     return existing.copy(
         title = nextTitle,
         creatorsJson = nextCreators,
         publishedAt = nextPub,
-        releaseYear = existing.releaseYear ?: extractYearPrefix(nextPub),
-        summary = summary,
+        releaseYear = nextYear,
+        summary = nextSummary,
         thumbnailUrl = nextThumb,
-        updatedAt = if (markDirty) nowIso else existing.updatedAt,
-        hlc = hlc,
-        isLocalDirty = markDirty || existing.isLocalDirty,
+        updatedAt = nowIso,
     )
 }
 

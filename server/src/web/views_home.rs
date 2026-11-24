@@ -236,11 +236,12 @@ pub(in crate::web) fn render_collection_draw_section(
     );
     render_sleeve_cover(out, entry, &entry_href);
     out.push_str("<div class=\"sleeve-info js-sleeve-drawers\">\n<div class=\"sleeve-head-row\">\n<div class=\"album-title-row\">\n");
+    let plain_entry_title = roche_core::document_meta::strip_inline_math_delimiters(&entry.title);
     let _ = writeln!(
         out,
         "<h2 class=\"album-title\"><a href=\"{}\">{}</a></h2>",
         esc(&entry_href),
-        esc(&entry.title),
+        roche_core::document_meta::render_inline_math_html(&entry.title),
     );
     render_sleeve_external_links(out, entry);
     let _ = write!(
@@ -260,7 +261,7 @@ pub(in crate::web) fn render_collection_draw_section(
          </details>\n\
          </div>\n",
         list = esc(&list_key_enc),
-        title = esc(&entry.title),
+        title = esc(&plain_entry_title),
         csrf = esc(csrf),
         return_to = esc(return_to),
     );
@@ -332,7 +333,7 @@ fn render_sleeve_cover(out: &mut String, entry: &crate::db::CatalogEntry, entry_
         out,
         "<a class=\"album-cover-link\" href=\"{}\" aria-label=\"Open {}\">{cover_inner}</a>",
         esc(entry_href),
-        esc(&entry.title),
+        esc(&roche_core::document_meta::strip_inline_math_delimiters(&entry.title)),
     );
     out.push_str("</div>\n");
 }
@@ -382,7 +383,7 @@ fn render_in_progress_section(out: &mut String, in_progress_items: &[Item], csrf
              <div class=\"inbox-title\"><a href=\"/reader/{id_enc}?return_to=%2F\">{title}</a></div>\
              <div class=\"item-byline\">",
             id = esc(&item.id),
-            title = esc(&item.title),
+            title = roche_core::document_meta::render_inline_math_html(&item.title),
         );
         if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
             if let Some(fid) = item.feed_id.as_deref() {
@@ -415,10 +416,11 @@ fn render_in_progress_section(out: &mut String, in_progress_items: &[Item], csrf
              </div><div class=\"inbox-controls\">"
         );
         render_audio_play_button(out, item);
+        let plain_title = roche_core::document_meta::strip_inline_math_delimiters(&item.title);
         if item.feed_id.is_some() {
             let dismiss_btn = format!(
                 "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Dismiss\" aria-label=\"Dismiss {}\">{DISMISS_SVG}</button>",
-                esc(&item.title),
+                esc(&plain_title),
             );
             render_triage_form(
                 out,
@@ -426,14 +428,14 @@ fn render_in_progress_section(out: &mut String, in_progress_items: &[Item], csrf
                 csrf,
                 &[("return_to", "/")],
                 "dismiss",
-                &item.title,
+                &plain_title,
                 &format!("/web/items/{id_enc}/mark-new"),
                 &dismiss_btn,
             );
         } else {
             let done_btn = format!(
                 "<button type=\"submit\" class=\"btn btn-small btn-ghost\" aria-label=\"Mark {} as done\"><span aria-hidden=\"true\">&#10003;</span> Done</button>",
-                esc(&item.title),
+                esc(&plain_title),
             );
             render_triage_form(
                 out,
@@ -441,7 +443,7 @@ fn render_in_progress_section(out: &mut String, in_progress_items: &[Item], csrf
                 csrf,
                 &[("return_to", "/")],
                 "finish",
-                &item.title,
+                &plain_title,
                 &format!("/web/items/{id_enc}/unfinish"),
                 &done_btn,
             );
@@ -488,7 +490,7 @@ fn render_want_to_read_section(
                  <div class=\"inbox-title\"><a href=\"/reader/{id_enc}?return_to=%2F\">{title}</a></div>\
                  <div class=\"item-byline\">",
                 raw_id = esc(&item.id),
-                title = esc(&item.title),
+                title = roche_core::document_meta::render_inline_math_html(&item.title),
             );
             if let Some((badge_cls, label)) = item_kind_badge(item) {
                 let _ = write!(
@@ -611,7 +613,7 @@ fn render_home_inbox_row(out: &mut String, item: &Item, csrf: &str) {
         "<div class=\"inbox-main\">\
          <div class=\"inbox-title\"><a href=\"/reader/{id_enc}?return_to=%2F\">{}</a></div>\
          <div class=\"item-byline\">",
-        esc(&item.title),
+        roche_core::document_meta::render_inline_math_html(&item.title),
     );
     if let Some((badge_cls, label)) = item_kind_badge(item) {
         let _ = write!(out, "<span class=\"badge badge-kind{badge_cls}\">{}</span>", esc(label));

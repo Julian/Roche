@@ -52,6 +52,7 @@ import androidx.compose.ui.unit.sp
 import com.grayvines.roche.core.isLikelyFeedUrl
 import com.grayvines.roche.core.isLocalPdfUrl
 import com.grayvines.roche.core.parseIsoInstant
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
@@ -288,6 +289,29 @@ private fun buildEntrySecondaryActions(
     onShare: () -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ): List<ContextActionSpec> = buildList {
+    add(
+        ContextActionSpec(
+            label = "Edit Details…",
+            onClick = { onAction(MainAction.OpenEditEntrySheet(entry.id)) },
+            modifier = Modifier.testTag("context_edit_entry_btn"),
+        )
+    )
+    if (
+        entry.entryKind == EntryKind.PAPER ||
+            entry.entryKind == EntryKind.ARTICLE ||
+            entry.entryKind == EntryKind.BOOK
+    ) {
+        add(
+            ContextActionSpec(
+                label = "↻ Refresh Metadata",
+                onClick = {
+                    onAction(MainAction.CloseContextSheet)
+                    onAction(MainAction.RefreshCatalogEntryMetadata(entry.id))
+                },
+                modifier = Modifier.testTag("context_refresh_meta_btn"),
+            )
+        )
+    }
     if (entry.feedId != null) {
         add(
             ContextActionSpec(

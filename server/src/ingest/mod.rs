@@ -514,6 +514,47 @@ impl FeedIngester {
                                 error = %e,
                                 "Failed to record PDF media row"
                             );
+                        } else {
+                            let saved_path = ctx
+                                .media_store
+                                .validate_path_async(std::path::Path::new(&rel_path))
+                                .await
+                                .ok();
+                            let adapter =
+                                crate::service::enrich::FeedFetcherTextAdapter(ctx.fetcher);
+                            let meta = crate::service::enrich::discover_pdf_metadata_from_bytes(
+                                bytes.clone(),
+                                saved_path.clone(),
+                                Some(url.as_str().to_owned()),
+                                Some(&adapter),
+                            )
+                            .await;
+                            let mut reflow_html = if let Some(aid) = meta.arxiv_id.as_deref() {
+                                crate::service::enrich::fetch_arxiv_html5(aid, &adapter).await
+                            } else {
+                                None
+                            };
+                            if reflow_html.is_none() {
+                                reflow_html = crate::content::extract_reflowed_pdf_html(
+                                    saved_path.as_deref(),
+                                    Some(bytes),
+                                    meta.title.as_deref(),
+                                )
+                                .await;
+                            }
+                            if !meta.is_empty() || reflow_html.is_some() {
+                                let _ = ctx
+                                    .db
+                                    .items()
+                                    .apply_document_enrichment(
+                                        item_id,
+                                        &meta,
+                                        None,
+                                        reflow_html.as_deref(),
+                                        false,
+                                    )
+                                    .await;
+                            }
                         }
                     }
                     Err(e) => {

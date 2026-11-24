@@ -2717,8 +2717,11 @@ async fn test_round2_web_security_reader_origin_and_rank_redirect() {
         .unwrap();
     let pub_reader_html =
         read_body_html(get_authed(&app, &format!("/reader/{}", pub_item.id), &cookie).await).await;
-    assert!(pub_reader_html.contains("href=\"https://example.org/public-essay\""));
-    assert!(pub_reader_html.contains("Original &#8599;"));
+    assert!(
+        pub_reader_html
+            .contains("class=\"reader-title-link\" href=\"https://example.org/public-essay\"")
+    );
+    assert!(!pub_reader_html.contains("Original &#8599;"));
 
     // 3. Invalid ranking ordering preserves `want=true`, `focus`, and `round`
     let bad_rank_resp = post_form(
@@ -4847,16 +4850,19 @@ async fn test_web_boards_onboarding_lifecycle_backfill_promote_reader_and_isolat
             .await;
     assert!(tagged_view_html.contains("Systems Architecture Deep Dive"));
 
-    // Regular /reader/{entry_id} and /entries/{entry_id} display persisted Hacker News discussion link!
+    // Regular /reader/{entry_id} and /entries/{entry_id} link the title to the original URL and
+    // display the persisted Hacker News discussion link without redundant Original / Open Source links.
     let regular_reader_html =
         read_body_html(get_authed(&app, &format!("/reader/{entry_id}"), &cookie).await).await;
-    assert!(regular_reader_html.contains("Original &#8599;"));
+    assert!(regular_reader_html.contains("class=\"reader-title-link\""));
+    assert!(!regular_reader_html.contains("Original &#8599;"));
     assert!(regular_reader_html.contains("Hacker News &#8599;"));
     assert!(regular_reader_html.contains("https://news.ycombinator.com/item?id=1001"));
 
     let entry_detail_html =
         read_body_html(get_authed(&app, &format!("/entries/{entry_id}"), &cookie).await).await;
-    assert!(entry_detail_html.contains("Open Source"));
+    assert!(entry_detail_html.contains("class=\"entry-title-link\""));
+    assert!(!entry_detail_html.contains("Open Source"));
     assert!(entry_detail_html.contains("Hacker News"));
     assert!(entry_detail_html.contains("https://news.ycombinator.com/item?id=1001"));
 
@@ -4903,4 +4909,174 @@ async fn test_web_boards_onboarding_lifecycle_backfill_promote_reader_and_isolat
     assert!(db.boards().get(&board_id).await.unwrap().is_none());
     // Promoted entry preserved in Diary/Catalog!
     assert!(db.catalog().get_entry_detail(&entry_id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_web_entry_edit_refresh_and_reader_harmonized_date() {
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!("roche_web_doc_test_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let _guard = TempDirGuard(tmp_dir.clone());
+
+    let mut cfg = Config::default();
+    cfg.storage.media_dir = tmp_dir.clone();
+
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let svc = RocheService::new(db.clone(), DummyWebFetcher, cfg);
+    let app = ApiRoutes::router_with_service(svc.clone());
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    // 1. Seed a Paper item with a placeholder filename title and a cached PDF on disk
+    let pdf_url =
+        Url::parse("https://web.maths.unsw.edu.au/~davidharvey/research/subnlogn.pdf").unwrap();
+    let (paper, _) = db
+        .items()
+        .save_manual_input_with_tags(&crate::db::ManualItemInput {
+            url: &pdf_url,
+            title: "subnlogn.pdf",
+            summary: None,
+            content_html: None,
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Pdf,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+
+    let stream = "\
+BT\n\
+/F1 17.28 Tf\n\
+100 720 Td (Integer multiplication in time O\\(n log n\\)) Tj\n\
+/F1 12 Tf\n\
+0 -28 Td (David Harvey and Joris van der Hoeven) Tj\n\
+/F1 10 Tf\n\
+0 -20 Td (October 20, 2026) Tj\n\
+0 -28 Td (Abstract) Tj\n\
+0 -14 Td (We prove an O\\(n log n\\) multiplication bound for large integers.) Tj\n\
+ET\n";
+    let pdf_bytes = format!(
+        "%PDF-1.5\n\
+         1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+         2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+         3 0 obj << /Type /Page /Parent 2 0 R /Contents 4 0 R >> endobj\n\
+         4 0 obj << /Length {} >>\nstream\n{}\nendstream\nendobj\n\
+         5 0 obj << /Title () /Author () /Producer (pdfTeX) >> endobj\n\
+         %%EOF\n",
+        stream.len(),
+        stream
+    );
+    let rel_path = format!("pdfs/{}.pdf", paper.id);
+    let file_size = svc.media_store().write_bytes(&rel_path, pdf_bytes.as_bytes()).await.unwrap();
+    db.media()
+        .create(&paper.id, crate::db::MediaType::Pdf, &rel_path, Some(file_size), None)
+        .await
+        .unwrap();
+
+    // 2. Entry page shows inline pencil edit trigger (no ugly rail edit card), title-as-link,
+    // Refresh Metadata button, and triggers auto-enrich predicate
+    let before_detail = db.catalog().get_entry_detail(&paper.id).await.unwrap().unwrap();
+    assert!(crate::service::enrich::should_auto_enrich_document(&before_detail));
+    let entry_html =
+        read_body_html(get_authed(&app, &format!("/entries/{}", paper.id), &cookie).await).await;
+    assert!(entry_html.contains("id=\"entry-inline-edit\""));
+    assert!(entry_html.contains("js-entry-edit-toggle"));
+    assert!(entry_html.contains("class=\"entry-title-link\""));
+    assert!(!entry_html.contains("id=\"edit-details\""));
+    assert!(!entry_html.contains("Open Source"));
+    assert!(entry_html.contains("Refresh Metadata"));
+
+    // ?edit=1 unlocks the inline hero editor directly without JS
+    let entry_edit_html =
+        read_body_html(get_authed(&app, &format!("/entries/{}?edit=1", paper.id), &cookie).await)
+            .await;
+    assert!(entry_edit_html.contains("entry-hero-text is-editing"));
+
+    // 3. POST /web/entries/{id}/refresh-metadata discovers metadata from the cached PDF
+    let refresh_resp = post_form(
+        &app,
+        &format!("/web/entries/{}/refresh-metadata", paper.id),
+        &cookie,
+        &[("_csrf", &csrf)],
+    )
+    .await;
+    assert_eq!(refresh_resp.status(), StatusCode::SEE_OTHER);
+    let after_refresh = db.catalog().get_entry_detail(&paper.id).await.unwrap().unwrap();
+    assert_eq!(after_refresh.entry.title, "Integer multiplication in time O(n log n)");
+    assert_eq!(after_refresh.entry.creators, vec!["David Harvey", "Joris van der Hoeven"]);
+    assert_eq!(after_refresh.entry.release_year, Some(2026));
+    assert!(after_refresh.entry.summary.as_deref().unwrap_or("").contains("O(n log n)"));
+
+    // 4. POST /web/entries/{id}/edit updates details with inline LaTeX math and stamps edited_hlc
+    let edit_resp = post_form(
+        &app,
+        &format!("/web/entries/{}/edit", paper.id),
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("title", "On the recently proposed $o(n \\log n)$ integer multiplication algorithm"),
+            ("kind", "paper"),
+            ("creators", "David Harvey, Joris van der Hoeven"),
+            ("published_date", "2021-03-15"),
+            ("release_year", ""),
+            ("url", "https://web.maths.unsw.edu.au/~davidharvey/research/subnlogn.pdf"),
+            ("summary", "Analysis of the $o(n \\log n)$ bound."),
+            ("doi", "10.4007/annals.2021.193.2.4"),
+            ("arxiv_id", ""),
+            ("isbn", ""),
+        ],
+    )
+    .await;
+    assert_eq!(edit_resp.status(), StatusCode::SEE_OTHER);
+    let after_edit = db.catalog().get_entry_detail(&paper.id).await.unwrap().unwrap();
+    assert_eq!(
+        after_edit.entry.title,
+        "On the recently proposed $o(n \\log n)$ integer multiplication algorithm"
+    );
+    assert_eq!(after_edit.entry.release_year, Some(2021));
+    assert_eq!(after_edit.entry.identifier("doi"), Some("10.4007/annals.2021.193.2.4"));
+    assert!(
+        roche_core::crdt::extract_entry_edited_hlc_from_value(Some(&after_edit.entry.metadata))
+            .is_some()
+    );
+
+    // Entry page renders inline MathML in hero h2 + summary, strips $ from <title>, and shows DOI in hero facts
+    let after_entry_html =
+        read_body_html(get_authed(&app, &format!("/entries/{}", paper.id), &cookie).await).await;
+    assert!(after_entry_html.contains("<math><mi>o</mi><mo stretchy=\"false\">(</mo><mi>n</mi>"));
+    assert!(
+        after_entry_html.contains(
+            "<title>On the recently proposed o(n log n) integer multiplication algorithm"
+        )
+    );
+    assert!(after_entry_html.contains("<dt>DOI</dt>"));
+    assert!(after_entry_html.contains("10.4007/annals.2021.193.2.4"));
+
+    // 5. Reader displays harmonized date, MathML title-as-link, pencil edit button, and 3-mode PDF switcher
+    let reader_html =
+        read_body_html(get_authed(&app, &format!("/reader/{}", paper.id), &cookie).await).await;
+    assert!(reader_html.contains(&format!("/entries/{}?edit=1", paper.id)));
+    assert!(reader_html.contains("2021"));
+    assert!(reader_html.contains("class=\"reader-title-link\""));
+    assert!(reader_html.contains("<math><mi>o</mi><mo stretchy=\"false\">(</mo><mi>n</mi>"));
+    assert!(!reader_html.contains("Original &#8599;"));
+    assert!(reader_html.contains("reader-pdf-mode-switch"));
+    assert!(reader_html.contains("data-pdf-mode-target=\"extracted\""));
+    assert!(reader_html.contains("data-pdf-mode-target=\"pdf\""));
+    assert!(reader_html.contains("data-pdf-mode-target=\"split\""));
+    assert!(reader_html.contains("data-pdf-mode=\"extracted\""));
+
+    let reader_split_html = read_body_html(
+        get_authed(&app, &format!("/reader/{}?view=split", paper.id), &cookie).await,
+    )
+    .await;
+    assert!(reader_split_html.contains("data-pdf-mode=\"split\""));
 }

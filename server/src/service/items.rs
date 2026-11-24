@@ -75,7 +75,9 @@ impl<'a> ItemService<'a> {
         let arxiv_id = extract_arxiv_id(url.as_str());
         let content_type = if arxiv_id.is_some() { ContentType::Paper } else { classify_url(url) };
         let explicit_title = title.map(str::trim).filter(|t| !t.is_empty());
-        let has_explicit_title = explicit_title.is_some();
+        let has_explicit_title = explicit_title.is_some_and(|t| {
+            !roche_core::document_meta::is_placeholder_entry_title(t, Some(url.as_str()))
+        });
         let initial_title = explicit_title.unwrap_or_else(|| url.as_str());
         let yt_thumb_fallback = youtube_thumbnail_url(url);
         let audio_url = (content_type == ContentType::Audio).then(|| url.as_str());
@@ -177,17 +179,34 @@ impl<'a> ItemService<'a> {
                         let body_html = (content_type == ContentType::Article)
                             .then_some(snapshot.content_html.as_str())
                             .filter(|h| !h.trim().is_empty());
+                        let mut doc_meta = roche_core::document_meta::ExtractedDocumentMetadata {
+                            title: snapshot.title,
+                            authors: snapshot.authors,
+                            published_at: snapshot.published_at,
+                            release_year: snapshot.release_year,
+                            summary: snapshot.summary,
+                            doi: snapshot.doi,
+                            arxiv_id: None,
+                            isbn: snapshot.isbn,
+                        };
+                        if doc_meta.doi.is_some()
+                            && let Some(client) = service.artist_enricher.active_http_client()
+                        {
+                            crate::service::enrich::lookup_external_document_metadata(
+                                &mut doc_meta,
+                                client,
+                            )
+                            .await;
+                        }
                         let _ = service
                             .db
                             .items()
-                            .apply_background_enrichment(
+                            .apply_document_enrichment(
                                 item_id,
-                                snapshot.title.as_deref(),
-                                snapshot.author.as_slice(),
-                                None,
-                                snapshot.summary.as_deref(),
+                                &doc_meta,
                                 snapshot.thumbnail_url.as_deref(),
                                 body_html,
+                                false,
                             )
                             .await;
                     }

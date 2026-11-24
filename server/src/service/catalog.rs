@@ -16,7 +16,7 @@ use crate::{
     db::{
         CatalogBatchInput, CatalogBatchResult, CatalogEntry, CatalogRepo, CollectionGeneratorState,
         CollectionRankingInputs, CollectionSummary, ComparisonRecord, ConsumptionLogView, Db,
-        EntryDetailView, EntryIdentifier, UpsertEntryInput, WantSearchMatch,
+        EntryDetailView, EntryIdentifier, UpdateEntryInput, UpsertEntryInput, WantSearchMatch,
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::{
@@ -295,6 +295,14 @@ impl<'a> CatalogService<'a> {
 
     pub async fn upsert_entry(&self, input: &UpsertEntryInput) -> Result<CatalogEntry, AppError> {
         Ok(self.repo.upsert_entry(input).await?)
+    }
+
+    pub async fn update_entry(
+        &self,
+        id: &str,
+        input: &UpdateEntryInput,
+    ) -> Result<EntryDetailView, AppError> {
+        Ok(self.repo.update_entry(id, input).await?)
     }
 
     pub async fn merge_entries(

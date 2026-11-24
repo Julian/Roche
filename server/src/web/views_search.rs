@@ -172,7 +172,7 @@ fn render_search_catalog_section(
                <div class=\"search-result-main\">\
                  <a class=\"search-result-title\" href=\"/entries/{}\">{}</a>",
             esc(&urlencode(&entry.id)),
-            esc(&entry.title),
+            roche_core::document_meta::render_inline_math_html(&entry.title),
         );
         render_creator_year_meta(
             out,
@@ -254,7 +254,7 @@ fn render_search_want_section(
                <div class=\"search-result-main\">\
                  <a class=\"search-result-title\" href=\"{}\">{}</a>",
             esc(&href),
-            esc(&wm.entry.title),
+            roche_core::document_meta::render_inline_math_html(&wm.entry.title),
         );
         render_creator_year_meta(
             out,
@@ -291,7 +291,7 @@ fn render_search_inbox_section(out: &mut String, res: &WorkspaceSearchResults, r
                  <a class=\"search-result-title\" href=\"{}\">{}</a>\
                  <div class=\"item-byline\">",
             esc(&reader_href),
-            esc(&item.title),
+            roche_core::document_meta::render_inline_math_html(&item.title),
         );
         if let Some((badge_cls, label)) = item_kind_badge(item) {
             let _ =

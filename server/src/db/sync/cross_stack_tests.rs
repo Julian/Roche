@@ -319,6 +319,13 @@ struct BoardIdVector {
 }
 
 #[derive(Deserialize)]
+struct PlaceholderTitleVector {
+    title: String,
+    url: Option<String>,
+    expected: bool,
+}
+
+#[derive(Deserialize)]
 struct ExpandedCrossStackVectors {
     custom_collection_ids: Vec<CustomCollectionIdVector>,
     url_classification: Vec<UrlClassificationVector>,
@@ -331,6 +338,7 @@ struct ExpandedCrossStackVectors {
     feed_xml_fixtures: Vec<FeedXmlFixtureVector>,
     wire_dto_roundtrip: WireDtoRoundtripSuite,
     board_ids: Vec<BoardIdVector>,
+    placeholder_entry_titles: Vec<PlaceholderTitleVector>,
 }
 
 fn load_expanded_vectors() -> ExpandedCrossStackVectors {
@@ -1104,6 +1112,21 @@ fn test_cross_stack_board_ids() {
             "deterministic_board_id mismatch for ({}, {})",
             case.adapter_type,
             case.source_key
+        );
+    }
+}
+
+#[test]
+fn test_cross_stack_placeholder_entry_titles() {
+    let vectors = load_expanded_vectors().placeholder_entry_titles;
+    assert!(vectors.len() >= 8);
+    for case in &vectors {
+        assert_eq!(
+            roche_core::document_meta::is_placeholder_entry_title(&case.title, case.url.as_deref()),
+            case.expected,
+            "is_placeholder_entry_title mismatch for ('{}', {:?})",
+            case.title,
+            case.url
         );
     }
 }

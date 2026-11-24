@@ -17,6 +17,7 @@ import com.grayvines.roche.core.formatUtcMillisIso
 import com.grayvines.roche.core.inferFeedTypeWireValue
 import com.grayvines.roche.core.isArxivUrl
 import com.grayvines.roche.core.isDirectAudioUrl
+import com.grayvines.roche.core.isEntryUserEdited
 import com.grayvines.roche.core.isHttpOrHttpsUrl
 import com.grayvines.roche.core.isSyncablePublicUrl
 import com.grayvines.roche.core.isYoutubeUrl
@@ -321,7 +322,9 @@ internal object LocalFeedPoller {
             val detId = deterministicItemId(feed.url, cleanUrl)
             val existing = byNaturalUrl[canonicalUrlKey] ?: byId[detId]
             if (existing != null) {
-                val merged = mergePolledCandidate(existing, feed, candidate)
+                val isUserEdited =
+                    dao.getEntryById(existing.id)?.metadataJson?.let(::isEntryUserEdited) == true
+                val merged = mergePolledCandidate(existing, feed, candidate, isUserEdited)
                 if (merged != existing) {
                     toUpsert.add(merged)
                 }
@@ -384,9 +387,15 @@ internal object LocalFeedPoller {
         existing: InboxItemRow,
         feed: FeedRow,
         candidate: ParsedFeedCandidateItem,
+        isUserEdited: Boolean = false,
     ): InboxItemRow {
         val richerSummary =
-            pickRicherString(existing.summary, candidate.summary)?.take(MAX_SQLITE_SUMMARY_CHARS)
+            if (isUserEdited) {
+                existing.summary
+            } else {
+                pickRicherString(existing.summary, candidate.summary)
+                    ?.take(MAX_SQLITE_SUMMARY_CHARS)
+            }
         val richerText =
             existing.contentText
                 ?.takeIf { it.isNotBlank() && it != existing.summary }
@@ -406,9 +415,20 @@ internal object LocalFeedPoller {
             feedId = existing.feedId ?: feed.id,
             feedUrl = existing.feedUrl ?: feed.url,
             feedTitle = resolveMergedFeedTitle(existing.feedTitle, feed),
-            title = existing.title.ifBlank { candidate.title },
-            author = existing.author?.takeIf { it.isNotBlank() } ?: candidate.author,
-            publishedAt = existing.publishedAt?.takeIf { it.isNotBlank() } ?: candidate.publishedAt,
+            title =
+                if (isUserEdited) existing.title else existing.title.ifBlank { candidate.title },
+            author =
+                if (isUserEdited) {
+                    existing.author
+                } else {
+                    existing.author?.takeIf { it.isNotBlank() } ?: candidate.author
+                },
+            publishedAt =
+                if (isUserEdited) {
+                    existing.publishedAt
+                } else {
+                    existing.publishedAt?.takeIf { it.isNotBlank() } ?: candidate.publishedAt
+                },
             summary = richerSummary,
             contentText = richerText,
             contentHtml = richerHtml,

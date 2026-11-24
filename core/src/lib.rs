@@ -3,6 +3,7 @@
 pub mod boards;
 pub mod classify;
 pub mod crdt;
+pub mod document_meta;
 pub mod domain;
 pub mod external_links;
 pub mod feeds;

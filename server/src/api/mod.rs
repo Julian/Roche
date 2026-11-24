@@ -218,7 +218,10 @@ impl ApiRoutes {
                 "/api/v1/catalog/entries",
                 get(catalog::catalog_entries_search).post(catalog::catalog_entries_upsert),
             )
-            .route("/api/v1/catalog/entries/{id}", get(catalog::catalog_entry_get))
+            .route(
+                "/api/v1/catalog/entries/{id}",
+                get(catalog::catalog_entry_get).patch(catalog::catalog_entry_update),
+            )
             .route("/api/v1/catalog/entries/{id}/enrich", post(catalog::catalog_entry_enrich))
             .route("/api/v1/catalog/entries/{id}/merge", post(catalog::catalog_entry_merge))
             .route("/api/v1/catalog/diary", get(catalog::catalog_diary_list))

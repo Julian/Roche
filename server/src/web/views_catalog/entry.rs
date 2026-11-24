@@ -9,31 +9,33 @@ use axum::{
     extract::{Extension, Path, Query, State},
     response::{IntoResponse, Response},
 };
+use roche_core::document_meta::{render_inline_math_html, strip_inline_math_delimiters};
 
 use super::{
-    AddArtistAlbumForm, EntryAddToListForm, EntryDetailQuery, EntryLogForm, EntryMergeForm,
-    EntryQueueToggleForm, parse_consumption_status, parse_optional_year,
+    AddArtistAlbumForm, EntryAddToListForm, EntryDetailQuery, EntryEditForm, EntryLogForm,
+    EntryMergeForm, EntryQueueToggleForm, EntryRefreshMetadataForm, parse_consumption_status,
+    parse_optional_year, render_editable_kind_options,
 };
 use crate::{
     db::{
-        CatalogEntry, CollectionSummary, EntryDetailView, EntryIdentifier, UpsertEntryInput,
-        WANT_TO_READ_SLUG,
+        CatalogEntry, CollectionSummary, EntryDetailView, EntryIdentifier, UpdateEntryInput,
+        UpsertEntryInput, WANT_TO_READ_SLUG,
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     service::{
         AppError, EntryListAppearance, RocheService,
         enrich::{
-            AlbumTrack, DiscographyAlbum, extract_album_tracks, extract_artist_discography,
-            normalize_album_match_key,
+            AlbumTrack, DiscographyAlbum, EnrichService, extract_album_tracks,
+            extract_artist_discography, normalize_album_match_key,
         },
     },
     web::{
         auth::WebSession,
         html::{
-            NavSection, PageShell, WebError, WithWebCsrf as _, consumption_status_label, esc,
-            parse_form_bool, redirect_with_flash, render_inline_csrf_form,
-            render_inline_csrf_form_with_class, render_page, safe_local_redirect,
-            safe_web_error_message, urlencode,
+            NavSection, PENCIL_SVG, PageShell, WebError, WithWebCsrf as _,
+            consumption_status_label, esc, parse_form_bool, redirect_with_flash,
+            render_inline_csrf_form, render_inline_csrf_form_with_class, render_page,
+            safe_local_redirect, safe_web_error_message, urlencode,
         },
         links::{
             WebLinkIcon, collect_web_external_links, extract_entry_tags,
@@ -57,6 +59,11 @@ enum MergePreviewState {
     Error(String),
 }
 
+enum EditDrawerState {
+    Open,
+    Closed,
+}
+
 struct EntryRenderCtx<'a> {
     detail: &'a EntryDetailView,
     tracks: &'a [AlbumTrack],
@@ -65,6 +72,8 @@ struct EntryRenderCtx<'a> {
     available_manual_lists: &'a [CollectionSummary],
     want_queue_slug: Option<&'a str>,
     needs_enrich: bool,
+    can_refresh: bool,
+    edit_drawer: EditDrawerState,
     merge_preview_query: Option<&'a str>,
     merge_preview: Option<&'a MergePreviewState>,
     artist_links: &'a HashMap<String, String>,
@@ -88,6 +97,12 @@ pub(in crate::web) async fn entry_detail_get(
             )
         })?;
     let needs_enrich = service.enrich().needs_enrichment(&detail);
+    let can_refresh = EnrichService::can_manual_refresh(&detail);
+    let edit_drawer = if parse_form_bool(query.edit.as_deref()) {
+        EditDrawerState::Open
+    } else {
+        EditDrawerState::Closed
+    };
 
     let mut relevant_creators: Vec<String> = detail.entry.creators.clone();
     relevant_creators.extend(detail.children.iter().flat_map(|c| c.creators.iter().cloned()));
@@ -102,6 +117,54 @@ pub(in crate::web) async fn entry_detail_get(
         load_child_entry_tiers(&service, &detail.children),
     );
     let all_lists = collections_res.unwrap_or_default();
+    let (want_queue_slug, parent_lists, available_manual_lists) =
+        build_entry_list_links(&detail, &all_lists);
+
+    let merge_preview_query =
+        query.merge_preview.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let merge_preview = load_merge_preview(&service, &detail.entry.id, merge_preview_query).await;
+
+    let has_reader_item = reader_ids_res.is_ok_and(|ids| ids.contains(&detail.entry.id));
+    let tracks = extract_album_tracks(&detail);
+
+    let ctx = EntryRenderCtx {
+        detail: &detail,
+        tracks: &tracks,
+        appearances: &appearances,
+        parent_lists: &parent_lists,
+        available_manual_lists: &available_manual_lists,
+        want_queue_slug: want_queue_slug.as_deref(),
+        needs_enrich,
+        can_refresh,
+        edit_drawer,
+        merge_preview_query,
+        merge_preview: merge_preview.as_ref(),
+        artist_links: &artist_links,
+        child_tiers: &child_tiers,
+        has_reader_item,
+        csrf: &session.csrf_token,
+    };
+    let mut body = String::with_capacity(10_240);
+    render_entry_detail_body(&mut body, &ctx);
+
+    let plain_title = strip_inline_math_delimiters(&detail.entry.title);
+    Ok(render_page(&PageShell {
+        title: &plain_title,
+        active: NavSection::Lists,
+        csrf_token: &session.csrf_token,
+        flash: &session.flash,
+        is_refreshing: service.is_refreshing(),
+        theme: session.theme,
+        search_query: None,
+        body_html: &body,
+    })
+    .into_response())
+}
+
+fn build_entry_list_links(
+    detail: &EntryDetailView,
+    all_lists: &[CollectionSummary],
+) -> (Option<String>, Vec<EntryParentListLink>, Vec<CollectionSummary>) {
     let list_by_id: HashMap<&str, &CollectionSummary> =
         all_lists.iter().map(|c| (c.id.as_str(), c)).collect();
 
@@ -144,42 +207,7 @@ pub(in crate::web) async fn entry_detail_get(
         .cloned()
         .collect();
 
-    let merge_preview_query =
-        query.merge_preview.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let merge_preview = load_merge_preview(&service, &detail.entry.id, merge_preview_query).await;
-
-    let has_reader_item = reader_ids_res.is_ok_and(|ids| ids.contains(&detail.entry.id));
-    let tracks = extract_album_tracks(&detail);
-
-    let ctx = EntryRenderCtx {
-        detail: &detail,
-        tracks: &tracks,
-        appearances: &appearances,
-        parent_lists: &parent_lists,
-        available_manual_lists: &available_manual_lists,
-        want_queue_slug: want_queue_slug.as_deref(),
-        needs_enrich,
-        merge_preview_query,
-        merge_preview: merge_preview.as_ref(),
-        artist_links: &artist_links,
-        child_tiers: &child_tiers,
-        has_reader_item,
-        csrf: &session.csrf_token,
-    };
-    let mut body = String::with_capacity(10_240);
-    render_entry_detail_body(&mut body, &ctx);
-
-    Ok(render_page(&PageShell {
-        title: &detail.entry.title,
-        active: NavSection::Lists,
-        csrf_token: &session.csrf_token,
-        flash: &session.flash,
-        is_refreshing: service.is_refreshing(),
-        theme: session.theme,
-        search_query: None,
-        body_html: &body,
-    })
-    .into_response())
+    (want_queue_slug, parent_lists, available_manual_lists)
 }
 
 async fn load_merge_preview(
@@ -217,10 +245,11 @@ fn render_entry_detail_body(out: &mut String, ctx: &EntryRenderCtx<'_>) {
     out.push_str("<div class=\"entry-grid\">\n<div class=\"entry-main\">\n");
     render_entry_crumb(out, &ctx.detail.entry);
     if ctx.needs_enrich {
-        let msg = if ctx.detail.entry.kind == EntryKind::Artist {
-            "Fetching artist bio &amp; discography…"
-        } else {
-            "Fetching album tracklist…"
+        let msg = match ctx.detail.entry.kind {
+            EntryKind::Artist => "Fetching artist bio &amp; discography…",
+            EntryKind::Album => "Fetching album tracklist…",
+            EntryKind::Paper => "Discovering paper metadata…",
+            _ => "Refreshing metadata…",
         };
         let _ = writeln!(
             out,
@@ -233,6 +262,7 @@ fn render_entry_detail_body(out: &mut String, ctx: &EntryRenderCtx<'_>) {
         out,
         &ctx.detail.entry,
         ctx.has_reader_item,
+        ctx.can_refresh,
         ctx.want_queue_slug,
         ctx.csrf,
     );
@@ -280,6 +310,11 @@ fn render_entry_crumb(out: &mut String, entry: &CatalogEntry) {
 
 fn render_entry_hero(out: &mut String, ctx: &EntryRenderCtx<'_>) {
     let entry = &ctx.detail.entry;
+    let can_edit = entry.kind != EntryKind::Collection;
+    let is_editing = can_edit && matches!(ctx.edit_drawer, EditDrawerState::Open);
+    let editing_cls = if is_editing { " is-editing" } else { "" };
+    let plain_title = strip_inline_math_delimiters(&entry.title);
+    let id_enc = urlencode(&entry.id);
     let artwork_url = entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href);
     if let Some(thumb) = artwork_url {
         let art_cls = if entry.kind == EntryKind::Artist {
@@ -289,41 +324,184 @@ fn render_entry_hero(out: &mut String, ctx: &EntryRenderCtx<'_>) {
         };
         let _ = write!(
             out,
-            "<div class=\"entry-hero\">\n\
+            "<div class=\"entry-hero{editing_cls}\">\n\
                <img class=\"{art_cls}\" src=\"{}\" alt=\"{}\" loading=\"lazy\" referrerpolicy=\"no-referrer\">\n\
                <div class=\"entry-hero-main\">\n",
             esc(thumb),
-            esc(&entry.title),
+            esc(&plain_title),
         );
     } else {
-        out.push_str(
-            "<div class=\"entry-hero entry-hero-text\">\n<div class=\"entry-hero-main\">\n",
+        let _ = write!(
+            out,
+            "<div class=\"entry-hero entry-hero-text{editing_cls}\">\n<div class=\"entry-hero-main\">\n",
         );
     }
 
-    let _ = writeln!(
-        out,
-        "<p class=\"entry-kicker\">{}</p>\n<h2>{}</h2>",
-        esc(entry.kind.display_label()),
-        esc(&entry.title),
-    );
+    out.push_str("<div class=\"entry-hero-view\">\n<div class=\"entry-kicker-row\">\n");
+    let _ = writeln!(out, "<p class=\"entry-kicker\">{}</p>", esc(entry.kind.display_label()));
+    if can_edit {
+        let _ = writeln!(
+            out,
+            "<a class=\"entry-edit-toggle js-entry-edit-toggle\" href=\"/entries/{id_enc}?edit=1\" role=\"button\" aria-expanded=\"{}\" aria-controls=\"entry-inline-edit\" title=\"Edit details\" aria-label=\"Edit details\">{PENCIL_SVG}</a>",
+            if is_editing { "true" } else { "false" },
+            id_enc = esc(&id_enc),
+        );
+    }
+    out.push_str("</div>\n");
+
+    let title_html = render_inline_math_html(&entry.title);
+    if let Some(orig_href) = entry.url.as_deref().and_then(sanitize_non_local_href) {
+        let _ = writeln!(
+            out,
+            "<h2><a class=\"entry-title-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\">{title_html}<span class=\"title-ext-mark\" aria-hidden=\"true\">&#8599;</span></a></h2>",
+            esc(orig_href),
+        );
+    } else {
+        let _ = writeln!(out, "<h2>{title_html}</h2>");
+    }
 
     render_entry_meta_line(out, entry, ctx.tracks, ctx.artist_links);
 
     if let Some(sum) = entry.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let _ = writeln!(out, "<p class=\"entry-summary\">{}</p>", esc(sum));
+        let _ = writeln!(out, "<p class=\"entry-summary\">{}</p>", render_inline_math_html(sum));
     }
 
-    let genres = extract_entry_tags(entry);
-    if !genres.is_empty() {
-        let _ = writeln!(
-            out,
-            "<dl class=\"facts\"><dt>Genres</dt><dd>{}</dd></dl>",
-            esc(&genres.join(" · ")),
-        );
+    render_entry_hero_facts(out, entry);
+    out.push_str("</div>\n");
+
+    if can_edit {
+        render_entry_inline_edit_form(out, entry, &id_enc, ctx.csrf);
     }
 
     out.push_str("</div>\n</div>\n");
+}
+
+fn render_entry_hero_facts(out: &mut String, entry: &CatalogEntry) {
+    let doi = entry.identifier("doi").map(str::trim).filter(|s| !s.is_empty());
+    let arxiv = entry.identifier("arxiv").map(str::trim).filter(|s| !s.is_empty());
+    let isbn = entry.identifier("isbn").map(str::trim).filter(|s| !s.is_empty());
+    let genres = extract_entry_tags(entry);
+    if doi.is_none() && arxiv.is_none() && isbn.is_none() && genres.is_empty() {
+        return;
+    }
+    out.push_str("<dl class=\"facts\">");
+    if let Some(d) = doi {
+        if let Some(safe) = roche_core::external_links::external_identifier_url("doi", d)
+            .as_deref()
+            .and_then(sanitize_non_local_href)
+        {
+            let _ = write!(
+                out,
+                "<dt>DOI</dt><dd><a href=\"{}\" target=\"_blank\" rel=\"noopener\">{}</a></dd>",
+                esc(safe),
+                esc(d),
+            );
+        } else {
+            let _ = write!(out, "<dt>DOI</dt><dd>{}</dd>", esc(d));
+        }
+    }
+    if let Some(aid) = arxiv {
+        if let Some(safe) = roche_core::external_links::external_identifier_url("arxiv", aid)
+            .as_deref()
+            .and_then(sanitize_non_local_href)
+        {
+            let _ = write!(
+                out,
+                "<dt>arXiv</dt><dd><a href=\"{}\" target=\"_blank\" rel=\"noopener\">{}</a></dd>",
+                esc(safe),
+                esc(aid),
+            );
+        } else {
+            let _ = write!(out, "<dt>arXiv</dt><dd>{}</dd>", esc(aid));
+        }
+    }
+    if let Some(i) = isbn {
+        let _ = write!(out, "<dt>ISBN</dt><dd>{}</dd>", esc(i));
+    }
+    if !genres.is_empty() {
+        let _ = write!(out, "<dt>Genres</dt><dd>{}</dd>", esc(&genres.join(" · ")));
+    }
+    out.push_str("</dl>\n");
+}
+
+fn render_entry_inline_edit_form(out: &mut String, entry: &CatalogEntry, id_enc: &str, csrf: &str) {
+    let return_to = format!("/entries/{id_enc}");
+    let creators_val = entry.creators.join(", ");
+    let date_val =
+        entry.published_at.map_or_else(String::new, |dt| dt.format("%Y-%m-%d").to_string());
+    let year_val = entry.release_year.map_or_else(String::new, |y| y.to_string());
+    let url_val = entry.url.as_deref().unwrap_or("");
+    let summary_val = entry.summary.as_deref().unwrap_or("");
+    let doi_val = entry.identifier("doi").unwrap_or("");
+    let arxiv_val = entry.identifier("arxiv").unwrap_or("");
+    let isbn_val = entry.identifier("isbn").unwrap_or("");
+    let kind_opts = render_editable_kind_options(entry.kind);
+
+    let _ = write!(
+        out,
+        "<form id=\"entry-inline-edit\" method=\"post\" action=\"/web/entries/{id_enc}/edit\" class=\"entry-inline-edit-form js-entry-inline-edit\">\n\
+           <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+           <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
+           <div class=\"entry-inline-top-row\">\n\
+             <select id=\"edit-entry-kind\" name=\"kind\" class=\"entry-inline-kind-select\" aria-label=\"Kind\">{kind_opts}</select>\n\
+             <a class=\"entry-edit-toggle js-entry-edit-cancel\" href=\"{ret}\" role=\"button\" title=\"Cancel editing\" aria-label=\"Cancel editing\">&times;</a>\n\
+           </div>\n\
+           <input id=\"edit-entry-title\" name=\"title\" type=\"text\" required value=\"{title}\" class=\"entry-inline-title-input\" aria-label=\"Title\" placeholder=\"Title (supports $LaTeX$ math)\">\n\
+           <div class=\"entry-inline-meta-grid\">\n\
+             <div class=\"field\">\n\
+               <label for=\"edit-entry-creators\">Authors / Creators</label>\n\
+               <input id=\"edit-entry-creators\" name=\"creators\" type=\"text\" value=\"{creators}\" placeholder=\"Comma-separated names\">\n\
+             </div>\n\
+             <div class=\"field\">\n\
+               <label for=\"edit-entry-date\">Published Date</label>\n\
+               <input id=\"edit-entry-date\" name=\"published_date\" type=\"date\" value=\"{date}\">\n\
+             </div>\n\
+             <div class=\"field\">\n\
+               <label for=\"edit-entry-year\">Year</label>\n\
+               <input id=\"edit-entry-year\" name=\"release_year\" type=\"number\" min=\"1000\" max=\"2100\" value=\"{year}\" placeholder=\"YYYY\">\n\
+             </div>\n\
+           </div>\n\
+           <div class=\"field\">\n\
+             <label for=\"edit-entry-summary\">Summary / Abstract</label>\n\
+             <textarea id=\"edit-entry-summary\" name=\"summary\" class=\"entry-inline-summary-input\" placeholder=\"Optional summary or abstract (supports $LaTeX$ math)…\">{summary}</textarea>\n\
+           </div>\n\
+           <div class=\"entry-inline-extra-grid\">\n\
+             <div class=\"field entry-inline-url-field\">\n\
+               <label for=\"edit-entry-url\">Source URL</label>\n\
+               <input id=\"edit-entry-url\" name=\"url\" type=\"text\" value=\"{url}\" placeholder=\"https://…\">\n\
+             </div>\n\
+             <div class=\"field\">\n\
+               <label for=\"edit-entry-doi\">DOI</label>\n\
+               <input id=\"edit-entry-doi\" name=\"doi\" type=\"text\" value=\"{doi}\" placeholder=\"10.xxxx/…\">\n\
+             </div>\n\
+             <div class=\"field\">\n\
+               <label for=\"edit-entry-arxiv\">arXiv ID</label>\n\
+               <input id=\"edit-entry-arxiv\" name=\"arxiv_id\" type=\"text\" value=\"{arxiv}\" placeholder=\"2610.12345\">\n\
+             </div>\n\
+             <div class=\"field\">\n\
+               <label for=\"edit-entry-isbn\">ISBN</label>\n\
+               <input id=\"edit-entry-isbn\" name=\"isbn\" type=\"text\" value=\"{isbn}\" placeholder=\"978…\">\n\
+             </div>\n\
+           </div>\n\
+           <div class=\"entry-inline-edit-actions\">\n\
+             <button type=\"submit\" class=\"btn btn-primary btn-small\">Save Details</button>\n\
+             <a class=\"btn btn-small btn-ghost js-entry-edit-cancel\" href=\"{ret}\">Cancel</a>\n\
+             <span class=\"meta\">Tip: wrap inline math in $&hellip;$</span>\n\
+           </div>\n\
+         </form>\n",
+        id_enc = esc(id_enc),
+        csrf = esc(csrf),
+        ret = esc(&return_to),
+        title = esc(&entry.title),
+        creators = esc(&creators_val),
+        date = esc(&date_val),
+        year = esc(&year_val),
+        url = esc(url_val),
+        summary = esc(summary_val),
+        doi = esc(doi_val),
+        arxiv = esc(arxiv_val),
+        isbn = esc(isbn_val),
+    );
 }
 
 fn render_entry_meta_line(
@@ -332,7 +510,10 @@ fn render_entry_meta_line(
     tracks: &[AlbumTrack],
     artist_links: &HashMap<String, String>,
 ) {
-    let has_meta = !entry.creators.is_empty() || entry.release_year.is_some() || !tracks.is_empty();
+    let has_meta = !entry.creators.is_empty()
+        || entry.published_at.is_some()
+        || entry.release_year.is_some()
+        || !tracks.is_empty();
     if !has_meta {
         return;
     }
@@ -342,7 +523,9 @@ fn render_entry_meta_line(
         render_creator_links(out, &entry.creators, artist_links, false);
         out.push_str("</span>");
     }
-    if let Some(yr) = entry.release_year {
+    if let Some(dt) = entry.published_at {
+        let _ = write!(out, "<span class=\"byline-item\">{}</span>", dt.format("%b %-d, %Y"));
+    } else if let Some(yr) = entry.release_year {
         let _ = write!(out, "<span class=\"byline-item\">{yr}</span>");
     }
     if !tracks.is_empty() {
@@ -366,12 +549,16 @@ fn render_entry_action_bar(
     out: &mut String,
     entry: &CatalogEntry,
     has_reader_item: bool,
+    can_refresh: bool,
     want_queue_slug: Option<&str>,
     csrf: &str,
 ) {
-    let links = collect_web_external_links(entry, Some("Open Source"));
+    let links: Vec<_> = collect_web_external_links(entry, None)
+        .into_iter()
+        .filter(|l| !matches!(l.label.as_str(), "Web" | "DOI" | "arXiv"))
+        .collect();
     let can_queue = entry.kind.default_want_slug().is_some();
-    if !has_reader_item && !can_queue && links.is_empty() {
+    if !has_reader_item && !can_queue && !can_refresh && links.is_empty() {
         return;
     }
     let id_enc = urlencode(&entry.id);
@@ -406,6 +593,16 @@ fn render_entry_action_bar(
                 "<button type=\"submit\" class=\"btn btn-small btn-ghost\" title=\"Add to Queue\">+ Add to Queue</button>",
             );
         }
+    }
+    if can_refresh {
+        render_inline_csrf_form(
+            out,
+            &format!("/web/entries/{id_enc}/refresh-metadata"),
+            csrf,
+            &[("return_to", &return_to)],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\" title=\"Auto-discover metadata from PDF, webpage, arXiv, or Crossref\">Refresh Metadata</button>",
+        );
     }
     if !links.is_empty() {
         out.push_str("<ul class=\"external-links\">\n");
@@ -1140,12 +1337,137 @@ pub(in crate::web) async fn post_entry_enrich(
             )
         })?;
     let after = service.enrich().enrich_entry_now(&id).await.web_err(&session)?;
-    let enriched = before.entry.summary != after.entry.summary
+    let enriched = entry_detail_metadata_changed(&before, &after);
+    Ok(Json(serde_json::json!({ "enriched": enriched })).into_response())
+}
+
+pub(in crate::web) async fn post_entry_refresh_metadata(
+    State(service): State<Arc<RocheService>>,
+    Extension(session): Extension<WebSession>,
+    Path(id): Path<String>,
+    Form(form): Form<EntryRefreshMetadataForm>,
+) -> Result<Response, WebError> {
+    let fallback = format!("/entries/{}", urlencode(&id));
+    let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
+    let before =
+        service.catalog().get_entry_detail(&id).await.web_err(&session)?.ok_or_else(|| {
+            WebError::from_app(
+                AppError::not_found(format!("Entry '{id}' not found")),
+                Some(&session.csrf_token),
+                session.theme,
+            )
+        })?;
+    let after = service.enrich().refresh_entry_metadata_now(&id).await.web_err(&session)?;
+    let msg = if entry_detail_metadata_changed(&before, &after) {
+        "Refreshed metadata"
+    } else {
+        "No new metadata found"
+    };
+    Ok(redirect_with_flash(&dest, "notice", msg))
+}
+
+fn entry_detail_metadata_changed(before: &EntryDetailView, after: &EntryDetailView) -> bool {
+    before.entry.title != after.entry.title
+        || before.entry.creators != after.entry.creators
+        || before.entry.published_at != after.entry.published_at
+        || before.entry.release_year != after.entry.release_year
+        || before.entry.summary != after.entry.summary
         || before.entry.thumbnail_url != after.entry.thumbnail_url
         || before.entry.metadata != after.entry.metadata
-        || before.entry.identifiers.len() != after.entry.identifiers.len()
-        || before.children.len() != after.children.len();
-    Ok(Json(serde_json::json!({ "enriched": enriched })).into_response())
+        || before.entry.identifiers != after.entry.identifiers
+        || before.children.len() != after.children.len()
+}
+
+pub(in crate::web) async fn post_entry_edit(
+    State(service): State<Arc<RocheService>>,
+    Extension(_session): Extension<WebSession>,
+    Path(id): Path<String>,
+    Form(form): Form<EntryEditForm>,
+) -> Result<Response, WebError> {
+    let fallback = format!("/entries/{}", urlencode(&id));
+    let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
+
+    let title = form.title.trim();
+    if title.is_empty() {
+        return Ok(redirect_with_flash(&dest, "err", "Title cannot be empty"));
+    }
+
+    let kind = match form.kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => match EntryKind::parse_flexible(raw) {
+            Ok(k) if k != EntryKind::Collection => Some(k),
+            _ => return Ok(redirect_with_flash(&dest, "err", "Invalid entry kind")),
+        },
+        None => None,
+    };
+
+    let creators: Vec<String> = form
+        .creators
+        .as_deref()
+        .unwrap_or("")
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    let raw_date = form.published_date.as_deref().map_or("", str::trim);
+    let (published_at, parsed_date_year) = if raw_date.is_empty() {
+        (Some(None), None)
+    } else if let Some(parsed) = roche_core::document_meta::parse_publication_date_str(raw_date) {
+        (Some(parsed.published_at), parsed.release_year)
+    } else {
+        return Ok(redirect_with_flash(&dest, "err", "Invalid publication date"));
+    };
+
+    let raw_year = form.release_year.as_deref().map_or("", str::trim);
+    let release_year = if raw_year.is_empty() {
+        Some(parsed_date_year)
+    } else if let Some(yr) =
+        parse_optional_year(Some(raw_year)).filter(|y| (1000..=2100).contains(y))
+    {
+        Some(Some(yr))
+    } else {
+        return Ok(redirect_with_flash(&dest, "err", "Year must be between 1000 and 2100"));
+    };
+
+    let url =
+        Some(form.url.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned));
+    let summary = Some(
+        form.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned),
+    );
+
+    let mut identifier_updates = Vec::new();
+    for (scheme, raw) in [
+        ("doi", form.doi.as_deref()),
+        ("arxiv", form.arxiv_id.as_deref()),
+        ("isbn", form.isbn.as_deref()),
+    ] {
+        if let Some(val) = raw {
+            let trimmed = val.trim();
+            identifier_updates
+                .push((scheme.to_owned(), (!trimmed.is_empty()).then(|| trimmed.to_owned())));
+        }
+    }
+
+    let input = UpdateEntryInput {
+        kind,
+        title: Some(title.to_owned()),
+        creators: Some(creators),
+        url,
+        published_at,
+        release_year,
+        summary,
+        thumbnail_url: None,
+        identifier_updates,
+    };
+
+    match service.catalog().update_entry(&id, &input).await {
+        Ok(_) => Ok(redirect_with_flash(&dest, "notice", "Saved details")),
+        Err(err) => {
+            let msg = safe_web_error_message(&err);
+            Ok(redirect_with_flash(&dest, "err", &msg))
+        }
+    }
 }
 
 pub(in crate::web) async fn post_entry_merge(

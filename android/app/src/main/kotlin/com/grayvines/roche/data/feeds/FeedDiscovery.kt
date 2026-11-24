@@ -1,16 +1,28 @@
+@file:Suppress("TooManyFunctions")
+
 package com.grayvines.roche.data.feeds
 
 import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
+import com.grayvines.roche.core.ExtractedDocumentMetadata
+import com.grayvines.roche.core.ParsedPublicationDate
+import com.grayvines.roche.core.SCHEME_ARXIV
+import com.grayvines.roche.core.SCHEME_DOI
+import com.grayvines.roche.core.SCHEME_ISBN
 import com.grayvines.roche.core.buildYoutubeChannelFeedUrl
 import com.grayvines.roche.core.canonicalizeSyncUrl
+import com.grayvines.roche.core.coreJson
 import com.grayvines.roche.core.encodeQueryValue
+import com.grayvines.roche.core.extractArxivIdFromText
 import com.grayvines.roche.core.extractArxivIdentifier
+import com.grayvines.roche.core.extractDoiFromText
 import com.grayvines.roche.core.extractHostTitle
 import com.grayvines.roche.core.extractQueryParam
 import com.grayvines.roche.core.extractYoutubeChannelId
+import com.grayvines.roche.core.fillMissingFrom
 import com.grayvines.roche.core.inferFeedTypeWireValue
 import com.grayvines.roche.core.isArxivPaperUrl
 import com.grayvines.roche.core.isArxivUrl
+import com.grayvines.roche.core.isEmpty
 import com.grayvines.roche.core.isHttpOrHttpsUrl
 import com.grayvines.roche.core.isLikelyFeedUrl
 import com.grayvines.roche.core.isLocalPdfUrl
@@ -20,22 +32,36 @@ import com.grayvines.roche.core.isYoutubeChannelFeedInput
 import com.grayvines.roche.core.isYoutubeChannelId
 import com.grayvines.roche.core.isYoutubeFeedUrl
 import com.grayvines.roche.core.isYoutubeUrl
+import com.grayvines.roche.core.normalizeDoi
+import com.grayvines.roche.core.normalizeIsbn
+import com.grayvines.roche.core.normalizeWhitespace
+import com.grayvines.roche.core.parsePublicationDateStr
 import com.grayvines.roche.core.runSuspendCatching
+import com.grayvines.roche.core.splitAuthorNames
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.local.DbWriteLock
+import com.grayvines.roche.data.local.DocumentEnrichmentPatch
 import com.grayvines.roche.data.local.MAX_SQLITE_HTML_CHARS
 import com.grayvines.roche.data.local.RocheDao
-import com.grayvines.roche.data.local.enrichEntryMetadataIfPresent
+import com.grayvines.roche.data.local.applyDocumentEnrichment
 import com.grayvines.roche.data.remote.PublicWebFetcher
+import com.grayvines.roche.media.findCachedPdfFileForEntry
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.inferContentType
 import com.grayvines.roche.reader.parseStylesheetRules
 import com.grayvines.roche.reader.sanitizeRocheHtml
 import com.grayvines.roche.reader.selectArticleContainer
+import java.io.File
 import java.net.URI
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 
@@ -51,6 +77,11 @@ internal data class ExtractedWebPageSnapshot(
     val summary: String?,
     val contentHtml: String?,
     val thumbnailUrl: String?,
+    val authors: List<String> = listOfNotNull(author),
+    val publishedAt: String? = null,
+    val releaseYear: Int? = null,
+    val doi: String? = null,
+    val isbn: String? = null,
 )
 
 internal fun normalizeUserSubmittedUrl(rawInput: String): String {
@@ -266,26 +297,240 @@ internal suspend fun enrichWantToReadItemOnDevice(
     hasUserTitleOverride: Boolean,
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
     writeLock: DbWriteLock = DbWriteLock(),
-) {
-    if (!isHttpOrHttpsUrl(url)) return
-    val arxivId = extractArxivIdentifier(url)
-    if (arxivId != null) {
-        enrichArxivItemOnDevice(
-            dao,
-            publicWebFetcher,
-            itemId,
-            arxivId,
-            hasUserTitleOverride,
-            nodeId,
-            writeLock,
-        )
-        return
+    cacheDir: File? = null,
+    forceRefresh: Boolean = false,
+): Boolean {
+    val isLocalPdf = isLocalPdfUrl(url)
+    if (!isLocalPdf && !isHttpOrHttpsUrl(url)) return false
+    val cachedPdf = cacheDir?.let { findCachedPdfFileForEntry(it, itemId) }
+    val arxivId = if (!isLocalPdf) extractArxivIdentifier(url) else null
+    return when {
+        arxivId != null ->
+            enrichArxivItemOnDevice(
+                dao = dao,
+                publicWebFetcher = publicWebFetcher,
+                itemId = itemId,
+                arxivId = arxivId,
+                hasUserTitleOverride = hasUserTitleOverride,
+                nodeId = nodeId,
+                writeLock = writeLock,
+                forceRefresh = forceRefresh,
+            )
+        isLocalPdf || inferContentType(url) == ContentType.PDF ->
+            enrichPdfItemOnDevice(
+                dao = dao,
+                publicWebFetcher = publicWebFetcher,
+                itemId = itemId,
+                url = url,
+                cachedPdf = cachedPdf,
+                hasUserTitleOverride = hasUserTitleOverride,
+                nodeId = nodeId,
+                writeLock = writeLock,
+                forceRefresh = forceRefresh,
+            )
+        inferContentType(url) == ContentType.ARTICLE ->
+            enrichHtmlItemOnDevice(
+                dao = dao,
+                publicWebFetcher = publicWebFetcher,
+                itemId = itemId,
+                url = url,
+                hasUserTitleOverride = hasUserTitleOverride,
+                nodeId = nodeId,
+                writeLock = writeLock,
+                forceRefresh = forceRefresh,
+            )
+        else -> false
     }
-    if (inferContentType(url) != ContentType.ARTICLE) return
-    val html = publicWebFetcher.fetchHtml(url).getOrNull() ?: return
+}
+
+@Suppress("LongParameterList")
+internal suspend fun enrichDocumentEntryOnDevice(
+    dao: RocheDao,
+    publicWebFetcher: PublicWebFetcher,
+    entryId: String,
+    cacheDir: File? = null,
+    forceRefresh: Boolean = true,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+    writeLock: DbWriteLock = DbWriteLock(),
+): Boolean {
+    val entry = dao.getEntryById(entryId) ?: return false
+    val kind = EntryKind.fromWireValue(entry.kind)
+    val isDocKind = kind == EntryKind.PAPER || kind == EntryKind.ARTICLE || kind == EntryKind.BOOK
+    if (!isDocKind) return false
+    val url = entry.url?.trim().orEmpty()
+    val enrichedByUrl =
+        if (url.isNotEmpty() && (isLocalPdfUrl(url) || isHttpOrHttpsUrl(url))) {
+            enrichWantToReadItemOnDevice(
+                dao = dao,
+                publicWebFetcher = publicWebFetcher,
+                itemId = entryId,
+                url = url,
+                hasUserTitleOverride = false,
+                nodeId = nodeId,
+                writeLock = writeLock,
+                cacheDir = cacheDir,
+                forceRefresh = forceRefresh,
+            )
+        } else {
+            false
+        }
+    return enrichedByUrl ||
+        enrichDocumentFromStoredIdents(
+            dao = dao,
+            publicWebFetcher = publicWebFetcher,
+            entryId = entryId,
+            entryUrl = entry.url,
+            cacheDir = cacheDir,
+            forceRefresh = forceRefresh,
+            nodeId = nodeId,
+            writeLock = writeLock,
+        )
+}
+
+@Suppress("LongParameterList")
+private suspend fun enrichDocumentFromStoredIdents(
+    dao: RocheDao,
+    publicWebFetcher: PublicWebFetcher,
+    entryId: String,
+    entryUrl: String?,
+    cacheDir: File?,
+    forceRefresh: Boolean,
+    nodeId: String,
+    writeLock: DbWriteLock,
+): Boolean {
+    val idents = dao.getIdentifiersForEntry(entryId)
+    val seedMeta =
+        ExtractedDocumentMetadata(
+            doi = idents.firstOrNull { it.scheme == SCHEME_DOI }?.value?.let(::normalizeDoi),
+            arxivId = idents.firstOrNull { it.scheme == SCHEME_ARXIV }?.value,
+            isbn = idents.firstOrNull { it.scheme == SCHEME_ISBN }?.value,
+        )
+    val cachedPdf = cacheDir?.let { findCachedPdfFileForEntry(it, entryId) }
+    val discovered =
+        when {
+            cachedPdf != null ->
+                extractPdfMetadataOnDevice(cachedPdf, null, entryUrl, publicWebFetcher)
+                    .fillMissingFrom(seedMeta)
+            seedMeta.doi != null || seedMeta.arxivId != null ->
+                lookupExternalDocumentMetadata(seedMeta, publicWebFetcher)
+            else -> ExtractedDocumentMetadata()
+        }
+    if (discovered.isEmpty()) return false
+    return writeLock.withLock {
+        dao.applyDocumentEnrichment(
+            DocumentEnrichmentPatch(
+                entryId = entryId,
+                title = discovered.title,
+                hasUserTitleOverride = false,
+                authors = discovered.authors,
+                summary = discovered.summary,
+                publishedAt = discovered.publishedAt,
+                releaseYear = discovered.releaseYear,
+                doi = discovered.doi,
+                arxivId = discovered.arxivId,
+                isbn = discovered.isbn,
+                forceRefresh = forceRefresh,
+                nodeId = nodeId,
+            )
+        )
+    }
+}
+
+@Suppress("LongParameterList")
+private suspend fun enrichPdfItemOnDevice(
+    dao: RocheDao,
+    publicWebFetcher: PublicWebFetcher,
+    itemId: String,
+    url: String,
+    cachedPdf: File?,
+    hasUserTitleOverride: Boolean,
+    nodeId: String,
+    writeLock: DbWriteLock,
+    forceRefresh: Boolean,
+): Boolean {
+    val pdfBytes =
+        if (cachedPdf != null) {
+            null
+        } else if (isHttpOrHttpsUrl(url)) {
+            publicWebFetcher.fetchPdfBytes(url)
+        } else {
+            null
+        }
+    if (cachedPdf == null && pdfBytes == null) return false
+    val discovered =
+        extractPdfMetadataOnDevice(
+            pdfFile = cachedPdf,
+            pdfBytes = pdfBytes,
+            sourceUrl = url,
+            publicWebFetcher = publicWebFetcher,
+        )
+    if (discovered.isEmpty()) return false
+    return writeLock.withLock {
+        dao.applyDocumentEnrichment(
+            DocumentEnrichmentPatch(
+                entryId = itemId,
+                title = discovered.title,
+                hasUserTitleOverride = hasUserTitleOverride,
+                authors = discovered.authors,
+                summary = discovered.summary,
+                publishedAt = discovered.publishedAt,
+                releaseYear = discovered.releaseYear,
+                doi = discovered.doi,
+                arxivId = discovered.arxivId,
+                isbn = discovered.isbn,
+                forceRefresh = forceRefresh,
+                nodeId = nodeId,
+            )
+        )
+    }
+}
+
+@Suppress("LongParameterList")
+private suspend fun enrichHtmlItemOnDevice(
+    dao: RocheDao,
+    publicWebFetcher: PublicWebFetcher,
+    itemId: String,
+    url: String,
+    hasUserTitleOverride: Boolean,
+    nodeId: String,
+    writeLock: DbWriteLock,
+    forceRefresh: Boolean,
+): Boolean {
+    val html = publicWebFetcher.fetchHtml(url).getOrNull() ?: return false
     val snapshot = withContext(Dispatchers.Default) { extractWebPageSnapshot(html, url) }
-    writeLock.withLock {
-        applyWebPageSnapshotToItem(dao, itemId, snapshot, hasUserTitleOverride, nodeId)
+    var docMeta =
+        ExtractedDocumentMetadata(
+            title = snapshot.title,
+            authors = snapshot.authors,
+            publishedAt = snapshot.publishedAt,
+            releaseYear = snapshot.releaseYear,
+            summary = snapshot.summary,
+            doi = snapshot.doi,
+            arxivId = extractArxivIdentifier(url) ?: extractArxivIdFromText(url),
+            isbn = snapshot.isbn,
+        )
+    if (docMeta.doi != null || docMeta.arxivId != null) {
+        docMeta = lookupExternalDocumentMetadata(docMeta, publicWebFetcher)
+    }
+    return writeLock.withLock {
+        dao.applyDocumentEnrichment(
+            DocumentEnrichmentPatch(
+                entryId = itemId,
+                title = docMeta.title,
+                hasUserTitleOverride = hasUserTitleOverride,
+                authors = docMeta.authors,
+                summary = docMeta.summary,
+                publishedAt = docMeta.publishedAt,
+                releaseYear = docMeta.releaseYear,
+                thumbnailUrl = snapshot.thumbnailUrl,
+                contentHtml = snapshot.contentHtml,
+                doi = docMeta.doi,
+                arxivId = docMeta.arxivId,
+                isbn = docMeta.isbn,
+                forceRefresh = forceRefresh,
+                nodeId = nodeId,
+            )
+        )
     }
 }
 
@@ -298,30 +543,36 @@ private suspend fun enrichArxivItemOnDevice(
     hasUserTitleOverride: Boolean,
     nodeId: String,
     writeLock: DbWriteLock,
-) {
-    if (!isValidArxivId(arxivId)) return
+    forceRefresh: Boolean,
+): Boolean {
+    if (!isValidArxivId(arxivId)) return false
     val queryUrl = "https://export.arxiv.org/api/query?id_list=${encodeQueryValue(arxivId)}"
-    val xml = publicWebFetcher.fetchFeedXml(queryUrl).getOrNull() ?: return
+    val xml = publicWebFetcher.fetchFeedXml(queryUrl).getOrNull() ?: return false
     val candidate =
         withContext(Dispatchers.Default) {
             runCatching { LocalFeedPoller.parseFeedXml(xml, queryUrl, "arxiv") }
                 .getOrNull()
                 ?.items
                 ?.firstOrNull()
-        } ?: return
+        } ?: return false
     val cleanTitle =
         candidate.title.replace(WHITESPACE_SPLIT_REGEX, " ").trim().takeIf {
             it.isNotEmpty()
         }
-    writeLock.withLock {
-        dao.enrichEntryMetadataIfPresent(
-            itemId = itemId,
-            title = cleanTitle,
-            hasUserTitleOverride = hasUserTitleOverride,
-            author = candidate.author,
-            summary = candidate.summary,
-            publishedAt = candidate.publishedAt,
-            nodeId = nodeId,
+    val authors = candidate.author?.let(::splitAuthorNames).orEmpty()
+    return writeLock.withLock {
+        dao.applyDocumentEnrichment(
+            DocumentEnrichmentPatch(
+                entryId = itemId,
+                title = cleanTitle,
+                hasUserTitleOverride = hasUserTitleOverride,
+                authors = authors,
+                summary = candidate.summary,
+                publishedAt = candidate.publishedAt,
+                arxivId = arxivId,
+                forceRefresh = forceRefresh,
+                nodeId = nodeId,
+            )
         )
     }
 }
@@ -329,15 +580,15 @@ private suspend fun enrichArxivItemOnDevice(
 internal fun extractWebPageSnapshot(rawHtml: String, pageUrl: String): ExtractedWebPageSnapshot {
     val doc = Jsoup.parse(rawHtml, pageUrl)
     doc.outputSettings().prettyPrint(false)
-    val title = extractCleanDocumentTitle(doc)
-    val author =
-        doc.selectFirst("meta[name=author], meta[property=article:author]")
-            ?.attr(ATTR_CONTENT)
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
+    val ld = extractJsonLdMetadata(doc)
+    val title = extractCleanDocumentTitle(doc) ?: ld.title
+    val authors = extractDocumentAuthors(doc, ld.authors)
+    val parsedDate = extractDocumentPublishedDate(doc) ?: ld.date
+    val doi = extractDocumentDoi(doc, pageUrl) ?: ld.doi
+    val isbn = extractDocumentIsbn(doc) ?: ld.isbn
     val summary =
         doc.selectFirst(
-                "meta[property=og:description], meta[name=description], meta[name=twitter:description]"
+                "meta[name=citation_abstract], meta[property=og:description], meta[name=description], meta[name=twitter:description]"
             )
             ?.attr(ATTR_CONTENT)
             ?.trim()
@@ -355,36 +606,189 @@ internal fun extractWebPageSnapshot(rawHtml: String, pageUrl: String): Extracted
             ?.take(MAX_SQLITE_HTML_CHARS)
     return ExtractedWebPageSnapshot(
         title = title,
-        author = author,
+        author = authors.firstOrNull(),
         summary = summary,
         contentHtml = bodyHtml,
         thumbnailUrl = thumb,
+        authors = authors,
+        publishedAt = parsedDate?.publishedAt,
+        releaseYear = parsedDate?.releaseYear,
+        doi = doi,
+        isbn = isbn,
     )
 }
 
-private suspend fun applyWebPageSnapshotToItem(
-    dao: RocheDao,
-    itemId: String,
-    snapshot: ExtractedWebPageSnapshot,
-    hasUserTitleOverride: Boolean,
-    nodeId: String,
-) {
-    dao.enrichEntryMetadataIfPresent(
-        itemId = itemId,
-        title = snapshot.title,
-        hasUserTitleOverride = hasUserTitleOverride,
-        author = snapshot.author,
-        summary = snapshot.summary,
-        thumbnailUrl = snapshot.thumbnailUrl,
-        contentHtml = snapshot.contentHtml,
-        nodeId = nodeId,
+private data class JsonLdDocMeta(
+    val title: String? = null,
+    val authors: List<String> = emptyList(),
+    val date: ParsedPublicationDate? = null,
+    val doi: String? = null,
+    val isbn: String? = null,
+)
+
+private fun extractDocumentAuthors(doc: Document, ldAuthors: List<String>): List<String> {
+    val citationAuthors =
+        doc.select("meta[name=citation_author], meta[name=dc.creator], meta[name=DC.creator]")
+            .mapNotNull { el -> el.attr(ATTR_CONTENT).trim().takeIf { it.isNotEmpty() } }
+            .flatMap(::splitAuthorNames)
+    if (citationAuthors.isNotEmpty()) {
+        return citationAuthors.distinctBy { it.lowercase(Locale.ROOT) }
+    }
+    val metaAuthor =
+        doc.selectFirst("meta[name=author], meta[property=article:author]")
+            ?.attr(ATTR_CONTENT)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() && !isHttpOrHttpsUrl(it) }
+            ?.let(::splitAuthorNames)
+            .orEmpty()
+    return metaAuthor.ifEmpty { ldAuthors }.distinctBy { it.lowercase(Locale.ROOT) }
+}
+
+private fun extractDocumentPublishedDate(doc: Document): ParsedPublicationDate? {
+    val selectors =
+        listOf(
+            "meta[name=citation_publication_date]",
+            "meta[name=citation_date]",
+            "meta[name=citation_online_date]",
+            "meta[property=article:published_time]",
+            "meta[property=og:article:published_time]",
+            "meta[name=pubdate]",
+            "meta[name=publishdate]",
+            "meta[name=dc.date]",
+            "meta[name=DC.date]",
+            "meta[name=dcterms.issued]",
+            "meta[name=dcterms.created]",
+            "meta[name=date]",
+        )
+    for (selector in selectors) {
+        val content = doc.selectFirst(selector)?.attr(ATTR_CONTENT)?.trim().orEmpty()
+        if (content.isNotEmpty()) {
+            parsePublicationDateStr(content)?.let {
+                return it
+            }
+        }
+    }
+    val timeAttr = doc.selectFirst("time[datetime]")?.attr("datetime")?.trim().orEmpty()
+    return timeAttr.takeIf { it.isNotEmpty() }?.let(::parsePublicationDateStr)
+}
+
+private fun extractDocumentDoi(doc: Document, pageUrl: String): String? {
+    for (el in
+        doc.select(
+            "meta[name=citation_doi], meta[name=dc.identifier], meta[name=DC.identifier], meta[name=prism.doi]"
+        )) {
+        val raw = el.attr(ATTR_CONTENT).trim()
+        normalizeDoi(raw)?.let {
+            return it
+        }
+    }
+    return normalizeDoi(pageUrl) ?: extractDoiFromText(pageUrl)
+}
+
+private fun extractDocumentIsbn(doc: Document): String? {
+    for (el in
+        doc.select(
+            "meta[name=citation_isbn], meta[property=book:isbn], meta[property=books:isbn]"
+        )) {
+        normalizeIsbn(el.attr(ATTR_CONTENT))?.let {
+            return it
+        }
+    }
+    return null
+}
+
+private fun extractJsonLdMetadata(doc: Document): JsonLdDocMeta {
+    val objects =
+        doc.select("script[type=application/ld+json]")
+            .take(MAX_JSON_LD_SCRIPTS)
+            .map { it.data().trim() }
+            .filter { it.isNotEmpty() && it.length <= MAX_JSON_LD_CHARS }
+            .mapNotNull { runCatching { coreJson.parseToJsonElement(it) }.getOrNull() }
+            .flatMap(::collectJsonLdObjects)
+    return objects.fold(JsonLdDocMeta(), ::mergeJsonLdObject)
+}
+
+private fun mergeJsonLdObject(acc: JsonLdDocMeta, obj: JsonObject): JsonLdDocMeta {
+    val title =
+        acc.title
+            ?: (obj.strField("headline") ?: obj.strField("name"))
+                ?.let(::normalizeWhitespace)
+                ?.takeIf { it.isNotEmpty() }
+    val authors =
+        acc.authors.ifEmpty {
+            extractJsonLdAuthors(obj["author"]).distinctBy { it.lowercase(Locale.ROOT) }
+        }
+    val date =
+        acc.date
+            ?: (obj.strField("datePublished") ?: obj.strField("dateCreated"))?.let(
+                ::parsePublicationDateStr
+            )
+    return JsonLdDocMeta(
+        title = title,
+        authors = authors,
+        date = date,
+        doi = acc.doi ?: extractJsonLdDoi(obj),
+        isbn = acc.isbn ?: obj.strField("isbn")?.let(::normalizeIsbn),
     )
 }
+
+private fun collectJsonLdObjects(root: JsonElement): List<JsonObject> =
+    when (root) {
+        is JsonObject -> {
+            val graph = (root["@graph"] as? JsonArray)?.mapNotNull { it as? JsonObject }.orEmpty()
+            listOf(root) + graph
+        }
+        is JsonArray -> {
+            root.mapNotNull { it as? JsonObject }
+        }
+        else -> {
+            emptyList()
+        }
+    }
+
+private fun extractJsonLdAuthors(element: JsonElement?): List<String> =
+    when (element) {
+        is JsonPrimitive -> element.contentOrNull?.let(::splitAuthorNames).orEmpty()
+        is JsonObject -> element.strField("name")?.let(::splitAuthorNames).orEmpty()
+        is JsonArray -> element.flatMap(::extractJsonLdAuthors)
+        else -> emptyList()
+    }
+
+private fun extractJsonLdDoi(obj: JsonObject): String? {
+    val rawCandidates = buildList {
+        obj.strField("doi")?.let(::add)
+        obj.strField("sameAs")?.let(::add)
+        when (val ident = obj["identifier"]) {
+            is JsonPrimitive -> ident.contentOrNull?.let(::add)
+            is JsonObject -> ident.strField("value")?.let(::add)
+            is JsonArray ->
+                ident.forEach { el ->
+                    when (el) {
+                        is JsonPrimitive -> el.contentOrNull?.let(::add)
+                        is JsonObject -> el.strField("value")?.let(::add)
+                        else -> Unit
+                    }
+                }
+            else -> Unit
+        }
+    }
+    return rawCandidates.firstNotNullOfOrNull { normalizeDoi(it) ?: extractDoiFromText(it) }
+}
+
+private fun JsonObject.strField(key: String): String? =
+    (this[key] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
 
 private fun extractCleanDocumentTitle(doc: Document): String? =
-    doc.selectFirst("meta[property=og:title]")?.attr(ATTR_CONTENT)?.trim()?.takeIf {
+    doc.selectFirst("meta[name=citation_title]")?.attr(ATTR_CONTENT)?.trim()?.takeIf {
         it.isNotEmpty()
-    } ?: doc.title().trim().takeIf { it.isNotEmpty() }
+    }
+        ?: doc.selectFirst("meta[property=og:title]")?.attr(ATTR_CONTENT)?.trim()?.takeIf {
+            it.isNotEmpty()
+        }
+        ?: doc.title().trim().takeIf { it.isNotEmpty() }
+
+private const val MAX_JSON_LD_SCRIPTS = 8
+private const val MAX_JSON_LD_CHARS = 128_000
 
 private const val ATTR_CONTENT = "content"
 private const val MAX_DISCOVERY_PROBES = 6

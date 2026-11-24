@@ -27,6 +27,8 @@ pub(super) use reader::{
 pub(super) struct ReaderQuery {
     #[serde(default)]
     pub return_to: Option<String>,
+    #[serde(default)]
+    pub view: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

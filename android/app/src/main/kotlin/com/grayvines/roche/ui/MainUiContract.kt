@@ -16,6 +16,7 @@ import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.RankSettlementSummary
+import com.grayvines.roche.data.catalog.UpdateCatalogEntryInput
 import com.grayvines.roche.data.matchesSearchQuery
 import com.grayvines.roche.data.remote.NetworkTier
 import com.grayvines.roche.data.remote.PeerNodeDto
@@ -216,6 +217,7 @@ data class MainUiState(
     val selectedWantCollectionId: String? = null,
     val catalogDetailEntryId: String? = null,
     val catalogDetailStack: List<String> = listOfNotNull(catalogDetailEntryId),
+    val editingCatalogEntryId: String? = null,
     val isQuickLogSheetOpen: Boolean = false,
     val quickLogDefaultWant: Boolean = false,
     val quickLogTargetCollectionId: String? = null,
@@ -283,6 +285,7 @@ data class MainUiState(
                 drawNoteDialog != null ||
                 rankSession != null ||
                 catalogDetailEntryId != null ||
+                editingCatalogEntryId != null ||
                 isQuickLogSheetOpen ||
                 isPlayerSpeedSheetOpen ||
                 activePlayerDrawerTab != null
@@ -607,6 +610,10 @@ sealed interface MainAction {
 
     data object CloseCatalogDetailSheet : CatalogUi
 
+    data class OpenEditEntrySheet(val entryId: String) : CatalogUi
+
+    data object CloseEditEntrySheet : CatalogUi
+
     data class LaunchCollectionDraw(val draw: CollectionDrawSnapshot) : CatalogUi
 
     data class EnrichAndLaunchMusicDraw(val draw: CollectionDrawSnapshot) : CatalogUi
@@ -695,6 +702,11 @@ sealed interface MainAction {
     ) : CatalogMutation
 
     data class RefreshCatalogEntryMetadata(val entryId: String) : CatalogMutation
+
+    data class UpdateCatalogEntry(
+        val entryId: String,
+        val input: UpdateCatalogEntryInput,
+    ) : CatalogMutation
 
     data class MarkFeedEntryFinished(
         val entryId: String,
@@ -897,6 +909,7 @@ internal data class TransientUiState(
     val selectedBoardReaderExternalId: String? = null,
     val boardReaderState: BoardReaderUiState? = null,
     val catalogDetailStack: List<String> = emptyList(),
+    val editingCatalogEntryId: String? = null,
     val isQuickLogSheetOpen: Boolean = false,
     val quickLogDefaultWant: Boolean = false,
     val quickLogTargetCollectionId: String? = null,
@@ -1140,6 +1153,7 @@ internal fun assembleMainUiState(
         selectedWantCollectionId = local.selectedWantCollectionId,
         catalogDetailEntryId = local.catalogDetailEntryId,
         catalogDetailStack = local.catalogDetailStack,
+        editingCatalogEntryId = local.editingCatalogEntryId,
         isQuickLogSheetOpen = local.isQuickLogSheetOpen,
         quickLogDefaultWant = local.quickLogDefaultWant,
         quickLogTargetCollectionId = local.quickLogTargetCollectionId,

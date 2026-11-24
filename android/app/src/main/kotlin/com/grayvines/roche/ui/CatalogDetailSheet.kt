@@ -68,6 +68,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.data.catalog.AlbumTrackItem
 import com.grayvines.roche.data.catalog.CatalogEntryItem
@@ -339,13 +340,40 @@ private fun CatalogDetailActionStrip(
                 },
             )
         }
-        if (refreshState.canRefreshOnline) {
-            RefreshMetadataChip(
-                isEnriching = refreshState.isEnriching,
-                accentColor = colors.accentBlue,
-                onClick = { onAction(MainAction.RefreshCatalogEntryMetadata(entry.id)) },
-            )
-        }
+        DetailEditAndRefreshChips(
+            entry = entry,
+            refreshState = refreshState,
+            accentColor = colors.accentBlue,
+            onAction = onAction,
+        )
+    }
+}
+
+@Composable
+private fun DetailEditAndRefreshChips(
+    entry: CatalogEntryItem,
+    refreshState: CatalogMetaRefreshState,
+    accentColor: Color,
+    onAction: (MainAction) -> Unit,
+) {
+    if (entry.kind != EntryKind.COLLECTION) {
+        FilterChipPill(
+            label = "✎ Edit",
+            selected = false,
+            onClick = { onAction(MainAction.OpenEditEntrySheet(entry.id)) },
+            modifier = Modifier.testTag("catalog_detail_edit_btn"),
+        )
+    }
+    val supportsDeviceRefresh =
+        entry.kind == EntryKind.PAPER ||
+            entry.kind == EntryKind.ARTICLE ||
+            entry.kind == EntryKind.BOOK
+    if (refreshState.canRefreshOnline || supportsDeviceRefresh) {
+        RefreshMetadataChip(
+            isEnriching = refreshState.isEnriching,
+            accentColor = accentColor,
+            onClick = { onAction(MainAction.RefreshCatalogEntryMetadata(entry.id)) },
+        )
     }
 }
 
@@ -635,7 +663,7 @@ private fun HeroTitleWithYear(
                         fontWeight = FontWeight.Normal,
                     )
                 ) {
-                    append(title)
+                    append(formatInlineMathAnnotated(title))
                 }
                 if (releaseYear != null && releaseYear > 0) {
                     append("  ")
@@ -1531,7 +1559,7 @@ private fun GenericCatalogDetailBody(
     if (!entry.summary.isNullOrBlank()) {
         RocheSurfaceCard {
             Text(
-                text = entry.summary,
+                text = remember(entry.summary) { formatInlineMathAnnotated(entry.summary) },
                 color = colors.textSecondary,
                 fontSize = 13.sp,
                 lineHeight = 19.sp,
@@ -1595,9 +1623,16 @@ private fun GenericCatalogDetailHero(
     onAction: (MainAction) -> Unit,
     onPlaySong: (() -> Unit)? = null,
 ) {
-    val colors = LocalRocheColors.current
     val entry = model.entry
     val genresLine = remember(model.genres) { model.genres.take(3).joinToString(" · ") }
+    val formattedPubDate =
+        remember(entry.publishedAt) {
+            entry.publishedAt?.let {
+                parseIsoInstant(it)?.let { inst ->
+                    DIARY_FULL_DATE_FMT.format(inst.atZone(ZoneOffset.UTC))
+                }
+            }
+        }
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(14.dp),
@@ -1612,43 +1647,69 @@ private fun GenericCatalogDetailHero(
                 size = 72.dp,
             )
         }
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(
-                text = entry.kind.displayLabel.uppercase(),
-                color = colors.textMuted,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 10.sp,
-                letterSpacing = 0.8.sp,
-            )
-            HeroTitleWithYear(
-                title = entry.title,
-                releaseYear = entry.releaseYear,
-                onClick = onPlaySong,
-                testTag = onPlaySong?.let { "catalog_detail_play_title" },
-            )
-            if (entry.creators.isNotEmpty()) {
-                Text(
-                    text = entry.creators.joinToString(", "),
-                    color = colors.textSecondary,
-                    fontSize = 13.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            if (genresLine.isNotBlank()) {
-                Text(
-                    text = genresLine,
-                    color = colors.textMuted,
-                    fontSize = 11.5.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
+        GenericCatalogHeroMetaColumn(
+            entry = entry,
+            genresLine = genresLine,
+            formattedPubDate = formattedPubDate,
+            onPlaySong = onPlaySong,
+            modifier = Modifier.weight(1f),
+        )
         HeroCompactRankBadge(
             appearance = model.primaryAppearance,
             onClick = { startFocusedRank(model.primaryAppearance, entry.id, onAction) },
         )
+    }
+}
+
+@Composable
+private fun GenericCatalogHeroMetaColumn(
+    entry: CatalogEntryItem,
+    genresLine: String,
+    formattedPubDate: String?,
+    onPlaySong: (() -> Unit)?,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val metaSubLine =
+        remember(formattedPubDate, genresLine) {
+            listOfNotNull(
+                    formattedPubDate?.takeIf { it.isNotBlank() },
+                    genresLine.takeIf { it.isNotBlank() },
+                )
+                .joinToString(" · ")
+        }
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = entry.kind.displayLabel.uppercase(),
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
+            letterSpacing = 0.8.sp,
+        )
+        HeroTitleWithYear(
+            title = entry.title,
+            releaseYear = if (formattedPubDate == null) entry.releaseYear else null,
+            onClick = onPlaySong,
+            testTag = onPlaySong?.let { "catalog_detail_play_title" },
+        )
+        if (entry.creators.isNotEmpty()) {
+            Text(
+                text = entry.creators.joinToString(", "),
+                color = colors.textSecondary,
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (metaSubLine.isNotBlank()) {
+            Text(
+                text = metaSubLine,
+                color = colors.textMuted,
+                fontSize = 11.5.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 

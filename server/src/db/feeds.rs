@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{SqliteConnection, SqlitePool};
 use url::Url;
@@ -1406,30 +1406,36 @@ impl<'a> FeedRepo<'a> {
                 if existing_state.is_none() {
                     let clean_summary =
                         Some(item.summary.as_str()).filter(|s| !s.trim().is_empty());
+                    let item_release_year = item.published_at.map(|dt| dt.year());
                     let entry_hlc = tx.next_hlc().await?;
                     sqlx::query(
                         "UPDATE entries
                          SET url = COALESCE(url, ?),
                              published_at = COALESCE(published_at, ?),
+                             release_year = COALESCE(release_year, ?),
                              summary = COALESCE(summary, ?),
                              thumbnail_url = COALESCE(thumbnail_url, ?),
                              updated_at = ?,
                              hlc = CASE
                                  WHEN url IS NULL
                                    OR (published_at IS NULL AND ? IS NOT NULL)
+                                   OR (release_year IS NULL AND ? IS NOT NULL)
                                    OR (summary IS NULL AND ? IS NOT NULL)
                                    OR (thumbnail_url IS NULL AND ? IS NOT NULL)
                                  THEN ?
                                  ELSE hlc
                              END
-                         WHERE id = ?",
+                         WHERE id = ?
+                           AND json_extract(metadata_json, '$.edited_hlc') IS NULL",
                     )
                     .bind(item_url_str)
                     .bind(item.published_at)
+                    .bind(item_release_year)
                     .bind(clean_summary)
                     .bind(item_thumb)
                     .bind(now)
                     .bind(item.published_at)
+                    .bind(item_release_year)
                     .bind(clean_summary)
                     .bind(item_thumb)
                     .bind(&entry_hlc)
@@ -1524,6 +1530,7 @@ impl<'a> FeedRepo<'a> {
                         creators_json: &creators_json,
                         url: Some(item_url_str),
                         published_at: item.published_at,
+                        release_year: item.published_at.map(|dt| dt.year()),
                         summary: Some(item.summary.as_str()),
                         thumbnail_url: item_thumb,
                         ..EntryInsertParams::minimal(&det_id, entry_kind, &item.title, now, now)
@@ -1735,6 +1742,7 @@ impl<'a> FeedRepo<'a> {
                  updated_at = ?,
                  hlc = ?
              WHERE id = ?
+               AND json_extract(metadata_json, '$.edited_hlc') IS NULL
                AND ((thumbnail_url IS NULL AND ? IS NOT NULL)
                     OR (creators_json = '[]' AND ? IS NOT NULL)
                     OR (kind = 'article' AND ? IS NOT NULL))",

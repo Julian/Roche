@@ -145,6 +145,7 @@
     "openlibrary",
     "igdb",
     "arxiv",
+    "doi",
     "wikipedia",
     "feed_url",
     "url"
@@ -282,6 +283,34 @@
       "raw_value": "HTTPS://NEWS.YCOMBINATOR.COM/item?id=998877&p=2",
       "expected_scheme": "hacker_news",
       "expected_value": "998877"
+    },
+    {
+      "kind": "paper",
+      "scheme": "DOI",
+      "raw_value": "https://doi.org/10.1000/XYZ.123.",
+      "expected_scheme": "doi",
+      "expected_value": "10.1000/xyz.123"
+    },
+    {
+      "kind": "paper",
+      "scheme": "doi",
+      "raw_value": "doi:10.48550/arXiv.2301.07041",
+      "expected_scheme": "doi",
+      "expected_value": "10.48550/arxiv.2301.07041"
+    },
+    {
+      "kind": "book",
+      "scheme": "ISBN",
+      "raw_value": "ISBN-13: 978-0-262-03384-8",
+      "expected_scheme": "isbn",
+      "expected_value": "9780262033848"
+    },
+    {
+      "kind": "book",
+      "scheme": "isbn",
+      "raw_value": "0-262-03384-x",
+      "expected_scheme": "isbn",
+      "expected_value": "026203384X"
     }
   ],
   "album_edition_stripping": [
@@ -4281,6 +4310,48 @@
       "source_key": "  TOP ",
       "expected_natural_key": "hacker_news\u0000top",
       "expected_board_id": "04c4f7a8-4795-5c04-83c2-8a2d95b25437"
+    }
+  ],
+  "placeholder_entry_titles": [
+    {
+      "title": "subnlogn.pdf",
+      "url": "https://web.maths.unsw.edu.au/~davidharvey/research/subnlogn.pdf",
+      "expected": true
+    },
+    {
+      "title": "subnlogn",
+      "url": "https://web.maths.unsw.edu.au/~davidharvey/research/subnlogn.pdf",
+      "expected": true
+    },
+    {
+      "title": "https://example.com/paper.pdf",
+      "url": "https://example.com/paper.pdf",
+      "expected": true
+    },
+    {
+      "title": "example.com — PDF",
+      "url": "https://example.com/paper.pdf",
+      "expected": true
+    },
+    {
+      "title": "arXiv:2301.07041v2",
+      "url": "https://arxiv.org/abs/2301.07041",
+      "expected": true
+    },
+    {
+      "title": "Untitled",
+      "url": null,
+      "expected": true
+    },
+    {
+      "title": "Integer multiplication in time O(n log n)",
+      "url": "https://web.maths.unsw.edu.au/~davidharvey/research/subnlogn.pdf",
+      "expected": false
+    },
+    {
+      "title": "Subnlogn: A Survey",
+      "url": "https://web.maths.unsw.edu.au/~davidharvey/research/subnlogn.pdf",
+      "expected": false
     }
   ]
 }

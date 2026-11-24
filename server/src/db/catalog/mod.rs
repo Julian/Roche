@@ -23,7 +23,7 @@ pub use models::{
     CollectionRankingInputs, CollectionSummary, ComparisonRecord, ConsumptionLogRow,
     ConsumptionLogView, DynamicCollectionRule, EntryDetailView, EntryIdentifier,
     ExportCatalogEntry, ExportCollectionEntry, ExportCollectionGenerator, ExportComparison,
-    ExportConsumptionLog, UpsertEntryInput, WantSearchMatch,
+    ExportConsumptionLog, UpdateEntryInput, UpsertEntryInput, WantSearchMatch,
 };
 pub use roche_core::{
     domain::{matches_dynamic_collection_rule, parse_dynamic_collection_rule},

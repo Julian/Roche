@@ -210,6 +210,36 @@ pub struct UpsertEntryInput {
     pub parent_position: Option<f64>,
 }
 
+/// Partial update payload for explicitly editing an existing non-collection catalog entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateEntryInput {
+    #[serde(default)]
+    pub kind: Option<EntryKind>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub creators: Option<Vec<String>>,
+    #[allow(clippy::option_option)]
+    #[serde(default)]
+    pub url: Option<Option<String>>,
+    #[allow(clippy::option_option)]
+    #[serde(default)]
+    pub published_at: Option<Option<DateTime<Utc>>>,
+    #[allow(clippy::option_option)]
+    #[serde(default)]
+    pub release_year: Option<Option<i32>>,
+    #[allow(clippy::option_option)]
+    #[serde(default)]
+    pub summary: Option<Option<String>>,
+    #[allow(clippy::option_option)]
+    #[serde(default)]
+    pub thumbnail_url: Option<Option<String>>,
+    /// Per-scheme identifier replacements (`(scheme, Some(value))` to set/replace,
+    /// `(scheme, None)` to clear identifiers for that scheme on this entry).
+    #[serde(default)]
+    pub identifier_updates: Vec<(String, Option<String>)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionSummary {
     pub id: String,

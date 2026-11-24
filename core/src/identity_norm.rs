@@ -1,5 +1,6 @@
 use crate::{
     boards::extract_hn_item_id,
+    document_meta::{normalize_doi, normalize_isbn},
     domain::{EntryIdentifier, EntryKind},
     identity::{
         canonicalize_sync_url, deterministic_catalog_entry_id, deterministic_title_entry_id,
@@ -26,7 +27,7 @@ pub const EDITION_KEYWORDS: [&str; 15] = [
     "remasters",
 ];
 
-pub const PREFERRED_IDENTIFIER_SCHEMES: [&str; 14] = [
+pub const PREFERRED_IDENTIFIER_SCHEMES: [&str; 15] = [
     "spotify",
     "musicbrainz_release",
     "musicbrainz_recording",
@@ -38,6 +39,7 @@ pub const PREFERRED_IDENTIFIER_SCHEMES: [&str; 14] = [
     "openlibrary",
     "igdb",
     "arxiv",
+    "doi",
     "wikipedia",
     "feed_url",
     "url",
@@ -88,6 +90,8 @@ pub fn normalize_identifier_value(kind: EntryKind, scheme: &str, raw_value: &str
         "imdb" => normalize_imdb_identifier(trimmed),
         "wikipedia" => normalize_wikipedia_identifier(trimmed),
         "arxiv" => extract_arxiv_id(trimmed).unwrap_or_else(|| trimmed.to_owned()),
+        "doi" => normalize_doi(trimmed).unwrap_or_else(|| trimmed.to_owned()),
+        "isbn" => normalize_isbn(trimmed).unwrap_or_else(|| trimmed.to_owned()),
         "hacker_news" => extract_hn_item_id(trimmed).unwrap_or_else(|| trimmed.to_owned()),
         _ => trimmed.to_owned(),
     }

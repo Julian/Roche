@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 
 use roche_core::identity_norm::{
@@ -12,15 +12,18 @@ use super::{
     CatalogRepo,
     models::{
         CatalogEntry, CatalogError, CatalogResult, ConsumptionLogRow, EntryDetailView,
-        EntryIdentifier, RawEntryRow, UpsertEntryInput, collection_immutable_reason,
-        is_dynamic_rule, raw_entry_columns,
+        EntryIdentifier, RawEntryRow, UpdateEntryInput, UpsertEntryInput,
+        collection_immutable_reason, is_dynamic_rule, raw_entry_columns,
     },
 };
 use crate::db::{
     WriteTx,
     entries_core::{self, EntryInsertParams},
     sync::{SyncRepo, deterministic_title_entry_id},
-    types::{ActivityAction, ActivityEntityType, CollectionRole, ConsumptionStatus, EntryKind},
+    types::{
+        ActivityAction, ActivityEntityType, CollectionRole, ConsumptionStatus, ContentType,
+        EntryKind,
+    },
 };
 
 impl CatalogRepo<'_> {
@@ -340,6 +343,368 @@ impl CatalogRepo<'_> {
             .ok_or_else(|| CatalogError::NotFound(format!("Entry '{entry_id}'")))
     }
 
+    /// Explicitly edits bibliographic metadata on an existing non-collection catalog entry.
+    ///
+    /// Stamps `"edited_hlc"` in `metadata_json` so explicit user corrections (including clearing
+    /// creators, dates, summary, URL, or identifiers) win deterministically during peer sync and
+    /// are protected from being clobbered by stale feed repolls.
+    #[allow(clippy::too_many_lines)]
+    pub async fn update_entry(
+        &self,
+        id: &str,
+        input: &UpdateEntryInput,
+    ) -> CatalogResult<EntryDetailView> {
+        let now = crate::util::clock::now_utc();
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
+
+        let Some(canon_id) = Self::follow_merged_id_in_tx(tx.conn(), id).await? else {
+            return Err(CatalogError::NotFound(format!("Entry '{id}'")));
+        };
+        if crate::db::is_protected_system_collection_id(&canon_id) {
+            return Err(CatalogError::Conflict(format!(
+                "Protected system collection '{canon_id}' cannot be edited"
+            )));
+        }
+        let Some(raw) = Self::get_entry_raw_in_tx(tx.conn(), &canon_id).await? else {
+            return Err(CatalogError::NotFound(format!("Entry '{id}'")));
+        };
+        if raw.kind == EntryKind::Collection {
+            return Err(CatalogError::Conflict(
+                "Collections cannot be edited via entry update".to_owned(),
+            ));
+        }
+        let is_collection_or_feed: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM collection_specs WHERE collection_id = ?
+             UNION ALL
+             SELECT 1 FROM feed_sources WHERE collection_id = ?
+             LIMIT 1",
+        )
+        .bind(&canon_id)
+        .bind(&canon_id)
+        .fetch_optional(tx.conn())
+        .await?;
+        if is_collection_or_feed.is_some() {
+            return Err(CatalogError::Conflict(
+                "Collections and feeds cannot be edited via entry update".to_owned(),
+            ));
+        }
+
+        let target_kind = match input.kind {
+            Some(EntryKind::Collection) => {
+                return Err(CatalogError::InvalidInput(
+                    "Entry kind cannot be changed to collection".to_owned(),
+                ));
+            }
+            Some(k) => k,
+            None => raw.kind,
+        };
+
+        let target_title = match input.title.as_deref() {
+            Some(t) => {
+                let trimmed = t.trim();
+                if trimmed.is_empty() {
+                    return Err(CatalogError::InvalidInput(
+                        "Entry title cannot be empty".to_owned(),
+                    ));
+                }
+                trimmed.to_owned()
+            }
+            None => raw.title.clone(),
+        };
+
+        let (target_creators_json, parsed_creators) = match &input.creators {
+            Some(list) => {
+                let mut deduped = Vec::new();
+                let mut seen = HashSet::new();
+                for c in list {
+                    let trimmed = c.trim();
+                    if !trimmed.is_empty() && seen.insert(trimmed.to_lowercase()) {
+                        deduped.push(trimmed.to_owned());
+                    }
+                }
+                let json = serde_json::to_string(&deduped).unwrap_or_else(|_| "[]".to_owned());
+                (json, Some(deduped))
+            }
+            None => (raw.creators_json.clone(), None),
+        };
+
+        let target_url = match &input.url {
+            Some(opt) => match opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(u) => {
+                    validate_editable_entry_url(u)?;
+                    Some(u.to_owned())
+                }
+                None => None,
+            },
+            None => raw.url.clone(),
+        };
+
+        if let Some(Some(yr)) = input.release_year
+            && !(1000..=2100).contains(&yr)
+        {
+            return Err(CatalogError::InvalidInput(
+                "Release year must be between 1000 and 2100".to_owned(),
+            ));
+        }
+
+        let (target_published_at, target_release_year) = harmonize_updated_publication_dates(
+            raw.published_at,
+            raw.release_year,
+            input.published_at,
+            input.release_year,
+        );
+
+        let target_summary = match &input.summary {
+            Some(opt) => {
+                opt.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned)
+            }
+            None => raw.summary.clone(),
+        };
+
+        let target_thumb = match &input.thumbnail_url {
+            Some(opt) => match opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(u) => {
+                    validate_http_url(u, "Thumbnail URL")?;
+                    Some(u.to_owned())
+                }
+                None => None,
+            },
+            None => raw.thumbnail_url.clone(),
+        };
+
+        // Validate and deduplicate identifier updates before mutating anything
+        let mut ident_patches: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for (raw_scheme, raw_val) in &input.identifier_updates {
+            let scheme = normalize_identifier_scheme(raw_scheme);
+            if scheme.is_empty() {
+                return Err(CatalogError::InvalidInput(
+                    "Identifier scheme cannot be empty".to_owned(),
+                ));
+            }
+            if matches!(scheme.as_str(), "slug" | "tag" | "feed_url" | "url") {
+                return Err(CatalogError::InvalidInput(format!(
+                    "Identifier scheme '{scheme}' cannot be edited directly"
+                )));
+            }
+            let normalized_val = match raw_val.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(raw_v) => {
+                    let validated =
+                        match scheme.as_str() {
+                            "doi" => roche_core::document_meta::normalize_doi(raw_v).ok_or_else(
+                                || CatalogError::InvalidInput(format!("Invalid DOI: {raw_v}")),
+                            )?,
+                            "arxiv" => crate::util::media_urls::extract_arxiv_id(raw_v)
+                                .ok_or_else(|| {
+                                    CatalogError::InvalidInput(format!("Invalid arXiv ID: {raw_v}"))
+                                })?,
+                            "isbn" => roche_core::document_meta::normalize_isbn(raw_v).ok_or_else(
+                                || CatalogError::InvalidInput(format!("Invalid ISBN: {raw_v}")),
+                            )?,
+                            _ => normalize_identifier_value(target_kind, &scheme, raw_v),
+                        };
+                    (!validated.is_empty()).then_some(validated)
+                }
+            };
+            if let Some(ref val) = normalized_val
+                && let Some(owner_raw) =
+                    entries_core::find_entry_id_by_identifier_in_tx(tx.conn(), &scheme, val).await?
+                && let Some(owner_canon) =
+                    Self::follow_merged_id_in_tx(tx.conn(), &owner_raw).await?
+                && owner_canon != canon_id
+            {
+                return Err(CatalogError::Conflict(format!(
+                    "Identifier {scheme}:{val} is already assigned to another entry"
+                )));
+            }
+            ident_patches.insert(scheme, normalized_val);
+        }
+
+        // Check URL ownership conflict only when URL is explicitly being changed
+        if input.url.is_some()
+            && target_url != raw.url
+            && let Some(ref new_u) = target_url
+        {
+            let new_norm = normalize_identifier_value(target_kind, "url", new_u);
+            if !new_norm.is_empty()
+                && let Some(owner_raw) =
+                    entries_core::find_entry_id_by_identifier_in_tx(tx.conn(), "url", &new_norm)
+                        .await?
+                && let Some(owner_canon) =
+                    Self::follow_merged_id_in_tx(tx.conn(), &owner_raw).await?
+                && owner_canon != canon_id
+            {
+                let owner_kind: Option<EntryKind> =
+                    sqlx::query_scalar("SELECT kind FROM entries WHERE id = ?")
+                        .bind(&owner_canon)
+                        .fetch_optional(tx.conn())
+                        .await?;
+                if owner_kind == Some(target_kind) {
+                    return Err(CatalogError::Conflict(format!(
+                        "URL '{new_u}' is already assigned to another entry"
+                    )));
+                }
+            }
+        }
+
+        let edit_hlc = tx.next_hlc().await?;
+        let next_metadata_json =
+            roche_core::crdt::stamp_entry_edited_hlc(&raw.metadata_json, &edit_hlc);
+
+        sqlx::query(
+            "UPDATE entries
+             SET kind = ?,
+                 title = ?,
+                 creators_json = ?,
+                 url = ?,
+                 published_at = ?,
+                 release_year = ?,
+                 summary = ?,
+                 thumbnail_url = ?,
+                 metadata_json = ?,
+                 updated_at = ?,
+                 hlc = ?
+             WHERE id = ?",
+        )
+        .bind(target_kind)
+        .bind(&target_title)
+        .bind(&target_creators_json)
+        .bind(target_url.as_deref())
+        .bind(target_published_at)
+        .bind(target_release_year)
+        .bind(target_summary.as_deref())
+        .bind(target_thumb.as_deref())
+        .bind(&next_metadata_json)
+        .bind(now)
+        .bind(&edit_hlc)
+        .bind(&canon_id)
+        .execute(tx.conn())
+        .await?;
+
+        // Sync URL identifier when URL was explicitly patched
+        if input.url.is_some() && target_url != raw.url {
+            if let Some(ref old_url) = raw.url {
+                let old_norm = normalize_identifier_value(raw.kind, "url", old_url);
+                if !old_norm.is_empty() {
+                    sqlx::query(
+                        "DELETE FROM entry_identifiers
+                         WHERE entry_id = ? AND scheme = 'url' AND value = ?",
+                    )
+                    .bind(&canon_id)
+                    .bind(&old_norm)
+                    .execute(tx.conn())
+                    .await?;
+                }
+            }
+            if let Some(ref new_u) = target_url {
+                let new_norm = normalize_identifier_value(target_kind, "url", new_u);
+                entries_core::upsert_entry_identifier_in_tx(tx.conn(), &canon_id, "url", &new_norm)
+                    .await?;
+                if !ident_patches.contains_key("arxiv")
+                    && let Some(aid) = crate::util::media_urls::extract_arxiv_id(new_u)
+                {
+                    let norm_aid = normalize_identifier_value(target_kind, "arxiv", &aid);
+                    entries_core::upsert_entry_identifier_in_tx(
+                        tx.conn(),
+                        &canon_id,
+                        "arxiv",
+                        &norm_aid,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        // Apply explicit identifier replacements / deletions
+        for (scheme, val_opt) in ident_patches {
+            sqlx::query("DELETE FROM entry_identifiers WHERE entry_id = ? AND scheme = ?")
+                .bind(&canon_id)
+                .bind(&scheme)
+                .execute(tx.conn())
+                .await?;
+            if let Some(val) = val_opt {
+                entries_core::upsert_entry_identifier_in_tx(tx.conn(), &canon_id, &scheme, &val)
+                    .await?;
+            }
+        }
+
+        // Keep `entry_content.content_type` coherent if entry kind changed
+        if target_kind != raw.kind {
+            Self::align_entry_content_type_for_kind_in_tx(tx.conn(), &canon_id, target_kind)
+                .await?;
+        }
+
+        // Synthesize artist links when editing music works
+        if matches!(target_kind, EntryKind::Album | EntryKind::Song)
+            && let Some(ref creators) = parsed_creators
+        {
+            for creator in creators {
+                let artist_id = Self::ensure_artist_entry_in_tx(&mut tx, creator, now).await?;
+                let ce_hlc = tx.next_hlc().await?;
+                sqlx::query(
+                    "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at, hlc)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(&artist_id)
+                .bind(&canon_id)
+                .bind(now)
+                .bind(&ce_hlc)
+                .execute(tx.conn())
+                .await?;
+            }
+        }
+
+        SyncRepo::record_activity(
+            tx.conn(),
+            ActivityEntityType::Entry,
+            &canon_id,
+            ActivityAction::Update,
+            now,
+        )
+        .await?;
+
+        tx.commit().await?;
+
+        self.get_entry_detail(&canon_id)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(format!("Entry '{canon_id}'")))
+    }
+
+    async fn align_entry_content_type_for_kind_in_tx(
+        conn: &mut SqliteConnection,
+        entry_id: &str,
+        target_kind: EntryKind,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let existing_ct: Option<ContentType> =
+            sqlx::query_scalar("SELECT content_type FROM entry_content WHERE entry_id = ?")
+                .bind(entry_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        let Some(cur_ct) = existing_ct else {
+            return Ok(());
+        };
+        if cur_ct == ContentType::Pdf {
+            return Ok(());
+        }
+        let next_ct = match target_kind {
+            EntryKind::Paper if cur_ct == ContentType::Article => Some(ContentType::Paper),
+            EntryKind::Article if cur_ct == ContentType::Paper => Some(ContentType::Article),
+            EntryKind::Video => Some(ContentType::Video),
+            EntryKind::PodcastEpisode => Some(ContentType::Audio),
+            _ => None,
+        };
+        if let Some(ct) = next_ct
+            && ct != cur_ct
+        {
+            sqlx::query("UPDATE entry_content SET content_type = ? WHERE entry_id = ?")
+                .bind(ct)
+                .bind(entry_id)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn upsert_entry_in_tx(
         tx: &mut WriteTx<'_>,
         input: &UpsertEntryInput,
@@ -574,6 +939,8 @@ impl CatalogRepo<'_> {
         let clean_url_ref = clean_url.as_deref();
         let clean_summary = input.summary.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let clean_thumb = input.thumbnail_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let effective_release_year =
+            input.release_year.or_else(|| input.published_at.map(|dt| dt.year()));
 
         let (final_id, activity_action) = if let Some(existing_id) = matched_id {
             let clean_existing_title = if kind == EntryKind::Album {
@@ -630,7 +997,7 @@ impl CatalogRepo<'_> {
             .bind(&creators_json)
             .bind(clean_url_ref)
             .bind(input.published_at)
-            .bind(input.release_year)
+            .bind(effective_release_year)
             .bind(clean_summary)
             .bind(clean_thumb)
             .bind(&metadata_json)
@@ -643,7 +1010,7 @@ impl CatalogRepo<'_> {
             .bind(&creators_json)
             .bind(clean_url_ref)
             .bind(input.published_at)
-            .bind(input.release_year)
+            .bind(effective_release_year)
             .bind(clean_summary)
             .bind(clean_thumb)
             .bind(&metadata_json)
@@ -715,7 +1082,7 @@ impl CatalogRepo<'_> {
                         creators_json: &creators_json,
                         url: clean_url_ref,
                         published_at: input.published_at,
-                        release_year: input.release_year,
+                        release_year: effective_release_year,
                         summary: clean_summary,
                         thumbnail_url: clean_thumb,
                         metadata_json: &metadata_json,
@@ -956,5 +1323,60 @@ impl CatalogRepo<'_> {
         }
         let hydrated = Self::hydrate_entries_in_tx(&mut *conn, raw_rows).await?;
         Ok(hydrated.into_iter().map(|e| (e.id.clone(), e)).collect())
+    }
+}
+
+fn validate_http_url(raw: &str, label: &str) -> CatalogResult<()> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| CatalogError::InvalidInput(format!("{label} must be a valid URL")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(CatalogError::InvalidInput(format!("{label} must use http or https")));
+    }
+    Ok(())
+}
+
+fn validate_editable_entry_url(raw: &str) -> CatalogResult<()> {
+    if raw.starts_with("local-pdf://") {
+        return Ok(());
+    }
+    validate_http_url(raw, "Entry URL")
+}
+
+#[allow(clippy::option_option)]
+fn harmonize_updated_publication_dates(
+    existing_published_at: Option<DateTime<Utc>>,
+    existing_release_year: Option<i32>,
+    patch_published_at: Option<Option<DateTime<Utc>>>,
+    patch_release_year: Option<Option<i32>>,
+) -> (Option<DateTime<Utc>>, Option<i32>) {
+    match patch_published_at {
+        Some(Some(dt)) => match patch_release_year {
+            Some(Some(yr)) if yr != dt.year() => {
+                let same_date_as_existing =
+                    existing_published_at.is_some_and(|ex| ex.date_naive() == dt.date_naive());
+                let year_changed = existing_release_year != Some(yr);
+                if same_date_as_existing && year_changed {
+                    // User changed only the pre-filled Year input while Date stayed unchanged
+                    (None, Some(yr))
+                } else {
+                    // User changed Date (or both); keep release_year aligned with published_at
+                    (Some(dt), Some(dt.year()))
+                }
+            }
+            Some(Some(yr)) => (Some(dt), Some(yr)),
+            _ => (Some(dt), Some(dt.year())),
+        },
+        Some(None) => {
+            let year = patch_release_year.unwrap_or(existing_release_year);
+            (None, year)
+        }
+        None => match patch_release_year {
+            Some(Some(yr)) => {
+                let pub_at = existing_published_at.filter(|dt| dt.year() == yr);
+                (pub_at, Some(yr))
+            }
+            Some(None) => (None, None),
+            None => (existing_published_at, existing_release_year),
+        },
     }
 }

@@ -61,6 +61,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
@@ -1093,7 +1094,7 @@ private fun InboxEntryHeadlineRow(entry: InboxEntry, ultraDense: Boolean) {
             )
         }
         Text(
-            text = entry.title,
+            text = remember(entry.title) { formatInlineMathAnnotated(entry.title) },
             color = titleColor,
             fontFamily = headlineFamily,
             fontSize = titleSize,

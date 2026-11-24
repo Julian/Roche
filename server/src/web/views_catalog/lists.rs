@@ -516,7 +516,7 @@ fn render_catalog_search_results(
             out,
             "<li><a href=\"/entries/{}\">{}</a>",
             esc(&urlencode(&entry.id)),
-            esc(&entry.title),
+            roche_core::document_meta::render_inline_math_html(&entry.title),
         );
         render_creator_year_meta(
             out,
@@ -1032,7 +1032,7 @@ fn render_ranked_table_row(
         out,
         "<div class=\"ranked-work-text\"><span class=\"title\"><a href=\"{}\">{}</a></span>",
         esc(&entry_href),
-        esc(&row.entry.title),
+        roche_core::document_meta::render_inline_math_html(&row.entry.title),
     );
     render_creator_year_meta(
         out,

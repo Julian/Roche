@@ -19,6 +19,7 @@ import com.grayvines.roche.core.deterministicConsumptionLogId
 import com.grayvines.roche.core.deterministicTitleEntryId
 import com.grayvines.roche.core.encodeCreatorsJson
 import com.grayvines.roche.core.extractArxivIdentifier
+import com.grayvines.roche.core.extractYearPrefix
 import com.grayvines.roche.core.isSyncablePublicUrl
 import com.grayvines.roche.core.normalizeIdentifierScheme
 import com.grayvines.roche.core.nowUtcIso
@@ -286,7 +287,7 @@ private suspend fun findEntryIdByIdentifiers(
 }
 
 @Suppress("LongParameterList")
-private suspend fun synthesizeArtistsInDao(
+internal suspend fun synthesizeArtistsInDao(
     dao: RocheDao,
     childEntryId: String,
     creators: List<String>,
@@ -726,14 +727,17 @@ private fun mergeEntryEntity(
         } else {
             existing?.metadataJson ?: "{}"
         }
+    val nextPublishedAt = nonBlankOrKeep(input.publishedAt, existing?.publishedAt)
+    val nextReleaseYear =
+        input.releaseYear ?: existing?.releaseYear ?: extractYearPrefix(nextPublishedAt)
     return EntryEntity(
         id = resolvedId,
         kind = existing?.kind ?: input.kind.wireValue,
         title = nonBlankOrKeep(normalizedTitle, existing?.title) ?: normalizedTitle,
         creatorsJson = mergedCreators,
         url = nonBlankOrKeep(input.url, existing?.url),
-        publishedAt = nonBlankOrKeep(input.publishedAt, existing?.publishedAt),
-        releaseYear = input.releaseYear ?: existing?.releaseYear,
+        publishedAt = nextPublishedAt,
+        releaseYear = nextReleaseYear,
         summary = nonBlankOrKeep(input.summary, existing?.summary),
         thumbnailUrl = sanitizeHttpUrl(input.thumbnailUrl) ?: existing?.thumbnailUrl,
         metadataJson = metadataJson,

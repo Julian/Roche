@@ -10,6 +10,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use roche_core::document_meta::{render_inline_math_html, strip_inline_math_delimiters};
 use url::Url;
 
 use super::{
@@ -26,19 +27,37 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            DISMISS_SVG, NavSection, PageShell, RESTORE_BOX_SVG, WebError, WithWebCsrf as _, esc,
-            format_audio_duration, parse_form_bool, redirect_see_other, redirect_with_flash,
-            render_feed_favicon, render_inline_csrf_form, render_inline_csrf_form_with_class,
-            render_page, safe_local_redirect, urlencode,
+            DISMISS_SVG, NavSection, PENCIL_SVG, PageShell, RESTORE_BOX_SVG, WebError,
+            WithWebCsrf as _, esc, format_audio_duration, parse_form_bool, redirect_see_other,
+            redirect_with_flash, render_feed_favicon, render_inline_csrf_form,
+            render_inline_csrf_form_with_class, render_page, safe_local_redirect, urlencode,
         },
         links::sanitize_non_local_href,
     },
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfReaderViewMode {
+    Extracted,
+    Pdf,
+    Split,
+}
+
+impl PdfReaderViewMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Extracted => "extracted",
+            Self::Pdf => "pdf",
+            Self::Split => "split",
+        }
+    }
+}
+
 pub(in crate::web) const QUEUE_ADD_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 2.5h9v11l-4.5-3-4.5 3v-11Z\"/><path d=\"M8 5.2v3.6M6.2 7h3.6\"/></svg>";
 pub(in crate::web) const QUEUE_CHECK_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 2.5h9v11l-4.5-3-4.5 3v-11Z\"/><path d=\"m6 6.8 1.5 1.5 2.6-2.6\"/></svg>";
 pub(in crate::web) const TOP_ARROW_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M8 13V3.5\"/><path d=\"M4 7.5 8 3.5l4 4\"/></svg>";
 
+#[allow(clippy::too_many_lines)]
 pub(in crate::web) async fn reader_get(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
@@ -47,21 +66,24 @@ pub(in crate::web) async fn reader_get(
 ) -> Result<Response, WebError> {
     let detail = service.items().get(&id).await.web_err(&session)?;
 
-    let (is_consumed, rank_slug, can_rank) = match service.catalog().get_entry_detail(&id).await {
-        Ok(Some(ed)) => {
-            let consumed = ed.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed);
-            let slug = if consumed {
-                service.catalog().rank_target_after_consumption(&ed.entry).await.ok().flatten()
-            } else {
-                None
-            };
-            let rankable = slug.is_some()
-                || ed.entry.kind.default_list_slug().is_some()
-                || ed.parents.iter().any(|p| p.kind == EntryKind::Collection);
-            (consumed, slug, rankable)
-        }
-        _ => (false, None, false),
-    };
+    let (is_consumed, rank_slug, can_rank, entry_release_year, entry_arxiv_id) =
+        match service.catalog().get_entry_detail(&id).await {
+            Ok(Some(ed)) => {
+                let consumed =
+                    ed.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed);
+                let slug = if consumed {
+                    service.catalog().rank_target_after_consumption(&ed.entry).await.ok().flatten()
+                } else {
+                    None
+                };
+                let rankable = slug.is_some()
+                    || ed.entry.kind.default_list_slug().is_some()
+                    || ed.parents.iter().any(|p| p.kind == EntryKind::Collection);
+                let arxiv_id = ed.entry.identifier("arxiv").map(str::to_owned);
+                (consumed, slug, rankable, ed.entry.release_year, arxiv_id)
+            }
+            _ => (false, None, false, None, None),
+        };
 
     let default_back = if detail.item.in_want_to_read { "/queue" } else { "/inbox" };
     let return_to = safe_local_redirect(query.return_to.as_deref(), default_back);
@@ -86,9 +108,25 @@ pub(in crate::web) async fn reader_get(
             || n.eq_ignore_ascii_case("Dismissed")
     });
 
-    let hardened_prose_html = if let Some(raw_html) =
-        detail.item.content_html.as_deref().filter(|s| !s.trim().is_empty()).map(ToOwned::to_owned)
+    let requested_view = query.view.as_deref().map(str::trim);
+    let has_local_pdf = detail.media.iter().any(|m| m.media_type == MediaType::Pdf);
+    let mut raw_content_html =
+        detail.item.content_html.as_deref().filter(|s| !s.trim().is_empty()).map(ToOwned::to_owned);
+    let pdf_extraction_skipped =
+        raw_content_html.is_none() && has_local_pdf && requested_view == Some("pdf");
+    if raw_content_html.is_none()
+        && has_local_pdf
+        && !pdf_extraction_skipped
+        && let Some(extracted) = service
+            .enrich()
+            .ensure_paper_reader_html(&id, entry_arxiv_id.as_deref(), Some(&detail.item.title))
+            .await
     {
+        raw_content_html = Some(extracted);
+    }
+
+    let reading_minutes = estimate_reading_minutes(&detail, raw_content_html.as_deref());
+    let hardened_prose_html = if let Some(raw_html) = raw_content_html {
         let item_url = detail.item.url.clone();
         let item_title = detail.item.title.clone();
         let rendered = tokio::task::spawn_blocking(move || {
@@ -103,11 +141,28 @@ pub(in crate::web) async fn reader_get(
         None
     };
 
+    let pdf_mode = has_local_pdf.then(|| match requested_view {
+        Some("pdf") => PdfReaderViewMode::Pdf,
+        Some("split") => PdfReaderViewMode::Split,
+        Some("extracted") => PdfReaderViewMode::Extracted,
+        _ => {
+            if hardened_prose_html.is_some() {
+                PdfReaderViewMode::Extracted
+            } else {
+                PdfReaderViewMode::Pdf
+            }
+        }
+    });
+
     let mut body = String::with_capacity(14_336);
     render_reader_article(
         &mut body,
         &detail,
         hardened_prose_html.as_deref(),
+        reading_minutes,
+        pdf_mode,
+        pdf_extraction_skipped,
+        entry_release_year,
         triage_state,
         suppress_auto_finish,
         can_rank,
@@ -116,8 +171,9 @@ pub(in crate::web) async fn reader_get(
         &session.csrf_token,
     );
 
+    let plain_title = strip_inline_math_delimiters(&detail.item.title);
     Ok(render_page(&PageShell {
-        title: &detail.item.title,
+        title: &plain_title,
         active: active_nav,
         csrf_token: &session.csrf_token,
         flash: &session.flash,
@@ -129,12 +185,10 @@ pub(in crate::web) async fn reader_get(
     .into_response())
 }
 
-fn estimate_reading_minutes(detail: &ItemDetail) -> Option<usize> {
-    let src = detail
-        .item
-        .content_html
-        .as_deref()
+fn estimate_reading_minutes(detail: &ItemDetail, extracted_html: Option<&str>) -> Option<usize> {
+    let src = extracted_html
         .filter(|s| !s.trim().is_empty())
+        .or_else(|| detail.item.content_html.as_deref().filter(|s| !s.trim().is_empty()))
         .or_else(|| detail.item.summary.as_deref().filter(|s| !s.trim().is_empty()))?;
     let mut words = 0usize;
     let mut in_tag = false;
@@ -183,6 +237,10 @@ fn render_reader_article(
     out: &mut String,
     detail: &ItemDetail,
     hardened_prose_html: Option<&str>,
+    reading_minutes: Option<usize>,
+    pdf_mode: Option<PdfReaderViewMode>,
+    pdf_extraction_skipped: bool,
+    entry_release_year: Option<i32>,
     triage_state: EntryTriageState,
     suppress_auto_finish: bool,
     can_rank: bool,
@@ -201,10 +259,14 @@ fn render_reader_article(
         format!("/reader/{id_enc}?return_to={}", urlencode(return_to))
     };
     let suppress_attr = if suppress_auto_finish { " data-suppress-auto-finish=\"1\"" } else { "" };
+    let pdf_mode_attr =
+        pdf_mode.map_or_else(String::new, |m| format!(" data-pdf-mode=\"{}\"", m.as_str()));
+    let pdf_unextracted_attr =
+        if pdf_extraction_skipped { " data-pdf-unextracted=\"1\"" } else { "" };
 
     let _ = writeln!(
         out,
-        "<div class=\"reader-layout\">\n\
+        "<div class=\"reader-layout js-reader-layout\"{pdf_mode_attr}{pdf_unextracted_attr}>\n\
          <article class=\"reader-article js-reader-root\" data-item-id=\"{}\" data-kind=\"{}\" data-content-type=\"{}\" data-has-audio=\"{}\" data-progress=\"{:.4}\" data-finished=\"{}\" data-dismissed=\"{}\" data-back-href=\"{}\"{suppress_attr}>",
         esc(&item.id),
         entry_kind.as_str(),
@@ -219,6 +281,8 @@ fn render_reader_article(
     render_reader_header(
         out,
         detail,
+        reading_minutes,
+        entry_release_year,
         &id_enc,
         &reader_path,
         return_to,
@@ -230,6 +294,7 @@ fn render_reader_article(
         out,
         detail,
         hardened_prose_html,
+        pdf_mode,
         &id_enc,
         &reader_path,
         return_to,
@@ -262,7 +327,12 @@ fn render_reader_article(
     out.push_str("</div>\n");
 }
 
-fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail, return_to: &str) {
+fn render_reader_crumb_row(
+    out: &mut String,
+    detail: &ItemDetail,
+    reading_minutes: Option<usize>,
+    return_to: &str,
+) {
     let item = &detail.item;
     let back_label = back_label_for_return_to(return_to);
     let _ = write!(
@@ -288,7 +358,7 @@ fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail, return_to: &st
         }
     }
     if item.content_type != ContentType::Audio
-        && let Some(mins) = estimate_reading_minutes(detail)
+        && let Some(mins) = reading_minutes
     {
         if wrote_meta {
             out.push_str(" &middot; ");
@@ -309,24 +379,6 @@ fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail, return_to: &st
             out,
             "<button type=\"button\" class=\"pill js-reader-resume-btn\" data-resume-progress=\"{:.4}\">Resume at {pct}%</button>",
             item.read_progress.clamp(0.0, 1.0),
-        );
-        wrote_meta = true;
-    }
-    let orig_href = sanitize_non_local_href(item.url.as_str());
-    let orig_canon = orig_href.map(canonicalize_sync_url);
-    let orig_is_discussion = orig_canon.as_deref().is_some_and(|oc| {
-        item.discussions.iter().any(|d| {
-            sanitize_non_local_href(&d.url).is_some_and(|dh| canonicalize_sync_url(dh) == oc)
-        })
-    });
-    if !orig_is_discussion && let Some(ext_href) = orig_href {
-        if wrote_meta {
-            out.push_str(" &middot; ");
-        }
-        let _ = write!(
-            out,
-            "<a href=\"{}\" target=\"_blank\" rel=\"noopener\">Original &#8599;</a>",
-            esc(ext_href)
         );
         wrote_meta = true;
     }
@@ -365,6 +417,8 @@ fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail, return_to: &st
 fn render_reader_header(
     out: &mut String,
     detail: &ItemDetail,
+    reading_minutes: Option<usize>,
+    entry_release_year: Option<i32>,
     id_enc: &str,
     reader_path: &str,
     return_to: &str,
@@ -375,7 +429,8 @@ fn render_reader_header(
     let item = &detail.item;
     let is_finished = triage_state == EntryTriageState::Finished;
     let is_dismissed = triage_state == EntryTriageState::Dismissed;
-    render_reader_crumb_row(out, detail, return_to);
+    let plain_title = strip_inline_math_delimiters(&item.title);
+    render_reader_crumb_row(out, detail, reading_minutes, return_to);
     out.push_str("<div class=\"reader-header\">\n<div class=\"reader-title-row\">\n");
 
     let (star_glyph, star_pressed, star_cls, star_action_word) = if item.is_favorite {
@@ -385,7 +440,7 @@ fn render_reader_header(
     };
     let star_btn = format!(
         "<button type=\"submit\" class=\"{star_cls}\" title=\"Toggle Star\" data-title=\"{title}\" aria-label=\"{star_action_word} {title}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
-        title = esc(&item.title),
+        title = esc(&plain_title),
     );
     render_inline_csrf_form(
         out,
@@ -395,10 +450,18 @@ fn render_reader_header(
         None,
         &star_btn,
     );
-    let _ = writeln!(
-        out,
-        "<h2>{}</h2>\n</div>\n<div class=\"reader-meta-row\">\n<div class=\"item-byline js-reader-byline\">",
-        esc(&item.title),
+    let title_html = render_inline_math_html(&item.title);
+    if let Some(ext_href) = sanitize_non_local_href(item.url.as_str()) {
+        let _ = writeln!(
+            out,
+            "<h2><a class=\"reader-title-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\">{title_html}<span class=\"title-ext-mark\" aria-hidden=\"true\">&#8599;</span></a></h2>",
+            esc(ext_href),
+        );
+    } else {
+        let _ = writeln!(out, "<h2>{title_html}</h2>");
+    }
+    out.push_str(
+        "</div>\n<div class=\"reader-meta-row\">\n<div class=\"item-byline js-reader-byline\">",
     );
     if is_finished {
         out.push_str(
@@ -430,6 +493,8 @@ fn render_reader_header(
     }
     if let Some(dt) = item.published_at {
         let _ = write!(out, "<span class=\"byline-item\">{}</span>", dt.format("%B %d, %Y"));
+    } else if let Some(yr) = entry_release_year {
+        let _ = write!(out, "<span class=\"byline-item\">{yr}</span>");
     }
     out.push_str("</div>\n<div class=\"reader-quick-tools\">\n");
     render_audio_play_button(out, item);
@@ -489,8 +554,9 @@ fn render_reader_mobile_tools(
     );
     let _ = writeln!(
         out,
-        "<a class=\"reader-rail-link\" href=\"/entries/{}\">History &amp; Lists &rarr;</a>",
-        esc(id_enc),
+        "<a class=\"reader-rail-link\" href=\"/entries/{id}\">History &amp; Lists &rarr;</a>\n\
+         <a class=\"reader-rail-link\" href=\"/entries/{id}?edit=1\">Edit details &rarr;</a>",
+        id = esc(id_enc),
     );
     if let Some(slug) = rank_slug {
         let _ = writeln!(
@@ -508,6 +574,7 @@ fn render_reader_media_and_prose(
     out: &mut String,
     detail: &ItemDetail,
     hardened_prose_html: Option<&str>,
+    pdf_mode: Option<PdfReaderViewMode>,
     id_enc: &str,
     reader_path: &str,
     return_to: &str,
@@ -515,10 +582,11 @@ fn render_reader_media_and_prose(
     csrf: &str,
 ) {
     let item = &detail.item;
+    let plain_title = strip_inline_math_delimiters(&item.title);
     let is_finished = triage_state == EntryTriageState::Finished;
     let is_dismissed = triage_state == EntryTriageState::Dismissed;
     let mut has_local_video = false;
-    let mut has_local_pdf = false;
+    let mut pdf_media_href: Option<String> = None;
     for m in &detail.media {
         match m.media_type {
             MediaType::Video => {
@@ -533,23 +601,10 @@ fn render_reader_media_and_prose(
                     esc(&urlencode(&m.id)),
                 );
             }
-            MediaType::Pdf => {
-                has_local_pdf = true;
-                let media_href = format!("/web/media/{}", urlencode(&m.id));
-                let _ = writeln!(
-                    out,
-                    "<div class=\"reader-media-box reader-pdf-box\">\
-                       <div class=\"reader-pdf-bar\">\
-                         <span class=\"meta\">Cached PDF</span>\
-                         <a class=\"btn btn-small btn-ghost\" href=\"{href}\" target=\"_blank\" rel=\"noopener\">Open PDF in new tab &#8599;</a>\
-                       </div>\
-                       <iframe class=\"reader-pdf-frame\" src=\"{href}\" title=\"PDF viewer: {title}\" loading=\"lazy\"></iframe>\
-                     </div>",
-                    href = esc(&media_href),
-                    title = esc(&item.title),
-                );
+            MediaType::Pdf if pdf_media_href.is_none() => {
+                pdf_media_href = Some(format!("/web/media/{}", urlencode(&m.id)));
             }
-            MediaType::Audio | MediaType::Thumbnail => {}
+            MediaType::Pdf | MediaType::Audio | MediaType::Thumbnail => {}
         }
     }
 
@@ -570,17 +625,79 @@ fn render_reader_media_and_prose(
         );
     }
 
+    if let (Some(media_href), Some(active_mode)) = (pdf_media_href.as_deref(), pdf_mode) {
+        render_reader_pdf_mode_bar(out, reader_path, media_href, active_mode);
+        out.push_str("<div class=\"reader-pdf-workspace\">\n");
+    }
+
     out.push_str("<div class=\"reader-prose\">\n");
     if let Some(prose_html) = hardened_prose_html {
         out.push_str(prose_html);
     } else if let Some(summary) = item.summary.as_deref().filter(|s| !s.trim().is_empty()) {
         for para in summary.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
-            let _ = writeln!(out, "<p>{}</p>", esc(para));
+            let _ = writeln!(out, "<p>{}</p>", render_inline_math_html(para));
         }
-    } else if !has_local_pdf && !has_local_video && item.content_type != ContentType::Video {
+    } else if pdf_media_href.is_some() {
+        out.push_str("<p class=\"empty\">No extractable text found in this PDF. Switch to <strong>PDF</strong> mode to view the original pages.</p>\n");
+    } else if !has_local_video && item.content_type != ContentType::Video {
         out.push_str("<p class=\"empty\">No extracted article text stored for this entry.</p>\n");
     }
     out.push_str("</div>\n");
+
+    if let Some(media_href) = pdf_media_href.as_deref() {
+        let iframe_src_attr = if pdf_mode == Some(PdfReaderViewMode::Extracted) {
+            format!("data-src=\"{}\"", esc(media_href))
+        } else {
+            format!("src=\"{}\"", esc(media_href))
+        };
+        let _ = writeln!(
+            out,
+            "<div class=\"reader-media-box reader-pdf-box\">\
+               <iframe class=\"reader-pdf-frame js-reader-pdf-frame\" {iframe_src_attr} title=\"PDF viewer: {title}\" loading=\"lazy\"></iframe>\
+             </div>\n</div>",
+            title = esc(&plain_title),
+        );
+    }
+}
+
+fn render_reader_pdf_mode_bar(
+    out: &mut String,
+    reader_path: &str,
+    media_href: &str,
+    active_mode: PdfReaderViewMode,
+) {
+    let sep = if reader_path.contains('?') { "&" } else { "?" };
+    out.push_str(
+        "<div class=\"reader-pdf-toolbar\">\n\
+           <div class=\"view-mode-switch reader-pdf-mode-switch\" role=\"group\" aria-label=\"Paper reading mode\">\n",
+    );
+    for (mode, label) in [
+        (PdfReaderViewMode::Extracted, "Extracted"),
+        (PdfReaderViewMode::Pdf, "PDF"),
+        (PdfReaderViewMode::Split, "Split"),
+    ] {
+        let is_active = mode == active_mode;
+        let cls = if is_active {
+            "view-mode-btn js-pdf-mode-btn is-active"
+        } else {
+            "view-mode-btn js-pdf-mode-btn"
+        };
+        let current_attr = if is_active { " aria-current=\"true\"" } else { "" };
+        let href = format!("{reader_path}{sep}view={}", mode.as_str());
+        let _ = writeln!(
+            out,
+            "<a class=\"{cls}\" href=\"{}\" data-pdf-mode-target=\"{}\"{current_attr}>{label}</a>",
+            esc(&href),
+            mode.as_str(),
+        );
+    }
+    let _ = writeln!(
+        out,
+        "</div>\n\
+         <a class=\"reader-pdf-tab-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\">Open PDF &#8599;</a>\n\
+         </div>",
+        esc(media_href),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -786,6 +903,7 @@ fn render_reader_rail(
              <div class=\"reader-rail-actions\">\n",
     );
 
+    let plain_title = strip_inline_math_delimiters(&item.title);
     let (star_glyph, star_pressed, star_cls, star_action_word) = if item.is_favorite {
         ("&#9733;", "true", "rail-icon-btn js-star-toggle is-starred", "Unstar")
     } else {
@@ -793,7 +911,7 @@ fn render_reader_rail(
     };
     let star_btn = format!(
         "<button type=\"submit\" class=\"{star_cls}\" title=\"Star\" data-title=\"{title}\" aria-label=\"{star_action_word} {title}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
-        title = esc(&item.title),
+        title = esc(&plain_title),
     );
     render_inline_csrf_form(
         out,
@@ -807,7 +925,7 @@ fn render_reader_rail(
     if item.in_want_to_read {
         let q_btn = format!(
             "<button type=\"submit\" class=\"rail-icon-btn\" title=\"Remove from Queue\" aria-label=\"Remove {} from Queue\">{QUEUE_CHECK_SVG}</button>",
-            esc(&item.title),
+            esc(&plain_title),
         );
         render_inline_csrf_form(
             out,
@@ -820,7 +938,7 @@ fn render_reader_rail(
     } else {
         let q_btn = format!(
             "<button type=\"submit\" class=\"rail-icon-btn\" title=\"Add to Queue\" aria-label=\"Add {} to Queue\">{QUEUE_ADD_SVG}</button>",
-            esc(&item.title),
+            esc(&plain_title),
         );
         render_inline_csrf_form(
             out,
@@ -839,10 +957,11 @@ fn render_reader_rail(
 
     let _ = writeln!(
         out,
-        "<a class=\"rail-icon-btn\" href=\"#roche-masthead\" title=\"Back to top\" aria-label=\"Back to top\">{TOP_ARROW_SVG}</a>\n\
+        "<a class=\"rail-icon-btn\" href=\"/entries/{id}?edit=1\" title=\"Edit details\" aria-label=\"Edit details\">{PENCIL_SVG}</a>\n\
+         <a class=\"rail-icon-btn\" href=\"#roche-masthead\" title=\"Back to top\" aria-label=\"Back to top\">{TOP_ARROW_SVG}</a>\n\
          </div>\n\
-         <a class=\"reader-rail-link\" href=\"/entries/{}\">History &amp; Lists &rarr;</a>",
-        esc(id_enc),
+         <a class=\"reader-rail-link\" href=\"/entries/{id}\">History &amp; Lists &rarr;</a>",
+        id = esc(id_enc),
     );
     if let Some(slug) = rank_slug {
         let _ = writeln!(

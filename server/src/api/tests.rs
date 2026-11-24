@@ -2799,3 +2799,146 @@ async fn test_api_patch_feed_url_updates_validates_and_rejects_conflicts() {
         .unwrap();
     assert_eq!(yt_watch_res.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_patch_catalog_entry_and_document_refresh_api() {
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!("roche_api_doc_test_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let _guard = TempDirGuard(tmp_dir.clone());
+
+    let mut cfg = crate::config::Config::default();
+    cfg.storage.media_dir = tmp_dir.clone();
+
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let token = TokenManager::new(db.auth()).create("api-edit-test", 32).await.unwrap();
+    let auth = format!("Bearer {token}");
+    let service = RocheService::new(db.clone(), FakeFeedFetcher, cfg);
+    let app = ApiRoutes::router_with_service(service.clone());
+
+    let pdf_url =
+        Url::parse("https://web.maths.unsw.edu.au/~davidharvey/research/subnlogn.pdf").unwrap();
+    let (paper, _) = db
+        .items()
+        .save_manual_input_with_tags(&crate::db::ManualItemInput {
+            url: &pdf_url,
+            title: "subnlogn.pdf",
+            summary: None,
+            content_html: None,
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: crate::domain::ContentType::Pdf,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+
+    let stream = "\
+BT\n\
+/F1 17.28 Tf\n\
+100 720 Td (Integer multiplication in time O\\(n log n\\)) Tj\n\
+/F1 12 Tf\n\
+0 -28 Td (David Harvey and Joris van der Hoeven) Tj\n\
+/F1 10 Tf\n\
+0 -20 Td (October 20, 2026) Tj\n\
+0 -28 Td (Abstract) Tj\n\
+0 -14 Td (We prove that n-bit integers can be multiplied in O\\(n log n\\) bit operations.) Tj\n\
+ET\n";
+    let pdf_bytes = format!(
+        "%PDF-1.5\n\
+         1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+         2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+         3 0 obj << /Type /Page /Parent 2 0 R /Contents 4 0 R >> endobj\n\
+         4 0 obj << /Length {} >>\nstream\n{}\nendstream\nendobj\n\
+         5 0 obj << /Title () /Author () /Producer (pdfTeX) >> endobj\n\
+         %%EOF\n",
+        stream.len(),
+        stream
+    );
+    let rel_path = format!("pdfs/{}.pdf", paper.id);
+    let file_size =
+        service.media_store().write_bytes(&rel_path, pdf_bytes.as_bytes()).await.unwrap();
+    db.media()
+        .create(&paper.id, crate::db::MediaType::Pdf, &rel_path, Some(file_size), None)
+        .await
+        .unwrap();
+
+    // 1. POST /api/v1/catalog/entries/{id}/enrich discovers metadata from the cached PDF
+    let enrich_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/catalog/entries/{}/enrich", paper.id))
+                .header(header::AUTHORIZATION, &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enrich_res.status(), StatusCode::OK);
+    let enrich_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(enrich_res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(enrich_json["entry"]["title"], "Integer multiplication in time O(n log n)");
+    assert_eq!(enrich_json["entry"]["release_year"], 2026);
+    assert_eq!(
+        enrich_json["entry"]["creators"],
+        serde_json::json!(["David Harvey", "Joris van der Hoeven"])
+    );
+
+    // 2. PATCH /api/v1/catalog/entries/{id} edits metadata, harmonizes date, attaches DOI & clears summary
+    let patch_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/catalog/entries/{}", paper.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "title": "Integer multiplication in time O(n log n) — Final",
+                        "creators": ["David Harvey", "Joris van der Hoeven"],
+                        "published_date": "2021-03-15",
+                        "summary": null,
+                        "doi": "https://doi.org/10.4007/ANNALS.2021.193.2.4",
+                        "isbn": "978-0-306-40615-7"
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patch_res.status(), StatusCode::OK);
+    let patch_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(patch_res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(patch_json["entry"]["title"], "Integer multiplication in time O(n log n) — Final");
+    assert_eq!(patch_json["entry"]["release_year"], 2021);
+    assert!(patch_json["entry"]["summary"].is_null());
+    assert!(patch_json["entry"]["metadata"]["edited_hlc"].is_string());
+
+    // 3. Rejects empty title (400 Bad Request)
+    let bad_res = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/catalog/entries/{}", paper.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title": "   "}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+}

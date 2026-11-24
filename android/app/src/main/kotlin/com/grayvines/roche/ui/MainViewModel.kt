@@ -532,11 +532,13 @@ class MainViewModel(
             val nextPlayerNotes =
                 current.activePlayerNotesContent?.takeUnless { it.itemId in removedIds }
             val nextSheetId = current.contextSheetEntryId?.takeUnless { it in removedIds }
+            val nextEditId = current.editingCatalogEntryId?.takeUnless { it in removedIds }
             current.copy(
                 selectedReaderEntryId = nextReaderId,
                 readerContent = nextContent,
                 activePlayerNotesContent = nextPlayerNotes,
                 contextSheetEntryId = nextSheetId,
+                editingCatalogEntryId = nextEditId,
                 isPlayerFullscreenOpen =
                     if (clearingActivePlayer) false else current.isPlayerFullscreenOpen,
                 isPlayerSpeedSheetOpen =

@@ -13,6 +13,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 
 internal const val METADATA_KEY_DISCUSSIONS = "discussions"
+internal const val METADATA_KEY_EDITED_HLC = "edited_hlc"
 private const val DISCUSSION_FIELD_SOURCE = "source"
 private const val DISCUSSION_FIELD_URL = "url"
 private const val DISCUSSION_FIELD_EXTERNAL_ID = "external_id"
@@ -95,11 +96,33 @@ internal fun mergeDiscussionIntoMetadata(
     return JsonObject(updatedMap).toString()
 }
 
+internal fun extractEntryEditedHlc(metaObj: JsonObject?): String? =
+    metaObj?.stringFieldOrNull(METADATA_KEY_EDITED_HLC)
+
+internal fun extractEntryEditedHlc(metadataJson: String?): String? =
+    extractEntryEditedHlc(parseMetadataJsonObject(metadataJson))
+
+internal fun isEntryUserEdited(metadataJson: String?): Boolean =
+    extractEntryEditedHlc(metadataJson) != null
+
+internal fun stampEntryEditedHlc(metadataJson: String?, hlc: String): String {
+    val cleanHlc = hlc.trim()
+    val existingObj = parseMetadataJsonObject(metadataJson) ?: JsonObject(emptyMap())
+    if (cleanHlc.isEmpty()) return JsonObject(existingObj).toString()
+    val updated = LinkedHashMap<String, JsonElement>(existingObj)
+    val prev = extractEntryEditedHlc(existingObj)
+    val winner = if (prev != null && prev >= cleanHlc) prev else cleanHlc
+    updated[METADATA_KEY_EDITED_HLC] = JsonPrimitive(winner)
+    return JsonObject(updated).toString()
+}
+
 /**
  * CRDT metadata JSON merge matching Rust `core/src/crdt.rs::merge_entry_metadata_json`:
  * - For key `"discussions"` when both existing and incoming are JSON arrays, performs a
  *   deduplicated union by canonicalized `url` (preserving existing order first, appending unseen
  *   incoming items, and filling blank `label`/`external_id`/`source` from incoming).
+ * - For key `"edited_hlc"`, always keeps the lexicographically greater non-empty HLC string
+ *   regardless of [incomingWins].
  * - For all other keys, overwrites existing keys when [incomingWins] is true and backfills missing
  *   keys regardless.
  */
@@ -113,17 +136,44 @@ internal fun mergeEntryMetadataJson(
     val existingObj = parseMetadataJsonObject(fallback) ?: JsonObject(emptyMap())
     val merged = LinkedHashMap<String, JsonElement>(existingObj)
     for ((key, incomingVal) in incomingMeta) {
-        if (key == METADATA_KEY_DISCUSSIONS && incomingVal is JsonArray) {
+        mergeSingleMetadataEntry(merged, key, incomingVal, incomingWins)
+    }
+    return JsonObject(merged).toString()
+}
+
+private fun mergeSingleMetadataEntry(
+    merged: MutableMap<String, JsonElement>,
+    key: String,
+    incomingVal: JsonElement,
+    incomingWins: Boolean,
+) {
+    when {
+        key == METADATA_KEY_EDITED_HLC -> {
+            mergeEditedHlcKey(merged, incomingVal)
+        }
+        key == METADATA_KEY_DISCUSSIONS && incomingVal is JsonArray -> {
             val existingArr = merged[key] as? JsonArray ?: JsonArray(emptyList())
             val union = mergeDiscussionsJsonArrays(existingArr, incomingVal)
             if (union.isNotEmpty() || key !in merged) {
                 merged[key] = union
             }
-        } else if (incomingWins || key !in merged) {
+        }
+        incomingWins || key !in merged -> {
             merged[key] = incomingVal
         }
     }
-    return JsonObject(merged).toString()
+}
+
+private fun mergeEditedHlcKey(
+    merged: MutableMap<String, JsonElement>,
+    incomingVal: JsonElement,
+) {
+    val incStr = (incomingVal as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+    val curStr =
+        (merged[METADATA_KEY_EDITED_HLC] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+    if (incStr.isNotEmpty() && (curStr.isEmpty() || incStr > curStr)) {
+        merged[METADATA_KEY_EDITED_HLC] = JsonPrimitive(incStr)
+    }
 }
 
 internal fun mergeDiscussionsJsonArrays(existing: JsonArray, incoming: JsonArray): JsonArray {

@@ -4,6 +4,7 @@ use chrono::{DateTime, SubsecRound, Utc};
 
 use crate::{
     boards::merge_discussions_json_arrays,
+    document_meta::is_placeholder_entry_title,
     domain::{EntryKind, InboxState},
     hlc::{clamp_incoming_timestamp, clamp_incoming_timestamp_opt},
     identity_norm::strip_album_edition_suffix,
@@ -124,10 +125,10 @@ pub fn compute_merged_entry_title(
     final_title: &str,
     inc_newer: bool,
 ) -> String {
-    let ex_is_url_placeholder = existing_title.trim().is_empty()
-        || existing_url.is_some_and(|u| existing_title == u)
-        || inc_url.is_some_and(|u| existing_title == u.trim());
-    let inc_is_url_placeholder = inc_url.is_some_and(|u| final_title == u.trim());
+    let ex_is_url_placeholder = is_placeholder_entry_title(existing_title, existing_url)
+        || is_placeholder_entry_title(existing_title, inc_url);
+    let inc_is_url_placeholder = is_placeholder_entry_title(final_title, inc_url)
+        || is_placeholder_entry_title(final_title, existing_url);
     if (ex_is_url_placeholder || (inc_newer && !inc_is_url_placeholder)) && !final_title.is_empty()
     {
         final_title.to_owned()
@@ -200,11 +201,69 @@ pub fn resolve_merged_board_item_state(
     }
 }
 
+/// Metadata key storing the HLC of the latest explicit user metadata edit on an entry.
+///
+/// Entries carrying a strictly newer `edited_hlc` exercise full LWW authority over editable
+/// bibliographic fields (`kind`, `title`, `creators`, `url`, `published_at`, `release_year`,
+/// `summary`, `thumbnail_url`, and document identifiers) during peer sync—allowing explicit
+/// user edits to shorten or clear fields while preventing stale feed repolls or unedited peers
+/// from clobbering user corrections.
+pub const ENTRY_EDITED_HLC_META_KEY: &str = "edited_hlc";
+
+/// Extracts a non-empty `edited_hlc` marker from a parsed JSON metadata value.
+#[must_use]
+pub fn extract_entry_edited_hlc_from_value(meta: Option<&serde_json::Value>) -> Option<&str> {
+    meta.and_then(serde_json::Value::as_object)
+        .and_then(|obj| obj.get(ENTRY_EDITED_HLC_META_KEY))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Extracts a non-empty `edited_hlc` marker from a serialized `entries.metadata_json` string.
+#[must_use]
+pub fn extract_entry_edited_hlc(metadata_json: &str) -> Option<String> {
+    let val = serde_json::from_str::<serde_json::Value>(metadata_json).ok()?;
+    extract_entry_edited_hlc_from_value(Some(&val)).map(str::to_owned)
+}
+
+/// Returns `true` when `metadata_json` carries an explicit user-edit HLC marker.
+#[must_use]
+pub fn is_entry_user_edited(metadata_json: &str) -> bool {
+    extract_entry_edited_hlc(metadata_json).is_some()
+}
+
+/// Stamps `edited_hlc` monotonically into an `entries.metadata_json` object string
+/// (preserving existing keys and never regressing a newer `edited_hlc`).
+#[must_use]
+pub fn stamp_entry_edited_hlc(metadata_json: &str, hlc: &str) -> String {
+    let mut obj = serde_json::from_str::<serde_json::Value>(metadata_json)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let trimmed = hlc.trim();
+    if !trimmed.is_empty() {
+        let prev = obj
+            .get(ENTRY_EDITED_HLC_META_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if prev.is_none_or(|p| trimmed > p) {
+            obj.insert(
+                ENTRY_EDITED_HLC_META_KEY.to_owned(),
+                serde_json::Value::String(trimmed.to_owned()),
+            );
+        }
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
 /// Merges incoming JSON metadata object keys into `existing_json`, overwriting existing keys only
 /// when `inc_newer` is true and backfilling missing keys regardless.
 ///
 /// The `"discussions"` array performs a grow-only deduplicated set-union by canonicalized `url`
 /// regardless of `inc_newer`, preserving existing order and enriching blank fields from incoming.
+/// The `"edited_hlc"` marker always takes the lexicographical maximum regardless of `inc_newer`.
 #[must_use]
 pub fn merge_entry_metadata_json(
     existing_json: &str,
@@ -219,6 +278,20 @@ pub fn merge_entry_metadata_json(
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default();
         for (k, v) in inc_map {
+            if k == ENTRY_EDITED_HLC_META_KEY {
+                let inc_val = v.as_str().map(str::trim).filter(|s| !s.is_empty());
+                let cur_val = cur_obj
+                    .get(ENTRY_EDITED_HLC_META_KEY)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if let Some(inc_s) = inc_val
+                    && cur_val.is_none_or(|cur_s| inc_s > cur_s)
+                {
+                    cur_obj.insert(k.clone(), serde_json::Value::String(inc_s.to_owned()));
+                }
+                continue;
+            }
             if k == "discussions"
                 && let serde_json::Value::Array(inc_arr) = v
             {
@@ -440,5 +513,27 @@ mod tests {
         assert_eq!(res2.dismissed_at, None);
         assert_eq!(res2.last_seen_in_snapshot_at, t3);
         assert_eq!(res2.hlc, res.hlc);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_edited_hlc_stamp_and_commutative_max_merge() {
+        let h1 = "001780315200000-0001-peer-a";
+        let h2 = "001780316000000-0000-peer-b";
+        let stamped_a = stamp_entry_edited_hlc(r#"{"want_notes":"note"}"#, h1);
+        assert_eq!(extract_entry_edited_hlc(&stamped_a).as_deref(), Some(h1));
+        assert!(is_entry_user_edited(&stamped_a));
+
+        let stamped_b = stamp_entry_edited_hlc("{}", h2);
+        let inc_b: serde_json::Value = serde_json::from_str(&stamped_b).unwrap();
+        let inc_a: serde_json::Value = serde_json::from_str(&stamped_a).unwrap();
+
+        // Even with inc_newer = false, higher edited_hlc wins
+        let merged_ab = merge_entry_metadata_json(&stamped_a, Some(&inc_b), false);
+        assert_eq!(extract_entry_edited_hlc(&merged_ab).as_deref(), Some(h2));
+
+        // Even with inc_newer = true, lower edited_hlc does NOT overwrite higher edited_hlc
+        let merged_ba = merge_entry_metadata_json(&stamped_b, Some(&inc_a), true);
+        assert_eq!(extract_entry_edited_hlc(&merged_ba).as_deref(), Some(h2));
     }
 }

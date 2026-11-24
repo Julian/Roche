@@ -10,9 +10,10 @@ use crate::{
     url_guard::sanitize_public_http_href,
 };
 
-pub const EXTERNAL_ID_DISPLAY_ORDER: [&str; 23] = [
+pub const EXTERNAL_ID_DISPLAY_ORDER: [&str; 24] = [
     "wikipedia",
     "arxiv",
+    "doi",
     "hacker_news",
     "musicbrainz_release",
     "musicbrainz_recording",

@@ -61,6 +61,11 @@ class CatalogDetailAndSheetsTest {
         assertNull(closedQuick.quickLogPrefillKind)
         assertEquals("", closedQuick.quickLogPrefillTitle)
 
+        val openedEdit = reduceUiAction(closedQuick, MainAction.OpenEditEntrySheet("paper-1"))
+        assertEquals("paper-1", openedEdit.editingCatalogEntryId)
+        val closedEdit = reduceUiAction(openedEdit, MainAction.CloseEditEntrySheet)
+        assertNull(closedEdit.editingCatalogEntryId)
+
         var target = ""
         resolveCatalogEntryOpenAction(
                 entryId = "alb-1",

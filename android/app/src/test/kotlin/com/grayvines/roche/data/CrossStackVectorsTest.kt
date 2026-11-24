@@ -12,6 +12,7 @@ import com.grayvines.roche.core.deterministicBoardId
 import com.grayvines.roche.core.deterministicFeedId
 import com.grayvines.roche.core.deterministicItemId
 import com.grayvines.roche.core.deterministicTagId
+import com.grayvines.roche.core.isPlaceholderEntryTitle
 import com.grayvines.roche.core.normalizeIdentifierScheme
 import com.grayvines.roche.core.stripAlbumEditionSuffix
 import com.grayvines.roche.core.systemCollectionUuid
@@ -190,6 +191,13 @@ internal data class BoardIdVector(
 )
 
 @Serializable
+internal data class PlaceholderTitleVector(
+    val title: String,
+    val url: String? = null,
+    val expected: Boolean,
+)
+
+@Serializable
 internal data class CrossStackGoldenVectors(
     @SerialName("canonical_urls") val canonicalUrls: List<CanonicalUrlVector>,
     @SerialName("entity_ids") val entityIds: List<EntityIdVector>,
@@ -211,6 +219,8 @@ internal data class CrossStackGoldenVectors(
     val staggeredPollSchedules: List<StaggeredPollScheduleVector>,
     @SerialName("throughput_ewma_steps") val throughputEwmaSteps: List<ThroughputEwmaStepVector>,
     @SerialName("board_ids") val boardIds: List<BoardIdVector> = emptyList(),
+    @SerialName("placeholder_entry_titles")
+    val placeholderEntryTitles: List<PlaceholderTitleVector> = emptyList(),
 )
 
 class CrossStackVectorsTest {
@@ -478,6 +488,19 @@ class CrossStackVectorsTest {
                 updateThroughputEwma(vector.currentWeight, vector.sampleWeight),
                 EWMA_FLOAT_EPSILON,
                 "throughput_ewma_steps mismatch for (${vector.currentWeight} -> ${vector.sampleWeight})",
+            )
+        }
+    }
+
+    @Test
+    fun `placeholder entry titles match Rust golden vectors`() {
+        val vectors = loadGoldenVectors()
+        assertTrue(vectors.placeholderEntryTitles.isNotEmpty())
+        vectors.placeholderEntryTitles.forEach { vector ->
+            assertEquals(
+                vector.expected,
+                isPlaceholderEntryTitle(vector.title, vector.url),
+                "placeholder_entry_titles mismatch for title='${vector.title}' url='${vector.url}'",
             )
         }
     }

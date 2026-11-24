@@ -874,13 +874,17 @@ fn render_single_inbox_row(
         "<div class=\"inbox-main\">\n\
            <div class=\"inbox-title\"><a class=\"js-kbd-open\" href=\"{}\">{}</a></div>",
         esc(&reader_href),
-        esc(&item.title),
+        roche_core::document_meta::render_inline_math_html(&item.title),
     );
     render_inbox_row_byline(out, item, tag_id_by_lower_name);
     if let Some(sum) = item.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let excerpt = clean_plain_excerpt(sum);
         if !excerpt.is_empty() {
-            let _ = writeln!(out, "<p class=\"item-excerpt-clamped\">{}</p>", esc(&excerpt));
+            let _ = writeln!(
+                out,
+                "<p class=\"item-excerpt-clamped\">{}</p>",
+                roche_core::document_meta::render_inline_math_html(&excerpt),
+            );
         }
     }
     out.push_str("</div>\n");

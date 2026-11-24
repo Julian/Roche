@@ -68,6 +68,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.core.isLocalPdfUrl
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.media.PdfRendererSession
@@ -229,6 +230,7 @@ private data class ReaderArticleCallbacks(
     val onOpenAudioPlayer: () -> Unit,
     val onToggleOfflineAudio: () -> Unit,
     val onShare: () -> Unit,
+    val onEditDetails: () -> Unit,
     val onOpenExternalUrl: (String) -> Unit,
     val onJumpToAnchor: (String) -> Unit,
     val onZoomPdfPage: (Int) -> Unit,
@@ -295,6 +297,7 @@ fun ReaderView(
     settings: Settings = Settings(),
     isHydrating: Boolean = false,
     isDownloadingOffline: Boolean = false,
+    catalogReleaseYear: Int? = null,
     playerStateFlow: StateFlow<PodcastPlayerState>? = null,
 ) {
     var showTypographyDrawer by rememberSaveable(entry.id) { mutableStateOf(false) }
@@ -324,6 +327,7 @@ fun ReaderView(
         settings = settings,
         content = content,
         isDownloadingOffline = isDownloadingOffline,
+        catalogReleaseYear = catalogReleaseYear,
         playerStateFlow = playerStateFlow,
         showTypographyDrawer = showTypographyDrawer,
         listState = listState,
@@ -382,6 +386,7 @@ private fun buildReaderArticleCallbacks(
         },
         onToggleOfflineAudio = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
         onShare = { onShareEntry(entry) },
+        onEditDetails = { onAction(MainAction.OpenEditEntrySheet(entry.id)) },
         onOpenExternalUrl = onOpenExternalUrl,
         onJumpToAnchor = { anchorId ->
             jumpToReaderAnchor(anchorId, content, listState, coroutineScope)
@@ -410,6 +415,7 @@ private fun ReaderViewScaffold(
     settings: Settings,
     content: ReaderContentBundle,
     isDownloadingOffline: Boolean,
+    catalogReleaseYear: Int?,
     playerStateFlow: StateFlow<PodcastPlayerState>?,
     showTypographyDrawer: Boolean,
     listState: LazyListState,
@@ -461,6 +467,7 @@ private fun ReaderViewScaffold(
             pdfSession = content.pdfSession,
             isHydrating = content.awaitingBlankHydration,
             isDownloadingOffline = isDownloadingOffline,
+            catalogReleaseYear = catalogReleaseYear,
             playerStateFlow = playerStateFlow,
             listState = listState,
             callbacks = callbacks,
@@ -1213,6 +1220,7 @@ private fun ReaderArticleBody(
     pdfSession: PdfRendererSession?,
     isHydrating: Boolean,
     isDownloadingOffline: Boolean,
+    catalogReleaseYear: Int?,
     playerStateFlow: StateFlow<PodcastPlayerState>?,
     listState: LazyListState,
     callbacks: ReaderArticleCallbacks,
@@ -1239,6 +1247,7 @@ private fun ReaderArticleBody(
                 readerPreBodyItems(
                     entry = entry,
                     isLocalPdf = isLocalPdf,
+                    catalogReleaseYear = catalogReleaseYear,
                     showUncachedPdfCard = showUncachedPdfCard,
                     isDownloadingOffline = isDownloadingOffline,
                     playerStateFlow = playerStateFlow,
@@ -1291,6 +1300,7 @@ private fun LazyListScope.readerFooterItem(
                 onMarkFinished = callbacks.onMarkFinished,
                 onUnfinish = callbacks.onUnfinish,
                 onShare = callbacks.onShare,
+                onEditDetails = callbacks.onEditDetails,
                 onOpenExternalUrl = callbacks.onOpenExternalUrl,
             )
         }
@@ -1301,6 +1311,7 @@ private fun LazyListScope.readerFooterItem(
 private fun LazyListScope.readerPreBodyItems(
     entry: InboxEntry,
     isLocalPdf: Boolean,
+    catalogReleaseYear: Int?,
     showUncachedPdfCard: Boolean,
     isDownloadingOffline: Boolean,
     playerStateFlow: StateFlow<PodcastPlayerState>?,
@@ -1313,6 +1324,7 @@ private fun LazyListScope.readerPreBodyItems(
             ReaderHeaderItem(
                 entry = entry,
                 isLocalPdf = isLocalPdf,
+                catalogReleaseYear = catalogReleaseYear,
                 dividerColor = dividerColor,
                 onSelectFeed = callbacks.onSelectFeed,
                 onSelectTag = callbacks.onSelectTag,
@@ -1483,6 +1495,7 @@ private fun LazyListScope.readerPdfPageItems(
 private fun ReaderHeaderItem(
     entry: InboxEntry,
     isLocalPdf: Boolean,
+    catalogReleaseYear: Int?,
     dividerColor: Color,
     onSelectFeed: (String) -> Unit,
     onSelectTag: (String) -> Unit,
@@ -1492,6 +1505,7 @@ private fun ReaderHeaderItem(
         ReaderArticleHeader(
             entry = entry,
             isLocalPdf = isLocalPdf,
+            catalogReleaseYear = catalogReleaseYear,
             onSelectFeed = onSelectFeed,
             onOpenExternalUrl = onOpenExternalUrl,
         )
@@ -1564,6 +1578,7 @@ private fun ReaderEndCard(
     onMarkFinished: () -> Unit,
     onUnfinish: () -> Unit,
     onShare: () -> Unit,
+    onEditDetails: () -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -1589,6 +1604,7 @@ private fun ReaderEndCard(
                     onMarkFinished = onMarkFinished,
                     onUnfinish = onUnfinish,
                     onShare = onShare,
+                    onEditDetails = onEditDetails,
                     onOpenExternalUrl = onOpenExternalUrl,
                 )
             }
@@ -1605,6 +1621,7 @@ private fun ReaderEndCardActionsRow(
     onMarkFinished: () -> Unit,
     onUnfinish: () -> Unit,
     onShare: () -> Unit,
+    onEditDetails: () -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
     FlowRow(
@@ -1635,6 +1652,11 @@ private fun ReaderEndCardActionsRow(
                 modifier = Modifier.testTag("reader_end_archive_btn"),
             )
         }
+        HeaderActionButton(
+            label = "Edit Details",
+            onClick = onEditDetails,
+            modifier = Modifier.testTag("reader_end_edit_btn"),
+        )
         HeaderActionButton(label = "Share", onClick = onShare)
         presentation.externalUrl?.let { url ->
             HeaderActionButton(
@@ -1671,6 +1693,7 @@ private fun ReaderPlainParagraphItem(paragraph: String) {
 internal fun ReaderArticleHeader(
     entry: InboxEntry,
     isLocalPdf: Boolean = isLocalPdfUrl(entry.url),
+    catalogReleaseYear: Int? = null,
     onSelectFeed: (String) -> Unit = {},
     onOpenExternalUrl: (String) -> Unit = {},
 ) {
@@ -1680,7 +1703,7 @@ internal fun ReaderArticleHeader(
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         SelectionContainer {
             Text(
-                text = entry.title,
+                text = remember(entry.title) { formatInlineMathAnnotated(entry.title) },
                 color = colors.textPrimary,
                 fontFamily = headlineFamily,
                 fontSize = (23f * scale).sp,
@@ -1697,7 +1720,7 @@ internal fun ReaderArticleHeader(
             ReaderStateBadgePill(entry = entry)
             ReaderBylineFeedChip(entry = entry, onSelectFeed = onSelectFeed)
             Text(
-                text = formatReaderByline(entry),
+                text = formatReaderByline(entry, catalogReleaseYear),
                 color = colors.textMuted,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Normal,
@@ -1910,14 +1933,23 @@ internal fun resolveReaderHtmlBody(entry: InboxEntry): String? =
     entry.contentHtml?.takeIf { it.isNotBlank() }
         ?: entry.summary?.takeIf { "<" in it || "&" in it }
 
-private fun formatReaderByline(entry: InboxEntry): String = buildList {
-    entry.author?.takeIf { it.isNotBlank() }?.let { add(it) }
-    add(entry.formattedPublishedLabel)
-    add(entry.readEstimateLabel)
-    if (entry.isCachedOffline) {
-        add("Offline")
+private fun formatReaderByline(entry: InboxEntry, catalogReleaseYear: Int? = null): String =
+    buildList {
+        entry.author?.takeIf { it.isNotBlank() }?.let { add(it) }
+        val dateLabel =
+            if (!entry.publishedAt.isNullOrBlank()) {
+                entry.formattedPublishedLabel
+            } else if (catalogReleaseYear != null && catalogReleaseYear > 0) {
+                catalogReleaseYear.toString()
+            } else {
+                entry.formattedPublishedLabel
+            }
+        add(dateLabel)
+        add(entry.readEstimateLabel)
+        if (entry.isCachedOffline) {
+            add("Offline")
+        }
     }
-}
     .joinToString(" · ", prefix = "· ")
 
 private val MAX_READER_PROSE_WIDTH = 520.dp

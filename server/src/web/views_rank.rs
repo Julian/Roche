@@ -353,7 +353,7 @@ fn render_settled_rank_view(out: &mut String, ctx: &SettledRankCtx<'_>) {
             "<div class=\"album-kicker\">Placement Settled</div>\n\
              <h3 class=\"settled-title\">{}</h3>\n\
              <p class=\"lede mb-md\">Settled at <strong>#{}</strong> of {}{} after {} comparison round(s).</p>",
-            esc(&row.entry.title),
+            roche_core::document_meta::render_inline_math_html(&row.entry.title),
             row.rank,
             ctx.ranked_view.rows.len(),
             tier_part,
@@ -661,7 +661,7 @@ fn render_rank_session_rail(out: &mut String, ctx: &ActiveClusterCtx<'_>, round:
                <div class=\"rank-focus-kicker\">Placing &middot; Round {cur_round} of {max_rounds}</div>\n\
                <div class=\"rank-focus-title\">{}</div>\n\
                <progress class=\"sleeve-progress rank-focus-progress\" value=\"{cur_round}\" max=\"{max_rounds}\"></progress>",
-            esc(&focus_row.entry.title),
+            roche_core::document_meta::render_inline_math_html(&focus_row.entry.title),
         );
         if round >= 1 {
             let tier_part = focus_row.tier.map_or_else(String::new, |t| {
@@ -758,6 +758,7 @@ fn render_cluster_card(
     let open_url = web_primary_open_url(item).unwrap_or_default();
     let focus_attr = if is_focus { "1" } else { "0" };
 
+    let plain_title = roche_core::document_meta::strip_inline_math_delimiters(&item.title);
     let _ = write!(
         out,
         "<li class=\"rank-bucket\" data-bucket-index=\"{idx}\">\n\
@@ -771,7 +772,7 @@ fn render_cluster_card(
                  <span class=\"rank-grip\" aria-hidden=\"true\" title=\"Drag to reorder or drop onto another card to tie\">{GRIP_SVG}</span>\n",
         id = esc(&item.id),
         open_url = esc(&open_url),
-        title = esc(&item.title),
+        title = esc(&plain_title),
     );
 
     if let Some(thumb) = item.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
@@ -798,7 +799,7 @@ fn render_cluster_card(
            <div class=\"rank-title-row\">\n\
              <strong><a href=\"/entries/{id_enc}\" target=\"_blank\" rel=\"noopener\" draggable=\"false\">{title}</a></strong>",
         id_enc = esc(&urlencode(&item.id)),
-        title = esc(&item.title),
+        title = roche_core::document_meta::render_inline_math_html(&item.title),
     );
     if is_focus {
         out.push_str(" <span class=\"rank-focus-pill\">Placing</span>");
@@ -821,7 +822,7 @@ fn render_cluster_card(
                 out,
                 " <a class=\"rank-ext-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\" draggable=\"false\" title=\"Open link (o)\" aria-label=\"Open {} external link\">{EXT_SVG}</a>",
                 esc(href),
-                esc(&item.title),
+                esc(&roche_core::document_meta::strip_inline_math_delimiters(&item.title)),
             );
         }
         out.push_str("</div>\n");
@@ -839,11 +840,12 @@ fn render_cluster_card_controls(
     is_focus: bool,
 ) {
     let rank_num = idx + 1;
+    let plain_title = roche_core::document_meta::strip_inline_math_delimiters(&item.title);
     let _ = write!(
         out,
         "<noscript><select name=\"pos_{}\" class=\"js-noscript-pos\" aria-label=\"Rank position for {}\">",
         esc(&item.id),
-        esc(&item.title),
+        esc(&plain_title),
     );
     for p in 1..=cluster_len {
         let sel = if p == rank_num { " selected" } else { "" };
@@ -862,14 +864,14 @@ fn render_cluster_card_controls(
         "<button type=\"button\" class=\"btn btn-small btn-ghost js-card-up\"{up_disabled} title=\"Move Up (K)\" aria-label=\"Move {title} up\"><span aria-hidden=\"true\">&uarr;</span></button>\
          <button type=\"button\" class=\"btn btn-small btn-ghost js-card-down\"{down_disabled} title=\"Move Down (J)\" aria-label=\"Move {title} down\"><span aria-hidden=\"true\">&darr;</span></button>\
          <button type=\"button\" class=\"btn btn-small btn-ghost js-card-tie\"{tie_disabled} title=\"Tie with above (=)\" aria-label=\"Tie {title} with above\" aria-pressed=\"false\"><span aria-hidden=\"true\">=</span> Tie</button>",
-        title = esc(&item.title),
+        title = esc(&plain_title),
     );
     if !is_focus {
         let ex_disabled = if cluster_len <= MIN_K { " disabled" } else { "" };
         let _ = write!(
             out,
             "<button type=\"button\" class=\"btn btn-small btn-ghost js-card-exclude\"{ex_disabled} title=\"Exclude from this comparison (x)\" aria-label=\"Exclude {title} from comparison\"><span aria-hidden=\"true\">&times;</span></button>",
-            title = esc(&item.title),
+            title = esc(&plain_title),
         );
     }
 }
