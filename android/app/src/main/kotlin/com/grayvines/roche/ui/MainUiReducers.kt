@@ -192,7 +192,11 @@ private fun reduceCatalogUiAction(
         is MainAction.SelectWantCollection ->
             state.copy(selectedWantCollectionId = action.collectionId)
         is MainAction.LaunchCollectionDraw,
-        is MainAction.EnrichAndLaunchMusicDraw -> state
+        is MainAction.EnrichAndLaunchMusicDraw,
+        is MainAction.SetDiaryStatusFilter,
+        is MainAction.SetDiaryYearFilter,
+        MainAction.LoadMoreDiary,
+        MainAction.LoadMoreCatalogDetailLogs -> state
         else -> reduceCatalogSheetUiAction(state, action)
     }
 

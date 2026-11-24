@@ -29,7 +29,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -69,32 +68,6 @@ import java.time.YearMonth
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-private data class DiaryFilteredSlice(
-    val availableYears: List<String>,
-    val effectiveYear: String?,
-    val filteredEntries: List<DiaryEntryItem>,
-)
-
-@Composable
-private fun rememberDiaryFilteredSlice(
-    allDiary: List<DiaryEntryItem>,
-    statusFilter: ConsumptionStatus?,
-    yearFilter: String?,
-): DiaryFilteredSlice =
-    remember(allDiary, statusFilter, yearFilter) {
-        val years =
-            allDiary
-                .mapNotNull { it.monthKey.take(4).takeIf { y -> y.length == 4 } }
-                .distinct()
-                .sortedDescending()
-        val activeYear = yearFilter?.takeIf { it in years }
-        val filtered = allDiary.filter { entry ->
-            (statusFilter == null || entry.status == statusFilter) &&
-                (activeYear == null || entry.monthKey.startsWith(activeYear))
-        }
-        DiaryFilteredSlice(years, activeYear, filtered)
-    }
-
 @Composable
 fun DiaryScreen(
     state: MainUiState,
@@ -102,19 +75,11 @@ fun DiaryScreen(
     listState: LazyListState = rememberLazyListState(),
     onOpenExternalUrl: (String) -> Unit = {},
 ) {
-    var statusFilter by rememberSaveable { mutableStateOf<ConsumptionStatus?>(null) }
-    var yearFilter by rememberSaveable { mutableStateOf<String?>(null) }
+    val diary = state.diary
     var editingLogId by rememberSaveable { mutableStateOf<String?>(null) }
-    val allDiary = state.catalog.diaryEntries
-    val slice = rememberDiaryFilteredSlice(allDiary, statusFilter, yearFilter)
-    LaunchedEffect(slice.effectiveYear) {
-        if (yearFilter != null && slice.effectiveYear == null) {
-            yearFilter = null
-        }
-    }
     val editingLog =
-        remember(editingLogId, allDiary) {
-            editingLogId?.let { id -> allDiary.firstOrNull { it.id == id } }
+        remember(editingLogId, diary.entries) {
+            editingLogId?.let { id -> diary.entries.firstOrNull { it.id == id } }
         }
 
     RocheRefreshableTabScaffold(
@@ -124,29 +89,35 @@ fun DiaryScreen(
         modifier = Modifier.testTag("diary_screen"),
         header = {
             DiaryTopHeaderBar(
-                entryCount = slice.filteredEntries.size,
+                entryCount = diary.totalFilteredCount,
                 showBackToHome = state.isUnpinnedDestination(AppTab.DIARY),
                 onBackToHome = { onAction(MainAction.SelectTab(AppTab.HOME)) },
                 onOpenSearch = { onAction(MainAction.OpenSearch) },
             )
             DiaryStatusFilterStrip(
-                selectedStatus = statusFilter,
-                onSelectStatus = { statusFilter = it },
-                availableYears = slice.availableYears,
-                selectedYear = slice.effectiveYear,
-                onSelectYear = { yearFilter = it },
+                selectedStatus = diary.statusFilter,
+                onSelectStatus = { onAction(MainAction.SetDiaryStatusFilter(it)) },
+                availableYears = diary.availableYears,
+                selectedYear = diary.yearFilter,
+                onSelectYear = { onAction(MainAction.SetDiaryYearFilter(it)) },
             )
         },
     ) {
-        if (slice.filteredEntries.isEmpty()) {
-            DiaryEmptyBody(
-                hasAnyEntries = allDiary.isNotEmpty(),
-                onQuickLog = { onAction(MainAction.OpenQuickLogSheet(false)) },
-            )
+        if (diary.entries.isEmpty()) {
+            if (diary.isLoaded || state.catalog.totalDiaryCount == 0) {
+                DiaryEmptyBody(
+                    hasAnyEntries = diary.hasAnyEntries,
+                    onQuickLog = { onAction(MainAction.OpenQuickLogSheet(false)) },
+                )
+            }
         } else {
             DiaryMonthsList(
                 state = state,
-                diaryEntries = slice.filteredEntries,
+                diaryEntries = diary.entries,
+                monthCounts = diary.monthCounts,
+                hasMore = diary.hasMore,
+                isLoadingMore = diary.isLoadingMore,
+                totalFilteredCount = diary.totalFilteredCount,
                 listState = listState,
                 onAction = onAction,
                 onEditLog = { editingLogId = it.id },
@@ -336,12 +307,15 @@ private fun DiaryEmptyBody(
 private fun DiaryMonthsList(
     state: MainUiState,
     diaryEntries: List<DiaryEntryItem>,
+    monthCounts: Map<String, Int>,
+    hasMore: Boolean,
+    isLoadingMore: Boolean,
+    totalFilteredCount: Int,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
     onEditLog: (DiaryEntryItem) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
-    val colors = LocalRocheColors.current
     val grouped = remember(diaryEntries) { diaryEntries.groupBy { it.monthKey }.entries.toList() }
 
     LazyColumn(
@@ -354,7 +328,7 @@ private fun DiaryMonthsList(
                 if (groupIdx > 0) Spacer(modifier = Modifier.height(14.dp))
                 DiaryMonthSectionHeader(
                     label = formatDiaryMonthLabel(monthKey),
-                    count = itemsInMonth.size,
+                    count = monthCounts[monthKey] ?: itemsInMonth.size,
                 )
                 Spacer(modifier = Modifier.height(6.dp))
             }
@@ -362,34 +336,87 @@ private fun DiaryMonthsList(
                 items = itemsInMonth,
                 key = { _, diary -> diary.id },
             ) { idx, diary ->
-                val isFirst = idx == 0
-                val isLast = idx == itemsInMonth.lastIndex
-                val onOpen =
-                    resolveCatalogEntryOpenAction(
-                        entryId = diary.entryId,
-                        externalUrl = state.catalogUrlsById[diary.entryId],
-                        readableIds = state.readableEntryIds,
-                        onOpenReader = { onAction(MainAction.OpenReader(it)) },
-                        onOpenExternalUrl = onOpenExternalUrl,
-                        entryKind = diary.kind,
-                        onOpenCatalogDetail = { onAction(MainAction.OpenCatalogDetailSheet(it)) },
-                    )
-                Column(
-                    modifier =
-                        Modifier.fillMaxWidth()
-                            .lazyGroupedCardRow(
-                                isFirst = isFirst,
-                                isLast = isLast,
-                                surfaceColor = colors.surface,
-                                borderColor = colors.border,
-                            )
-                ) {
-                    if (!isFirst) HorizontalDivider(color = colors.border, thickness = 1.dp)
-                    DiaryLogRow(diary = diary, onOpen = onOpen, onEdit = { onEditLog(diary) })
-                }
+                DiaryGroupedLogRow(
+                    diary = diary,
+                    isFirst = idx == 0,
+                    isLast = idx == itemsInMonth.lastIndex,
+                    readableEntryIds = state.readableEntryIds,
+                    onAction = onAction,
+                    onEditLog = onEditLog,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                )
+            }
+        }
+        if (hasMore) {
+            item(key = "diary_load_more") {
+                DiaryLoadMoreFooter(
+                    remaining = (totalFilteredCount - diaryEntries.size).coerceAtLeast(0),
+                    isLoadingMore = isLoadingMore,
+                    onLoadMore = { onAction(MainAction.LoadMoreDiary) },
+                )
             }
         }
         item(key = "diary_bottom_spacer") { Spacer(modifier = Modifier.height(72.dp)) }
+    }
+}
+
+@Suppress("LongParameterList")
+@Composable
+private fun DiaryGroupedLogRow(
+    diary: DiaryEntryItem,
+    isFirst: Boolean,
+    isLast: Boolean,
+    readableEntryIds: Set<String>,
+    onAction: (MainAction) -> Unit,
+    onEditLog: (DiaryEntryItem) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val onOpen =
+        resolveCatalogEntryOpenAction(
+            entryId = diary.entryId,
+            externalUrl = diary.url,
+            readableIds = readableEntryIds,
+            onOpenReader = { onAction(MainAction.OpenReader(it)) },
+            onOpenExternalUrl = onOpenExternalUrl,
+            entryKind = diary.kind,
+            onOpenCatalogDetail = { onAction(MainAction.OpenCatalogDetailSheet(it)) },
+        )
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .lazyGroupedCardRow(
+                    isFirst = isFirst,
+                    isLast = isLast,
+                    surfaceColor = colors.surface,
+                    borderColor = colors.border,
+                )
+    ) {
+        if (!isFirst) HorizontalDivider(color = colors.border, thickness = 1.dp)
+        DiaryLogRow(diary = diary, onOpen = onOpen, onEdit = { onEditLog(diary) })
+    }
+}
+
+@Composable
+private fun DiaryLoadMoreFooter(
+    remaining: Int,
+    isLoadingMore: Boolean,
+    onLoadMore: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Spacer(modifier = Modifier.height(12.dp))
+    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+        TextButton(
+            enabled = !isLoadingMore,
+            onClick = onLoadMore,
+            modifier = Modifier.testTag("diary_load_more_btn"),
+        ) {
+            Text(
+                text = if (isLoadingMore) "Loading…" else "Load More ($remaining remaining)",
+                color = colors.accentBlue,
+                fontSize = 13.sp,
+            )
+        }
     }
 }
 

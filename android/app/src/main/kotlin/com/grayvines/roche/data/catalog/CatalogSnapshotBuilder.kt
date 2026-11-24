@@ -15,9 +15,11 @@ import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.ComparisonEntity
-import com.grayvines.roche.data.local.ConsumptionLogEntity
+import com.grayvines.roche.data.local.DiaryLogRow
 import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryIdentifierEntity
+import com.grayvines.roche.data.local.EntryStatusRow
+import com.grayvines.roche.data.local.LatestEntryLogRow
 import com.grayvines.roche.data.local.isDynamic
 import com.grayvines.roche.ranking.EpRankingEngine
 import java.time.ZoneOffset
@@ -30,13 +32,20 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 
+internal data class RawCatalogLogSummary(
+    val entryStatuses: List<EntryStatusRow> = emptyList(),
+    val latestLogs: List<LatestEntryLogRow> = emptyList(),
+    val recentDiaryLogs: List<DiaryLogRow> = emptyList(),
+    val totalDiaryCount: Int = 0,
+)
+
 internal data class RawCatalogTables(
     val entries: List<EntryEntity>,
     val identifiers: List<EntryIdentifierEntity>,
     val specs: List<CollectionSpecEntity>,
     val memberships: List<CollectionEntryEntity>,
     val generators: List<CollectionGeneratorEntity>,
-    val logs: List<ConsumptionLogEntity>,
+    val logSummary: RawCatalogLogSummary = RawCatalogLogSummary(),
     val comparisons: List<ComparisonEntity>,
 )
 
@@ -60,12 +69,21 @@ internal fun buildCatalogSnapshot(
             rankedInput.globalScores,
             rankedInput.globalOrderings,
         )
+    val recentDiary = tables.logSummary.recentDiaryLogs.map { toDiaryEntryItem(it, globalTiers) }
+    val diaryConsumedCount =
+        rankedInput.consumedIds.count { id ->
+            rankedInput.domainEntries[id]?.kind?.isDiaryVisibleKind == true
+        }
     return CatalogSnapshot(
         lists = collectionBundle.sortedLists,
         wantQueues = collectionBundle.sortedWants,
         entriesByCollectionId = collectionBundle.entriesByCollectionId,
         entriesById = rankedInput.domainEntries.filterValues { it.kind != EntryKind.COLLECTION },
-        diaryEntries = buildDiaryItems(tables.logs, rankedInput.domainEntries, globalTiers),
+        recentDiaryEntries = recentDiary,
+        totalDiaryCount = tables.logSummary.totalDiaryCount,
+        consumedEntryIds = rankedInput.consumedIds,
+        consumedCount = diaryConsumedCount,
+        globalTiersByEntryId = globalTiers,
         generators =
             buildCollectionGeneratorStates(
                 specs = tables.specs,
@@ -87,7 +105,16 @@ private fun buildRankedCollectionsInput(
     epScoreCache: EpScoreCache?,
 ): RankedCollectionsInput {
     val mergeRedirects = buildCatalogMergeRedirects(tables.entries)
-    val logsByEntryId = tables.logs.groupBy { it.entryId }
+    val consumedIds = HashSet<String>()
+    val abandonedIds = HashSet<String>()
+    val statusesByEntryId = HashMap<String, MutableSet<ConsumptionStatus>>()
+    for (row in tables.logSummary.entryStatuses) {
+        val status = ConsumptionStatus.fromWireValue(row.status)
+        statusesByEntryId.getOrPut(row.entryId) { HashSet() }.add(status)
+        if (status == ConsumptionStatus.CONSUMED) consumedIds.add(row.entryId)
+        if (status == ConsumptionStatus.ABANDONED) abandonedIds.add(row.entryId)
+    }
+    val latestLogsByEntryId = tables.logSummary.latestLogs.associateBy { it.entryId }
     val prepared = prepareComparisons(tables.comparisons, mergeRedirects, epScoreCache)
     return RankedCollectionsInput(
         specs = tables.specs,
@@ -95,13 +122,10 @@ private fun buildRankedCollectionsInput(
         membershipsByCollection = groupSortedMemberships(tables.memberships),
         generatorsByCollection = tables.generators.associateBy { it.collectionId },
         domainEntries = buildDomainEntries(activeEntries, tables.identifiers),
-        consumedIds = extractEntryIdsWithStatus(tables.logs, ConsumptionStatus.CONSUMED),
-        abandonedIds = extractEntryIdsWithStatus(tables.logs, ConsumptionStatus.ABANDONED),
-        statusesByEntryId =
-            logsByEntryId.mapValues { (_, list) ->
-                list.map { ConsumptionStatus.fromWireValue(it.status) }.toHashSet()
-            },
-        logsByEntryId = logsByEntryId,
+        consumedIds = consumedIds,
+        abandonedIds = abandonedIds,
+        statusesByEntryId = statusesByEntryId,
+        latestLogsByEntryId = latestLogsByEntryId,
         globalOrderings = prepared.globalEp.orderings,
         globalScores = prepared.globalEp.scores,
         scopedComparisonsByColId = prepared.scopedByColId,
@@ -151,15 +175,6 @@ private fun buildDomainEntries(
     }
 }
 
-private fun extractEntryIdsWithStatus(
-    logs: List<ConsumptionLogEntity>,
-    status: ConsumptionStatus,
-): Set<String> =
-    logs
-        .filter { ConsumptionStatus.fromWireValue(it.status) == status }
-        .map { it.entryId }
-        .toHashSet()
-
 private fun groupSortedMemberships(
     memberships: List<CollectionEntryEntity>
 ): Map<String, List<CollectionEntryEntity>> =
@@ -186,7 +201,7 @@ private data class RankedCollectionsInput(
     val consumedIds: Set<String>,
     val abandonedIds: Set<String>,
     val statusesByEntryId: Map<String, Set<ConsumptionStatus>>,
-    val logsByEntryId: Map<String, List<ConsumptionLogEntity>>,
+    val latestLogsByEntryId: Map<String, LatestEntryLogRow>,
     val globalOrderings: List<List<List<String>>>,
     val globalScores: Map<String, EpRankingEngine.Score>,
     val scopedComparisonsByColId: Map<String, List<ComparisonEntity>>,
@@ -323,7 +338,7 @@ private fun rankSpecEntries(
         isPriorityScoped = isWant,
         orderings = orderings,
         precomputedScores = precomputedScores,
-        logsByEntryId = input.logsByEntryId,
+        latestLogsByEntryId = input.latestLogsByEntryId,
     )
 }
 
@@ -455,7 +470,7 @@ internal fun rankEntriesByOrderings(
     isPriorityScoped: Boolean,
     orderings: List<List<List<String>>>,
     precomputedScores: Map<String, EpRankingEngine.Score>? = null,
-    logsByEntryId: Map<String, List<ConsumptionLogEntity>> = emptyMap(),
+    latestLogsByEntryId: Map<String, LatestEntryLogRow> = emptyMap(),
 ): List<RankedCatalogEntry> {
     if (entries.isEmpty()) return emptyList()
     val memberIds = entries.map { it.id }
@@ -480,7 +495,7 @@ internal fun rankEntriesByOrderings(
     val maxMean = localScores.values.maxOfOrNull { it.mean } ?: 0.0
     return sortedEntries.mapIndexed { idx, domain ->
         val score = localScores[domain.id] ?: EpRankingEngine.Score()
-        val latestLog = logsByEntryId[domain.id]?.firstOrNull()
+        val latestLog = latestLogsByEntryId[domain.id]
         RankedCatalogEntry(
             entry = domain,
             rank = idx + 1,
@@ -565,32 +580,28 @@ private fun computePerKindGlobalTiers(
     return tiers
 }
 
-private fun buildDiaryItems(
-    logs: List<ConsumptionLogEntity>,
-    domainEntries: Map<String, CatalogEntryItem>,
-    globalTiers: Map<String, Char>,
-): List<DiaryEntryItem> = logs.mapNotNull { log ->
-    domainEntries[log.entryId]
-        ?.takeIf { it.kind.isDiaryVisibleKind }
-        ?.let { entry ->
-            val (monthKey, dateLabel) = formatDiaryTimestamp(log.ts)
-            val status = ConsumptionStatus.fromWireValue(log.status)
-            DiaryEntryItem(
-                id = log.id,
-                entryId = entry.id,
-                kind = entry.kind,
-                title = entry.title,
-                creators = entry.creators,
-                releaseYear = entry.releaseYear,
-                ts = log.ts,
-                monthKey = monthKey,
-                dateLabel = dateLabel,
-                status = status,
-                notes = log.notes?.takeIf { it.isNotBlank() },
-                tier = if (status == ConsumptionStatus.CONSUMED) globalTiers[entry.id] else null,
-                thumbnailUrl = entry.thumbnailUrl,
-            )
-        }
+internal fun toDiaryEntryItem(
+    row: DiaryLogRow,
+    globalTiers: Map<String, Char> = emptyMap(),
+): DiaryEntryItem {
+    val (monthKey, dateLabel) = formatDiaryTimestamp(row.ts)
+    val status = ConsumptionStatus.fromWireValue(row.status)
+    return DiaryEntryItem(
+        id = row.id,
+        entryId = row.entryId,
+        kind = EntryKind.fromWireValue(row.kind),
+        title = row.title,
+        creators = decodeCreatorsJson(row.creatorsJson),
+        releaseYear = row.releaseYear,
+        ts = row.ts,
+        monthKey = monthKey,
+        dateLabel = dateLabel,
+        status = status,
+        notes = row.notes?.takeIf { it.isNotBlank() },
+        tier = if (status == ConsumptionStatus.CONSUMED) globalTiers[row.entryId] else null,
+        thumbnailUrl = row.thumbnailUrl?.takeIf { it.isNotBlank() },
+        url = row.url?.takeIf { it.isNotBlank() },
+    )
 }
 
 @Suppress("LongParameterList")

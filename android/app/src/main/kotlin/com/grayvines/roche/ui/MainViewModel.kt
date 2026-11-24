@@ -11,6 +11,7 @@ import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
 import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.catalog.EntryDiaryLogsResult
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
@@ -108,6 +109,11 @@ class MainViewModel(
             scope = viewModelScope,
             repository = repository,
         )
+    private val diaryFeature =
+        DiaryFeatureModel(
+            scope = viewModelScope,
+            repository = repository,
+        )
     private val searchFeature =
         SearchFeatureModel(
             scope = viewModelScope,
@@ -121,7 +127,9 @@ class MainViewModel(
         combine(
             catalogRankFeature.resolvingMusicEntryId,
             settingsFeature.settingsHubResetTick,
-        ) { _, _ ->
+            diaryFeature.diaryState,
+            diaryFeature.detailLogsState,
+        ) { _, _, _, _ ->
             currentAuxUiMeta()
         }
 
@@ -184,6 +192,10 @@ class MainViewModel(
         observeActiveEpisodeNotes()
         observeActiveCollectionDraws()
         observeSettledStars()
+        diaryFeature.startObserving(
+            snapshotFlow = sharedSnapshotFlow,
+            detailEntryIdFlow = transientState.map { it.catalogDetailEntryId },
+        )
         restoredNavState?.let(::restoreNavigationSideEffects)
     }
 
@@ -191,6 +203,8 @@ class MainViewModel(
         AuxUiMeta(
             resolvingMusicEntryId = catalogRankFeature.resolvingMusicEntryId.value,
             settingsHubResetTick = settingsFeature.settingsHubResetTick.value,
+            diary = diaryFeature.diaryState.value,
+            catalogDetailLogs = diaryFeature.detailLogsState.value,
         )
 
     private fun observeSettledStars() {
@@ -327,6 +341,7 @@ class MainViewModel(
     }
 
     private fun handleUiSideEffects(action: MainAction.Ui) {
+        if (diaryFeature.handleUiAction(action)) return
         when (action) {
             is MainAction.OpenReader -> openReaderAndCancelBoardLoad(action.entryId)
             is MainAction.OpenBoardReader ->
@@ -638,6 +653,8 @@ class MainViewModel(
 private data class AuxUiMeta(
     val resolvingMusicEntryId: String?,
     val settingsHubResetTick: Int,
+    val diary: DiaryUiState,
+    val catalogDetailLogs: EntryDiaryLogsResult?,
 )
 
 private data class RootUiStateInput(
@@ -700,6 +717,8 @@ private fun reduceDerivedUiStateSlice(
             local = input.local,
             resolvingMusicEntryId = input.auxMeta.resolvingMusicEntryId,
             settingsHubResetTick = input.auxMeta.settingsHubResetTick,
+            diary = input.auxMeta.diary,
+            catalogDetailLogs = input.auxMeta.catalogDetailLogs,
         )
     return DerivedUiStateSlice(
         rawEntries = input.snapshot.entries,

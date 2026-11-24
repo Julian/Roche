@@ -10,6 +10,7 @@ import com.grayvines.roche.data.boards.RawBoardTables
 import com.grayvines.roche.data.boards.projectBoardsSnapshot
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.RawCatalogTables
+import com.grayvines.roche.data.catalog.loadRawCatalogLogSummary
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.EntryContentPreviewRow
@@ -72,6 +73,7 @@ internal class UnifiedSnapshotLoader(
             boards = boardsProjection.boards,
             boardItems = boardsProjection.boardItems,
             boardItemStates = boardsProjection.boardItemStates,
+            diaryRevisionStamp = "${tablesState.stamp.logsStamp}|${tablesState.stamp.entriesStamp}",
         )
     }
 
@@ -140,9 +142,13 @@ internal class UnifiedSnapshotLoader(
                 ) {
                     dao.getAllCollectionGenerators()
                 },
-            logs =
-                reloadTable(stamp.logsStamp != prevStamp?.logsStamp, prevCat?.logs) {
-                    dao.getAllConsumptionLogs()
+            logSummary =
+                reloadTable(
+                    stamp.logsStamp != prevStamp?.logsStamp ||
+                        stamp.entriesStamp != prevStamp.entriesStamp,
+                    prevCat?.logSummary,
+                ) {
+                    loadRawCatalogLogSummary(dao)
                 },
             comparisons =
                 reloadTable(
@@ -364,7 +370,7 @@ internal fun projectInboxTables(
             .sortedWith(compareBy<CollectionEntryEntity> { it.addedAt }.thenBy { it.collectionId })
             .groupBy { it.entryId }
     val consumedEntryIds =
-        catalogTables.logs
+        catalogTables.logSummary.entryStatuses
             .asSequence()
             .filter { it.status.equals(STATUS_CONSUMED, ignoreCase = true) }
             .mapTo(HashSet()) { it.entryId }

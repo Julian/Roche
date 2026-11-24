@@ -46,11 +46,13 @@ import com.grayvines.roche.data.boards.resolveBoardItemForAction
 import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.DiaryEntryItem
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.attachEntryIdentifiers
 import com.grayvines.roche.data.catalog.deleteConsumedLogsInDao
 import com.grayvines.roche.data.catalog.hasYoutubeAlbumBrowseId
 import com.grayvines.roche.data.catalog.logFeedItemConsumedInDao
+import com.grayvines.roche.data.catalog.toDiaryEntryItem
 import com.grayvines.roche.data.enrichment.AlbumStreamingResolver
 import com.grayvines.roche.data.enrichment.withResolvedStreamingIds
 import com.grayvines.roche.data.feeds.LocalFeedPoller
@@ -195,7 +197,7 @@ data class WorkspaceSearchResult(
     val entries: List<InboxEntry> = emptyList(),
     val snippetsByEntryId: Map<String, String> = emptyMap(),
     val matchedCollectionIds: List<String> = emptyList(),
-    val matchedDiaryLogs: List<com.grayvines.roche.data.local.ConsumptionLogEntity> = emptyList(),
+    val matchedDiaryLogs: List<DiaryEntryItem> = emptyList(),
 )
 
 data class RepositorySnapshot(
@@ -207,6 +209,7 @@ data class RepositorySnapshot(
     val boards: List<BoardSummary> = emptyList(),
     val boardItems: Map<String, List<BoardItemView>> = emptyMap(),
     val boardItemStates: Map<Pair<String, String>, BoardItemStateEntity> = emptyMap(),
+    val diaryRevisionStamp: String = "",
 )
 
 @Suppress("TooManyFunctions", "LargeClass", "LongParameterList")
@@ -357,7 +360,20 @@ class RocheRepository(
                     }
                 val snippetsById = buildFtsSnippetsMap(tokenQueries)
                 val matchedCollectionIds = dao.searchCollectionIdsByTitle(likePattern)
-                val matchedDiaryLogs = dao.searchConsumptionLogsByNotes(likePattern)
+                val globalTiers =
+                    (latestSnapshot?.catalog ?: catalog.getSnapshot()).globalTiersByEntryId
+                val matchedDiaryRows =
+                    if (tokenQueries.isNotEmpty()) {
+                        val combinedMatch = tokenQueries.joinToString(" ")
+                        val diaryFtsQuery = "{title creatorsJson} : ($combinedMatch)"
+                        runSuspendCatching {
+                            dao.searchDiaryLogsWithFts(diaryFtsQuery, likePattern)
+                        }
+                            .getOrElse { dao.searchDiaryLogsByLike(likePattern) }
+                    } else {
+                        dao.searchDiaryLogsByLike(likePattern)
+                    }
+                val matchedDiaryLogs = matchedDiaryRows.map { toDiaryEntryItem(it, globalTiers) }
                 WorkspaceSearchResult(
                     entries = entries,
                     snippetsByEntryId = snippetsById,

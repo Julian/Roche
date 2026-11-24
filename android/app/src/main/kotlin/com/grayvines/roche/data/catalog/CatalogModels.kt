@@ -264,6 +264,24 @@ data class DiaryEntryItem(
     val notes: String?,
     val tier: Char?,
     val thumbnailUrl: String? = null,
+    val url: String? = null,
+)
+
+data class DiaryPageResult(
+    val entries: List<DiaryEntryItem> = emptyList(),
+    val availableYears: List<String> = emptyList(),
+    val monthCounts: Map<String, Int> = emptyMap(),
+    val totalFilteredCount: Int = 0,
+    val hasAnyEntries: Boolean = false,
+    val effectiveYear: String? = null,
+    val hasMore: Boolean = false,
+)
+
+data class EntryDiaryLogsResult(
+    val entryId: String,
+    val logs: List<DiaryEntryItem> = emptyList(),
+    val totalCount: Int = 0,
+    val hasMore: Boolean = false,
 )
 
 data class CollectionGeneratorState(
@@ -288,18 +306,19 @@ data class CatalogSnapshot(
     val wantQueues: List<CatalogListSummary> = emptyList(),
     val entriesByCollectionId: Map<String, List<RankedCatalogEntry>> = emptyMap(),
     val entriesById: Map<String, CatalogEntryItem> = emptyMap(),
-    val diaryEntries: List<DiaryEntryItem> = emptyList(),
+    val recentDiaryEntries: List<DiaryEntryItem> = emptyList(),
+    val totalDiaryCount: Int = recentDiaryEntries.size,
+    val consumedEntryIds: Set<String> =
+        recentDiaryEntries
+            .filter { it.status == ConsumptionStatus.CONSUMED }
+            .mapTo(HashSet()) { it.entryId },
+    val consumedCount: Int = consumedEntryIds.count { id ->
+        entriesById[id]?.kind?.isDiaryVisibleKind != false
+    },
+    val globalTiersByEntryId: Map<String, Char> = emptyMap(),
     val generators: List<CollectionGeneratorState> = emptyList(),
     val comparisonCount: Int = 0,
 ) {
-    val consumedCount: Int
-        get() =
-            diaryEntries
-                .filter { it.status == ConsumptionStatus.CONSUMED }
-                .map { it.entryId }
-                .distinct()
-                .size
-
     val wantItemCount: Int
         get() = wantQueues.sumOf { it.entryCount }
 }

@@ -29,10 +29,7 @@ internal fun CollectionDrawSnapshot.musicResolveKey(): String = entryId.ifBlank 
     "$creator|$title"
 }
 
-internal data class CatalogProjections(
-    val catalog: CatalogSnapshot = CatalogSnapshot(),
-    val catalogUrlsById: Map<String, String> = emptyMap(),
-)
+internal data class CatalogProjections(val catalog: CatalogSnapshot = CatalogSnapshot())
 
 internal class CatalogRankFeatureModel(
     private val scope: CoroutineScope,
@@ -105,27 +102,4 @@ internal class CatalogRankFeatureModel(
 }
 
 internal fun buildCatalogProjections(catalog: CatalogSnapshot): CatalogProjections =
-    CatalogProjections(
-        catalog = catalog,
-        catalogUrlsById = computeCatalogUrlsById(catalog),
-    )
-
-internal fun computeCatalogUrlsById(catalog: CatalogSnapshot): Map<String, String> {
-    if (catalog.entriesById.isEmpty() && catalog.entriesByCollectionId.isEmpty()) return emptyMap()
-    val urls = LinkedHashMap<String, String>()
-    for (item in catalog.entriesById.values) {
-        val url = item.url
-        if (!url.isNullOrBlank()) {
-            urls[item.id] = url
-        }
-    }
-    for (entries in catalog.entriesByCollectionId.values) {
-        for (ranked in entries) {
-            val url = ranked.entry.url
-            if (!url.isNullOrBlank() && ranked.entry.id !in urls) {
-                urls[ranked.entry.id] = url
-            }
-        }
-    }
-    return urls
-}
+    CatalogProjections(catalog = catalog)

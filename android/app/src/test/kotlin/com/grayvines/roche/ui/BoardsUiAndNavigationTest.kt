@@ -538,7 +538,7 @@ class BoardsUiAndNavigationTest {
                             mapOf(
                                 STARRED_COLLECTION_ID to listOf(sampleRankedCatalogEntry("e-ext"))
                             ),
-                        diaryEntries = listOf(sampleConsumedDiaryItem("e-ext")),
+                        recentDiaryEntries = listOf(sampleConsumedDiaryItem("e-ext")),
                     ),
             )
         val reconciled =

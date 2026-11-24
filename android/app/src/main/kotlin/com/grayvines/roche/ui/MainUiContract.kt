@@ -14,6 +14,7 @@ import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.EntryDiaryLogsResult
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.RankSettlementSummary
 import com.grayvines.roche.data.catalog.UpdateCatalogEntryInput
@@ -209,7 +210,8 @@ data class MainUiState(
     val offlineBytesByEntryId: Map<String, Long> = emptyMap(),
     val totalOfflineCacheBytes: Long = 0L,
     val catalog: CatalogSnapshot = CatalogSnapshot(),
-    val catalogUrlsById: Map<String, String> = computeCatalogUrlsById(catalog),
+    val diary: DiaryUiState = DiaryUiState(),
+    val catalogDetailLogs: EntryDiaryLogsResult? = null,
     val resolvingMusicEntryId: String? = null,
     val companionSubTab: CompanionSubTab = CompanionSubTab.LISTS,
     val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
@@ -603,6 +605,14 @@ sealed interface MainAction {
     data class SelectCatalogCollection(val collectionId: String?) : CatalogUi
 
     data class SelectWantCollection(val collectionId: String) : CatalogUi
+
+    data class SetDiaryStatusFilter(val status: ConsumptionStatus?) : CatalogUi
+
+    data class SetDiaryYearFilter(val year: String?) : CatalogUi
+
+    data object LoadMoreDiary : CatalogUi
+
+    data object LoadMoreCatalogDetailLogs : CatalogUi
 
     data class OpenCatalogDetailSheet(val entryId: String) : CatalogUi
 
@@ -1073,6 +1083,8 @@ internal fun assembleMainUiState(
     local: TransientUiState,
     resolvingMusicEntryId: String?,
     settingsHubResetTick: Int,
+    diary: DiaryUiState = DiaryUiState(),
+    catalogDetailLogs: EntryDiaryLogsResult? = null,
 ): MainUiState {
     val isSyncing = local.isSyncing || inboxDerived.isSyncActive
     val visible =
@@ -1145,7 +1157,8 @@ internal fun assembleMainUiState(
         offlineBytesByEntryId = inboxDerived.offlineSizes.bytesByEntryId,
         totalOfflineCacheBytes = inboxDerived.offlineSizes.totalBytes,
         catalog = catalogProjections.catalog,
-        catalogUrlsById = catalogProjections.catalogUrlsById,
+        diary = diary,
+        catalogDetailLogs = catalogDetailLogs,
         resolvingMusicEntryId = resolvingMusicEntryId,
         companionSubTab = local.companionSubTab,
         queueSubTab = local.queueSubTab,

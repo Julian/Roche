@@ -144,10 +144,7 @@ private suspend fun ensureConsumedOnceInDao(
     nowIso: String,
     nodeId: String,
 ) {
-    val alreadyConsumed =
-        dao.getConsumptionLogsForEntry(entryId).any {
-            ConsumptionStatus.fromWireValue(it.status) == ConsumptionStatus.CONSUMED
-        }
+    val alreadyConsumed = dao.hasConsumedLogForEntry(entryId)
     if (!alreadyConsumed) {
         appendConsumptionInDao(
             dao = dao,
@@ -460,11 +457,7 @@ private suspend fun engageSingleArtistInDao(
     markDirty: Boolean,
     nodeId: String,
 ) {
-    val alreadyLogged =
-        dao.getConsumptionLogsForEntry(artistId).any {
-            ConsumptionStatus.fromWireValue(it.status) == ConsumptionStatus.CONSUMED
-        }
-    if (alreadyLogged) return
+    if (dao.hasConsumedLogForEntry(artistId)) return
     val logId = deterministicAutoLogId(artistId)
     val hlc =
         if (markDirty) {

@@ -269,7 +269,9 @@ data class CollectionGeneratorEntity(
         ],
     indices =
         [
-            Index(value = ["entryId"]),
+            Index(value = ["entryId", "status"]),
+            Index(value = ["entryId", "ts"]),
+            Index(value = ["status", "ts"]),
             Index(value = ["ts"]),
             Index(value = ["createdAt"]),
             Index(value = ["isLocalDirty"]),
@@ -521,6 +523,42 @@ data class ItemTagRow(
 data class SearchSnippetRow(
     val entryId: String,
     val excerpt: String,
+)
+
+data class EntryStatusRow(
+    val entryId: String,
+    val status: String,
+)
+
+data class LatestEntryLogRow(
+    val entryId: String,
+    val status: String,
+    val notes: String?,
+)
+
+data class DiaryYearCountRow(
+    val year: String,
+    val count: Int,
+)
+
+data class DiaryMonthCountRow(
+    val monthKey: String,
+    val count: Int,
+)
+
+@Suppress("LongParameterList")
+data class DiaryLogRow(
+    val id: String,
+    val entryId: String,
+    val kind: String,
+    val title: String,
+    val creatorsJson: String,
+    val releaseYear: Int?,
+    val url: String?,
+    val thumbnailUrl: String?,
+    val ts: String,
+    val status: String,
+    val notes: String?,
 )
 
 @Suppress("LongParameterList")

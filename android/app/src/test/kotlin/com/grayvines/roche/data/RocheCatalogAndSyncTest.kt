@@ -661,7 +661,7 @@ class RocheCatalogAndSyncTest {
             // consumedCount
             val artistsList = afterOneSnap.lists.first { it.slug == "artists" }
             assertTrue(artistsList.entryCount >= 1)
-            assertTrue(afterOneSnap.diaryEntries.none { it.kind == EntryKind.ARTIST })
+            assertTrue(afterOneSnap.recentDiaryEntries.none { it.kind == EntryKind.ARTIST })
             assertEquals(1, afterOneSnap.consumedCount)
         }
 
@@ -737,9 +737,11 @@ class RocheCatalogAndSyncTest {
 
             val snap = catalog.getSnapshot()
             assertTrue(
-                snap.diaryEntries.any { it.entryId == canonId && it.notes == "Noir atmosphere" }
+                snap.recentDiaryEntries.any {
+                    it.entryId == canonId && it.notes == "Noir atmosphere"
+                }
             )
-            assertTrue(snap.diaryEntries.none { it.entryId == dupId })
+            assertTrue(snap.recentDiaryEntries.none { it.entryId == dupId })
             val customMembers =
                 snap.entriesByCollectionId[customListId].orEmpty().map { it.entry.id }
             assertEquals(listOf(canonId), customMembers)

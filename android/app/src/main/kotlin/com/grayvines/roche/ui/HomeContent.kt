@@ -1241,7 +1241,9 @@ internal fun HomeRecentDiaryWidget(
     modifier: Modifier = Modifier,
 ) {
     val diaryEntries =
-        remember(state.catalog.diaryEntries, maxItems) { state.catalog.diaryEntries.take(maxItems) }
+        remember(state.catalog.recentDiaryEntries, maxItems) {
+            state.catalog.recentDiaryEntries.take(maxItems)
+        }
     val openDiary = { onAction(MainAction.OpenCompanionSection(CompanionSubTab.DIARY)) }
 
     Column(
@@ -1264,7 +1266,6 @@ internal fun HomeRecentDiaryWidget(
                 HomeRecentDiaryList(
                     diaryEntries = diaryEntries,
                     readableIds = state.readableEntryIds,
-                    catalogUrlsById = state.catalogUrlsById,
                     onOpenDiary = openDiary,
                     onAction = onAction,
                     onOpenExternalUrl = onOpenExternalUrl,
@@ -1278,7 +1279,6 @@ internal fun HomeRecentDiaryWidget(
 private fun HomeRecentDiaryList(
     diaryEntries: List<DiaryEntryItem>,
     readableIds: Set<String>,
-    catalogUrlsById: Map<String, String>,
     onOpenDiary: () -> Unit,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
@@ -1291,7 +1291,7 @@ private fun HomeRecentDiaryList(
         val onClick =
             resolveCatalogEntryOpenAction(
                 entryId = diary.entryId,
-                externalUrl = catalogUrlsById[diary.entryId],
+                externalUrl = diary.url,
                 readableIds = readableIds,
                 onOpenReader = { onAction(MainAction.OpenReader(it)) },
                 onOpenExternalUrl = onOpenExternalUrl,

@@ -7,6 +7,7 @@ import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.extractArxivIdentifier
 import com.grayvines.roche.core.extractHackerNewsItemId
 import com.grayvines.roche.core.normalizeConsecutiveFailures
+import com.grayvines.roche.data.catalog.RawCatalogLogSummary
 import com.grayvines.roche.data.catalog.RawCatalogTables
 import com.grayvines.roche.data.local.BoardEntity
 import com.grayvines.roche.data.local.BoardItemEntity
@@ -74,7 +75,7 @@ internal fun buildBoardDedupLookup(catalogTables: RawCatalogTables): BoardDedupL
     val idents = indexIdentifiersForBoardDedup(catalogTables, redirects, entryKindById)
     val (inQueueIds, starredIds) = collectMembershipBadges(catalogTables, redirects)
     val finishedIds =
-        catalogTables.logs
+        catalogTables.logSummary.entryStatuses
             .asSequence()
             .filter { it.status.equals(STATUS_CONSUMED, ignoreCase = true) }
             .mapTo(HashSet()) { followRedirect(it.entryId, redirects) }
@@ -142,7 +143,7 @@ internal suspend fun loadBoardDedupLookupFromDao(dao: RocheDao): BoardDedupLooku
             specs = dao.getAllCollectionSpecs(),
             memberships = dao.getAllCollectionEntries(),
             generators = emptyList(),
-            logs = dao.getAllConsumptionLogs(),
+            logSummary = RawCatalogLogSummary(entryStatuses = dao.getDistinctEntryLogStatuses()),
             comparisons = emptyList(),
         )
     return buildBoardDedupLookup(rawCatalog)

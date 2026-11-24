@@ -211,6 +211,35 @@ private const val DEFAULT_FTS_SEARCH_LIMIT = 150
 private const val DEFAULT_FTS_TOKEN_ID_LIMIT = 600
 private const val DEFAULT_EXTRA_SEARCH_LIMIT = 50
 
+private const val DIARY_VISIBLE_ENTRY_WHERE =
+    "(e.mergedIntoId IS NULL OR e.mergedIntoId = '') " +
+        "AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')"
+
+private const val DIARY_LOG_ROW_COLUMNS =
+    "cl.id AS id, " +
+        "cl.entryId AS entryId, " +
+        "e.kind AS kind, " +
+        "e.title AS title, " +
+        "e.creatorsJson AS creatorsJson, " +
+        "e.releaseYear AS releaseYear, " +
+        "e.url AS url, " +
+        "e.thumbnailUrl AS thumbnailUrl, " +
+        "cl.ts AS ts, " +
+        "cl.status AS status, " +
+        "cl.notes AS notes"
+
+private const val DIARY_LOG_ROW_SELECT =
+    "SELECT $DIARY_LOG_ROW_COLUMNS " +
+        "FROM consumption_log cl " +
+        "INNER JOIN entries e ON e.id = cl.entryId " +
+        "WHERE $DIARY_VISIBLE_ENTRY_WHERE"
+
+private const val DIARY_LOG_ROW_CROSS_SELECT =
+    "SELECT $DIARY_LOG_ROW_COLUMNS " +
+        "FROM consumption_log cl " +
+        "CROSS JOIN entries e ON e.id = cl.entryId " +
+        "WHERE $DIARY_VISIBLE_ENTRY_WHERE"
+
 private const val FEED_ROW_SELECT =
     "SELECT fs.collectionId AS id, " +
         "COALESCE(NULLIF(e.title, ''), NULLIF(fs.feedTitle, ''), fs.feedUrl) AS title, " +
@@ -628,16 +657,48 @@ interface RocheDao {
     ): List<String>
 
     @Query(
-        "SELECT cl.* FROM consumption_log cl " +
-            "INNER JOIN entries e ON e.id = cl.entryId " +
-            "WHERE e.mergedIntoId IS NULL AND cl.notes IS NOT NULL " +
-            "AND cl.notes LIKE :likePattern ESCAPE '\\' " +
-            "ORDER BY cl.ts DESC LIMIT :limit"
+        """
+        SELECT $DIARY_LOG_ROW_COLUMNS
+        FROM (
+            SELECT cl.rowid AS logRowId
+            FROM entries_fts
+            INNER JOIN entries e ON e.rowid = entries_fts.rowid
+            INNER JOIN consumption_log cl ON cl.entryId = e.id
+            WHERE entries_fts MATCH :tokenMatchQuery
+              AND $DIARY_VISIBLE_ENTRY_WHERE
+            UNION
+            SELECT cl.rowid AS logRowId
+            FROM consumption_log cl
+            INNER JOIN entries e ON e.id = cl.entryId
+            WHERE cl.notes IS NOT NULL
+              AND cl.notes LIKE :likePattern ESCAPE '\'
+              AND $DIARY_VISIBLE_ENTRY_WHERE
+        ) matched
+        INNER JOIN consumption_log cl ON cl.rowid = matched.logRowId
+        INNER JOIN entries e ON e.id = cl.entryId
+        ORDER BY cl.ts DESC, cl.id DESC
+        LIMIT :limit
+        """
     )
-    suspend fun searchConsumptionLogsByNotes(
+    suspend fun searchDiaryLogsWithFts(
+        tokenMatchQuery: String,
         likePattern: String,
         limit: Int = DEFAULT_EXTRA_SEARCH_LIMIT,
-    ): List<ConsumptionLogEntity>
+    ): List<DiaryLogRow>
+
+    @Query(
+        """
+        $DIARY_LOG_ROW_SELECT AND (
+            e.title LIKE :likePattern ESCAPE '\'
+            OR e.creatorsJson LIKE :likePattern ESCAPE '\'
+            OR (cl.notes IS NOT NULL AND cl.notes LIKE :likePattern ESCAPE '\')
+        ) ORDER BY cl.ts DESC, cl.id DESC LIMIT :limit
+        """
+    )
+    suspend fun searchDiaryLogsByLike(
+        likePattern: String,
+        limit: Int = DEFAULT_EXTRA_SEARCH_LIMIT,
+    ): List<DiaryLogRow>
 
     @Transaction
     suspend fun searchFullItemsByTokens(
@@ -928,6 +989,115 @@ interface RocheDao {
 
     @Query("SELECT * FROM consumption_log ORDER BY ts DESC")
     suspend fun getAllConsumptionLogs(): List<ConsumptionLogEntity>
+
+    @Query("SELECT DISTINCT entryId, status FROM consumption_log")
+    suspend fun getDistinctEntryLogStatuses(): List<EntryStatusRow>
+
+    @Query(
+        "SELECT cl.entryId AS entryId, cl.status AS status, cl.notes AS notes " +
+            "FROM (SELECT DISTINCT entryId FROM consumption_log) d " +
+            "INNER JOIN consumption_log cl ON cl.rowid = (" +
+            "SELECT cl2.rowid FROM consumption_log cl2 " +
+            "WHERE cl2.entryId = d.entryId " +
+            "ORDER BY cl2.ts DESC, cl2.id DESC LIMIT 1" +
+            ")"
+    )
+    suspend fun getLatestLogsPerEntry(): List<LatestEntryLogRow>
+
+    @Query(
+        "SELECT EXISTS(SELECT 1 FROM consumption_log " +
+            "WHERE entryId = :entryId AND status = 'consumed')"
+    )
+    suspend fun hasConsumedLogForEntry(entryId: String): Boolean
+
+    @Query(
+        "SELECT COUNT(*) FROM consumption_log cl " +
+            "INNER JOIN entries e ON e.id = cl.entryId " +
+            "WHERE $DIARY_VISIBLE_ENTRY_WHERE"
+    )
+    suspend fun countDiaryLogs(): Int
+
+    @Query(
+        "SELECT SUBSTR(cl.ts, 1, 4) AS year, COUNT(*) AS count " +
+            "FROM consumption_log cl " +
+            "INNER JOIN entries e ON e.id = cl.entryId " +
+            "WHERE $DIARY_VISIBLE_ENTRY_WHERE AND cl.ts GLOB '[0-9][0-9][0-9][0-9]*' " +
+            "GROUP BY year ORDER BY year DESC"
+    )
+    suspend fun getDiaryYearCounts(): List<DiaryYearCountRow>
+
+    @Query(
+        "SELECT SUBSTR(cl.ts, 1, 7) AS monthKey, COUNT(*) AS count " +
+            "FROM consumption_log cl " +
+            "INNER JOIN entries e ON e.id = cl.entryId " +
+            "WHERE $DIARY_VISIBLE_ENTRY_WHERE " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "GROUP BY monthKey ORDER BY monthKey DESC"
+    )
+    suspend fun getDiaryMonthCounts(minTs: String, maxTs: String): List<DiaryMonthCountRow>
+
+    @Query(
+        "SELECT SUBSTR(cl.ts, 1, 7) AS monthKey, COUNT(*) AS count " +
+            "FROM consumption_log cl " +
+            "INNER JOIN entries e ON e.id = cl.entryId " +
+            "WHERE $DIARY_VISIBLE_ENTRY_WHERE " +
+            "AND cl.status = :status " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "GROUP BY monthKey ORDER BY monthKey DESC"
+    )
+    suspend fun getDiaryMonthCountsByStatus(
+        status: String,
+        minTs: String,
+        maxTs: String,
+    ): List<DiaryMonthCountRow>
+
+    @Query(
+        "$DIARY_LOG_ROW_CROSS_SELECT " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "ORDER BY cl.ts DESC, cl.id DESC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getDiaryLogPage(
+        minTs: String,
+        maxTs: String,
+        limit: Int,
+        offset: Int,
+    ): List<DiaryLogRow>
+
+    @Query(
+        "$DIARY_LOG_ROW_CROSS_SELECT " +
+            "AND cl.status = :status " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "ORDER BY cl.ts DESC, cl.id DESC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getDiaryLogPageByStatus(
+        status: String,
+        minTs: String,
+        maxTs: String,
+        limit: Int,
+        offset: Int,
+    ): List<DiaryLogRow>
+
+    @Query(
+        "$DIARY_LOG_ROW_SELECT " +
+            "AND cl.entryId = :entryId " +
+            "ORDER BY cl.ts DESC, cl.id DESC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getDiaryLogsForEntry(entryId: String, limit: Int, offset: Int): List<DiaryLogRow>
+
+    @Query(
+        "SELECT COUNT(*) FROM consumption_log cl " +
+            "INNER JOIN entries e ON e.id = cl.entryId " +
+            "WHERE $DIARY_VISIBLE_ENTRY_WHERE AND cl.entryId = :entryId"
+    )
+    suspend fun countDiaryLogsForEntry(entryId: String): Int
+
+    @Query("SELECT * FROM consumption_log WHERE id IN (:ids)")
+    suspend fun getConsumptionLogsByIds(ids: List<String>): List<ConsumptionLogEntity>
+
+    @Query(
+        "SELECT * FROM consumption_log " + "WHERE entryId IN (:entryIds) AND status = 'consumed'"
+    )
+    suspend fun getConsumedLogsForEntries(entryIds: List<String>): List<ConsumptionLogEntity>
 
     @Query("SELECT * FROM consumption_log WHERE isLocalDirty = 1")
     suspend fun getDirtyConsumptionLogs(): List<ConsumptionLogEntity>

@@ -14,7 +14,6 @@ import com.grayvines.roche.data.boards.BoardItemView
 import com.grayvines.roche.data.boards.BoardReaderContent
 import com.grayvines.roche.data.boards.BoardSummary
 import com.grayvines.roche.data.boards.HackerNewsSection
-import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.inferContentType
@@ -187,11 +186,7 @@ private fun buildEphemeralDedupSets(snapshot: RepositorySnapshot): EphemeralDedu
             inQueueIds.add(it.entry.id)
         }
     }
-    val finishedIds =
-        snapshot.catalog.diaryEntries
-            .asSequence()
-            .filter { it.status == ConsumptionStatus.CONSUMED }
-            .mapTo(HashSet()) { it.entryId }
+    val finishedIds = snapshot.catalog.consumedEntryIds
     return EphemeralDedupSets(
         entryIdByCanonUrl = byCanonUrl,
         entryIdByArxiv = byArxiv,

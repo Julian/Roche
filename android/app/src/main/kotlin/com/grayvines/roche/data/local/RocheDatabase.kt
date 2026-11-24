@@ -35,7 +35,7 @@ import kotlin.coroutines.CoroutineContext
             BoardItemEntity::class,
             BoardItemStateEntity::class,
         ],
-    version = 14,
+    version = 15,
     exportSchema = true,
 )
 abstract class RocheDatabase : RoomDatabase() {
@@ -215,6 +215,13 @@ abstract class RocheDatabase : RoomDatabase() {
                 }
             }
 
+        internal val MIGRATION_14_15 =
+            object : Migration(14, 15) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    migrateSchemaV14ToV15(connection)
+                }
+            }
+
         internal fun schemaCallback(): Callback =
             object : Callback() {
                 override suspend fun onCreate(connection: SQLiteConnection) {
@@ -243,6 +250,7 @@ abstract class RocheDatabase : RoomDatabase() {
                 MIGRATION_11_12,
                 MIGRATION_12_13,
                 MIGRATION_13_14,
+                MIGRATION_14_15,
             )
 
         internal fun createInMemory(

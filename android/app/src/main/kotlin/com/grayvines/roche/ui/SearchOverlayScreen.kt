@@ -137,12 +137,14 @@ private fun rememberSearchOverlayComputed(
             } else {
                 emptyList()
             }
+        val effectiveDiaryTotalCount =
+            resolveDiarySearchTotalCount(displayState, scopeFilter, allDiaryMatches.size)
         val scopeCounts =
             computeSearchScopeCounts(
                 searchResults = displayState.searchResults,
                 catalogTotalCount = catalogResult.totalCount,
                 listTotalCount = allListMatches.size,
-                diaryTotalCount = allDiaryMatches.size,
+                diaryTotalCount = effectiveDiaryTotalCount,
                 hasQuery = displayState.searchQuery.isNotBlank(),
             )
         SearchOverlayComputed(
@@ -152,9 +154,20 @@ private fun rememberSearchOverlayComputed(
             shownListMatches = shownListMatches,
             listTotalCount = allListMatches.size,
             shownDiaryMatches = shownDiaryMatches,
-            diaryTotalCount = allDiaryMatches.size,
+            diaryTotalCount = effectiveDiaryTotalCount,
             scopeCounts = scopeCounts,
         )
+    }
+
+private fun resolveDiarySearchTotalCount(
+    displayState: MainUiState,
+    scopeFilter: SearchScopeFilter,
+    matchedCount: Int,
+): Int =
+    if (displayState.searchQuery.isBlank() && scopeFilter == SearchScopeFilter.DIARY) {
+        maxOf(displayState.catalog.totalDiaryCount, matchedCount)
+    } else {
+        matchedCount
     }
 
 private fun resolveSearchListMatches(
@@ -182,15 +195,9 @@ private fun resolveSearchDiaryMatches(
 ): List<DiaryEntryItem> {
     val cleanQuery = state.searchQuery.trim().trimStart('#').trim()
     if (cleanQuery.isEmpty()) {
-        return if (includeWhenBlank) state.catalog.diaryEntries else emptyList()
+        return if (includeWhenBlank) state.catalog.recentDiaryEntries else emptyList()
     }
-    val ftsIds = state.workspaceSearch.matchedDiaryLogs.mapTo(HashSet()) { it.id }
-    return state.catalog.diaryEntries.filter { diary ->
-        diary.id in ftsIds ||
-            diary.title.contains(cleanQuery, ignoreCase = true) ||
-            diary.notes?.contains(cleanQuery, ignoreCase = true) == true ||
-            diary.creators.any { it.contains(cleanQuery, ignoreCase = true) }
-    }
+    return state.workspaceSearch.matchedDiaryLogs
 }
 
 @Composable

@@ -345,8 +345,8 @@ class CatalogRankAndDiaryFlowsTest {
             )
         val uiJob = collectInBackground(viewModel.uiState)
         val loaded =
-            viewModel.uiState.first { st -> st.catalog.diaryEntries.any { it.entryId == entryId } }
-        val logId = loaded.catalog.diaryEntries.first { it.entryId == entryId }.id
+            viewModel.uiState.first { st -> st.diary.entries.any { it.entryId == entryId } }
+        val logId = loaded.diary.entries.first { it.entryId == entryId }.id
 
         viewModel.dispatch(
             MainAction.UpdateConsumptionLog(
@@ -359,20 +359,17 @@ class CatalogRankAndDiaryFlowsTest {
         )
         val updated =
             viewModel.uiState.first { st ->
-                st.catalog.diaryEntries.any {
+                st.diary.entries.any {
                     it.id == logId &&
                         it.status == ConsumptionStatus.ABANDONED &&
                         it.notes == "Updated note"
                 }
             }
-        assertTrue(
-            updated.catalog.diaryEntries.first { it.id == logId }.ts.startsWith("2025-06-15")
-        )
+        assertTrue(updated.diary.entries.first { it.id == logId }.ts.startsWith("2025-06-15"))
 
         viewModel.dispatch(MainAction.DeleteConsumptionLog(logId))
-        val deleted =
-            viewModel.uiState.first { st -> st.catalog.diaryEntries.none { it.id == logId } }
-        assertTrue(deleted.catalog.diaryEntries.none { it.id == logId })
+        val deleted = viewModel.uiState.first { st -> st.diary.entries.none { it.id == logId } }
+        assertTrue(deleted.diary.entries.none { it.id == logId })
         uiJob.cancel()
     }
 

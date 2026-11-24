@@ -35,6 +35,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalBottomSheetProperties
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -119,6 +120,9 @@ private data class CatalogDetailModel(
     val primaryAppearance: CatalogListAppearance?,
     val matchingArtistId: String?,
     val diaryLogs: List<DiaryEntryItem>,
+    val diaryLogsTotalCount: Int,
+    val hasMoreDiaryLogs: Boolean,
+    val isLoadingDiaryLogs: Boolean,
     val genres: List<String>,
     val tracks: List<AlbumTrackItem>,
     val wikiUrl: String?,
@@ -139,7 +143,10 @@ internal fun CatalogDetailBottomSheet(
     onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
-    val model = remember(entryId, state.catalog) { buildCatalogDetailModel(entryId, state) }
+    val model =
+        remember(entryId, state.catalog, state.catalogDetailLogs, state.diary.entries) {
+            buildCatalogDetailModel(entryId, state)
+        }
     if (model == null) return
     val colors = LocalRocheColors.current
     val scrollState = rememberScrollState()
@@ -494,13 +501,29 @@ private fun AlbumDetailSheetBody(
                     openList,
                     onOpenExternalUrl,
                 )
-                CatalogDiarySection(model.entry, model.diaryLogs, onAction, onEditDiaryLog)
+                CatalogDiarySection(
+                    entry = model.entry,
+                    logs = model.diaryLogs,
+                    totalCount = model.diaryLogsTotalCount,
+                    hasMore = model.hasMoreDiaryLogs,
+                    isLoading = model.isLoadingDiaryLogs,
+                    onAction = onAction,
+                    onEditDiaryLog = onEditDiaryLog,
+                )
             }
         }
     } else {
         AlbumTracklistSection(model.entry, model.tracks, onPlayAlbum, onPlayMusicTrack)
         CatalogListsSection(model.appearances, model.wikiUrl, null, openList, onOpenExternalUrl)
-        CatalogDiarySection(model.entry, model.diaryLogs, onAction, onEditDiaryLog)
+        CatalogDiarySection(
+            entry = model.entry,
+            logs = model.diaryLogs,
+            totalCount = model.diaryLogsTotalCount,
+            hasMore = model.hasMoreDiaryLogs,
+            isLoading = model.isLoadingDiaryLogs,
+            onAction = onAction,
+            onEditDiaryLog = onEditDiaryLog,
+        )
     }
 }
 
@@ -1007,14 +1030,19 @@ private fun CatalogDiaryAddLogButton(entry: CatalogEntryItem, onAction: (MainAct
     }
 }
 
+@Suppress("LongParameterList")
 @Composable
 private fun CatalogDiarySection(
     entry: CatalogEntryItem,
     logs: List<DiaryEntryItem>,
+    totalCount: Int,
+    hasMore: Boolean,
+    isLoading: Boolean = false,
     onAction: (MainAction) -> Unit,
     onEditDiaryLog: (DiaryEntryItem) -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val headerLabel = if (totalCount > logs.size) "DIARY ($totalCount)" else "DIARY"
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 2.dp),
@@ -1022,7 +1050,7 @@ private fun CatalogDiarySection(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = "DIARY",
+                text = headerLabel,
                 color = colors.textMuted,
                 fontSize = 10.5.sp,
                 fontWeight = FontWeight.Medium,
@@ -1032,21 +1060,66 @@ private fun CatalogDiarySection(
             CatalogDiaryAddLogButton(entry = entry, onAction = onAction)
         }
         RocheSurfaceCard {
-            if (logs.isEmpty()) {
-                Text(
-                    text = "No plays logged yet.",
-                    color = colors.textMuted,
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-                )
-            } else {
-                logs.forEachIndexed { idx, log ->
-                    if (idx > 0) {
-                        HorizontalDivider(color = colors.border, thickness = 1.dp)
-                    }
-                    CatalogDiaryHistoryRow(log = log, onEdit = { onEditDiaryLog(log) })
-                }
-            }
+            CatalogDiaryCardBody(
+                logs = logs,
+                totalCount = totalCount,
+                hasMore = hasMore,
+                isLoading = isLoading,
+                onAction = onAction,
+                onEditDiaryLog = onEditDiaryLog,
+            )
+        }
+    }
+}
+
+@Suppress("LongParameterList")
+@Composable
+private fun CatalogDiaryCardBody(
+    logs: List<DiaryEntryItem>,
+    totalCount: Int,
+    hasMore: Boolean,
+    isLoading: Boolean,
+    onAction: (MainAction) -> Unit,
+    onEditDiaryLog: (DiaryEntryItem) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    if (logs.isEmpty()) {
+        Text(
+            text = if (isLoading) "Loading diary…" else "No plays logged yet.",
+            color = colors.textMuted,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+        )
+        return
+    }
+    logs.forEachIndexed { idx, log ->
+        if (idx > 0) {
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+        }
+        CatalogDiaryHistoryRow(log = log, onEdit = { onEditDiaryLog(log) })
+    }
+    if (hasMore) {
+        CatalogDiaryLoadMoreRow(
+            remaining = (totalCount - logs.size).coerceAtLeast(0),
+            onLoadMore = { onAction(MainAction.LoadMoreCatalogDetailLogs) },
+        )
+    }
+}
+
+@Composable
+private fun CatalogDiaryLoadMoreRow(remaining: Int, onLoadMore: () -> Unit) {
+    val colors = LocalRocheColors.current
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+        TextButton(
+            onClick = onLoadMore,
+            modifier = Modifier.testTag("catalog_detail_logs_load_more_btn"),
+        ) {
+            Text(
+                text = "Show more ($remaining remaining)",
+                color = colors.accentBlue,
+                fontSize = 12.sp,
+            )
         }
     }
 }
@@ -1567,26 +1640,28 @@ private fun GenericCatalogDetailBody(
             )
         }
     }
-    if (isWide) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(18.dp),
-            verticalAlignment = Alignment.Top,
-        ) {
-            Box(modifier = Modifier.weight(1f)) {
-                CatalogListsSection(
-                    model.appearances,
-                    model.wikiUrl,
-                    entry.url,
-                    openList,
-                    onOpenExternalUrl,
-                )
-            }
-            Box(modifier = Modifier.weight(1f)) {
-                CatalogDiarySection(entry, model.diaryLogs, onAction, onEditDiaryLog)
-            }
-        }
-    } else {
+    GenericCatalogDetailSections(
+        model = model,
+        isWide = isWide,
+        openList = openList,
+        onAction = onAction,
+        onEditDiaryLog = onEditDiaryLog,
+        onOpenExternalUrl = onOpenExternalUrl,
+    )
+}
+
+@Suppress("LongParameterList")
+@Composable
+private fun GenericCatalogDetailSections(
+    model: CatalogDetailModel,
+    isWide: Boolean,
+    openList: (String) -> Unit,
+    onAction: (MainAction) -> Unit,
+    onEditDiaryLog: (DiaryEntryItem) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val entry = model.entry
+    val listsSection: @Composable () -> Unit = {
         CatalogListsSection(
             model.appearances,
             model.wikiUrl,
@@ -1594,7 +1669,30 @@ private fun GenericCatalogDetailBody(
             openList,
             onOpenExternalUrl,
         )
-        CatalogDiarySection(entry, model.diaryLogs, onAction, onEditDiaryLog)
+    }
+    val diarySection: @Composable () -> Unit = {
+        CatalogDiarySection(
+            entry = entry,
+            logs = model.diaryLogs,
+            totalCount = model.diaryLogsTotalCount,
+            hasMore = model.hasMoreDiaryLogs,
+            isLoading = model.isLoadingDiaryLogs,
+            onAction = onAction,
+            onEditDiaryLog = onEditDiaryLog,
+        )
+    }
+    if (isWide) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(18.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Box(modifier = Modifier.weight(1f)) { listsSection() }
+            Box(modifier = Modifier.weight(1f)) { diarySection() }
+        }
+    } else {
+        listsSection()
+        diarySection()
     }
 }
 
@@ -1775,12 +1873,22 @@ private fun buildCatalogDetailModel(entryId: String, state: MainUiState): Catalo
             emptyList()
         }
     val membership = resolveCatalogDetailMembership(entry.id, appearances, catalog)
+    val loadedDetailLogs = state.catalogDetailLogs?.takeIf { it.entryId == entry.id }
+    val diaryLogs =
+        loadedDetailLogs?.logs ?: catalog.recentDiaryEntries.filter { it.entryId == entry.id }
+    val isLoadingDiaryLogs =
+        loadedDetailLogs == null &&
+            catalog.totalDiaryCount > catalog.recentDiaryEntries.size &&
+            state.catalogDetailStack.lastOrNull() == entry.id
     return CatalogDetailModel(
         entry = entry,
         appearances = appearances,
         primaryAppearance = appearances.firstOrNull(),
         matchingArtistId = matchingArtistId,
-        diaryLogs = catalog.diaryEntries.filter { it.entryId == entry.id },
+        diaryLogs = diaryLogs,
+        diaryLogsTotalCount = loadedDetailLogs?.totalCount ?: diaryLogs.size,
+        hasMoreDiaryLogs = loadedDetailLogs?.hasMore == true,
+        isLoadingDiaryLogs = isLoadingDiaryLogs,
         genres = extractMetadataGenres(entry.metadataJson),
         tracks =
             if (entry.kind == EntryKind.ALBUM) {
@@ -1835,7 +1943,7 @@ private fun resolveCatalogEntryById(entryId: String, state: MainUiState): Catalo
             .flatten()
             .firstOrNull { it.entry.id == entryId }
             ?.entry
-        ?: state.catalog.diaryEntries
+        ?: (state.catalog.recentDiaryEntries + state.diary.entries)
             .firstOrNull { it.entryId == entryId }
             ?.let { diary ->
                 CatalogEntryItem(
@@ -1843,7 +1951,7 @@ private fun resolveCatalogEntryById(entryId: String, state: MainUiState): Catalo
                     kind = diary.kind,
                     title = diary.title,
                     creators = diary.creators,
-                    url = null,
+                    url = diary.url,
                     publishedAt = null,
                     releaseYear = diary.releaseYear,
                     summary = null,

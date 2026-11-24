@@ -403,6 +403,32 @@ private data class IncomingLogsMergePlan(
     val clearedTombstoneIds: Set<String>,
 )
 
+private data class LoadedSyncExistingLogs(
+    val existingById: Map<String, ConsumptionLogEntity>,
+    val existingConsumedByEntry: Map<String, List<ConsumptionLogEntity>>,
+)
+
+private suspend fun loadExistingLogsForSyncBatch(
+    dao: RocheDao,
+    candidateLogIds: Set<String>,
+    candidateEntryIds: Set<String>,
+): LoadedSyncExistingLogs {
+    val existingById = HashMap<String, ConsumptionLogEntity>(candidateLogIds.size)
+    for (chunk in candidateLogIds.chunked(LOG_SYNC_BIND_CHUNK_SIZE)) {
+        for (row in dao.getConsumptionLogsByIds(chunk)) {
+            existingById[row.id] = row
+        }
+    }
+    val existingConsumedByEntry = HashMap<String, MutableList<ConsumptionLogEntity>>()
+    for (chunk in candidateEntryIds.chunked(LOG_SYNC_BIND_CHUNK_SIZE)) {
+        for (row in dao.getConsumedLogsForEntries(chunk)) {
+            existingById.putIfAbsent(row.id, row)
+            existingConsumedByEntry.getOrPut(row.entryId) { ArrayList() }.add(row)
+        }
+    }
+    return LoadedSyncExistingLogs(existingById, existingConsumedByEntry)
+}
+
 @Suppress("LongParameterList")
 private suspend fun mergeConsumptionLogsInDao(
     dao: RocheDao,
@@ -414,28 +440,32 @@ private suspend fun mergeConsumptionLogsInDao(
     nowMs: Long,
 ) {
     if (incoming.isEmpty()) return
-    val tombstonesById = cache.tombstonesFor(TOMBSTONE_ENTITY_CONSUMPTION_LOG)
-    val allExistingLogs = dao.getAllConsumptionLogs()
-    val existingById = allExistingLogs.associateBy { it.id }
-    val existingConsumedByEntry =
-        allExistingLogs
-            .filter { ConsumptionStatus.fromWireValue(it.status) == ConsumptionStatus.CONSUMED }
-            .groupBy { it.entryId }
     val knownEntryIds = cache.knownEntryIds()
+    val resolvedIncoming = ArrayList<Pair<SyncConsumptionLogDto, String>>(incoming.size)
+    val candidateLogIds = HashSet<String>(incoming.size * 2)
+    val candidateEntryIds = HashSet<String>(incoming.size)
+    for (log in incoming) {
+        val entryId = resolveKnownEntryId(log.entryId, redirects, knownEntryIds) ?: continue
+        resolvedIncoming.add(log to entryId)
+        candidateEntryIds.add(entryId)
+        val status = ConsumptionStatus.fromWireValue(log.status)
+        candidateLogIds.add(resolveSyncIncomingLogId(log, entryId, status))
+        candidateLogIds.add(deterministicAutoLogId(entryId))
+    }
+    if (resolvedIncoming.isEmpty()) return
+
+    val loaded = loadExistingLogsForSyncBatch(dao, candidateLogIds, candidateEntryIds)
     val acc =
         IncomingLogsAcc(
-            existingById = existingById,
-            existingConsumedByEntry = existingConsumedByEntry,
-            tombstonesById = tombstonesById,
+            existingById = loaded.existingById,
+            existingConsumedByEntry = loaded.existingConsumedByEntry,
+            tombstonesById = cache.tombstonesFor(TOMBSTONE_ENTITY_CONSUMPTION_LOG),
             serverNode = serverNode,
             nowIso = nowIso,
             nowMs = nowMs,
         )
-    for (log in incoming) {
-        val entryId = resolveKnownEntryId(log.entryId, redirects, knownEntryIds)
-        if (entryId != null) {
-            acc.accept(log, entryId)
-        }
+    for ((log, entryId) in resolvedIncoming) {
+        acc.accept(log, entryId)
     }
     val plan = acc.toPlan()
     plan.clearedTombstoneIds.forEach {
@@ -444,7 +474,7 @@ private suspend fun mergeConsumptionLogsInDao(
     }
     plan.replacedAutoLogIds.forEach { dao.deleteConsumptionLogById(it) }
     for (row in plan.toInsert) {
-        if (row.id in existingById) {
+        if (row.id in loaded.existingById) {
             dao.upsertConsumptionLog(row)
         } else {
             dao.insertConsumptionLogIgnore(row)
@@ -454,6 +484,31 @@ private suspend fun mergeConsumptionLogsInDao(
         prunePromotedWantMemberships(dao, cache, plan.maxConsumedHlcByEntry)
     }
 }
+
+internal fun resolveSyncIncomingLogId(
+    log: SyncConsumptionLogDto,
+    entryId: String,
+    status: ConsumptionStatus,
+): String {
+    val explicit = log.id.trim()
+    if (explicit.isNotEmpty()) return explicit
+    val tsMillis = parseIsoInstant(log.ts)?.toEpochMilli() ?: 0L
+    return deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
+}
+
+internal fun normalizeSyncLogTimestamp(
+    rawTs: String,
+    existingTs: String?,
+    fallbackIso: String,
+): String {
+    val trimmed = rawTs.trim()
+    if (trimmed.isNotEmpty()) {
+        return parseIsoInstant(trimmed)?.toString() ?: trimmed
+    }
+    return existingTs ?: fallbackIso
+}
+
+private const val LOG_SYNC_BIND_CHUNK_SIZE = 450
 
 @Suppress("LongParameterList")
 private class IncomingLogsAcc(
@@ -472,7 +527,7 @@ private class IncomingLogsAcc(
 
     fun accept(log: SyncConsumptionLogDto, entryId: String) {
         val status = ConsumptionStatus.fromWireValue(log.status)
-        val id = resolveIncomingLogId(log, entryId, status)
+        val id = resolveSyncIncomingLogId(log, entryId, status)
         val autoLogId = deterministicAutoLogId(entryId)
         val isConsumed = status == ConsumptionStatus.CONSUMED
         val logHlc = resolveOrSynthesizeHlc(log.hlc, log.ts, nowIso, serverNode, nowMs)
@@ -490,11 +545,12 @@ private class IncomingLogsAcc(
         if (isConsumed && id != autoLogId) {
             markReplacedAutoLogIfNeeded(entryId, autoLogId)
         }
+        val normalizedTs = normalizeSyncLogTimestamp(log.ts, existing?.ts, nowIso)
         toInsert.add(
             ConsumptionLogEntity(
                 id = id,
                 entryId = entryId,
-                ts = log.ts.ifBlank { existing?.ts ?: nowIso },
+                ts = normalizedTs,
                 status = status.wireValue,
                 notes = log.notes?.trim()?.takeIf { it.isNotEmpty() },
                 createdAt = log.createdAt ?: existing?.createdAt ?: nowIso,
@@ -506,17 +562,6 @@ private class IncomingLogsAcc(
             consumedInBatch.add(entryId)
             recordConsumedHlc(entryId, logHlc)
         }
-    }
-
-    private fun resolveIncomingLogId(
-        log: SyncConsumptionLogDto,
-        entryId: String,
-        status: ConsumptionStatus,
-    ): String {
-        val explicit = log.id.trim()
-        if (explicit.isNotEmpty()) return explicit
-        val tsMillis = parseIsoInstant(log.ts)?.toEpochMilli() ?: 0L
-        return deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
     }
 
     private fun checkAndClearLogTombstone(id: String, logHlc: String): Boolean {

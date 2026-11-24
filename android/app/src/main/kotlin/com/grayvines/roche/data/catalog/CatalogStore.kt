@@ -72,6 +72,83 @@ class CatalogStore(
 
     suspend fun getSnapshot(): CatalogSnapshot = getOrBuildCatalogSnapshot()
 
+    suspend fun loadDiaryPage(
+        status: ConsumptionStatus? = null,
+        year: String? = null,
+        limit: Int = DEFAULT_DIARY_PAGE_SIZE,
+        offset: Int = 0,
+        globalTiers: Map<String, Char>? = null,
+    ): DiaryPageResult {
+        ensureSystemSeeded()
+        val tiers = globalTiers ?: getOrBuildCatalogSnapshot().globalTiersByEntryId
+        val safeLimit = limit.coerceAtLeast(1)
+        val safeOffset = offset.coerceAtLeast(0)
+        var result = DiaryPageResult()
+        dao.executeInTransaction {
+            val yearCounts = dao.getDiaryYearCounts()
+            val availableYears = yearCounts.map { it.year }
+            val effectiveYear = year?.takeIf { it in availableYears }
+            val (minTs, maxTs) = resolveDiaryYearBounds(effectiveYear)
+            val monthRows =
+                if (status == null) {
+                    dao.getDiaryMonthCounts(minTs, maxTs)
+                } else {
+                    dao.getDiaryMonthCountsByStatus(status.wireValue, minTs, maxTs)
+                }
+            val totalFiltered = monthRows.sumOf { it.count }
+            val rows =
+                if (status == null) {
+                    dao.getDiaryLogPage(minTs, maxTs, safeLimit, safeOffset)
+                } else {
+                    dao.getDiaryLogPageByStatus(
+                        status.wireValue,
+                        minTs,
+                        maxTs,
+                        safeLimit,
+                        safeOffset,
+                    )
+                }
+            result =
+                DiaryPageResult(
+                    entries = rows.map { toDiaryEntryItem(it, tiers) },
+                    availableYears = availableYears,
+                    monthCounts = monthRows.associate { it.monthKey to it.count },
+                    totalFilteredCount = totalFiltered,
+                    hasAnyEntries = yearCounts.isNotEmpty() || totalFiltered > 0,
+                    effectiveYear = effectiveYear,
+                    hasMore = safeOffset + rows.size < totalFiltered,
+                )
+        }
+        return result
+    }
+
+    suspend fun loadEntryDiaryLogs(
+        entryId: String,
+        limit: Int = DEFAULT_ENTRY_DETAIL_LOGS_LIMIT,
+        offset: Int = 0,
+        globalTiers: Map<String, Char>? = null,
+    ): EntryDiaryLogsResult {
+        ensureSystemSeeded()
+        val resolvedId = followMergedId(entryId) ?: entryId.trim()
+        if (resolvedId.isEmpty()) return EntryDiaryLogsResult(entryId = resolvedId)
+        val tiers = globalTiers ?: getOrBuildCatalogSnapshot().globalTiersByEntryId
+        val safeLimit = limit.coerceAtLeast(1)
+        val safeOffset = offset.coerceAtLeast(0)
+        var result = EntryDiaryLogsResult(entryId = resolvedId)
+        dao.executeInTransaction {
+            val totalCount = dao.countDiaryLogsForEntry(resolvedId)
+            val rows = dao.getDiaryLogsForEntry(resolvedId, safeLimit, safeOffset)
+            result =
+                EntryDiaryLogsResult(
+                    entryId = resolvedId,
+                    logs = rows.map { toDiaryEntryItem(it, tiers) },
+                    totalCount = totalCount,
+                    hasMore = safeOffset + rows.size < totalCount,
+                )
+        }
+        return result
+    }
+
     internal suspend fun resolveLocalPeerId(): String =
         localPeerIdProvider().ifBlank { DEFAULT_LOCAL_HLC_NODE }
 
@@ -1130,9 +1207,13 @@ class CatalogStore(
                 ) {
                     dao.getAllCollectionGenerators()
                 },
-            logs =
-                reloadIfChanged(stamp.logsStamp != prevStamp?.logsStamp, prevTables?.logs) {
-                    dao.getAllConsumptionLogs()
+            logSummary =
+                reloadIfChanged(
+                    stamp.logsStamp != prevStamp?.logsStamp ||
+                        stamp.entriesStamp != prevStamp.entriesStamp,
+                    prevTables?.logSummary,
+                ) {
+                    loadRawCatalogLogSummary(dao)
                 },
             comparisons =
                 reloadIfChanged(
@@ -1163,9 +1244,34 @@ class CatalogStore(
             specs = dao.getAllCollectionSpecs(),
             memberships = dao.getAllCollectionEntries(),
             generators = dao.getAllCollectionGenerators(),
-            logs = dao.getAllConsumptionLogs(),
+            logSummary = loadRawCatalogLogSummary(dao),
             comparisons = dao.getAllComparisons(),
         )
+}
+
+internal suspend fun loadRawCatalogLogSummary(dao: RocheDao): RawCatalogLogSummary =
+    RawCatalogLogSummary(
+        entryStatuses = dao.getDistinctEntryLogStatuses(),
+        latestLogs = dao.getLatestLogsPerEntry(),
+        recentDiaryLogs =
+            dao.getDiaryLogPage(
+                minTs = "",
+                maxTs = MAX_ISO_TS_BOUND,
+                limit = RECENT_DIARY_PREVIEW_LIMIT,
+                offset = 0,
+            ),
+        totalDiaryCount = dao.countDiaryLogs(),
+    )
+
+internal fun resolveDiaryYearBounds(year: String?): Pair<String, String> {
+    val yr = year?.trim()?.toIntOrNull()?.takeIf { it in MIN_DIARY_YEAR..MAX_DIARY_YEAR }
+    return if (yr != null) {
+        val next = yr + 1
+        "${"%04d".format(java.util.Locale.US, yr)}-01-01" to
+            "${"%04d".format(java.util.Locale.US, next)}-01-01"
+    } else {
+        "" to MAX_ISO_TS_BOUND
+    }
 }
 
 internal data class CachedCatalogState(
@@ -1186,3 +1292,9 @@ internal fun RankedCatalogEntry.toRankCandidate(selectionPriority: Int = 0): Ran
     )
 
 private const val WANT_SLUG_PREFIX = "want:"
+internal const val DEFAULT_DIARY_PAGE_SIZE = 100
+internal const val DEFAULT_ENTRY_DETAIL_LOGS_LIMIT = 50
+internal const val RECENT_DIARY_PREVIEW_LIMIT = 12
+private const val MAX_ISO_TS_BOUND = "\uFFFF"
+private const val MIN_DIARY_YEAR = 1
+private const val MAX_DIARY_YEAR = 9_998
