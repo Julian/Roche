@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+pub mod backup;
 pub mod cli;
 pub mod config;
 mod content;
@@ -74,10 +75,12 @@ impl RocheServer {
         let prune_after = cfg.sync.op_log_prune_after;
         let media_dir = cfg.storage.media_dir.clone();
         let download_dir = cfg.media.download_dir.clone();
+        let backup_cfg = cfg.backup.clone();
         let worker_shutdown = shutdown_rx.clone();
         let worker_handle = tokio::spawn(async move {
             let worker_mgr = workers::WorkerManager::new(worker_db, prune_after, media_dir)
-                .with_download_dir(download_dir);
+                .with_download_dir(download_dir)
+                .with_backup(backup_cfg);
             if let Err(e) = worker_mgr.run_all_until_shutdown(worker_shutdown).await {
                 tracing::error!(error = %e, "WorkerManager terminated with error");
             }
@@ -100,10 +103,11 @@ impl RocheServer {
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            let _ = scheduler_handle.await;
-            let _ = worker_handle.await;
-            let drained =
-                bg_service.shutdown_background_tasks(std::time::Duration::from_secs(10)).await;
+            let (_sched_res, _worker_res, drained) = tokio::join!(
+                scheduler_handle,
+                worker_handle,
+                bg_service.shutdown_background_tasks(std::time::Duration::from_secs(10)),
+            );
             if !drained {
                 tracing::warn!(
                     active = bg_service.background_task_count(),

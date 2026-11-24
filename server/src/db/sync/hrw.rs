@@ -191,6 +191,7 @@ impl SyncRepo<'_> {
         network_tier: NetworkTier,
         measured_weight: Option<f64>,
         now: DateTime<Utc>,
+        mark_synced_epoch: Option<i64>,
     ) -> std::result::Result<(), sqlx::Error> {
         let initial_weight = bound_peer_weight(network_tier, measured_weight);
         let bounded_measured = measured_weight.map(|w| bound_peer_weight(network_tier, Some(w)));
@@ -199,9 +200,10 @@ impl SyncRepo<'_> {
             NetworkTier::Cellular => MAX_CELLULAR_PEER_WEIGHT,
             NetworkTier::Wifi | NetworkTier::Wired => MAX_PEER_WEIGHT,
         };
+        let initial_epoch = mark_synced_epoch.unwrap_or(0);
         sqlx::query(
-            "INSERT INTO peer_nodes (peer_id, device_name, network_tier, weight, last_seen_at)
-             VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO peer_nodes (peer_id, device_name, network_tier, weight, last_seen_at, synced_epoch)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
                  device_name = excluded.device_name,
                  network_tier = excluded.network_tier,
@@ -211,16 +213,23 @@ impl SyncRepo<'_> {
                      WHEN peer_nodes.weight > 0.0 THEN MIN(peer_nodes.weight, ?)
                      ELSE excluded.weight
                  END,
-                 last_seen_at = excluded.last_seen_at",
+                 last_seen_at = excluded.last_seen_at,
+                 synced_epoch = CASE
+                     WHEN ? IS NOT NULL THEN MAX(peer_nodes.synced_epoch, ?)
+                     ELSE peer_nodes.synced_epoch
+                 END",
         )
         .bind(peer_id)
         .bind(device_name)
         .bind(network_tier)
         .bind(initial_weight)
         .bind(now)
+        .bind(initial_epoch)
         .bind(bounded_measured)
         .bind(bounded_measured)
         .bind(max_tier_weight)
+        .bind(mark_synced_epoch)
+        .bind(initial_epoch)
         .execute(conn)
         .await?;
         Ok(())

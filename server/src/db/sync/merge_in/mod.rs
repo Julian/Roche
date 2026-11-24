@@ -260,6 +260,23 @@ impl SyncRepo<'_> {
         };
 
         let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
+        let (pre_merge_seq, restore_epoch): (i64, i64) =
+            sqlx::query_as("SELECT current_seq, restore_epoch FROM sync_clock WHERE id = 1")
+                .fetch_one(tx.conn())
+                .await?;
+        let existing_peer_epoch: i64 = if !peer_id.is_empty() && peer_id != SERVER_PEER_ID {
+            sqlx::query_scalar("SELECT synced_epoch FROM peer_nodes WHERE peer_id = ?")
+                .bind(peer_id)
+                .fetch_optional(tx.conn())
+                .await?
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let cursor_ahead_of_server = req.since_seq > 0 && req.since_seq > pre_merge_seq;
+        let peer_needs_restore_reset = req.since_seq > 0 && existing_peer_epoch < restore_epoch;
+        let force_reset_required = cursor_ahead_of_server || peer_needs_restore_reset;
+        let mark_synced_epoch = (req.since_seq <= 0).then_some(restore_epoch);
 
         Self::ensure_server_peer_in_tx(tx.conn(), now).await?;
         if !peer_id.is_empty() && peer_id != SERVER_PEER_ID {
@@ -270,6 +287,7 @@ impl SyncRepo<'_> {
                 req.network_tier,
                 measured_weight,
                 now,
+                mark_synced_epoch,
             )
             .await?;
         }
@@ -324,7 +342,13 @@ impl SyncRepo<'_> {
         tx.commit().await?;
 
         let response = self
-            .collect_peer_sync_response(req.since_seq, max_page_changes.max(1), server_hlc, now)
+            .collect_peer_sync_response_with_reset(
+                req.since_seq,
+                max_page_changes.max(1),
+                server_hlc,
+                now,
+                force_reset_required,
+            )
             .await?;
 
         Ok((response, inserted_candidates))

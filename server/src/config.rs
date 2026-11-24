@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub server: ServerConfig,
     pub storage: StorageConfig,
+    pub backup: BackupConfig,
     pub feeds: FeedsConfig,
     pub media: MediaConfig,
     pub sync: SyncConfig,
@@ -78,6 +79,45 @@ impl Default for StorageConfig {
             data_dir: PathBuf::from("./data"),
             database_path: PathBuf::from("./data/roche.db"),
             media_dir: PathBuf::from("./data/media"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackupConfig {
+    /// Enable automatic periodic database backups inside `roche serve`.
+    pub enabled: bool,
+    /// Directory where managed backup archives are stored.
+    pub dir: PathBuf,
+    /// Minimum hours between automatic periodic backups.
+    pub interval_hours: u64,
+    /// Compress backup snapshots with Zstandard (`.db.zst`).
+    pub compress: bool,
+    /// Zstandard compression level (`1..=19`).
+    pub compression_level: i32,
+    /// Also mirror `storage.media_dir` into `<backup.dir>/media`.
+    pub include_media: bool,
+    /// Number of most recent distinct calendar days to retain.
+    pub keep_daily: usize,
+    /// Number of 7-day weekly retention slots to retain.
+    pub keep_weekly: usize,
+    /// Number of 30-day monthly retention slots to retain.
+    pub keep_monthly: usize,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: PathBuf::from("./data/backups"),
+            interval_hours: 24,
+            compress: true,
+            compression_level: 9,
+            include_media: false,
+            keep_daily: 3,
+            keep_weekly: 1,
+            keep_monthly: 1,
         }
     }
 }
@@ -292,6 +332,15 @@ impl Config {
                 "data_dir" | "storage_data_dir" => "storage.data_dir".into(),
                 "database_path" | "storage_database_path" => "storage.database_path".into(),
                 "media_dir" | "storage_media_dir" => "storage.media_dir".into(),
+                "backup_enabled" => "backup.enabled".into(),
+                "backup_dir" => "backup.dir".into(),
+                "backup_interval_hours" => "backup.interval_hours".into(),
+                "backup_compress" => "backup.compress".into(),
+                "backup_compression_level" => "backup.compression_level".into(),
+                "backup_include_media" => "backup.include_media".into(),
+                "backup_keep_daily" => "backup.keep_daily".into(),
+                "backup_keep_weekly" => "backup.keep_weekly".into(),
+                "backup_keep_monthly" => "backup.keep_monthly".into(),
                 "default_poll_interval" | "feeds_default_poll_interval" => {
                     "feeds.default_poll_interval".into()
                 }
@@ -326,6 +375,7 @@ impl Config {
         let explicit_data_dir = overrides.contains("storage.data_dir");
         let explicit_db_path = overrides.contains("storage.database_path");
         let explicit_media_dir = overrides.contains("storage.media_dir");
+        let explicit_backup_dir = overrides.contains("backup.dir");
         let explicit_download_dir = overrides.contains("media.download_dir");
 
         let mut cfg: Self =
@@ -337,6 +387,9 @@ impl Config {
             }
             if !explicit_media_dir {
                 cfg.storage.media_dir = cfg.storage.data_dir.join("media");
+            }
+            if !explicit_backup_dir {
+                cfg.backup.dir = cfg.storage.data_dir.join("backups");
             }
         }
         if (explicit_data_dir || explicit_media_dir) && !explicit_download_dir {
@@ -398,6 +451,25 @@ impl Config {
                 "media.download_dir must be a dedicated subdirectory inside storage.media_dir"
             );
         }
+        if self.backup.interval_hours == 0 {
+            anyhow::bail!("backup.interval_hours must be greater than 0");
+        }
+        if !(1..=19).contains(&self.backup.compression_level) {
+            anyhow::bail!("backup.compression_level must be between 1 and 19");
+        }
+        if self.backup.keep_daily == 0
+            && self.backup.keep_weekly == 0
+            && self.backup.keep_monthly == 0
+        {
+            anyhow::bail!(
+                "at least one of backup.keep_daily, backup.keep_weekly, or backup.keep_monthly must be > 0"
+            );
+        }
+        crate::backup::validate_backup_dir(
+            &self.backup.dir,
+            &self.storage.database_path,
+            &self.storage.media_dir,
+        )?;
         if self.sync.op_log_prune_after <= 0 {
             anyhow::bail!("sync.op_log_prune_after must be greater than 0");
         }
@@ -602,5 +674,80 @@ auto_auth_users = [" Alice@Example.com ", "", "bob@github", "alice@example.com"]
                 "expected validation failure for download_dir={bad}"
             );
         }
+    }
+
+    #[test]
+    fn test_backup_config_defaults_derivation_and_validation() {
+        let defaults = Config::default();
+        assert!(defaults.backup.enabled);
+        assert_eq!(defaults.backup.dir, Path::new("./data/backups"));
+        assert_eq!(defaults.backup.interval_hours, 24);
+        assert!(defaults.backup.compress);
+        assert_eq!(defaults.backup.compression_level, 9);
+        assert!(!defaults.backup.include_media);
+        assert_eq!(defaults.backup.keep_daily, 3);
+        assert_eq!(defaults.backup.keep_weekly, 1);
+        assert_eq!(defaults.backup.keep_monthly, 1);
+
+        let derived = Config::from_toml_str(
+            r#"
+[storage]
+data_dir = "/srv/roche"
+"#,
+        )
+        .unwrap();
+        assert_eq!(derived.backup.dir, Path::new("/srv/roche/backups"));
+
+        let explicit = Config::from_toml_str(
+            r#"
+[storage]
+data_dir = "/srv/roche"
+
+[backup]
+dir = "/mnt/nas/roche-backups"
+interval_hours = 12
+compress = false
+keep_daily = 7
+keep_weekly = 4
+keep_monthly = 2
+"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.backup.dir, Path::new("/mnt/nas/roche-backups"));
+        assert_eq!(explicit.backup.interval_hours, 12);
+        assert!(!explicit.backup.compress);
+        assert_eq!(explicit.backup.keep_daily, 7);
+        assert_eq!(explicit.backup.keep_weekly, 4);
+        assert_eq!(explicit.backup.keep_monthly, 2);
+
+        // Zero retention across all tiers must fail validation
+        let zero_ret = Figment::new()
+            .merge(("backup.keep_daily", 0))
+            .merge(("backup.keep_weekly", 0))
+            .merge(("backup.keep_monthly", 0));
+        assert!(Config::from_figment(&zero_ret).is_err());
+
+        // Invalid compression level or interval
+        assert!(Config::from_figment(&Figment::new().merge(("backup.interval_hours", 0))).is_err());
+        assert!(
+            Config::from_figment(&Figment::new().merge(("backup.compression_level", 0))).is_err()
+        );
+        assert!(
+            Config::from_figment(&Figment::new().merge(("backup.compression_level", 20))).is_err()
+        );
+
+        // backup.dir must not be empty, overlap storage.media_dir, or contain storage.data_dir/db
+        let overlap = Figment::new()
+            .merge(("storage.media_dir", "/srv/roche/media"))
+            .merge(("backup.dir", "/srv/roche/media/backups"));
+        assert!(Config::from_figment(&overlap).is_err());
+
+        let equals_data_dir = Figment::new()
+            .merge(("storage.data_dir", "/srv/roche"))
+            .merge(("backup.dir", "/srv/roche"));
+        assert!(Config::from_figment(&equals_data_dir).is_err());
+
+        let empty_backup_dir = Figment::new().merge(("backup.dir", ""));
+        assert!(Config::from_figment(&empty_backup_dir).is_err());
     }
 }

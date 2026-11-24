@@ -166,6 +166,7 @@ impl Cli {
                 }
                 Ok(())
             }
+            Some(Command::Backup { args, action }) => run_backup_cmd(&cfg, &args, action).await,
             Some(Command::Lists { want, all }) => {
                 let db = crate::RocheServer::connect_db(&cfg).await?;
                 run_lists_cmd(&db, want || all, all).await
@@ -234,6 +235,218 @@ impl Cli {
     }
 }
 
+async fn run_backup_cmd(
+    cfg: &Config,
+    args: &BackupRunArgs,
+    action: Option<BackupCommand>,
+) -> anyhow::Result<()> {
+    let policy = crate::backup::RetentionPolicy::from_config(&cfg.backup);
+    if action.is_some()
+        && (args.output.is_some() || args.no_compress || args.no_prune || args.include_media)
+    {
+        anyhow::bail!(
+            "`--output`, `--no-compress`, `--no-prune`, and `--include-media` only apply when creating a backup (not with subcommands)"
+        );
+    }
+    match action {
+        None => run_backup_create(cfg, args).await?,
+        Some(BackupCommand::List { dir }) => {
+            let target_dir = dir.as_deref().or(args.dir.as_deref()).unwrap_or(&cfg.backup.dir);
+            run_backup_list(target_dir, policy).await?;
+        }
+        Some(BackupCommand::Prune { dir, dry_run }) => {
+            let target_dir = dir.as_deref().or(args.dir.as_deref()).unwrap_or(&cfg.backup.dir);
+            run_backup_prune(target_dir, policy, dry_run).await?;
+        }
+        Some(BackupCommand::Verify { file }) => {
+            if args.dir.is_some() {
+                anyhow::bail!("`--dir` cannot be combined with `roche backup verify`");
+            }
+            let verified = crate::backup::verify_backup_file(&file).await?;
+            let kind = if verified.compressed { "zstd" } else { "sqlite" };
+            println!(
+                "Verified {} ({kind}, {} archive -> {} db, {} entries)",
+                sanitize_terminal_text(&verified.path.display().to_string()),
+                format_bytes(verified.archive_bytes),
+                format_bytes(verified.database_bytes),
+                verified.entry_count
+            );
+        }
+        Some(BackupCommand::Restore { file, force }) => {
+            if args.dir.is_some() {
+                anyhow::bail!("`--dir` cannot be combined with `roche backup restore`");
+            }
+            let restored =
+                crate::backup::restore_backup_file(&file, &cfg.storage.database_path, force)
+                    .await?;
+            println!(
+                "Restored {} -> {} ({}, {} entries)",
+                sanitize_terminal_text(&restored.source_path.display().to_string()),
+                sanitize_terminal_text(&restored.target_path.display().to_string()),
+                format_bytes(restored.database_bytes),
+                restored.entry_count
+            );
+            if !restored.removed_sidecars.is_empty() {
+                println!(
+                    "Removed {} stale SQLite sidecar file(s).",
+                    restored.removed_sidecars.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_backup_create(cfg: &Config, args: &BackupRunArgs) -> anyhow::Result<()> {
+    if args.output.is_some() && args.dir.is_some() {
+        anyhow::bail!("`--output` and `--dir` cannot be combined");
+    }
+    if args.output.is_some() && args.include_media {
+        anyhow::bail!(
+            "`--include-media` cannot be combined with `--output`; use `--dir <DIR>` so database snapshots and `media/` stay together"
+        );
+    }
+
+    let mut opts = crate::backup::BackupOptions::from_config(cfg);
+    if let Some(ref dir) = args.dir {
+        crate::backup::validate_backup_dir(
+            dir,
+            &cfg.storage.database_path,
+            &cfg.storage.media_dir,
+        )?;
+        opts.backup_dir.clone_from(dir);
+    }
+    if let Some(ref output) = args.output {
+        opts.explicit_output = Some(output.clone());
+        opts.prune = false;
+        // Never silently mirror media to config's `backup.dir` during an explicit `-o` backup.
+        opts.include_media = false;
+    }
+    opts.compress = resolve_backup_compression(cfg, args);
+    if args.no_prune {
+        opts.prune = false;
+    }
+    if args.include_media {
+        opts.include_media = true;
+    }
+
+    let outcome = crate::backup::create_backup_from_path(&cfg.storage.database_path, &opts).await?;
+    let path_text = sanitize_terminal_text(&outcome.path.display().to_string());
+    if outcome.compressed {
+        println!(
+            "Created backup {path_text} ({} compressed from {}, zstd)",
+            format_bytes(outcome.final_bytes),
+            format_bytes(outcome.uncompressed_bytes)
+        );
+    } else {
+        println!("Created backup {path_text} ({})", format_bytes(outcome.final_bytes));
+    }
+    if !outcome.pruned.is_empty() {
+        println!("Pruned {} old backup(s).", outcome.pruned.len());
+    }
+    if let Some(media) = outcome.media {
+        println!(
+            "Mirrored media to {}: {} copied, {} unchanged, {} removed ({} total)",
+            sanitize_terminal_text(&media.dest_dir.display().to_string()),
+            media.copied_files,
+            media.skipped_files,
+            media.removed_files,
+            format_bytes(media.total_bytes)
+        );
+    }
+    Ok(())
+}
+
+async fn run_backup_list(
+    target_dir: &std::path::Path,
+    policy: crate::backup::RetentionPolicy,
+) -> anyhow::Result<()> {
+    let entries = crate::backup::list_backups(target_dir).await?;
+    if entries.is_empty() {
+        println!(
+            "No managed backups found in {}.",
+            sanitize_terminal_text(&target_dir.display().to_string())
+        );
+        return Ok(());
+    }
+    let plan = crate::backup::plan_retention(&entries, policy);
+    let tiers_by_name: std::collections::HashMap<&str, &[crate::backup::RetentionTier]> =
+        plan.keep.iter().map(|r| (r.entry.file_name.as_str(), r.tiers.as_slice())).collect();
+    for entry in &entries {
+        let tier_label = tiers_by_name.get(entry.file_name.as_str()).map_or_else(
+            || "prunable".to_owned(),
+            |tiers| tiers.iter().map(|t| t.as_str()).collect::<Vec<_>>().join("+"),
+        );
+        println!(
+            "{}  {:>10}  [{:<20}]  {}",
+            entry.timestamp.format("%Y-%m-%d %H:%M:%SZ"),
+            format_bytes(entry.size_bytes),
+            tier_label,
+            sanitize_terminal_text(&entry.file_name)
+        );
+    }
+    Ok(())
+}
+
+async fn run_backup_prune(
+    target_dir: &std::path::Path,
+    policy: crate::backup::RetentionPolicy,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let plan = crate::backup::prune_backups(target_dir, policy, dry_run).await?;
+    if plan.prune.is_empty() {
+        println!(
+            "No backups to prune in {} (keeping {}).",
+            sanitize_terminal_text(&target_dir.display().to_string()),
+            plan.keep.len()
+        );
+    } else {
+        let verb = if dry_run { "Would prune" } else { "Pruned" };
+        for item in &plan.prune {
+            println!(
+                "{verb} {} ({})",
+                sanitize_terminal_text(&item.file_name),
+                format_bytes(item.size_bytes)
+            );
+        }
+        println!("Retained {} backup(s).", plan.keep.len());
+    }
+    Ok(())
+}
+
+fn resolve_backup_compression(cfg: &Config, args: &BackupRunArgs) -> bool {
+    if args.no_compress {
+        return false;
+    }
+    if let Some(ext) = args.output.as_deref().and_then(|p| p.extension()) {
+        if ext.eq_ignore_ascii_case("zst") {
+            return true;
+        }
+        if ext.eq_ignore_ascii_case("db")
+            || ext.eq_ignore_ascii_case("sqlite")
+            || ext.eq_ignore_ascii_case("sqlite3")
+        {
+            return false;
+        }
+    }
+    cfg.backup.compress
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GIB {
+        format!("{}.{} GiB", bytes / GIB, ((bytes % GIB) * 10) / GIB)
+    } else if bytes >= MIB {
+        format!("{}.{} MiB", bytes / MIB, ((bytes % MIB) * 10) / MIB)
+    } else if bytes >= KIB {
+        format!("{}.{} KiB", bytes / KIB, ((bytes % KIB) * 10) / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 async fn run_catalog_apply_cmd(
     db: &Db,
     file: &std::path::Path,
@@ -293,6 +506,13 @@ pub enum Command {
         /// Optional output file path (defaults to stdout)
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
+    },
+    /// Create, list, verify, prune, or restore verified SQLite backups
+    Backup {
+        #[command(flatten)]
+        args: BackupRunArgs,
+        #[command(subcommand)]
+        action: Option<BackupCommand>,
     },
     /// List ranked collections and want queues
     Lists {
@@ -394,6 +614,57 @@ pub enum DeviceCommand {
     Revoke {
         /// Device token ID to revoke
         id: String,
+    },
+}
+
+#[derive(Args, Debug, Default, Clone, PartialEq, Eq)]
+pub struct BackupRunArgs {
+    /// Write the backup directly to an explicit file path (skips retention pruning)
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+    /// Override the managed backup directory for this run
+    #[arg(long, value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+    /// Write an uncompressed `.db` snapshot instead of Zstandard `.db.zst`
+    #[arg(long)]
+    pub no_compress: bool,
+    /// Skip GFS retention pruning after creating the backup
+    #[arg(long)]
+    pub no_prune: bool,
+    /// Also incrementally mirror `storage.media_dir` into `<backup_dir>/media`
+    #[arg(long)]
+    pub include_media: bool,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum BackupCommand {
+    /// List managed backups and their GFS retention tiers
+    List {
+        /// Override the managed backup directory to inspect
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+    /// Apply GFS retention pruning to managed backups
+    Prune {
+        /// Override the managed backup directory to prune
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Show which backups would be kept or pruned without deleting any files
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Verify a `.db.zst` or `.db` backup archive's checksum, SQLite integrity, and foreign keys
+    Verify {
+        /// Path to the backup file to verify
+        file: PathBuf,
+    },
+    /// Verify and restore a `.db.zst` or `.db` backup into `storage.database_path`
+    Restore {
+        /// Path to the backup file to restore
+        file: PathBuf,
+        /// Overwrite an existing database file (stop `roche serve` first!)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1052,6 +1323,113 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn test_cli_parses_backup_commands() {
+        let backup_default = Cli::try_parse_from(["roche", "backup"]).unwrap();
+        assert_eq!(
+            backup_default.command,
+            Some(Command::Backup { args: BackupRunArgs::default(), action: None })
+        );
+
+        let backup_custom = Cli::try_parse_from([
+            "roche",
+            "backup",
+            "-o",
+            "/tmp/snap.db",
+            "--no-compress",
+            "--include-media",
+        ])
+        .unwrap();
+        assert_eq!(
+            backup_custom.command,
+            Some(Command::Backup {
+                args: BackupRunArgs {
+                    output: Some(PathBuf::from("/tmp/snap.db")),
+                    dir: None,
+                    no_compress: true,
+                    no_prune: false,
+                    include_media: true,
+                },
+                action: None,
+            })
+        );
+
+        let backup_list = Cli::try_parse_from(["roche", "backup", "list"]).unwrap();
+        assert_eq!(
+            backup_list.command,
+            Some(Command::Backup {
+                args: BackupRunArgs::default(),
+                action: Some(BackupCommand::List { dir: None }),
+            })
+        );
+
+        let backup_prune = Cli::try_parse_from(["roche", "backup", "prune", "--dry-run"]).unwrap();
+        assert_eq!(
+            backup_prune.command,
+            Some(Command::Backup {
+                args: BackupRunArgs::default(),
+                action: Some(BackupCommand::Prune { dir: None, dry_run: true }),
+            })
+        );
+
+        let backup_verify =
+            Cli::try_parse_from(["roche", "backup", "verify", "/tmp/snap.db.zst"]).unwrap();
+        assert_eq!(
+            backup_verify.command,
+            Some(Command::Backup {
+                args: BackupRunArgs::default(),
+                action: Some(BackupCommand::Verify { file: PathBuf::from("/tmp/snap.db.zst") }),
+            })
+        );
+
+        let backup_restore =
+            Cli::try_parse_from(["roche", "backup", "restore", "/tmp/snap.db.zst", "--force"])
+                .unwrap();
+        assert_eq!(
+            backup_restore.command,
+            Some(Command::Backup {
+                args: BackupRunArgs::default(),
+                action: Some(BackupCommand::Restore {
+                    file: PathBuf::from("/tmp/snap.db.zst"),
+                    force: true,
+                }),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_backup_rejects_conflicting_flags_and_overlapping_dir() {
+        let cfg = Config::default();
+
+        // Create-only flag with subcommand must error
+        let sub_conflict = BackupRunArgs { include_media: true, ..BackupRunArgs::default() };
+        assert!(
+            run_backup_cmd(&cfg, &sub_conflict, Some(BackupCommand::List { dir: None }))
+                .await
+                .is_err()
+        );
+
+        // `--output` combined with `--include-media` or `--dir` must error
+        let out_media = BackupRunArgs {
+            output: Some(PathBuf::from("/tmp/snap.db.zst")),
+            include_media: true,
+            ..BackupRunArgs::default()
+        };
+        assert!(run_backup_cmd(&cfg, &out_media, None).await.is_err());
+
+        let out_dir = BackupRunArgs {
+            output: Some(PathBuf::from("/tmp/snap.db.zst")),
+            dir: Some(PathBuf::from("/tmp/backups")),
+            ..BackupRunArgs::default()
+        };
+        assert!(run_backup_cmd(&cfg, &out_dir, None).await.is_err());
+
+        // `--dir` overlapping `storage.media_dir` must error before touching disk
+        let overlap_dir =
+            BackupRunArgs { dir: Some(cfg.storage.media_dir.clone()), ..BackupRunArgs::default() };
+        assert!(run_backup_cmd(&cfg, &overlap_dir, None).await.is_err());
     }
 
     #[tokio::test]

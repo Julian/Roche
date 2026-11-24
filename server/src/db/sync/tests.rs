@@ -900,6 +900,193 @@ async fn test_sync_seq_pagination_and_pruned_cursor_reset() {
         "Stale cursor below min_retained_seq must flag reset_required"
     );
     assert!(!reset_resp.entries.is_empty());
+
+    // Restored-backup scenario: peer's `since_seq` is ahead of server's `current_seq`
+    let current_seq: i64 = sqlx::query_scalar("SELECT current_seq FROM sync_clock WHERE id = 1")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let (ahead_resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "ahead-after-restore-peer".to_string(),
+            since_seq: current_seq + 50,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        ahead_resp.reset_required,
+        "Peer cursor ahead of server current_seq (e.g. after backup restore) must flag reset_required"
+    );
+    assert!(!ahead_resp.entries.is_empty());
+
+    // Even when the peer's incoming writes advance `current_seq` past `since_seq` during the same
+    // request, pre-merge cursor detection must still signal `reset_required`.
+    let pre_seq: i64 = sqlx::query_scalar("SELECT current_seq FROM sync_clock WHERE id = 1")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let incoming_now = Utc::now();
+    let incoming_hlc =
+        HlcClock::new("ahead-writer-peer", None).tick(incoming_now.timestamp_millis());
+    let (ahead_with_writes_resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "ahead-writer-peer".to_string(),
+            since_seq: pre_seq + 1,
+            entries: vec![
+                SyncEntryRecord {
+                    id: deterministic_item_id(None, "https://example.com/rewind-write-1"),
+                    kind: EntryKind::Article,
+                    title: "Rewind Write 1".to_string(),
+                    creators: Vec::new(),
+                    url: Some("https://example.com/rewind-write-1".to_string()),
+                    published_at: None,
+                    release_year: None,
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: Some(serde_json::json!({})),
+                    merged_into_id: None,
+                    identifiers: Vec::new(),
+                    content: Some(SyncEntryContent {
+                        content_html: Some("<p>One</p>".to_string()),
+                        content_type: ContentType::Article,
+                        audio_url: None,
+                        duration: None,
+                    }),
+                    state: None,
+                    collection_spec: None,
+                    feed_source: None,
+                    created_at: Some(incoming_now),
+                    updated_at: Some(incoming_now),
+                    hlc: incoming_hlc.to_string(),
+                },
+                SyncEntryRecord {
+                    id: deterministic_item_id(None, "https://example.com/rewind-write-2"),
+                    kind: EntryKind::Article,
+                    title: "Rewind Write 2".to_string(),
+                    creators: Vec::new(),
+                    url: Some("https://example.com/rewind-write-2".to_string()),
+                    published_at: None,
+                    release_year: None,
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: Some(serde_json::json!({})),
+                    merged_into_id: None,
+                    identifiers: Vec::new(),
+                    content: Some(SyncEntryContent {
+                        content_html: Some("<p>Two</p>".to_string()),
+                        content_type: ContentType::Article,
+                        audio_url: None,
+                        duration: None,
+                    }),
+                    state: None,
+                    collection_spec: None,
+                    feed_source: None,
+                    created_at: Some(incoming_now),
+                    updated_at: Some(incoming_now),
+                    hlc: incoming_hlc.to_string(),
+                },
+            ],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        ahead_with_writes_resp.reset_required,
+        "Pre-merge cursor ahead of server must still flag reset_required even if incoming writes advance current_seq"
+    );
+
+    // Restored-backup scenario where post-restore server writes (e.g. PollScheduler) overtake an
+    // offline peer's cursor BEFORE the peer reconnects: `sync_clock.restore_epoch` must still force
+    // `reset_required = true` until the peer completes a `since_seq == 0` reset sync.
+    let (seeded_peer_resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "restored-offline-peer".to_string(),
+            since_seq: 0,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(!seeded_peer_resp.reset_required);
+    let peer_cursor_before_restore = seeded_peer_resp.sync_seq;
+
+    // Simulate backup restore bumping `restore_epoch`, followed by post-restore server writes
+    // advancing `current_seq` well past `peer_cursor_before_restore`.
+    sqlx::query("UPDATE sync_clock SET restore_epoch = restore_epoch + 1 WHERE id = 1")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let post_restore_url = Url::parse("https://example.com/post-restore-poll").unwrap();
+    db.items()
+        .create(&NewItem {
+            feed_id: None,
+            title: "Post Restore Poll Item",
+            url: &post_restore_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+
+    // Round 1: peer reconnects with `since_seq <= current_seq` -> MUST still get `reset_required`.
+    let (epoch_reset_resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "restored-offline-peer".to_string(),
+            since_seq: peer_cursor_before_restore,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        epoch_reset_resp.reset_required,
+        "Peer lagging behind sync_clock.restore_epoch must get reset_required even when since_seq <= current_seq"
+    );
+
+    // Round 2: peer resets to `since_seq = 0` -> converges and advances its `synced_epoch`.
+    let (after_reset_resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "restored-offline-peer".to_string(),
+            since_seq: 0,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(!after_reset_resp.reset_required);
+
+    // Round 3: subsequent incremental sync from the new cursor succeeds normally without looping.
+    let (steady_resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "restored-offline-peer".to_string(),
+            since_seq: after_reset_resp.sync_seq,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(!steady_resp.reset_required);
+
+    // Brand-new empty DB (`pre_merge_seq == 0`) with a peer sending `since_seq > 0` must also reset.
+    let empty_db = Db::connect("sqlite::memory:").await.unwrap();
+    let (empty_reset_resp, _) = empty_db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-on-wiped-server".to_string(),
+            since_seq: 42,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        empty_reset_resp.reset_required,
+        "Empty/wiped server (current_seq == 0) must flag reset_required for peer with since_seq > 0"
+    );
 }
 
 #[test]

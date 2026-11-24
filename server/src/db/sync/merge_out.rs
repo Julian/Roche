@@ -186,23 +186,26 @@ struct SyncPageDelta {
 }
 
 impl SyncRepo<'_> {
-    pub(super) async fn collect_peer_sync_response(
+    pub(super) async fn collect_peer_sync_response_with_reset(
         &self,
         requested_since_seq: i64,
         max_page_changes: usize,
         server_hlc: String,
         now: DateTime<Utc>,
+        force_reset_required: bool,
     ) -> Result<PeerSyncResponse> {
-        self.collect_peer_sync_response_with_budget(
+        self.collect_peer_sync_response_inner(
             requested_since_seq,
             max_page_changes,
             MAX_PEER_SYNC_PAGE_BYTES,
             server_hlc,
             now,
+            force_reset_required,
         )
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn collect_peer_sync_response_with_budget(
         &self,
         requested_since_seq: i64,
@@ -210,6 +213,26 @@ impl SyncRepo<'_> {
         page_budget: usize,
         server_hlc: String,
         now: DateTime<Utc>,
+    ) -> Result<PeerSyncResponse> {
+        self.collect_peer_sync_response_inner(
+            requested_since_seq,
+            max_page_changes,
+            page_budget,
+            server_hlc,
+            now,
+            false,
+        )
+        .await
+    }
+
+    async fn collect_peer_sync_response_inner(
+        &self,
+        requested_since_seq: i64,
+        max_page_changes: usize,
+        page_budget: usize,
+        server_hlc: String,
+        now: DateTime<Utc>,
+        force_reset_required: bool,
     ) -> Result<PeerSyncResponse> {
         let mut tx = crate::db::begin_read(self.pool).await?;
 
@@ -219,12 +242,11 @@ impl SyncRepo<'_> {
                 .await?;
 
         let clamped_since = requested_since_seq.max(0);
+        let cursor_out_of_range = force_reset_required
+            || (clamped_since > 0
+                && (clamped_since < clock.min_retained_seq || clamped_since > clock.current_seq));
         let (reset_required, effective_since) =
-            if clamped_since > 0 && clamped_since < clock.min_retained_seq {
-                (true, 0)
-            } else {
-                (false, clamped_since)
-            };
+            if cursor_out_of_range { (true, 0) } else { (false, clamped_since) };
 
         let active_peers = Self::list_active_peers_in_tx(tx.conn(), now).await?;
         if effective_since >= clock.current_seq {

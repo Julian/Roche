@@ -6,6 +6,7 @@
 /data/
 /server/data/
 *.db
+*.db.zst
 *.db-shm
 *.db-wal
 

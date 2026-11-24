@@ -581,6 +581,13 @@ impl Db {
         &self.pool
     }
 
+    /// Snapshots this SQLite database cleanly into `dest` using SQLite's online `VACUUM INTO`.
+    ///
+    /// `dest` must not already exist; on Unix its permissions are tightened to `0600`.
+    pub async fn vacuum_into(&self, dest: &Path) -> Result<()> {
+        vacuum_into_pool(&self.pool, dest).await
+    }
+
     #[must_use]
     pub const fn feeds(&self) -> FeedRepo<'_> {
         FeedRepo::new(&self.pool, &self.write_lock)
@@ -754,6 +761,15 @@ async fn verify_and_heal_fts_index_with_lock(
     .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+pub(crate) async fn vacuum_into_pool(pool: &SqlitePool, dest: &Path) -> Result<()> {
+    let dest_str = dest
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Backup destination path is not valid UTF-8"))?;
+    sqlx::query("VACUUM INTO ?").bind(dest_str).execute(pool).await?;
+    crate::util::fs_perms::tighten_private_file_if_exists(dest).await;
+    Ok(())
 }
 
 pub(crate) async fn tighten_sqlite_sidecar_permissions(db_path: &Path) {
