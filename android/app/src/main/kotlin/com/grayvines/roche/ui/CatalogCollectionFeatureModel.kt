@@ -361,11 +361,11 @@ internal class CatalogCollectionFeatureModel(
                         .map { it.catalogRevisionStamp to it.catalog.wantQueues }
                         .distinctUntilChanged(),
                     transientFlow
-                        .map { Triple(it.activeTab, it.queueSubTab, it.selectedWantCollectionId) }
+                        .map { it.activeTab to it.selectedWantCollectionId }
                         .distinctUntilChanged(),
-                ) { (rev, queues), (tab, subTab, selectedId) ->
+                ) { (rev, queues), (tab, selectedId) ->
                     val targetId =
-                        if (tab == AppTab.QUEUE && subTab == QueueSubTab.WANT) {
+                        if (tab == AppTab.QUEUE) {
                             resolveActiveWantQueue(queues, selectedId)?.collectionId
                         } else {
                             null

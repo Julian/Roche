@@ -48,47 +48,6 @@ internal data class QueueSwapMatch(
     val layoutOffsetDelta: Float,
 )
 
-internal enum class QueueRowBadgeTone {
-    ACTIVE_AUDIO,
-    UP_NEXT_AUDIO,
-}
-
-internal data class QueueRowStatusBadge(
-    val label: String,
-    val tone: QueueRowBadgeTone,
-)
-
-internal fun resolveQueueRowStatusBadge(
-    isPlayingAudio: Boolean,
-    isAudioActuallyPlaying: Boolean,
-    isQueuedNextAudio: Boolean,
-): QueueRowStatusBadge? =
-    when {
-        isPlayingAudio && isAudioActuallyPlaying ->
-            QueueRowStatusBadge("▶ PLAYING", QueueRowBadgeTone.ACTIVE_AUDIO)
-        isPlayingAudio -> QueueRowStatusBadge("⏸ PAUSED", QueueRowBadgeTone.ACTIVE_AUDIO)
-        isQueuedNextAudio -> QueueRowStatusBadge("UP NEXT", QueueRowBadgeTone.UP_NEXT_AUDIO)
-        else -> null
-    }
-
-internal fun buildQueueRowStateDescription(
-    position: Int,
-    totalCount: Int,
-    isPlayingAudio: Boolean,
-    isAudioActuallyPlaying: Boolean,
-    isQueuedNextAudio: Boolean,
-    isFavorite: Boolean,
-): String = buildList {
-    add("Position $position of $totalCount")
-    when {
-        isPlayingAudio && isAudioActuallyPlaying -> add("Now playing")
-        isPlayingAudio -> add("Paused in player")
-        isQueuedNextAudio -> add("Up next in audio queue")
-    }
-    if (isFavorite) add("Starred")
-}
-    .joinToString(", ")
-
 internal fun moveItemInList(ids: List<String>, fromIndex: Int, toIndex: Int): List<String> {
     if (ids.size <= 1) return ids
     if (fromIndex !in ids.indices) return ids

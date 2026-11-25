@@ -356,13 +356,16 @@ class CatalogRankAndDiaryFlowsTest {
                 tsIso = "2025-06-15T12:00:00Z",
             )
         )
+        // Updating status to ABANDONED hides it from the default Finished filter; switch to All.
+        viewModel.dispatch(MainAction.SetDiaryStatusFilter(null))
         val updated =
             viewModel.uiState.first { st ->
-                st.diary.entries.any {
-                    it.id == logId &&
-                        it.status == ConsumptionStatus.ABANDONED &&
-                        it.notes == "Updated note"
-                }
+                st.diary.statusFilter == null &&
+                    st.diary.entries.any {
+                        it.id == logId &&
+                            it.status == ConsumptionStatus.ABANDONED &&
+                            it.notes == "Updated note"
+                    }
             }
         assertTrue(updated.diary.entries.first { it.id == logId }.ts.startsWith("2025-06-15"))
 

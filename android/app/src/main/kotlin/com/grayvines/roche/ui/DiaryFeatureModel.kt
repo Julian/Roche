@@ -31,7 +31,7 @@ data class DiaryUiState(
     val hasSongLogs: Boolean = false,
     val totalFilteredCount: Int = 0,
     val hasAnyEntries: Boolean = false,
-    val statusFilter: ConsumptionStatus? = null,
+    val statusFilter: ConsumptionStatus? = ConsumptionStatus.CONSUMED,
     val yearFilter: String? = null,
     val kindFilter: DiaryKindFilter = DiaryKindFilter.DefaultNonSong,
     val hasMore: Boolean = false,
@@ -45,7 +45,7 @@ private data class DiaryInvalidationKey(
 )
 
 private data class DiaryQueryParams(
-    val statusFilter: ConsumptionStatus? = null,
+    val statusFilter: ConsumptionStatus? = ConsumptionStatus.CONSUMED,
     val yearFilter: String? = null,
     val kindFilter: DiaryKindFilter = DiaryKindFilter.DefaultNonSong,
     val pageLimit: Int = DEFAULT_DIARY_PAGE_SIZE,

@@ -235,12 +235,6 @@ private fun DiaryStatusFilterStrip(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         RocheStripTab(
-            label = "All",
-            selected = selectedStatus == null,
-            onClick = { onSelectStatus(null) },
-            modifier = Modifier.testTag("diary_filter_all"),
-        )
-        RocheStripTab(
             label = "Finished",
             selected = selectedStatus == ConsumptionStatus.CONSUMED,
             onClick = { onSelectStatus(ConsumptionStatus.CONSUMED) },
@@ -257,6 +251,12 @@ private fun DiaryStatusFilterStrip(
             selected = selectedStatus == ConsumptionStatus.ABANDONED,
             onClick = { onSelectStatus(ConsumptionStatus.ABANDONED) },
             modifier = Modifier.testTag("diary_filter_abandoned"),
+        )
+        RocheStripTab(
+            label = "All",
+            selected = selectedStatus == null,
+            onClick = { onSelectStatus(null) },
+            modifier = Modifier.testTag("diary_filter_all"),
         )
     }
     val showKindBar =

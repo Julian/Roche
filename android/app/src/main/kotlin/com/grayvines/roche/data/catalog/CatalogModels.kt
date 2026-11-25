@@ -380,6 +380,7 @@ data class CatalogSnapshot(
     val lists: List<CatalogListSummary> = emptyList(),
     val wantQueues: List<CatalogListSummary> = emptyList(),
     val recentDiaryEntries: List<DiaryEntryItem> = emptyList(),
+    val activeStartedEntries: List<DiaryEntryItem> = emptyList(),
     val totalDiaryCount: Int = recentDiaryEntries.size,
     val consumedCount: Int = 0,
     val globalTiers: GlobalTierIndex = GlobalTierIndex(),

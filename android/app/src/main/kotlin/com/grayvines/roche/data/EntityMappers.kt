@@ -180,6 +180,7 @@ internal fun toInboxEntry(entity: InboxItemRow, tags: List<String>): InboxEntry 
         isFinished = entity.isFinished,
         discussions = extractDiscussionsForEntry(entity.metadataJson, entity.hackerNewsId),
         releaseYear = entity.releaseYear,
+        interactionUpdatedAt = entity.interactionUpdatedAt,
     )
 
 internal fun createSavedItemEntity(

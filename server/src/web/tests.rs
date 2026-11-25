@@ -1815,3 +1815,454 @@ fn test_album_tracklist_and_artist_discography_parsers() {
     assert_eq!(discog[0].title, "Kind of Blue");
     assert_eq!(discog[0].release_year, Some(1959));
 }
+
+#[tokio::test]
+async fn test_unified_in_progress_home_queues_and_diary_default_finished() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    // 1. Seed a feed article at 42% progress + a queued saved article at 30% progress + a fresh queued article
+    let feed_url = Url::parse("https://notes.example/feed.xml").unwrap();
+    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Notes Feed"), None).await.unwrap();
+    let art_url = Url::parse("https://notes.example/half-read").unwrap();
+    let art = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Half-Read Essay",
+            url: &art_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    db.items()
+        .update_with_source(
+            &art.id,
+            None,
+            None,
+            Some(0.42),
+            crate::domain::ReadAtPatch::Unchanged,
+            Some(crate::domain::ProgressSource::Reader),
+        )
+        .await
+        .unwrap();
+
+    let saved_in_prog_url = Url::parse("https://notes.example/queued-midway").unwrap();
+    let (saved_in_prog, _) = db
+        .items()
+        .save_manual_with_tags(&saved_in_prog_url, "Queued Midway Paper", &[])
+        .await
+        .unwrap();
+    db.items()
+        .update_with_source(
+            &saved_in_prog.id,
+            None,
+            None,
+            Some(0.30),
+            crate::domain::ReadAtPatch::Unchanged,
+            Some(crate::domain::ProgressSource::Reader),
+        )
+        .await
+        .unwrap();
+
+    let saved_fresh_url = Url::parse("https://notes.example/queued-fresh").unwrap();
+    let (saved_fresh, _) = db
+        .items()
+        .save_manual_with_tags(&saved_fresh_url, "Queued Fresh Article", &[])
+        .await
+        .unwrap();
+
+    // 2. Log a started book (catalog work without reader progress) + a finished book
+    let book_started = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "The Brothers Karamazov".to_owned(),
+            creators: vec!["Fyodor Dostoevsky".to_owned()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(
+            &book_started.id,
+            crate::db::ConsumptionStatus::Started,
+            Some("Part I"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let book_finished = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Crime and Punishment".to_owned(),
+            creators: vec!["Fyodor Dostoevsky".to_owned()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(&book_finished.id, crate::db::ConsumptionStatus::Consumed, None, None)
+        .await
+        .unwrap();
+
+    // 3. GET /api/v1/home includes unified in_progress (2 reader items + 1 started book),
+    //    deduplicates shown in_progress from unread_items AND want_to_read_items,
+    //    and filters recent_diary to Finished only.
+    let home_json = read_body_json(get_authed(&app, "/api/v1/home", &cookie).await).await;
+    let home_in_prog = home_json["in_progress"].as_array().unwrap();
+    assert_eq!(home_in_prog.len(), 3);
+    assert!(home_in_prog.iter().any(|r| r["source"] == "item" && r["item"]["id"] == art.id));
+    assert!(
+        home_in_prog.iter().any(|r| r["source"] == "item" && r["item"]["id"] == saved_in_prog.id)
+    );
+    assert!(
+        home_in_prog
+            .iter()
+            .any(|r| r["source"] == "catalog" && r["entry"]["id"] == book_started.id)
+    );
+
+    let home_unread = home_json["unread_items"].as_array().unwrap();
+    assert!(
+        !home_unread.iter().any(|i| i["id"] == art.id),
+        "in-progress feed item must be deduplicated from Home unread_items"
+    );
+    let home_wtr = home_json["want_to_read_items"].as_array().unwrap();
+    assert!(
+        !home_wtr.iter().any(|i| i["id"] == saved_in_prog.id),
+        "in-progress queued item must be deduplicated from Home want_to_read_items preview"
+    );
+    assert!(home_wtr.iter().any(|i| i["id"] == saved_fresh.id));
+    assert_eq!(home_json["want_to_read_total"], 2);
+
+    let recent_diary = home_json["recent_diary"].as_array().unwrap();
+    assert_eq!(recent_diary.len(), 1);
+    assert_eq!(recent_diary[0]["entry"]["id"], book_finished.id);
+
+    // 4. GET /api/v1/catalog/queues surfaces unified in_progress + Want queues without double-counting
+    let queues_json =
+        read_body_json(get_authed(&app, "/api/v1/catalog/queues", &cookie).await).await;
+    let q_in_prog = queues_json["in_progress"].as_array().unwrap();
+    assert_eq!(q_in_prog.len(), 3);
+    // 2 want:read items + 2 non-queued in-progress items (art + book_started) = 4 unique items
+    assert_eq!(queues_json["total_items"], 4);
+
+    // 5. GET /api/v1/catalog/diary/page defaults to Finished, while ?status=all and ?status=started expose started logs
+    let diary_default =
+        read_body_json(get_authed(&app, "/api/v1/catalog/diary/page", &cookie).await).await;
+    assert_eq!(diary_default["total_for_filter"], 1);
+    assert_eq!(diary_default["entries"][0]["entry"]["id"], book_finished.id);
+
+    let diary_started = read_body_json(
+        get_authed(&app, "/api/v1/catalog/diary/page?status=started", &cookie).await,
+    )
+    .await;
+    assert_eq!(diary_started["total_for_filter"], 1);
+    assert_eq!(diary_started["entries"][0]["entry"]["id"], book_started.id);
+
+    let diary_all =
+        read_body_json(get_authed(&app, "/api/v1/catalog/diary/page?status=all", &cookie).await)
+            .await;
+    assert_eq!(diary_all["total_for_filter"], 2);
+
+    // 6. POST /api/v1/catalog/entries/{id}/log with status=abandoned clears book_started from In Progress
+    let skip_resp = post_json_authed(
+        &app,
+        &format!("/api/v1/catalog/entries/{}/log", book_started.id),
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({ "status": "abandoned" }),
+    )
+    .await;
+    assert_eq!(skip_resp.status(), StatusCode::OK);
+    let queues_after_skip =
+        read_body_json(get_authed(&app, "/api/v1/catalog/queues", &cookie).await).await;
+    assert!(
+        !queues_after_skip["in_progress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["source"] == "catalog" && r["entry"]["id"] == book_started.id),
+        "logging abandoned must clear started catalog entry from in_progress"
+    );
+}
+
+#[tokio::test]
+async fn test_in_progress_api_boundaries_log_validation_and_up_next_isolation() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    let feed_url = Url::parse("https://edges.example/feed.xml").unwrap();
+    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Edges Feed"), None).await.unwrap();
+
+    // 1. Progress threshold boundaries: 0.029 (out), 0.03 (in), 0.979 (in), 0.98 (out)
+    let mut boundary_ids = Vec::new();
+    for (slug, prog) in
+        [("below", 0.029_f64), ("min-in", 0.03_f64), ("max-in", 0.979_f64), ("above", 0.98_f64)]
+    {
+        let u = Url::parse(&format!("https://edges.example/{slug}")).unwrap();
+        let it = db
+            .items()
+            .create(&NewItem {
+                feed_id: Some(&feed.id),
+                title: &format!("Boundary {slug}"),
+                url: &u,
+                author: None,
+                published_at: None,
+                summary: None,
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+        db.items()
+            .update_with_source(
+                &it.id,
+                None,
+                None,
+                Some(prog),
+                crate::domain::ReadAtPatch::Unchanged,
+                Some(crate::domain::ProgressSource::Reader),
+            )
+            .await
+            .unwrap();
+        boundary_ids.push(it.id);
+    }
+
+    // 2. Overlap item: reader progress (0.40) + newer `started` log -> deduped as `source: "item"`
+    //    with boosted `activity_at`, plus 3 more started books to exceed Home's 4-item cap
+    let overlap_url = Url::parse("https://edges.example/overlap").unwrap();
+    let overlap_item = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Overlap Article".to_owned().as_str(),
+            url: &overlap_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    db.items()
+        .update_with_source(
+            &overlap_item.id,
+            None,
+            None,
+            Some(0.40),
+            crate::domain::ReadAtPatch::Unchanged,
+            Some(crate::domain::ProgressSource::Reader),
+        )
+        .await
+        .unwrap();
+    let future_ts = chrono::Utc::now() + chrono::Duration::hours(2);
+    db.catalog()
+        .log_consumption(
+            &overlap_item.id,
+            crate::db::ConsumptionStatus::Started,
+            Some("Started note"),
+            Some(future_ts),
+        )
+        .await
+        .unwrap();
+
+    let mut started_books = Vec::new();
+    for idx in 1..=3_i64 {
+        let b = db
+            .catalog()
+            .upsert_entry(&crate::db::UpsertEntryInput {
+                kind: Some(EntryKind::Book),
+                title: format!("Started Book {idx}"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.catalog()
+            .log_consumption(
+                &b.id,
+                crate::db::ConsumptionStatus::Started,
+                None,
+                Some(chrono::Utc::now() + chrono::Duration::minutes(idx)),
+            )
+            .await
+            .unwrap();
+        started_books.push(b.id);
+    }
+    // Also place started_books[0] into Want to Read so finishing it clears Want membership
+    db.catalog()
+        .add_collection_entry(crate::db::WANT_TO_READ_COLLECTION_ID, &started_books[0], None)
+        .await
+        .unwrap();
+
+    // Seed a legacy `up_next` member and ensure it is completely hidden from Home and Queues
+    let legacy_up_next = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Legacy Up Next Film".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    db.catalog()
+        .add_collection_entry(crate::db::UP_NEXT_COLLECTION_ID, &legacy_up_next.id, None)
+        .await
+        .unwrap();
+
+    // 3. Check /api/v1/catalog/queues: exact 6 in_progress (min-in, max-in, overlap, 3 books),
+    //    overlap appears once as source="item" at index 0 due to boosted started ts,
+    //    and up_next is hidden.
+    let queues_json =
+        read_body_json(get_authed(&app, "/api/v1/catalog/queues", &cookie).await).await;
+    let q_in_prog = queues_json["in_progress"].as_array().unwrap();
+    let q_ids: Vec<&str> = q_in_prog
+        .iter()
+        .map(|r| {
+            if r["source"] == "item" {
+                r["item"]["id"].as_str().unwrap()
+            } else {
+                r["entry"]["id"].as_str().unwrap()
+            }
+        })
+        .collect();
+    assert_eq!(q_ids.len(), 6);
+    assert_eq!(q_ids[0], overlap_item.id, "newer started ts must boost overlap reader item first");
+    assert_eq!(q_in_prog[0]["source"], "item");
+    assert!(q_ids.contains(&boundary_ids[1].as_str()), "0.03 must be included");
+    assert!(q_ids.contains(&boundary_ids[2].as_str()), "0.979 must be included");
+    assert!(!q_ids.contains(&boundary_ids[0].as_str()), "0.029 must be excluded");
+    assert!(!q_ids.contains(&boundary_ids[3].as_str()), "0.98 must be excluded");
+    let queues_arr = queues_json["queues"].as_array().unwrap();
+    assert!(!queues_arr.is_empty(), "want:read queue should be present");
+    assert!(
+        queues_arr.iter().all(|q| {
+            q["collection"]["id"].as_str().expect("queue.collection.id")
+                != crate::db::UP_NEXT_COLLECTION_ID
+        }),
+        "up_next must be hidden from queues"
+    );
+
+    // 4. Check /api/v1/home: capped at 4 in_progress, unshown 5th/6th reader items stay in unread_items,
+    //    and legacy up_next does not inflate other_want_total
+    let home_json = read_body_json(get_authed(&app, "/api/v1/home", &cookie).await).await;
+    let home_in_prog = home_json["in_progress"].as_array().unwrap();
+    assert_eq!(home_in_prog.len(), 4);
+    assert_eq!(home_json["other_want_total"], 0);
+    let home_unread_ids: Vec<&str> = home_json["unread_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["id"].as_str())
+        .collect();
+    assert!(
+        home_unread_ids.contains(&boundary_ids[1].as_str())
+            || home_unread_ids.contains(&boundary_ids[2].as_str()),
+        "in-progress reader item past Home's 4-item cap must remain visible in unread_items"
+    );
+
+    // 5. POST /api/v1/catalog/entries/{id}/log validation: missing CSRF -> 403, invalid status -> 400
+    let no_csrf = post_json_authed(
+        &app,
+        &format!("/api/v1/catalog/entries/{}/log", started_books[1]),
+        &cookie,
+        None,
+        serde_json::json!({ "status": "abandoned" }),
+    )
+    .await;
+    assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+
+    let bad_status = post_json_authed(
+        &app,
+        &format!("/api/v1/catalog/entries/{}/log", started_books[1]),
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({ "status": "bogus_status" }),
+    )
+    .await;
+    assert_eq!(bad_status.status(), StatusCode::BAD_REQUEST);
+
+    // "skipped" alias must log `abandoned`, NOT coerce to `consumed`
+    let skipped_resp = post_json_authed(
+        &app,
+        &format!("/api/v1/catalog/entries/{}/log", started_books[1]),
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({ "status": "skipped" }),
+    )
+    .await;
+    assert_eq!(skipped_resp.status(), StatusCode::OK);
+    let skipped_json = read_body_json(skipped_resp).await;
+    assert_eq!(skipped_json["logged"]["status"], "abandoned");
+
+    // Case-insensitive diary status filter (`?status=ALL`, `?status=Started`, `?status=SKIPPED`)
+    let diary_skipped = read_body_json(
+        get_authed(&app, "/api/v1/catalog/diary/page?status=SKIPPED", &cookie).await,
+    )
+    .await;
+    assert_eq!(diary_skipped["total_for_filter"], 1);
+    assert_eq!(diary_skipped["entries"][0]["entry"]["id"], started_books[1]);
+
+    let diary_started_ci = read_body_json(
+        get_authed(&app, "/api/v1/catalog/diary/page?status=Started", &cookie).await,
+    )
+    .await;
+    assert!(diary_started_ci["total_for_filter"].as_u64().unwrap() >= 3);
+
+    // 6. Finishing a queued started book with `rank_after: true` (with >=2 consumed books so
+    //    `books` is rankable) returns `rank_slug = "books"` and removes it from Want
+    let seed_finished_book = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Already Finished Seed Book".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(&seed_finished_book.id, crate::db::ConsumptionStatus::Consumed, None, None)
+        .await
+        .unwrap();
+    let finish_book = post_json_authed(
+        &app,
+        &format!("/api/v1/catalog/entries/{}/log", started_books[0]),
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({ "status": "consumed", "rank_after": true }),
+    )
+    .await;
+    assert_eq!(finish_book.status(), StatusCode::OK);
+    let finish_book_json = read_body_json(finish_book).await;
+    assert_eq!(finish_book_json["rank_slug"], "books");
+    assert!(
+        db.catalog()
+            .want_entry_ids_in(std::slice::from_ref(&started_books[0]))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // 7. Finishing a live reader item via /entries/{id}/log archives `entry_state` & sets progress = 1.0
+    let finish_reader = post_json_authed(
+        &app,
+        &format!("/api/v1/catalog/entries/{}/log", overlap_item.id),
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({ "status": "consumed" }),
+    )
+    .await;
+    assert_eq!(finish_reader.status(), StatusCode::OK);
+    let updated_reader = db.items().get(&overlap_item.id).await.unwrap().unwrap();
+    assert_eq!(updated_reader.status, crate::domain::ItemStatus::Archived);
+    assert!((updated_reader.read_progress - 1.0).abs() < 1e-6);
+
+    let diary_all_ci =
+        read_body_json(get_authed(&app, "/api/v1/catalog/diary/page?status=ALL", &cookie).await)
+            .await;
+    assert!(diary_all_ci["total_for_filter"].as_u64().unwrap() >= 5);
+}

@@ -830,7 +830,8 @@ private fun resolveUnpinnedTabSubtitle(
         AppTab.INBOX -> "Chronological stream from subscribed feeds"
         AppTab.BOARDS -> formatBoardsUnpinnedSubtitle(state)
         AppTab.DIARY -> "Chronological consumption log (${state.catalog.consumedCount} logged)"
-        AppTab.QUEUE -> "${state.queueEntries.size} up next · ${state.catalog.wantItemCount} want"
+        AppTab.QUEUE ->
+            "${state.inProgressItems.size} in progress · ${state.catalog.wantItemCount} want"
         AppTab.OFFLINE -> "${state.offlineEntries.size} cached articles & episodes"
         AppTab.STARRED -> "$totalStarred starred entries"
         AppTab.LISTS -> "Ranked collections & custom lists"

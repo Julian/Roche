@@ -186,7 +186,6 @@ private fun reduceCatalogUiAction(
     when (action) {
         is MainAction.OpenCompanionSection -> reduceOpenCompanionSection(state, action)
         is MainAction.SelectCompanionSubTab -> state.copy(companionSubTab = action.subTab)
-        is MainAction.SelectQueueSubTab -> state.copy(queueSubTab = action.subTab)
         is MainAction.SelectCatalogCollection ->
             state.copy(selectedCatalogCollectionId = action.collectionId)
         is MainAction.SelectWantCollection ->
@@ -283,12 +282,6 @@ private fun reduceOpenCompanionSection(
         .copy(
             activeTab = targetTab,
             companionSubTab = action.subTab,
-            queueSubTab =
-                if (action.subTab == CompanionSubTab.WANT) {
-                    QueueSubTab.WANT
-                } else {
-                    state.queueSubTab
-                },
             selectedCatalogCollectionId =
                 if (action.subTab == CompanionSubTab.LISTS) {
                     action.collectionId

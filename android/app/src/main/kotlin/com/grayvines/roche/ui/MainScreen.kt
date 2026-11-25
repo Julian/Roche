@@ -612,6 +612,7 @@ internal fun MainOverlaySheets(
             entry = contextEntry,
             availableTags = state.tags.map { it.name },
             isInQueue = state.isEntryInQueue(contextEntry.id),
+            isInAudioUpNext = state.isEntryInAudioUpNext(contextEntry.id),
             isDownloadingOffline = contextEntry.id in state.inFlightOfflineEntryIds,
             onAction = onAction,
             onShareEntry = onShareEntry,
@@ -957,7 +958,7 @@ private fun MainPlayerDestination(
                     .asSequence()
                     .filter { it != targetEntry.id }
                     .mapNotNull { state.entryById[it] }
-                    .filter { !it.isArchived && it.isPlayableAudio }
+                    .filter { !it.isArchived && !it.isFinished && it.isPlayableAudio }
                     .toList()
             }
         FullscreenPodcastPlayer(
@@ -1013,9 +1014,7 @@ internal fun MainTabDestinationContent(
             QueueTabContent(
                 state = state,
                 onAction = onAction,
-                upNextListState = scrollStates.lazyListState("queue:up_next"),
-                wantListState = scrollStates.lazyListState("queue:want"),
-                historyListState = scrollStates.lazyListState("queue:history"),
+                listState = scrollStates.lazyListState("queue"),
                 activeAudioEntryId = activeAudioEntryId,
                 onOpenExternalUrl = onOpenExternalUrl,
             )
@@ -1103,9 +1102,6 @@ private fun resolveListsFabAction(state: MainUiState): MainAction {
 }
 
 private fun resolveQueueFabAction(state: MainUiState): MainAction {
-    if (state.queueSubTab != QueueSubTab.WANT) {
-        return MainAction.OpenAddSheet()
-    }
     val activeQueue =
         resolveActiveWantQueue(
             queues = state.catalog.wantQueues,
@@ -1211,7 +1207,7 @@ internal class MainScrollStateHolder(
             AppTab.HOME -> scrollState("home").animateScrollTo(0)
             AppTab.INBOX ->
                 lazyListState("inbox:filter:${state.activeFilter.name}").animateScrollToItem(0)
-            AppTab.QUEUE -> lazyListState(queueScrollKey(state.queueSubTab)).animateScrollToItem(0)
+            AppTab.QUEUE -> lazyListState("queue").animateScrollToItem(0)
             AppTab.STARRED -> lazyListState("starred").animateScrollToItem(0)
             AppTab.FEEDS -> scrollState("feeds").animateScrollTo(0)
             AppTab.BOARDS -> lazyListState(boardScrollKey(state)).animateScrollToItem(0)
@@ -1229,13 +1225,6 @@ internal class MainScrollStateHolder(
             lazyListState(companionScrollKey(state)).animateScrollToItem(0)
         }
     }
-
-    private fun queueScrollKey(subTab: QueueSubTab): String =
-        when (subTab) {
-            QueueSubTab.UP_NEXT -> "queue:up_next"
-            QueueSubTab.WANT -> "queue:want"
-            QueueSubTab.HISTORY -> "queue:history"
-        }
 
     internal fun toSavedSnapshot(): SavedScrollStateSnapshot =
         SavedScrollStateSnapshot(

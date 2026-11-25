@@ -63,12 +63,33 @@
   let kindBadge = $derived(contentTypeBadge(item.content_type, hasAudio, item.entry_kind));
   let durationText = $derived(formatDuration(item.duration));
   let remainingText = $derived.by(() => {
-    if (!item.duration || item.read_progress < 0.03 || item.read_progress >= 0.98) {
+    if (
+      !item.duration ||
+      item.is_finished ||
+      item.status === 'archived' ||
+      item.read_progress < 0.03 ||
+      item.read_progress >= 0.98
+    ) {
       return null;
     }
     const rem = Math.round(item.duration * (1 - item.read_progress));
     const fmt = formatDuration(rem);
     return fmt ? `${fmt} left` : null;
+  });
+  let fallbackProgressLabel = $derived.by(() => {
+    if (
+      showProgress ||
+      remainingText !== null ||
+      item.is_finished ||
+      item.status === 'archived' ||
+      item.read_progress < 0.03 ||
+      item.read_progress >= 0.98
+    ) {
+      return null;
+    }
+    const pct = Math.round(item.read_progress * 100);
+    const verb = hasAudio ? 'played' : item.content_type === 'video' ? 'watched' : 'read';
+    return `${pct}% ${verb}`;
   });
   let isPlayingThis = $derived(player.isItemPlaying(item.id));
   let isDismissed = $derived(item.status === 'archived' && !item.is_finished);
@@ -272,6 +293,9 @@
       {/if}
       {#if remainingText}
         <span class="byline-item">{remainingText}</span>
+      {/if}
+      {#if fallbackProgressLabel}
+        <span class="byline-item">{fallbackProgressLabel}</span>
       {/if}
       {#if item.published_at || item.created_at}
         <span class="byline-item">{formatShortDate(item.published_at ?? item.created_at)}</span>

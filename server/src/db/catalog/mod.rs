@@ -17,8 +17,8 @@ mod tests;
 
 pub use collections::derive_manual_collection_slug_and_id;
 pub use models::{
-    BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
-    BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult,
+    ActiveStartedEntry, BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput,
+    BatchEntryInput, BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult,
     CatalogBatchStreamResult, CatalogEntry, CatalogError, CatalogExportSnapshot, CatalogResult,
     CollectionGeneratorState, CollectionPageMeta, CollectionRankingInputs, CollectionSummary,
     ComparisonRecord, ConsumptionLogRow, ConsumptionLogView, DiaryKindFilter,

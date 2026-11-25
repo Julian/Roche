@@ -1032,7 +1032,6 @@ internal suspend fun loadEntryDetailFromDao(
     val isStarred = STARRED_COLLECTION_ID in memberColIds
     val isInWantQueue = memberColIds.any { colId ->
         colId == WANT_TO_READ_COLLECTION_ID ||
-            colId == UP_NEXT_COLLECTION_ID ||
             CollectionRole.fromWireValue(specsById[colId]?.role) == CollectionRole.WANT
     }
     val appearances =

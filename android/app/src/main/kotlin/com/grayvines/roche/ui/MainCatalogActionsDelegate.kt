@@ -1,6 +1,7 @@
 package com.grayvines.roche.ui
 
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.catalog.CollectionRankMeta
 import com.grayvines.roche.data.catalog.ConsumptionStatus
@@ -11,6 +12,8 @@ import com.grayvines.roche.ranking.EpRankingEngine
 import com.grayvines.roche.ranking.RankClusterCandidate
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+
+private const val DEFAULT_QUEUE_LABEL = "Queue"
 
 @Suppress("TooManyFunctions")
 internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
@@ -23,8 +26,8 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
             return
         }
         catalogActionMutex.withLock {
-            if (!executeRankOrDraw(action)) {
-                executeCatalogEntryOrList(action)
+            if (!executeRankOrDraw(action) && !executeCatalogEntryAction(action)) {
+                executeCatalogListOrWantAction(action)
             }
         }
     }
@@ -56,20 +59,29 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
         return true
     }
 
-    private suspend fun executeCatalogEntryOrList(action: MainAction.CatalogMutation) {
+    private suspend fun executeCatalogEntryAction(action: MainAction.CatalogMutation): Boolean {
         when (action) {
             is MainAction.UpdateConsumptionLog -> performUpdateConsumptionLog(action)
             is MainAction.DeleteConsumptionLog -> performDeleteConsumptionLog(action.logId)
             is MainAction.ToggleCatalogStar -> performToggleCatalogStar(action.entryId)
-            is MainAction.ToggleCatalogWant -> performToggleCatalogWant(action.entryId)
-            is MainAction.AddCatalogEntryToList ->
-                performAddCatalogEntryToList(action.collectionId, action.entryId)
             is MainAction.UpdateCatalogEntry ->
                 performUpdateCatalogEntry(action.entryId, action.input)
             is MainAction.MarkFeedEntryFinished ->
                 performMarkFeedEntryFinished(action.entryId, action.rankImmediately)
             is MainAction.UnfinishFeedEntry -> performUnfinishFeedEntry(action.entryId)
             is MainAction.SubmitQuickLog -> performSubmitQuickLog(action)
+            else -> return false
+        }
+        return true
+    }
+
+    private suspend fun executeCatalogListOrWantAction(action: MainAction.CatalogMutation) {
+        when (action) {
+            is MainAction.ToggleCatalogWant -> performToggleCatalogWant(action.entryId)
+            is MainAction.ToggleWantToRead -> performToggleWantToRead(action.entryId)
+            is MainAction.SkipStartedEntry -> performSkipStartedEntry(action.entryId)
+            is MainAction.AddCatalogEntryToList ->
+                performAddCatalogEntryToList(action.collectionId, action.entryId)
             is MainAction.CreateCustomCatalogList -> performCreateCustomList(action.title)
             is MainAction.CompleteWantEntry ->
                 performCompleteWantEntry(action.entryId, action.rankImmediately)
@@ -193,18 +205,75 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
     }
 
     private suspend fun performToggleCatalogWant(entryId: String) {
-        val existingQueueId = host.repository.catalog.findWantCollectionForEntry(entryId)
-        if (existingQueueId != null) {
-            performRemoveWantEntry(existingQueueId, entryId)
+        val existingWantCols = host.repository.catalog.findWantCollectionsForEntry(entryId)
+        if (existingWantCols.isNotEmpty()) {
+            removeFromWantQueuesWithUndo(existingWantCols, entryId, label = DEFAULT_QUEUE_LABEL)
             return
         }
         runSuspendCatching { host.repository.catalog.wantExistingEntry(entryId) }
             .onSuccess { pair ->
-                val title = pair?.second ?: "Want Queue"
+                val title = pair?.second ?: DEFAULT_QUEUE_LABEL
                 host.showStatusMessage("Added to $title")
             }
             .onFailure { err ->
                 host.showStatusMessage("Could not queue (${err.message ?: "error"})")
+            }
+    }
+
+    private suspend fun performToggleWantToRead(entryId: String) {
+        val existingWantCols = host.repository.catalog.findWantCollectionsForEntry(entryId)
+        host.updateTransient { it.copy(contextSheetEntryId = null) }
+        if (existingWantCols.isNotEmpty()) {
+            removeFromWantQueuesWithUndo(existingWantCols, entryId, label = DEFAULT_QUEUE_LABEL)
+            return
+        }
+        runSuspendCatching {
+            host.repository.catalog.addCollectionEntry(WANT_TO_READ_COLLECTION_ID, entryId)
+        }
+            .onSuccess { host.showStatusMessage("Added to $DEFAULT_QUEUE_LABEL") }
+            .onFailure { err ->
+                host.showStatusMessage(
+                    "Could not add to $DEFAULT_QUEUE_LABEL (${err.message ?: "error"})"
+                )
+            }
+    }
+
+    private suspend fun removeFromWantQueuesWithUndo(
+        collectionIds: List<String>,
+        entryId: String,
+        label: String,
+    ) {
+        runSuspendCatching {
+            host.repository.catalog.removeEntryFromCollections(collectionIds, entryId)
+        }
+            .onSuccess { removedCols ->
+                if (removedCols.isNotEmpty()) {
+                    host.showUndoAction(
+                        UndoActionEvent(
+                            message = "Removed from $label",
+                            kind =
+                                UndoActionKind.RestoreCollectionEntry(
+                                    collectionId = removedCols.first(),
+                                    entryId = entryId,
+                                    label = label,
+                                    collectionIds = removedCols,
+                                ),
+                        )
+                    )
+                }
+            }
+            .onFailure { err ->
+                host.showStatusMessage("Could not remove from $label (${err.message ?: "error"})")
+            }
+    }
+
+    private suspend fun performSkipStartedEntry(entryId: String) {
+        runSuspendCatching {
+            host.repository.catalog.logExistingEntry(entryId, ConsumptionStatus.ABANDONED, null)
+        }
+            .onSuccess { host.showStatusMessage("Marked skipped") }
+            .onFailure { err ->
+                host.showStatusMessage("Could not skip item (${err.message ?: "error"})")
             }
     }
 
@@ -377,6 +446,7 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                     action.addToListOnly -> "Added to ${listLabel ?: "list"}"
                     action.addToWant && listLabel != null -> "Added to Want Queue & $listLabel"
                     action.addToWant -> "Added to Want Queue"
+                    action.status == ConsumptionStatus.STARTED -> "Started (In Progress)"
                     else -> "Logged to Diary"
                 }
             host.showStatusMessage("$verb · $cleanTitle")
@@ -400,6 +470,11 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
     }
 
     private suspend fun performCompleteWantEntry(entryId: String, rankImmediately: Boolean) {
+        val isLiveReaderItem = host.latestEntries().any { it.id == entryId }
+        if (isLiveReaderItem) {
+            performMarkFeedEntryFinished(entryId, rankImmediately)
+            return
+        }
         runSuspendCatching {
             host.repository.catalog.logExistingEntry(entryId, ConsumptionStatus.CONSUMED, null)
         }

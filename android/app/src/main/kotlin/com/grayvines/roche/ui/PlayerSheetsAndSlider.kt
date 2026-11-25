@@ -2,6 +2,8 @@
 
 package com.grayvines.roche.ui
 
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -46,11 +48,14 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
@@ -59,8 +64,10 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
 import com.grayvines.roche.model.FeedItem
@@ -339,6 +346,9 @@ internal fun PlayerContentDrawerSheet(
                             onMoveToTop = { targetId ->
                                 onAction(MainAction.MoveQueueItemToTop(targetId))
                             },
+                            onReorderQueue = { orderedIds ->
+                                onAction(MainAction.ReorderQueue(orderedIds))
+                            },
                             onRemoveFromQueue = { targetId ->
                                 onAction(MainAction.RemoveFromQueue(targetId))
                             },
@@ -413,11 +423,13 @@ private fun PlayerChaptersTabBody(
 }
 
 @Composable
+@Suppress("LongParameterList")
 private fun PlayerUpNextTabBody(
     entries: List<InboxEntry>,
     listState: LazyListState,
     onPlayEntry: (String) -> Unit,
     onMoveToTop: (String) -> Unit,
+    onReorderQueue: (List<String>) -> Unit,
     onRemoveFromQueue: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -432,40 +444,82 @@ private fun PlayerUpNextTabBody(
                 fontSize = 13.5.sp,
             )
             Text(
-                text = "Queue podcast episodes from Inbox or Queue to play them next.",
+                text = "Queue podcast episodes via Play Next or Audio Up Next to play them next.",
                 color = colors.textMuted,
                 fontSize = 12.sp,
             )
         }
         return
     }
+    val dragState =
+        rememberQueueDragReorderState(
+            listState = listState,
+            entries = entries,
+            onCommitReorder = onReorderQueue,
+        )
+    val displayEntries = dragState.resolveDisplayEntries(entries)
+    val currentIds = remember(displayEntries) { displayEntries.map { it.id } }
+    val canReorder = displayEntries.size > 1
     LazyColumn(
         state = listState,
+        userScrollEnabled = dragState.draggedEntryId == null,
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
         modifier = Modifier.fillMaxWidth().testTag("player_up_next_list"),
     ) {
-        itemsIndexed(items = entries, key = { _, item -> item.id }) { index, item ->
+        itemsIndexed(items = displayEntries, key = { _, item -> item.id }) { index, item ->
+            val isDragging = dragState.draggedEntryId == item.id
             PlayerUpNextEpisodeRow(
                 position = index + 1,
                 entry = item,
-                canMoveToTop = index > 0,
+                canReorder = canReorder,
+                canMoveUp = index > 0,
+                canMoveDown = index < currentIds.lastIndex,
+                isDragging = isDragging,
+                dragState = dragState,
                 onPlay = { onPlayEntry(item.id) },
                 onMoveToTop = { onMoveToTop(item.id) },
+                onMoveUp = { onReorderQueue(moveItemInList(currentIds, index, index - 1)) },
+                onMoveDown = { onReorderQueue(moveItemInList(currentIds, index, index + 1)) },
                 onRemove = { onRemoveFromQueue(item.id) },
+                modifier =
+                    Modifier.fillMaxWidth()
+                        .zIndex(if (isDragging) 1f else 0f)
+                        .graphicsLayer {
+                            if (isDragging) {
+                                translationY = dragState.dragOffsetY
+                                shadowElevation = 8.dp.toPx()
+                            }
+                        }
+                        .animateItem(
+                            placementSpec =
+                                if (isDragging) {
+                                    null
+                                } else {
+                                    spring<IntOffset>(stiffness = Spring.StiffnessMediumLow)
+                                }
+                        ),
             )
         }
     }
 }
 
 @Composable
+@Suppress("LongParameterList")
 private fun PlayerUpNextEpisodeRow(
     position: Int,
     entry: InboxEntry,
-    canMoveToTop: Boolean,
+    canReorder: Boolean,
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
+    isDragging: Boolean,
+    dragState: QueueDragReorderState,
     onPlay: () -> Unit,
     onMoveToTop: () -> Unit,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit,
     onRemove: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
     var showMenu by rememberSaveable(entry.id) { mutableStateOf(false) }
@@ -478,17 +532,46 @@ private fun PlayerUpNextEpisodeRow(
                 append(dur)
             }
     }
+    val a11yActions = buildList {
+        if (canMoveUp) {
+            add(
+                CustomAccessibilityAction("Move up in Up Next") {
+                    onMoveUp()
+                    true
+                }
+            )
+            add(
+                CustomAccessibilityAction("Move to top of Up Next") {
+                    onMoveToTop()
+                    true
+                }
+            )
+        }
+        if (canMoveDown) {
+            add(
+                CustomAccessibilityAction("Move down in Up Next") {
+                    onMoveDown()
+                    true
+                }
+            )
+        }
+    }
     Row(
         modifier =
-            Modifier.fillMaxWidth()
+            modifier
                 .heightIn(min = 56.dp)
                 .clip(RoundedCornerShape(8.dp))
+                .background(if (isDragging) colors.surfaceElevated else Color.Transparent)
                 .clickable(onClick = onPlay)
-                .semantics { role = Role.Button }
+                .queueLongPressDrag(enabled = canReorder, entryId = entry.id, dragState = dragState)
+                .semantics {
+                    role = Role.Button
+                    if (a11yActions.isNotEmpty()) customActions = a11yActions
+                }
                 .padding(start = 8.dp, end = 2.dp, top = 6.dp, bottom = 6.dp)
                 .testTag("player_up_next_row_${entry.id}"),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text(
             text = "$position",
@@ -514,6 +597,13 @@ private fun PlayerUpNextEpisodeRow(
                 overflow = TextOverflow.Ellipsis,
             )
         }
+        if (canReorder) {
+            QueueDragGripHandle(
+                entryId = entry.id,
+                isDragging = isDragging,
+                dragState = dragState,
+            )
+        }
         Box {
             RocheIconActionButton(
                 contentDescription = "Episode queue options",
@@ -531,7 +621,7 @@ private fun PlayerUpNextEpisodeRow(
                         onPlay()
                     },
                 )
-                if (canMoveToTop) {
+                if (canMoveUp) {
                     DropdownMenuItem(
                         text = { Text("Move to Top") },
                         onClick = {
@@ -541,7 +631,7 @@ private fun PlayerUpNextEpisodeRow(
                     )
                 }
                 DropdownMenuItem(
-                    text = { Text("Remove from Queue", color = colors.accentIndianRed) },
+                    text = { Text("Remove from Up Next", color = colors.accentIndianRed) },
                     onClick = {
                         showMenu = false
                         onRemove()

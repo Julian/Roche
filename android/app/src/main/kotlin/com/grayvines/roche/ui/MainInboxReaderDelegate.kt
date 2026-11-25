@@ -355,8 +355,8 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
         wasFinished: Boolean,
     ): String =
         when {
-            !entry.inFeedInbox && targetDismiss -> "Dismissed from Want to Read"
-            !entry.inFeedInbox -> "Restored to Want to Read"
+            !entry.inFeedInbox && targetDismiss -> "Dismissed from Queue"
+            !entry.inFeedInbox -> "Restored to Queue"
             targetDismiss && wasFinished -> "Dismissed · Removed from Diary"
             targetDismiss -> "Dismissed"
             else -> "Marked new"
@@ -392,12 +392,15 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
                 host.showStatusMessage("Restored ${kind.batchSnapshots.size} entries")
             }
             is UndoActionKind.RestoreCollectionEntry -> {
-                host.repository.catalog.addCollectionEntry(kind.collectionId, kind.entryId)
+                val targetCols = kind.collectionIds.ifEmpty { listOf(kind.collectionId) }
+                targetCols.forEach { colId ->
+                    host.repository.catalog.addCollectionEntry(colId, kind.entryId)
+                }
                 host.showStatusMessage("Restored to ${kind.label}")
             }
             is UndoActionKind.RestoreQueueItem -> {
                 restoreQueueItemAtIndex(kind.entryId, kind.previousIndex)
-                host.showStatusMessage("Restored to Queue")
+                host.showStatusMessage("Restored to Audio Up Next")
             }
             is UndoActionKind.RestoreOfflineCache -> {
                 val restored = host.repository.cacheEntryOffline(kind.entryId)
@@ -616,6 +619,11 @@ internal class MainQueueActionsDelegate(private val host: InboxReaderHost) {
     }
 
     suspend fun addToQueue(entryId: String, playNext: Boolean) {
+        val targetEntry = host.latestEntries().firstOrNull { it.id == entryId }
+        if (targetEntry == null || !targetEntry.isPlayableAudio) {
+            host.updateTransient { it.copy(contextSheetEntryId = null) }
+            return
+        }
         val activeAudioId = host.playerController.state.value.currentEntryId
         host.settingsRepository.update { current ->
             val withoutTarget = current.queueItemIds.filterNot { it == entryId }.toMutableList()
@@ -634,7 +642,7 @@ internal class MainQueueActionsDelegate(private val host: InboxReaderHost) {
         }
         host.playbackOrchestrator.syncActivePlayerQueueState(host.playerController)
         host.updateTransient { it.copy(contextSheetEntryId = null) }
-        host.showStatusMessage(if (playNext) "Queued to play next" else "Added to Queue")
+        host.showStatusMessage(if (playNext) "Queued to play next" else "Added to Audio Up Next")
     }
 
     suspend fun removeFromQueue(entryId: String, showBanner: Boolean) {
@@ -656,12 +664,12 @@ internal class MainQueueActionsDelegate(private val host: InboxReaderHost) {
                     .orEmpty()
             host.showUndoAction(
                 UndoActionEvent(
-                    message = "Removed from Queue$titlePart",
+                    message = "Removed from Audio Up Next$titlePart",
                     kind = UndoActionKind.RestoreQueueItem(entryId, previousIndex),
                 )
             )
         } else if (showBanner) {
-            host.showStatusMessage("Removed from Queue")
+            host.showStatusMessage("Removed from Audio Up Next")
         }
     }
 
@@ -693,7 +701,7 @@ internal class MainQueueActionsDelegate(private val host: InboxReaderHost) {
             current.copy(queueItemIds = withoutTarget)
         }
         host.playbackOrchestrator.syncActivePlayerQueueState(host.playerController)
-        host.showStatusMessage("Moved to top of Queue")
+        host.showStatusMessage("Moved to top of Audio Up Next")
     }
 
     suspend fun reorder(orderedVisibleIds: List<String>) {

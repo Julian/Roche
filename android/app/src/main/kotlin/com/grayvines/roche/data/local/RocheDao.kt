@@ -1808,8 +1808,7 @@ interface RocheDao {
     @Query(
         "SELECT DISTINCT ce.entryId FROM (" +
             "SELECT collectionId FROM collection_specs WHERE LOWER(role) = 'want' " +
-            "UNION SELECT '$WANT_TO_READ_COLLECTION_ID' " +
-            "UNION SELECT '$UP_NEXT_COLLECTION_ID'" +
+            "UNION SELECT '$WANT_TO_READ_COLLECTION_ID'" +
             ") wc " +
             "CROSS JOIN collection_entries ce ON ce.collectionId = wc.collectionId " +
             "CROSS JOIN entries e ON e.id = ce.entryId " +
@@ -1829,7 +1828,7 @@ interface RocheDao {
         "SELECT DISTINCT ce.entryId FROM collection_entries ce " +
             "LEFT JOIN collection_specs cs ON cs.collectionId = ce.collectionId " +
             "WHERE ce.entryId IN (:entryIds) " +
-            "AND (ce.collectionId IN ('$WANT_TO_READ_COLLECTION_ID', '$UP_NEXT_COLLECTION_ID') " +
+            "AND (ce.collectionId = '$WANT_TO_READ_COLLECTION_ID' " +
             "OR LOWER(COALESCE(cs.role, '')) = 'want')"
     )
     suspend fun getWantEntryIdsIn(entryIds: List<String>): List<String>
@@ -2225,6 +2224,72 @@ interface RocheDao {
         limit: Int,
         offset: Int,
     ): List<DiaryLogRow>
+
+    @Query(
+        "WITH started_candidates AS (" +
+            "SELECT cl.id, cl.entryId, cl.ts, cl.status, cl.notes, cl.createdAt, " +
+            "ROW_NUMBER() OVER (" +
+            "PARTITION BY cl.entryId " +
+            "ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) DESC, " +
+            "strftime('%Y-%m-%dT%H:%M:%fZ', cl.createdAt) DESC, " +
+            "cl.id DESC" +
+            ") AS rn " +
+            "FROM consumption_log cl " +
+            "INNER JOIN entries e ON e.id = cl.entryId " +
+            "WHERE cl.status = 'started' " +
+            "AND $DIARY_VISIBLE_ENTRY_WHERE " +
+            ") " +
+            "SELECT sc.id AS id, " +
+            "sc.entryId AS entryId, " +
+            "e.kind AS kind, " +
+            "e.title AS title, " +
+            "e.creatorsJson AS creatorsJson, " +
+            "e.releaseYear AS releaseYear, " +
+            "e.url AS url, " +
+            "e.thumbnailUrl AS thumbnailUrl, " +
+            "sc.ts AS ts, " +
+            "sc.status AS status, " +
+            "sc.notes AS notes " +
+            "FROM started_candidates sc " +
+            "INNER JOIN entries e ON e.id = sc.entryId " +
+            "WHERE sc.rn = 1 " +
+            "AND NOT EXISTS (" +
+            "SELECT 1 FROM consumption_log cl_later " +
+            "WHERE cl_later.entryId = sc.entryId " +
+            "AND cl_later.status IN ('consumed', 'abandoned') " +
+            "AND strftime('%Y-%m-%dT%H:%M:%fZ', cl_later.ts) >= " +
+            "strftime('%Y-%m-%dT%H:%M:%fZ', sc.ts)" +
+            ") " +
+            "AND NOT EXISTS (" +
+            "SELECT 1 FROM entry_state es " +
+            "WHERE es.entryId = sc.entryId " +
+            "AND (" +
+            "es.inboxState = 'deleted' " +
+            "OR (" +
+            "(" +
+            "es.inboxState = 'dismissed' " +
+            "OR (" +
+            "COALESCE(es.inboxState, 'none') = 'none' " +
+            "AND es.readAt IS NOT NULL " +
+            "AND NOT EXISTS (" +
+            "SELECT 1 FROM collection_entries ce_w " +
+            "WHERE ce_w.collectionId = '$WANT_TO_READ_COLLECTION_ID' " +
+            "AND ce_w.entryId = sc.entryId" +
+            ")" +
+            ")" +
+            ") " +
+            "AND COALESCE(" +
+            "strftime('%Y-%m-%dT%H:%M:%fZ', es.interactionUpdatedAt), " +
+            "strftime('%Y-%m-%dT%H:%M:%fZ', es.readAt), " +
+            "strftime('%Y-%m-%dT%H:%M:%fZ', es.updatedAt)" +
+            ") >= strftime('%Y-%m-%dT%H:%M:%fZ', sc.ts)" +
+            ")" +
+            ")" +
+            ") " +
+            "ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', sc.ts) DESC, sc.id DESC " +
+            "LIMIT :limit"
+    )
+    suspend fun getActiveStartedEntries(limit: Int = 100): List<DiaryLogRow>
 
     @Query(
         "$DIARY_LOG_ROW_ENTRIES_CROSS_SELECT " +

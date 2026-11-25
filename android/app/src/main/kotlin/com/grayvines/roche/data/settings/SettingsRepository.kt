@@ -159,6 +159,7 @@ internal constructor(
             prefs[KEY_SMART_REWIND_ENABLED] = updated.smartRewindEnabled
             prefs[KEY_SHOW_COLLECTION_DRAWS_ON_HOME] = updated.showCollectionDrawsOnHome
             prefs[KEY_RANK_CLUSTER_SIZE] = updated.rankClusterSize
+            prefs[KEY_MIGRATED_NON_AUDIO_QUEUE] = updated.migratedNonAudioQueueToWantRead
             persistedEditCount.incrementAndGet()
             latestSettings = updated
         }
@@ -261,6 +262,7 @@ internal constructor(
                 showCollectionDrawsOnHome = this[KEY_SHOW_COLLECTION_DRAWS_ON_HOME] ?: true,
                 rankClusterSize = this[KEY_RANK_CLUSTER_SIZE] ?: Settings.DEFAULT_RANK_CLUSTER_SIZE,
                 hasUndecryptableToken = rawStoredToken.isNotEmpty() && decodedToken.isEmpty(),
+                migratedNonAudioQueueToWantRead = this[KEY_MIGRATED_NON_AUDIO_QUEUE] ?: false,
             )
             .clamped()
     }
@@ -285,6 +287,8 @@ internal constructor(
         internal val KEY_SHOW_COLLECTION_DRAWS_ON_HOME =
             booleanPreferencesKey("show_collection_draws_on_home")
         internal val KEY_RANK_CLUSTER_SIZE = intPreferencesKey("rank_cluster_size")
+        internal val KEY_MIGRATED_NON_AUDIO_QUEUE =
+            booleanPreferencesKey("migrated_non_audio_queue_to_want_read")
 
         fun create(context: Context): SettingsRepository {
             val appContext = context.applicationContext

@@ -84,6 +84,7 @@ fun EntryContextBottomSheet(
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     isInQueue: Boolean = false,
+    isInAudioUpNext: Boolean = false,
     isDownloadingOffline: Boolean = false,
 ) {
     val colors = LocalRocheColors.current
@@ -110,6 +111,7 @@ fun EntryContextBottomSheet(
             ContextSheetActionsList(
                 entry = entry,
                 isInQueue = isInQueue,
+                isInAudioUpNext = isInAudioUpNext,
                 isDownloadingOffline = isDownloadingOffline,
                 onAction = onAction,
                 onShare = {
@@ -224,6 +226,7 @@ private fun ContextActionCardGroup(actions: List<ContextActionSpec>) {
 private fun ContextSheetActionsList(
     entry: InboxEntry,
     isInQueue: Boolean,
+    isInAudioUpNext: Boolean,
     isDownloadingOffline: Boolean,
     onAction: (MainAction) -> Unit,
     onShare: () -> Unit,
@@ -241,6 +244,7 @@ private fun ContextSheetActionsList(
             isPlayableAudio = isPlayableAudio,
             isAudioOnly = isAudioOnly,
             isInQueue = isInQueue,
+            isInAudioUpNext = isInAudioUpNext,
             isDownloadingOffline = isDownloadingOffline,
             accentBlue = colors.accentBlue,
             accentVerdigris = colors.accentVerdigris,
@@ -347,6 +351,7 @@ private fun buildEntryPrimaryActions(
     isPlayableAudio: Boolean,
     isAudioOnly: Boolean,
     isInQueue: Boolean,
+    isInAudioUpNext: Boolean,
     isDownloadingOffline: Boolean,
     accentBlue: Color,
     accentVerdigris: Color,
@@ -356,16 +361,32 @@ private fun buildEntryPrimaryActions(
     addEntryTriageActions(entry, accentVerdigris, onAction)
     add(
         ContextActionSpec(
-            "Play Next in Queue",
-            { onAction(MainAction.AddToQueue(entry.id, playNext = true)) },
+            label = if (isInQueue) "Remove from Queue" else "Add to Queue",
+            onClick = { onAction(MainAction.ToggleWantToRead(entry.id)) },
+            modifier = Modifier.testTag("context_toggle_queue_btn"),
         )
     )
-    add(
-        ContextActionSpec(
-            if (isInQueue) "Remove from Queue" else "Add to Queue",
-            { onAction(MainAction.ToggleQueueMembership(entry.id)) },
+    if (isPlayableAudio) {
+        add(
+            ContextActionSpec(
+                label = "Play Next",
+                onClick = { onAction(MainAction.AddToQueue(entry.id, playNext = true)) },
+                modifier = Modifier.testTag("context_audio_play_next_btn"),
+            )
         )
-    )
+        add(
+            ContextActionSpec(
+                label =
+                    if (isInAudioUpNext) {
+                        "Remove from Audio Up Next"
+                    } else {
+                        "Add to Audio Up Next"
+                    },
+                onClick = { onAction(MainAction.ToggleQueueMembership(entry.id)) },
+                modifier = Modifier.testTag("context_audio_up_next_btn"),
+            )
+        )
+    }
     add(
         buildOfflineActionSpec(
             entry = entry,

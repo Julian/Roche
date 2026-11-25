@@ -1444,3 +1444,389 @@ async fn test_update_entry_edits_metadata_harmonizes_dates_identifiers_and_prote
         .await;
     assert!(matches!(sys_err, Err(CatalogError::Conflict(_))));
 }
+
+#[tokio::test]
+async fn test_list_active_started_entries_tie_breakers_and_rereads() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    let ts = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc);
+
+    let active_book = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Active Book".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let finished_book = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Finished Book".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let skipped_game = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Game),
+            title: "Skipped Game".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let same_day_movie = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Same-Day Movie".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let reread_book = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Re-read Book".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+
+    // 1. Plain started -> active
+    catalog
+        .log_consumption(
+            &active_book.id,
+            ConsumptionStatus::Started,
+            Some("Chapter 2"),
+            Some(ts("2026-11-20T10:00:00Z")),
+        )
+        .await
+        .unwrap();
+
+    // 2. Started then later finished -> excluded
+    catalog
+        .log_consumption(
+            &finished_book.id,
+            ConsumptionStatus::Started,
+            None,
+            Some(ts("2026-11-10T10:00:00Z")),
+        )
+        .await
+        .unwrap();
+    catalog
+        .log_consumption(
+            &finished_book.id,
+            ConsumptionStatus::Consumed,
+            None,
+            Some(ts("2026-11-15T10:00:00Z")),
+        )
+        .await
+        .unwrap();
+
+    // 3. Started then later skipped -> excluded
+    catalog
+        .log_consumption(
+            &skipped_game.id,
+            ConsumptionStatus::Started,
+            None,
+            Some(ts("2026-11-11T10:00:00Z")),
+        )
+        .await
+        .unwrap();
+    catalog
+        .log_consumption(
+            &skipped_game.id,
+            ConsumptionStatus::Abandoned,
+            None,
+            Some(ts("2026-11-12T10:00:00Z")),
+        )
+        .await
+        .unwrap();
+
+    // 4. Started and finished at the exact same timestamp -> terminal wins, excluded
+    catalog
+        .log_consumption(
+            &same_day_movie.id,
+            ConsumptionStatus::Started,
+            None,
+            Some(ts("2026-11-18T12:00:00Z")),
+        )
+        .await
+        .unwrap();
+    catalog
+        .log_consumption(
+            &same_day_movie.id,
+            ConsumptionStatus::Consumed,
+            None,
+            Some(ts("2026-11-18T12:00:00Z")),
+        )
+        .await
+        .unwrap();
+
+    // 5. Finished in 2024, then re-started in 2026 -> active and ordered ahead of 2026-11-20
+    catalog
+        .log_consumption(
+            &reread_book.id,
+            ConsumptionStatus::Consumed,
+            None,
+            Some(ts("2024-05-01T12:00:00Z")),
+        )
+        .await
+        .unwrap();
+    catalog
+        .log_consumption(
+            &reread_book.id,
+            ConsumptionStatus::Started,
+            Some("Re-read"),
+            Some(ts("2026-11-22T12:00:00Z")),
+        )
+        .await
+        .unwrap();
+
+    let active = catalog.list_active_started_entries(None).await.unwrap();
+    let active_ids: Vec<&str> = active.iter().map(|a| a.entry.id.as_str()).collect();
+    assert_eq!(active_ids, vec![reread_book.id.as_str(), active_book.id.as_str()]);
+    assert_eq!(active[0].notes.as_deref(), Some("Re-read"));
+    assert_eq!(active[1].notes.as_deref(), Some("Chapter 2"));
+}
+
+#[tokio::test]
+async fn test_list_active_started_entries_edge_cases_and_want_entry_ids_in() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    let ts = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc);
+
+    // 1. Duplicate `started` rows on the same entry (including identical `ts`) collapse to 1 row
+    let dup_started = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Duplicate Started Book".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    for (log_id, note) in [("dup-log-a", "First"), ("dup-log-b", "Second")] {
+        sqlx::query(
+            "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at)
+             VALUES (?, ?, '2026-11-20T10:00:00Z', 'started', ?, '2026-11-20T10:00:00Z')",
+        )
+        .bind(log_id)
+        .bind(&dup_started.id)
+        .bind(note)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    // 2. Mixed timezone offsets: 12:00+02:00 == 10:00Z < 11:00Z consumed -> excluded
+    let tz_finished = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "TZ Offset Finished".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO consumption_log (id, entry_id, ts, status, created_at)
+         VALUES ('tz-s', ?, '2026-11-20T12:00:00+02:00', 'started', '2026-11-20T10:00:00Z'),
+                ('tz-c', ?, '2026-11-20T11:00:00Z', 'consumed', '2026-11-20T11:00:00Z')",
+    )
+    .bind(&tz_finished.id)
+    .bind(&tz_finished.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    // 3. Same-timestamp `started` + `abandoned` -> terminal wins, excluded
+    let same_ts_skipped = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Game),
+            title: "Same TS Skipped".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let tie_ts = ts("2026-11-19T12:00:00Z");
+    catalog
+        .log_consumption(&same_ts_skipped.id, ConsumptionStatus::Started, None, Some(tie_ts))
+        .await
+        .unwrap();
+    catalog
+        .log_consumption(&same_ts_skipped.id, ConsumptionStatus::Abandoned, None, Some(tie_ts))
+        .await
+        .unwrap();
+
+    // 4. Merged entry and non-diary-visible kinds (artist / podcast) -> excluded
+    let merged_dup = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Merged Dup".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let merge_target = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Merge Target".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE entries SET merged_into_id = ? WHERE id = ?")
+        .bind(&merge_target.id)
+        .bind(&merged_dup.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO consumption_log (id, entry_id, ts, status, created_at)
+         VALUES ('merged-s', ?, '2026-11-21T10:00:00Z', 'started', '2026-11-21T10:00:00Z')",
+    )
+    .bind(&merged_dup.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    for (kind, title) in [(EntryKind::Artist, "Miles Davis"), (EntryKind::Podcast, "Oxide")] {
+        let non_diary = catalog
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(kind),
+                title: title.to_owned(),
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO consumption_log (id, entry_id, ts, status, created_at)
+             VALUES (?, ?, '2026-11-21T11:00:00Z', 'started', '2026-11-21T11:00:00Z')",
+        )
+        .bind(format!("nd-{}", non_diary.id))
+        .bind(&non_diary.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    // 5. Reader item dismissal vs re-start timestamp ordering (both feed and non-feed saved URLs):
+    //    (a) Feed item started at T1 then dismissed at T2 >= T1 -> excluded
+    let dismissed_article = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Article),
+            title: "Dismissed Started Article".to_owned(),
+            url: Some("https://example.com/dismissed-started".to_owned()),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    catalog
+        .log_consumption(
+            &dismissed_article.id,
+            ConsumptionStatus::Started,
+            None,
+            Some(ts("2026-11-21T12:00:00Z")),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
+         VALUES (?, 'dismissed', 0.4, '2026-11-21T13:00:00Z')",
+    )
+    .bind(&dismissed_article.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    //    (b) Feed item dismissed/finished at T1 then re-started at T2 > T1 -> ACTIVE
+    let restarted_feed = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Article),
+            title: "Re-started Feed Article".to_owned(),
+            url: Some("https://example.com/restarted-feed".to_owned()),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO entry_state (entry_id, inbox_state, progress, read_at, interaction_updated_at, updated_at)
+         VALUES (?, 'dismissed', 1.0, '2026-11-10T10:00:00Z', '2026-11-10T10:00:00Z', '2026-11-10T10:00:00Z')",
+    )
+    .bind(&restarted_feed.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    catalog
+        .log_consumption(
+            &restarted_feed.id,
+            ConsumptionStatus::Consumed,
+            None,
+            Some(ts("2026-11-10T10:00:00Z")),
+        )
+        .await
+        .unwrap();
+    catalog
+        .log_consumption(
+            &restarted_feed.id,
+            ConsumptionStatus::Started,
+            Some("Re-reading"),
+            Some(ts("2026-11-22T10:00:00Z")),
+        )
+        .await
+        .unwrap();
+
+    //    (c) Non-feed saved article started at T1 then dismissed (inbox_state='none', read_at=T2) -> excluded
+    let dismissed_saved = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Article),
+            title: "Dismissed Saved URL".to_owned(),
+            url: Some("https://example.com/dismissed-saved".to_owned()),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    catalog
+        .log_consumption(
+            &dismissed_saved.id,
+            ConsumptionStatus::Started,
+            None,
+            Some(ts("2026-11-21T12:00:00Z")),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO entry_state (entry_id, inbox_state, progress, read_at, interaction_updated_at, updated_at)
+         VALUES (?, 'none', 0.3, '2026-11-21T14:00:00Z', '2026-11-21T14:00:00Z', '2026-11-21T14:00:00Z')",
+    )
+    .bind(&dismissed_saved.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let active = catalog.list_active_started_entries(None).await.unwrap();
+    let active_ids: Vec<&str> = active.iter().map(|a| a.entry.id.as_str()).collect();
+    assert_eq!(active_ids, vec![restarted_feed.id.as_str(), dup_started.id.as_str()]);
+
+    // 6. `want_entry_ids_in` returns matches in visible Want queues while ignoring `up_next`
+    catalog
+        .add_collection_entry(crate::db::WANT_TO_READ_COLLECTION_ID, &dup_started.id, None)
+        .await
+        .unwrap();
+    catalog
+        .add_collection_entry(crate::db::UP_NEXT_COLLECTION_ID, &tz_finished.id, None)
+        .await
+        .unwrap();
+    let matched = catalog
+        .want_entry_ids_in(&[
+            dup_started.id.clone(),
+            tz_finished.id.clone(),
+            same_ts_skipped.id.clone(),
+        ])
+        .await
+        .unwrap();
+    assert!(matched.contains(&dup_started.id));
+    assert!(!matched.contains(&tz_finished.id), "up_next must not count as a visible Want queue");
+    assert!(!matched.contains(&same_ts_skipped.id));
+}

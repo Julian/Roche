@@ -60,6 +60,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
@@ -163,6 +164,10 @@ internal fun HomeScrollableGrid(
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
     val activeDraws = state.activeCollectionDraws
+    val homeContinueItems =
+        remember(state.inProgressItems) { state.inProgressItems.take(HOME_CONTINUE_ITEMS) }
+    val shownContinueIds =
+        remember(homeContinueItems) { homeContinueItems.mapTo(HashSet()) { it.entryId } }
     Column(
         modifier =
             Modifier.fillMaxSize()
@@ -174,6 +179,8 @@ internal fun HomeScrollableGrid(
             HomeWideTwoColumnDashboard(
                 state = state,
                 activeDraws = activeDraws,
+                homeContinueItems = homeContinueItems,
+                shownContinueIds = shownContinueIds,
                 activeAudioEntryId = activeAudioEntryId,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
@@ -183,6 +190,8 @@ internal fun HomeScrollableGrid(
             HomeSingleColumnDashboard(
                 state = state,
                 activeDraws = activeDraws,
+                homeContinueItems = homeContinueItems,
+                shownContinueIds = shownContinueIds,
                 activeAudioEntryId = activeAudioEntryId,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
@@ -198,6 +207,8 @@ internal fun HomeScrollableGrid(
 private fun HomeWideTwoColumnDashboard(
     state: MainUiState,
     activeDraws: List<CollectionGeneratorState>,
+    homeContinueItems: List<InProgressItem>,
+    shownContinueIds: Set<String>,
     activeAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
@@ -212,16 +223,27 @@ private fun HomeWideTwoColumnDashboard(
             modifier = Modifier.weight(1.12f),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
+            if (homeContinueItems.isNotEmpty()) {
+                HomeContinueWidget(
+                    items = homeContinueItems,
+                    totalInProgressCount = state.inProgressItems.size,
+                    readableIds = state.readableEntryIds,
+                    activeAudioEntryId = activeAudioEntryId,
+                    onAction = onAction,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                )
+            }
             HomeInboxWidget(
                 state = state,
                 maxItems = WIDE_INBOX_ITEMS,
+                excludeEntryIds = shownContinueIds,
                 activeAudioEntryId = activeAudioEntryId,
                 onAction = onAction,
             )
             HomeWantQueueWidget(
                 state = state,
                 maxItems = HOME_QUEUE_PREVIEW_ITEMS,
-                activeAudioEntryId = activeAudioEntryId,
+                excludeEntryIds = shownContinueIds,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
             )
@@ -254,6 +276,8 @@ private fun HomeWideTwoColumnDashboard(
 private fun HomeSingleColumnDashboard(
     state: MainUiState,
     activeDraws: List<CollectionGeneratorState>,
+    homeContinueItems: List<InProgressItem>,
+    shownContinueIds: Set<String>,
     activeAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
@@ -268,16 +292,27 @@ private fun HomeSingleColumnDashboard(
             onOpenCollectionDraw = onOpenCollectionDraw,
         )
     }
+    if (homeContinueItems.isNotEmpty()) {
+        HomeContinueWidget(
+            items = homeContinueItems,
+            totalInProgressCount = state.inProgressItems.size,
+            readableIds = state.readableEntryIds,
+            activeAudioEntryId = activeAudioEntryId,
+            onAction = onAction,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+    }
     HomeInboxWidget(
         state = state,
         maxItems = COMPACT_INBOX_ITEMS,
+        excludeEntryIds = shownContinueIds,
         activeAudioEntryId = activeAudioEntryId,
         onAction = onAction,
     )
     HomeWantQueueWidget(
         state = state,
         maxItems = HOME_QUEUE_PREVIEW_ITEMS,
-        activeAudioEntryId = activeAudioEntryId,
+        excludeEntryIds = shownContinueIds,
         onAction = onAction,
         onOpenExternalUrl = onOpenExternalUrl,
     )
@@ -847,11 +882,55 @@ private fun CollectionDrawPlaceholderBody(
 }
 
 @Composable
+@Suppress("LongParameterList")
+internal fun HomeContinueWidget(
+    items: List<InProgressItem>,
+    totalInProgressCount: Int,
+    readableIds: Set<String>,
+    activeAudioEntryId: String?,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    Column(
+        modifier = modifier.fillMaxWidth().testTag("home_widget_continue"),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        RocheSectionHeader(
+            label = "Continue Reading & Listening",
+            badgeText =
+                if (totalInProgressCount > 0) formatIntegerCount(totalInProgressCount) else null,
+            actionLabel = "Queue →",
+            actionTestTag = "home_continue_open_queue_btn",
+            onActionClick = { onAction(MainAction.SelectTab(AppTab.QUEUE)) },
+        )
+        RocheSurfaceCard {
+            items.forEachIndexed { index, item ->
+                if (index > 0) {
+                    HorizontalDivider(color = colors.border, thickness = 1.dp)
+                }
+                InProgressRowDispatcher(
+                    item = item,
+                    readableIds = readableIds,
+                    activeAudioEntryId = activeAudioEntryId,
+                    onAction = onAction,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                    testTagPrefix = "home_continue_item",
+                )
+            }
+        }
+    }
+}
+
+@Composable
+@Suppress("LongParameterList")
 internal fun HomeInboxWidget(
     state: MainUiState,
     maxItems: Int,
     onAction: (MainAction) -> Unit,
     modifier: Modifier = Modifier,
+    excludeEntryIds: Set<String> = emptySet(),
     activeAudioEntryId: String? = null,
 ) {
     val newFeedEntries =
@@ -859,9 +938,19 @@ internal fun HomeInboxWidget(
     val recentFeedEntries =
         remember(state.allEntries) { state.allEntries.filter { it.inFeedInbox } }
     val newCount = newFeedEntries.size
+    val filteredNew =
+        remember(newFeedEntries, excludeEntryIds) {
+            newFeedEntries.filter { it.id !in excludeEntryIds }
+        }
+    val allNewInContinue = newCount > 0 && filteredNew.isEmpty()
     val previewEntries =
-        remember(newFeedEntries, recentFeedEntries, maxItems) {
-            newFeedEntries.ifEmpty { recentFeedEntries }.take(maxItems)
+        remember(filteredNew, recentFeedEntries, excludeEntryIds, allNewInContinue, maxItems) {
+            if (allNewInContinue) {
+                emptyList()
+            } else {
+                val filteredRecent = recentFeedEntries.filter { it.id !in excludeEntryIds }
+                filteredNew.ifEmpty { filteredRecent }.take(maxItems)
+            }
         }
     val headerBadge =
         when {
@@ -883,17 +972,46 @@ internal fun HomeInboxWidget(
             onActionClick = openInbox,
         )
         RocheSurfaceCard {
-            if (previewEntries.isEmpty()) {
-                HomeInboxEmptyBody(onOpenInbox = openInbox, onAction = onAction)
-            } else {
-                HomeInboxPreviewList(
-                    previewEntries = previewEntries,
-                    activeAudioEntryId = activeAudioEntryId,
-                    onOpenEntry = { onAction(MainAction.OpenReader(it)) },
-                    onLongPressEntry = { onAction(MainAction.OpenContextSheet(it)) },
-                )
+            when {
+                allNewInContinue ->
+                    HomeAllInContinueNote(
+                        message = "All unread items are currently in Continue above.",
+                        actionLabel = "Open Inbox",
+                        onActionClick = openInbox,
+                    )
+                previewEntries.isEmpty() ->
+                    HomeInboxEmptyBody(onOpenInbox = openInbox, onAction = onAction)
+                else ->
+                    HomeInboxPreviewList(
+                        previewEntries = previewEntries,
+                        activeAudioEntryId = activeAudioEntryId,
+                        onOpenEntry = { onAction(MainAction.OpenReader(it)) },
+                        onLongPressEntry = { onAction(MainAction.OpenContextSheet(it)) },
+                    )
             }
         }
+    }
+}
+
+@Composable
+private fun HomeAllInContinueNote(
+    message: String,
+    actionLabel: String,
+    onActionClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = message,
+            color = colors.textMuted,
+            fontSize = 12.5.sp,
+            modifier = Modifier.weight(1f).padding(end = 8.dp),
+        )
+        HeaderActionButton(label = actionLabel, onClick = onActionClick)
     }
 }
 
@@ -1021,39 +1139,28 @@ private fun HomeCompactEntryThumbnail(entry: InboxEntry) {
     }
 }
 
-private sealed interface HomeQueuePreviewItem {
-    val stableId: String
-
-    data class UpNextEntry(val entry: InboxEntry) : HomeQueuePreviewItem {
-        override val stableId: String = entry.id
-    }
-
-    data class WantCatalogItem(val item: RankedCatalogEntry) : HomeQueuePreviewItem {
-        override val stableId: String = item.entry.id
-    }
-}
-
 @Composable
+@Suppress("LongParameterList")
 internal fun HomeWantQueueWidget(
     state: MainUiState,
     maxItems: Int,
-    activeAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     modifier: Modifier = Modifier,
+    excludeEntryIds: Set<String> = emptySet(),
 ) {
-    val wantToReadItems = state.catalog.wantToReadPreview
     val previewItems =
-        remember(state.queueEntries, wantToReadItems, maxItems) {
-            buildHomeQueuePreviewItems(state.queueEntries, wantToReadItems, maxItems)
+        remember(state.catalog.wantToReadPreview, excludeEntryIds, maxItems) {
+            state.catalog.wantToReadPreview
+                .filter { it.entry.id !in excludeEntryIds }
+                .take(maxItems)
         }
-    val totalCount =
-        remember(state.queueEntries, state.catalog.wantToReadEntryIds) {
-            val ids =
-                HashSet<String>(state.queueEntries.size + state.catalog.wantToReadEntryIds.size)
-            state.queueEntries.forEach { ids.add(it.id) }
-            ids.addAll(state.catalog.wantToReadEntryIds)
-            ids.size
+    val totalCount = state.catalog.wantItemCount
+    val otherWantCount =
+        remember(state.catalog.wantQueues) {
+            state.catalog.wantQueues
+                .filter { it.collectionId != WANT_TO_READ_COLLECTION_ID }
+                .sumOf { it.entryCount }
         }
     val offlineCount = state.offlineEntries.size
     val offlineLabel = if (offlineCount > 0) "Offline ($offlineCount)" else "Offline"
@@ -1063,7 +1170,7 @@ internal fun HomeWantQueueWidget(
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         RocheSectionHeader(
-            label = "Queue & Want",
+            label = "Queue",
             badgeText = if (totalCount > 0) formatIntegerCount(totalCount) else null,
             secondaryActionLabel = offlineLabel,
             secondaryActionTestTag = "home_open_offline_btn",
@@ -1073,41 +1180,81 @@ internal fun HomeWantQueueWidget(
             onActionClick = { onAction(MainAction.SelectTab(AppTab.QUEUE)) },
         )
         RocheSurfaceCard {
-            if (previewItems.isEmpty()) {
-                HomeWantQueueEmptyBody(onAction = onAction)
-            } else {
-                HomeWantQueuePreviewList(
-                    items = previewItems,
-                    state = state,
-                    activeAudioEntryId = activeAudioEntryId,
-                    onAction = onAction,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                )
-            }
+            HomeWantQueueCardBody(
+                previewItems = previewItems,
+                totalCount = totalCount,
+                otherWantCount = otherWantCount,
+                state = state,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+            )
         }
     }
 }
 
-private fun buildHomeQueuePreviewItems(
-    queueEntries: List<InboxEntry>,
-    wantToReadItems: List<RankedCatalogEntry>,
-    maxItems: Int,
-): List<HomeQueuePreviewItem> {
-    val seen = HashSet<String>(maxItems)
-    val result = ArrayList<HomeQueuePreviewItem>(maxItems)
-    for (entry in queueEntries) {
-        if (result.size >= maxItems) break
-        if (seen.add(entry.id)) {
-            result.add(HomeQueuePreviewItem.UpNextEntry(entry))
+@Composable
+@Suppress("LongParameterList")
+private fun HomeWantQueueCardBody(
+    previewItems: List<RankedCatalogEntry>,
+    totalCount: Int,
+    otherWantCount: Int,
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    if (previewItems.isEmpty() && otherWantCount == 0) {
+        if (totalCount > 0) {
+            HomeAllInContinueNote(
+                message = "All saved items are currently in Continue above.",
+                actionLabel = "Open Queue",
+                onActionClick = { onAction(MainAction.SelectTab(AppTab.QUEUE)) },
+            )
+        } else {
+            HomeWantQueueEmptyBody(onAction = onAction)
         }
+        return
     }
-    for (want in wantToReadItems) {
-        if (result.size >= maxItems) break
-        if (seen.add(want.entry.id)) {
-            result.add(HomeQueuePreviewItem.WantCatalogItem(want))
-        }
+    HomeWantQueuePreviewList(
+        items = previewItems,
+        state = state,
+        onAction = onAction,
+        onOpenExternalUrl = onOpenExternalUrl,
+    )
+    if (otherWantCount > 0) {
+        HomeOtherWantQueuesFooter(
+            otherWantCount = otherWantCount,
+            showTopDivider = previewItems.isNotEmpty(),
+            onOpenQueue = { onAction(MainAction.SelectTab(AppTab.QUEUE)) },
+        )
     }
-    return result
+}
+
+@Composable
+private fun HomeOtherWantQueuesFooter(
+    otherWantCount: Int,
+    showTopDivider: Boolean,
+    onOpenQueue: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    if (showTopDivider) {
+        HorizontalDivider(color = colors.border, thickness = 1.dp)
+    }
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clickable(onClick = onOpenQueue)
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .testTag("home_other_want_queues_row"),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "+${formatIntegerCount(otherWantCount)} in other Want queues",
+            color = colors.textSecondary,
+            fontSize = 12.sp,
+        )
+        Text(text = "Open →", color = colors.accentBlue, fontSize = 12.sp)
+    }
 }
 
 @Composable
@@ -1119,7 +1266,7 @@ private fun HomeWantQueueEmptyBody(onAction: (MainAction) -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            text = "Save URLs or queue episodes to read and listen next.",
+            text = "Save URLs or add works to your synced Queue to read, watch, or listen next.",
             color = colors.textMuted,
             fontSize = 12.5.sp,
             modifier = Modifier.weight(1f).padding(end = 8.dp),
@@ -1134,9 +1281,8 @@ private fun HomeWantQueueEmptyBody(onAction: (MainAction) -> Unit) {
 
 @Composable
 private fun HomeWantQueuePreviewList(
-    items: List<HomeQueuePreviewItem>,
+    items: List<RankedCatalogEntry>,
     state: MainUiState,
-    activeAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
@@ -1145,22 +1291,10 @@ private fun HomeWantQueuePreviewList(
         if (index > 0) {
             HorizontalDivider(color = colors.border, thickness = 1.dp)
         }
-        when (item) {
-            is HomeQueuePreviewItem.UpNextEntry ->
-                HomeInboxPreviewRow(
-                    entry = item.entry,
-                    isPlayingAudio = item.entry.id == activeAudioEntryId,
-                    onClick = { onAction(MainAction.OpenReader(item.entry.id)) },
-                    onLongClick = { onAction(MainAction.OpenContextSheet(item.entry.id)) },
-                    testTagPrefix = "home_queue_item",
-                )
-            is HomeQueuePreviewItem.WantCatalogItem ->
-                HomeWantCatalogPreviewRow(
-                    item = item.item,
-                    onClick =
-                        resolveHomeWantItemClick(item.item, state, onAction, onOpenExternalUrl),
-                )
-        }
+        HomeWantCatalogPreviewRow(
+            item = item,
+            onClick = resolveHomeWantItemClick(item, state, onAction, onOpenExternalUrl),
+        )
     }
 }
 
@@ -1210,7 +1344,7 @@ private fun HomeWantCatalogPreviewRow(
     ) {
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
-                text = item.entry.title,
+                text = remember(item.entry.title) { formatInlineMathAnnotated(item.entry.title) },
                 color = colors.textPrimary,
                 fontFamily = headlineFamily,
                 fontSize = 14.sp,
@@ -1403,8 +1537,9 @@ private fun formatIntegerCount(value: Int): String =
     NumberFormat.getIntegerInstance(Locale.US).format(value)
 
 private val WIDE_DASHBOARD_BREAKPOINT = 540.dp
+private const val HOME_CONTINUE_ITEMS = 4
 private const val WIDE_INBOX_ITEMS = 7
 private const val COMPACT_INBOX_ITEMS = 4
-private const val HOME_QUEUE_PREVIEW_ITEMS = 3
+private const val HOME_QUEUE_PREVIEW_ITEMS = 4
 private const val WIDE_DIARY_ITEMS = 6
 private const val COMPACT_DIARY_ITEMS = 3

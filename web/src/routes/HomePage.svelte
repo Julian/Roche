@@ -12,6 +12,7 @@
   } from '../lib/utils/format';
   import CreatorLinks from '../components/CreatorLinks.svelte';
   import DrawSleeve from '../components/DrawSleeve.svelte';
+  import InProgressCatalogRow from '../components/InProgressCatalogRow.svelte';
   import ItemRow from '../components/ItemRow.svelte';
   import MathTitle from '../components/MathTitle.svelte';
 
@@ -22,6 +23,7 @@
   let quickSaveUrl = $state('');
   let saveBusy = $state(false);
   let loadController: AbortController | null = null;
+  let readerIds = $derived(new Set(data?.reader_item_ids ?? []));
 
   async function loadHome(): Promise<void> {
     loadController?.abort();
@@ -71,9 +73,21 @@
     }
   }
 
-  function removeInProgress(id: string): void {
+  function handleInProgressTriageRemoved(id: string): void {
     if (!data) return;
-    data = { ...data, in_progress: data.in_progress.filter((i) => i.id !== id) };
+    const removed = data.in_progress.find(
+      (r) => (r.source === 'item' ? r.item.id : r.entry.id) === id,
+    );
+    data = {
+      ...data,
+      in_progress: data.in_progress.filter(
+        (r) => (r.source === 'item' ? r.item.id : r.entry.id) !== id,
+      ),
+    };
+    if (removed?.source === 'item' && removed.item.feed_id) {
+      refresh.adjustUnread(-1);
+    }
+    void loadHome();
   }
 
   function removeUnread(id: string): void {
@@ -104,21 +118,35 @@
   <div class="home-grid">
     <section class="home-main" aria-label="Feed Inbox">
       {#if data.in_progress.length > 0}
-        <div class="section-head">
-          <h2>Continue Reading &amp; Listening</h2>
-          <a class="section-action" href="/inbox">Inbox →</a>
+        <div class="section-head section-head-link">
+          <h2><a class="section-head-anchor" href="/queue">Continue Reading &amp; Listening</a></h2>
+          <span class="section-action">Queue →</span>
         </div>
         <ul class="inbox-list mb-lg">
-          {#each data.in_progress as item (item.id)}
-            <ItemRow
-              {item}
-              titleHtml={data.title_html[item.id]}
-              returnTo="/"
-              showProgress
-              showExcerpt={false}
-              onTriageRemoved={removeInProgress}
-              onTriageRestored={() => void loadHome()}
-            />
+          {#each data.in_progress as row (row.source === 'item' ? row.item.id : row.entry.id)}
+            {#if row.source === 'item'}
+              <ItemRow
+                item={row.item}
+                titleHtml={data.title_html[row.item.id]}
+                returnTo="/"
+                showProgress
+                showExcerpt={false}
+                onTriageRemoved={handleInProgressTriageRemoved}
+                onTriageRestored={() => void loadHome()}
+                onQueueChanged={() => void loadHome()}
+              />
+            {:else}
+              <InProgressCatalogRow
+                entry={row.entry}
+                ts={row.ts}
+                notes={row.notes}
+                titleHtml={data.title_html[row.entry.id]}
+                artistLinks={data.artist_links}
+                isReader={readerIds.has(row.entry.id)}
+                returnTo="/"
+                onResolved={loadHome}
+              />
+            {/if}
           {/each}
         </ul>
       {/if}
@@ -136,9 +164,19 @@
       </div>
 
       {#if data.unread_items.length === 0}
-        <p class="empty">
-          All caught up! <a href="/feeds">Manage feeds</a> or browse <a href="/boards">Boards</a>.
-        </p>
+        {#if data.unread_total > 0 && data.in_progress.length > 0}
+          <p class="empty">
+            All unread items are currently in progress above. <a href="/inbox">Open Inbox</a>.
+          </p>
+        {:else if data.unread_total > 0}
+          <p class="empty">
+            More unread items are waiting in your <a href="/inbox">Inbox</a>.
+          </p>
+        {:else}
+          <p class="empty">
+            All caught up! <a href="/feeds">Manage feeds</a> or browse <a href="/boards">Boards</a>.
+          </p>
+        {/if}
       {:else}
         <ul class="inbox-list">
           {#each data.unread_items as item (item.id)}
@@ -191,7 +229,19 @@
         </form>
 
         {#if data.want_to_read_items.length === 0}
-          <p class="empty">No saved articles in your reading queue.</p>
+          {#if data.want_to_read_total > 0 && data.in_progress.length > 0}
+            <p class="empty">All saved articles are currently in progress above.</p>
+          {:else if data.want_to_read_total > 0}
+            <p class="empty">
+              More saved articles are in your <a href="/queue">Queue →</a>
+            </p>
+          {:else if data.other_want_total > 0}
+            <p class="empty">
+              No saved articles. <a href="/queue">View {data.other_want_total} in other Want queues →</a>
+            </p>
+          {:else}
+            <p class="empty">No saved articles in your reading queue.</p>
+          {/if}
         {:else}
           <ul class="inbox-list">
             {#each data.want_to_read_items as item (item.id)}

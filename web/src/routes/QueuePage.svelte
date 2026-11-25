@@ -13,6 +13,8 @@
     parseCsvList,
   } from '../lib/utils/format';
   import CreatorLinks from '../components/CreatorLinks.svelte';
+  import InProgressCatalogRow from '../components/InProgressCatalogRow.svelte';
+  import ItemRow from '../components/ItemRow.svelte';
   import MathTitle from '../components/MathTitle.svelte';
 
   let data = $state<QueuesPayload | null>(null);
@@ -30,10 +32,21 @@
   let addKind = $state<EntryKind>('movie');
   let addCreators = $state('');
   let addYear = $state('');
-  let addAction = $state<'want' | 'consumed'>('want');
+  let addAction = $state<'want' | 'started' | 'consumed'>('want');
   let addRankAfter = $state(false);
 
   let readerIds = $derived(new Set(data?.reader_item_ids ?? []));
+  let inProgressBadgeById = $derived.by(() => {
+    const map: Record<string, string> = {};
+    for (const row of data?.in_progress ?? []) {
+      if (row.source === 'item') {
+        map[row.item.id] = `${Math.round(row.item.read_progress * 100)}%`;
+      } else {
+        map[row.entry.id] = 'Started';
+      }
+    }
+    return map;
+  });
 
   async function loadQueues(): Promise<void> {
     loadController?.abort();
@@ -156,7 +169,7 @@
         action: addAction,
         creators: parseCsvList(addCreators),
         release_year: yr && Number.isFinite(yr) ? yr : null,
-        rank_after: addRankAfter,
+        rank_after: addAction !== 'started' && addRankAfter,
       });
       addTitle = '';
       addCreators = '';
@@ -164,7 +177,9 @@
       toast.show(
         res.action === 'want'
           ? `Added '${res.entry.title}' to ${res.queue_title ?? 'Queue'}`
-          : `Logged '${res.entry.title}' to Diary`,
+          : res.action === 'started'
+            ? `Started '${res.entry.title}'`
+            : `Logged '${res.entry.title}' to Diary`,
       );
       if (res.rank_slug) {
         const wantQ = res.rank_want ? 'want=true&' : '';
@@ -197,9 +212,54 @@
       <div class="notice notice-error" role="alert">{errorMsg}</div>
     {:else if loading && !data}
       <p class="empty">Loading queue…</p>
-    {:else if data && data.queues.length === 0}
+    {:else if data && data.in_progress.length === 0 && data.queues.length === 0}
       <p class="empty">All queues are empty. Save a URL or add a book, movie, or album on the right.</p>
     {:else if data}
+      {#if data.in_progress.length > 0}
+        <section class="queue-section" aria-label="In Progress">
+          <div class="section-head">
+            <h3>
+              In Progress
+              <span class="list-count-badge">{data.in_progress.length}</span>
+            </h3>
+          </div>
+
+          <ul class="inbox-list">
+            {#each data.in_progress as row (row.source === 'item' ? row.item.id : row.entry.id)}
+              {#if row.source === 'item'}
+                <ItemRow
+                  item={row.item}
+                  titleHtml={data.title_html[row.item.id]}
+                  returnTo="/queue"
+                  showProgress
+                  showExcerpt={false}
+                  onTriageRemoved={() => {
+                    if (row.item.feed_id) refresh.adjustUnread(-1);
+                    void loadQueues();
+                  }}
+                  onTriageRestored={() => {
+                    if (row.item.feed_id) refresh.adjustUnread(1);
+                    void loadQueues();
+                  }}
+                  onQueueChanged={() => void loadQueues()}
+                />
+              {:else}
+                <InProgressCatalogRow
+                  entry={row.entry}
+                  ts={row.ts}
+                  notes={row.notes}
+                  titleHtml={data.title_html[row.entry.id]}
+                  artistLinks={data.artist_links}
+                  isReader={readerIds.has(row.entry.id)}
+                  returnTo="/queue"
+                  onResolved={loadQueues}
+                />
+              {/if}
+            {/each}
+          </ul>
+        </section>
+      {/if}
+
       {#each data.queues as qview (qview.collection.id)}
         {@const qSlug = qview.collection.slug ?? qview.collection.id}
         {@const baseSlug = qSlug.startsWith('want:') ? qSlug.slice(5) : qSlug}
@@ -245,6 +305,9 @@
                         <span>{host}</span>
                       {/if}
                       <span>{entryKindLabel(row.entry.kind)}</span>
+                      {#if inProgressBadgeById[row.entry.id]}
+                        <span class="badge badge-started">{inProgressBadgeById[row.entry.id]}</span>
+                      {/if}
                     </div>
                   </div>
                 </div>
@@ -338,6 +401,7 @@
             <label for="queue-add-action">Action</label>
             <select id="queue-add-action" bind:value={addAction}>
               <option value="want">Want Queue</option>
+              <option value="started">Started (In Progress)</option>
               <option value="consumed">Finished (Diary)</option>
             </select>
           </div>
@@ -349,10 +413,12 @@
             <label for="queue-add-year">Year</label>
             <input id="queue-add-year" type="number" min="1000" max="2100" placeholder="1979" bind:value={addYear} />
           </div>
-          <div class="field field-check">
-            <input id="queue-add-rank" type="checkbox" bind:checked={addRankAfter} />
-            <label for="queue-add-rank">Rank immediately</label>
-          </div>
+          {#if addAction !== 'started'}
+            <div class="field field-check">
+              <input id="queue-add-rank" type="checkbox" bind:checked={addRankAfter} />
+              <label for="queue-add-rank">Rank immediately</label>
+            </div>
+          {/if}
           <button type="submit" class="btn btn-primary btn-small" disabled={busy}>Save</button>
         </form>
       </details>
@@ -373,7 +439,8 @@
     margin-bottom: 1.75rem;
   }
 
-  ol.queue-list {
+  ol.queue-list,
+  ul.inbox-list {
     list-style: none;
     padding: 0;
     margin: 0;

@@ -260,7 +260,6 @@ class CatalogStore(
         val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
         return memberCols.filter { colId ->
             colId == WANT_TO_READ_COLLECTION_ID ||
-                colId == UP_NEXT_COLLECTION_ID ||
                 CollectionRole.fromWireValue(specsById[colId]?.role) == CollectionRole.WANT
         }
     }
@@ -874,6 +873,58 @@ class CatalogStore(
             notifyLocalMutation()
         }
         return removed
+    }
+
+    private suspend fun resolveMutableSpecs(
+        collectionIds: List<String>
+    ): List<CollectionSpecEntity> = buildList {
+        for (colId in collectionIds) {
+            val spec = resolveCollectionSpec(colId) ?: continue
+            require(spec.immutableReason() == null) {
+                "Cannot manually modify entries of ${spec.immutableReason()} collection"
+            }
+            add(spec)
+        }
+    }
+
+    suspend fun removeEntryFromCollections(
+        collectionIds: List<String>,
+        entryId: String,
+    ): List<String> {
+        val distinctIds = collectionIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (distinctIds.isEmpty()) return emptyList()
+        val removedIds = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val resolvedEntry = followMergedId(entryId) ?: entryId.trim()
+            val specs = resolveMutableSpecs(distinctIds)
+            val nowIso = nowUtcIso()
+            val nodeId = resolveLocalPeerId()
+            val removed = mutableListOf<String>()
+            dao.executeInTransaction {
+                for (spec in specs) {
+                    val exists = dao.hasCollectionMembership(spec.collectionId, resolvedEntry) > 0
+                    if (!exists) continue
+                    val hlc = nextLocalHlc(dao, nodeId)
+                    dao.deleteCollectionEntry(spec.collectionId, resolvedEntry)
+                    dao.upsertTombstone(
+                        TombstoneEntity(
+                            entityType = TOMBSTONE_ENTITY_COLLECTION_ENTRY,
+                            naturalKey =
+                                collectionEntryNaturalKey(spec.collectionId, resolvedEntry),
+                            deletedAt = nowIso,
+                            hlc = hlc,
+                            isLocalDirty = true,
+                        )
+                    )
+                    removed.add(spec.collectionId)
+                }
+            }
+            removed
+        }
+        if (removedIds.isNotEmpty()) {
+            notifyLocalMutation()
+        }
+        return removedIds
     }
 
     suspend fun recordComparison(

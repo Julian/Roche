@@ -427,6 +427,11 @@ details.editorial-panel[open] > summary {
   border-color: var(--tier-A);
 }
 
+.badge-started {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 .badge-dismissed {
   color: var(--ink-faint);
 }

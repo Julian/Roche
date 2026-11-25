@@ -55,9 +55,10 @@ use crate::{
     config::Config,
     content::{HtmlSanitizer, MAX_SUMMARY_CHARS},
     db::{
-        ActivityEntry, CatalogEntry, CollectionSummary, ComparisonRecord, ConsumptionLogRow,
-        ConsumptionLogView, Db, ExportCollectionEntry, ExportCollectionGenerator, Feed, Item,
-        ItemFilter, ItemStatusFilter, ItemTag, Tag, WantSearchMatch,
+        ActiveStartedEntry, ActivityEntry, CatalogEntry, CollectionSummary, ComparisonRecord,
+        ConsumptionLogRow, ConsumptionLogView, Db, ExportCollectionEntry,
+        ExportCollectionGenerator, Feed, Item, ItemFilter, ItemStatusFilter, ItemTag, Tag,
+        WantSearchMatch,
     },
     domain::EntryKind,
     ingest::{
@@ -66,6 +67,58 @@ use crate::{
     media::{MediaStore, ytdlp::YtDlpWorker},
     util::{clock::now_utc, media_urls::youtube_thumbnail_url, task_tracker::TaskTracker},
 };
+
+/// A currently active, unfinished entry surfaced in "Continue Reading & Listening" and Queue:
+/// either a live reader/audio `Item` with `IN_PROGRESS_MIN_PROGRESS <= progress < READER_AUTO_READ_THRESHOLD`,
+/// or a diary-visible catalog entry whose latest `consumption_log` status is `started`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum InProgressRow {
+    Item {
+        item: Item,
+        activity_at: DateTime<Utc>,
+    },
+    Catalog {
+        log_id: String,
+        entry: CatalogEntry,
+        ts: DateTime<Utc>,
+        notes: Option<String>,
+        activity_at: DateTime<Utc>,
+    },
+}
+
+impl InProgressRow {
+    #[must_use]
+    pub fn entry_id(&self) -> &str {
+        match self {
+            Self::Item { item, .. } => &item.id,
+            Self::Catalog { entry, .. } => &entry.id,
+        }
+    }
+
+    #[must_use]
+    pub fn title(&self) -> &str {
+        match self {
+            Self::Item { item, .. } => &item.title,
+            Self::Catalog { entry, .. } => &entry.title,
+        }
+    }
+
+    #[must_use]
+    pub const fn activity_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Item { activity_at, .. } | Self::Catalog { activity_at, .. } => *activity_at,
+        }
+    }
+
+    #[must_use]
+    pub fn creators(&self) -> &[String] {
+        match self {
+            Self::Item { .. } => &[],
+            Self::Catalog { entry, .. } => &entry.creators,
+        }
+    }
+}
 
 /// Grouped workspace-wide search results across Catalog, Lists, Want Queues, Inbox, and Diary.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -367,6 +420,64 @@ impl RocheService {
     #[must_use]
     pub const fn catalog(&self) -> CatalogService<'_> {
         CatalogService::with_cache(&self.db, &self.ep_cache)
+    }
+
+    /// Unified "In Progress" feed combining tracked reader/audio items (`0.03 <= progress < 0.98`,
+    /// unread & unconsumed) and diary-visible catalog entries whose latest log status is `started`.
+    /// Deduplicated by entry ID (preferring reader metadata when both exist) and ordered by most
+    /// recent activity descending.
+    pub async fn list_in_progress(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<InProgressRow>, AppError> {
+        let cap = limit.unwrap_or(50).clamp(1, 200);
+        // Fetch a full merge window before deduplicating so overlapping reader items with
+        // newer `started` logs aren't pre-truncated out of `item_page` and misclassified as
+        // bare catalog rows (losing their progress bar and playback controls).
+        let fetch_cap = cap.max(200);
+        let readable_filter = ItemFilter {
+            status: Some(ItemStatusFilter::Unread),
+            in_progress_only: Some(true),
+            include_content: Some(false),
+            per_page: Some(fetch_cap),
+            ..ItemFilter::default()
+        };
+        let items_svc = self.items();
+        let catalog_svc = self.catalog();
+        let (item_page, started_entries) = tokio::try_join!(
+            items_svc.query().with_filter(readable_filter).list_page(),
+            catalog_svc.list_active_started_entries(Some(fetch_cap)),
+        )?;
+
+        let mut started_by_id: HashMap<String, ActiveStartedEntry> =
+            started_entries.into_iter().map(|s| (s.entry.id.clone(), s)).collect();
+        let mut rows: Vec<InProgressRow> =
+            Vec::with_capacity(item_page.items.len() + started_by_id.len());
+
+        for item in item_page.items {
+            let base_ts = item
+                .interaction_updated_at
+                .or(item.read_at)
+                .or(item.published_at)
+                .unwrap_or(item.created_at);
+            let activity_at =
+                started_by_id.remove(&item.id).map_or(base_ts, |started| base_ts.max(started.ts));
+            rows.push(InProgressRow::Item { item, activity_at });
+        }
+        for started in started_by_id.into_values() {
+            rows.push(InProgressRow::Catalog {
+                log_id: started.log_id,
+                entry: started.entry,
+                ts: started.ts,
+                notes: started.notes,
+                activity_at: started.ts,
+            });
+        }
+        rows.sort_by(|a, b| {
+            b.activity_at().cmp(&a.activity_at()).then_with(|| b.entry_id().cmp(a.entry_id()))
+        });
+        rows.truncate(cap);
+        Ok(rows)
     }
 
     /// Unified workspace-wide search across Catalog entries (`entries_fts`), Lists, Want queues,

@@ -9,7 +9,10 @@ use super::{
     ItemRepo, STARRED_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID, item_select_query_builder,
     push_item_select_projection,
 };
-use crate::db::{InboxState, ItemSortField, ItemStatus, ItemStatusFilter, SortOrder};
+use crate::db::{
+    IN_PROGRESS_MIN_PROGRESS, InboxState, ItemSortField, ItemStatus, ItemStatusFilter,
+    READER_AUTO_READ_THRESHOLD, SortOrder,
+};
 
 impl ItemRepo<'_> {
     pub async fn get(&self, id: &str) -> Result<Option<Item>> {
@@ -266,9 +269,10 @@ impl ItemRepo<'_> {
             }
         }
         if filter.in_progress_only == Some(true) {
-            qb.push(
-                " AND COALESCE(es.progress, 0.0) >= 0.03 AND COALESCE(es.progress, 0.0) < 0.98",
-            );
+            qb.push(" AND COALESCE(es.progress, 0.0) >= ")
+                .push_bind(IN_PROGRESS_MIN_PROGRESS)
+                .push(" AND COALESCE(es.progress, 0.0) < ")
+                .push_bind(READER_AUTO_READ_THRESHOLD);
         }
         Self::append_updated_after_where_clause(
             &mut qb,
@@ -285,7 +289,7 @@ impl ItemRepo<'_> {
             qb.push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at) ASC, i.id ASC");
         } else if filter.in_progress_only == Some(true) && filter.sort.is_none() {
             qb.push(
-                " ORDER BY COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', es.interaction_updated_at), strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at)) DESC, i.id DESC",
+                " ORDER BY COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', es.interaction_updated_at), strftime('%Y-%m-%dT%H:%M:%fZ', es.read_at), strftime('%Y-%m-%dT%H:%M:%fZ', i.published_at), strftime('%Y-%m-%dT%H:%M:%fZ', i.created_at)) DESC, i.id DESC",
             );
         } else if sort_by_relevance {
             let rank_dir = match filter.order.unwrap_or_default() {

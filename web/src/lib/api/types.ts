@@ -388,8 +388,28 @@ export interface BoardPromoteViewResponse {
   rank_slug: string | null;
 }
 
+export type InProgressRow =
+  | {
+      source: 'item';
+      item: Item;
+      activity_at: string;
+    }
+  | {
+      source: 'catalog';
+      log_id: string;
+      entry: CatalogEntry;
+      ts: string;
+      notes: string | null;
+      activity_at: string;
+    };
+
+export interface EntryLogResponse {
+  logged: ConsumptionLogView;
+  rank_slug: string | null;
+}
+
 export interface HomePayload {
-  in_progress: Item[];
+  in_progress: InProgressRow[];
   unread_items: Item[];
   unread_total: number;
   want_to_read_items: Item[];
@@ -401,6 +421,7 @@ export interface HomePayload {
   recent_diary: ConsumptionLogView[];
   artist_links: Record<string, string>;
   diary_tiers: Record<string, 'S' | 'A' | 'B' | 'C' | 'D'>;
+  reader_item_ids: string[];
   title_html: Record<string, string>;
   is_refreshing: boolean;
 }
@@ -527,6 +548,7 @@ export interface DiaryPagePayload {
 }
 
 export interface QueuesPayload {
+  in_progress: InProgressRow[];
   queues: RankedCollectionView[];
   total_items: number;
   artist_links: Record<string, string>;

@@ -21,7 +21,7 @@ internal fun findNextQueuedAudioEntry(
         .asSequence()
         .filter { it != excludeEntryId }
         .mapNotNull { entriesById[it] }
-        .firstOrNull { !it.isArchived && it.isPlayableAudio }
+        .firstOrNull { !it.isArchived && !it.isFinished && it.isPlayableAudio }
 
 internal fun hasNextQueuedAudio(
     entries: List<InboxEntry>,

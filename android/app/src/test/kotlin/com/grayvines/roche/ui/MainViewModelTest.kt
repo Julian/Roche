@@ -790,22 +790,30 @@ class MainViewModelTest {
                         audioUrl = "https://cdn.oxide.computer/ep2.mp3",
                         duration = "54:20",
                     )
+            val ep3 =
+                testItem("ep-3", "Ep 3: Async I/O", "f-pod")
+                    .copy(
+                        feedTitle = "Oxide and Friends",
+                        contentType = "audio",
+                        audioUrl = "https://cdn.oxide.computer/ep3.mp3",
+                        duration = "41:00",
+                    )
             database.dao().upsertFeeds(listOf(testFeed("f-1", "Systems Blog"), podcastFeed))
-            database.dao().upsertItems(listOf(ep1, articleMid, ep2))
+            database.dao().upsertItems(listOf(ep1, articleMid, ep2, ep3))
 
             val collectJob = collectInBackground(viewModel.uiState)
-            viewModel.uiState.first { it.allEntries.size == 3 }
+            viewModel.uiState.first { it.allEntries.size == 4 }
 
-            // Queue: ep-1, art-mid, ep-2
+            // Audio Up Next accepts playable audio only; non-audio articles go to synced want:read
             viewModel.dispatch(MainAction.AddToQueue("ep-1"))
             viewModel.dispatch(MainAction.AddToQueue("art-mid"))
             viewModel.dispatch(MainAction.AddToQueue("ep-2"))
-            val queuedState = viewModel.uiState.first { it.queueEntries.size == 3 }
-            assertEquals(listOf("ep-1", "art-mid", "ep-2"), queuedState.queueEntries.map { it.id })
+            val queuedState = viewModel.uiState.first { it.queueEntries.size == 2 }
+            assertEquals(listOf("ep-1", "ep-2"), queuedState.queueEntries.map { it.id })
             assertEquals("ep-1", queuedState.resolveNextQueuedAudioEntry(null)?.id)
 
             // Play ep-1: applies podcast customPlaybackSpeed (2.65x), parses chapters, sets
-            // next queued audio to ep-2 (skipping art-mid)
+            // next queued audio to ep-2
             viewModel.dispatch(MainAction.PlayAudioEntry("ep-1", openFullscreen = true))
             val playingEp1Player =
                 viewModel.playerState.first { it.currentEntryId == "ep-1" && !it.isBuffering }
@@ -816,7 +824,7 @@ class MainViewModelTest {
             assertEquals("ep-2", playingEp1.resolveNextQueuedAudioEntry("ep-1")?.id)
 
             // Seek ep-1 to 25%, then SkipToNextQueuedAudio: must NOT archive ep-1 or mark its
-            // progress 1.0; rotates ep-1 behind ep-2 and starts ep-2
+            // progress 1.0; rotates ep-1 behind ep-2 and starts ep-2; ep-1 stays in In Progress
             viewModel.dispatch(MainAction.SeekPlayerToFraction(0.25f))
             viewModel.uiState.first {
                 abs(it.allEntries.first { e -> e.id == "ep-1" }.readProgress - 0.25) < 1e-2
@@ -825,14 +833,14 @@ class MainViewModelTest {
             viewModel.playerState.first { it.currentEntryId == "ep-2" && !it.isBuffering }
             val playingEp2 =
                 viewModel.uiState.first {
-                    it.queueEntries.map { e -> e.id } == listOf("art-mid", "ep-2", "ep-1") &&
-                        it.listeningHistoryEntries.size == 2
+                    it.queueEntries.map { e -> e.id } == listOf("ep-2", "ep-1") &&
+                        it.inProgressItems.any { item -> item.entryId == "ep-1" }
                 }
             val skippedEp1 = playingEp2.allEntries.first { it.id == "ep-1" }
             assertFalse(skippedEp1.isArchived)
             assertEquals(0.25, skippedEp1.readProgress, 1e-2)
             assertEquals(
-                listOf("art-mid", "ep-2", "ep-1"),
+                listOf("ep-2", "ep-1"),
                 playingEp2.queueEntries.map { it.id },
             )
             assertFalse(playingEp2.allEntries.first { it.id == "art-mid" }.isArchived)
@@ -843,22 +851,18 @@ class MainViewModelTest {
             val afterEp2Completed =
                 viewModel.uiState.first {
                     it.allEntries.first { e -> e.id == "ep-2" }.isArchived &&
-                        it.queueEntries.map { e -> e.id } == listOf("art-mid", "ep-1") &&
-                        it.listeningHistoryEntries.any { e ->
-                            e.id == "ep-1" && !e.readAt.isNullOrBlank()
-                        } &&
-                        it.listeningHistoryEntries.any { e ->
-                            e.id == "ep-2" && !e.readAt.isNullOrBlank()
-                        }
+                        it.queueEntries.map { e -> e.id } == listOf("ep-1") &&
+                        !it.allEntries.first { e -> e.id == "ep-1" }.readAt.isNullOrBlank() &&
+                        !it.allEntries.first { e -> e.id == "ep-2" }.readAt.isNullOrBlank()
                 }
-            val ep2History = afterEp2Completed.listeningHistoryEntries.first { it.id == "ep-2" }
-            val ep1History = afterEp2Completed.listeningHistoryEntries.first { it.id == "ep-1" }
+            val ep2History = afterEp2Completed.allEntries.first { it.id == "ep-2" }
+            val ep1History = afterEp2Completed.allEntries.first { it.id == "ep-1" }
             assertEquals(1.0, ep2History.readProgress, 1e-3)
             assertTrue(!ep1History.readAt.isNullOrBlank())
             assertTrue(!ep2History.readAt.isNullOrBlank())
             assertTrue(ep2History.isFinished)
             assertEquals("Played now · Finished", ep2History.formattedListeningHistoryLabel)
-            assertEquals(listOf("art-mid", "ep-1"), afterEp2Completed.queueEntries.map { it.id })
+            assertEquals(listOf("ep-1"), afterEp2Completed.queueEntries.map { it.id })
 
             // Verify favoriting/starring a podcast episode adds it to starredEntries
             viewModel.dispatch(MainAction.ToggleStar("ep-1"))
@@ -868,23 +872,27 @@ class MainViewModelTest {
                 }
             assertTrue(starredState.allEntries.first { it.id == "ep-1" }.isFavorite)
 
-            // Reorder queue and test speed & podcast settings
-            viewModel.dispatch(MainAction.MoveQueueItemUp("ep-1"))
+            // Reorder audio Up Next queue and test speed & podcast settings
+            viewModel.dispatch(MainAction.AddToQueue("ep-3"))
+            viewModel.uiState.first {
+                it.queueEntries.map { e -> e.id } == listOf("ep-1", "ep-3")
+            }
+            viewModel.dispatch(MainAction.MoveQueueItemUp("ep-3"))
             val reordered =
                 viewModel.uiState.first {
-                    it.queueEntries.map { e -> e.id } == listOf("ep-1", "art-mid")
+                    it.queueEntries.map { e -> e.id } == listOf("ep-3", "ep-1")
                 }
-            assertEquals(listOf("ep-1", "art-mid"), reordered.queueEntries.map { it.id })
+            assertEquals(listOf("ep-3", "ep-1"), reordered.queueEntries.map { it.id })
 
-            viewModel.dispatch(MainAction.ReorderQueue(listOf("art-mid", "ep-1")))
+            viewModel.dispatch(MainAction.ReorderQueue(listOf("ep-1", "ep-3")))
             val dragReordered =
                 viewModel.uiState.first {
-                    it.queueEntries.map { e -> e.id } == listOf("art-mid", "ep-1")
+                    it.queueEntries.map { e -> e.id } == listOf("ep-1", "ep-3")
                 }
-            assertEquals(listOf("art-mid", "ep-1"), dragReordered.queueEntries.map { it.id })
-            viewModel.dispatch(MainAction.ReorderQueue(listOf("ep-1", "art-mid")))
+            assertEquals(listOf("ep-1", "ep-3"), dragReordered.queueEntries.map { it.id })
+            viewModel.dispatch(MainAction.ReorderQueue(listOf("ep-3", "ep-1")))
             viewModel.uiState.first {
-                it.queueEntries.map { e -> e.id } == listOf("ep-1", "art-mid")
+                it.queueEntries.map { e -> e.id } == listOf("ep-3", "ep-1")
             }
 
             viewModel.dispatch(
@@ -896,12 +904,12 @@ class MainViewModelTest {
             assertEquals(2.75f, viewModel.playerState.value.playbackSpeed, 1e-3f)
 
             // Explicitly marking active episode finished clears active player and removes from
-            // queue
+            // audio Up Next queue
             viewModel.dispatch(MainAction.MarkFeedEntryFinished("ep-1"))
             viewModel.playerState.first { it.currentEntryId == null }
             val afterExplicitFinish =
                 viewModel.uiState.first {
-                    it.queueEntries.map { e -> e.id } == listOf("art-mid") &&
+                    it.queueEntries.map { e -> e.id } == listOf("ep-3") &&
                         it.allEntries.first { e -> e.id == "ep-1" }.isArchived
                 }
             assertTrue(afterExplicitFinish.allEntries.first { it.id == "ep-1" }.isArchived)
@@ -1266,14 +1274,21 @@ class MainViewModelTest {
             val article =
                 testItem("art-stage-2", "Systems Storage Notes", "f-pod-stage")
                     .copy(contentType = "article")
+            val episode2 =
+                testItem("ep-stage-2", "Systems Storage Episode", "f-pod-stage")
+                    .copy(
+                        contentType = "audio",
+                        audioUrl = "https://cdn.example.com/stage-2.mp3",
+                        duration = "22:00",
+                    )
             database.dao().upsertFeeds(listOf(activeFeed, archivedFeed))
-            database.dao().upsertItems(listOf(episode, article))
+            database.dao().upsertItems(listOf(episode, article, episode2))
 
             val collectJob = collectInBackground(viewModel.uiState)
-            val seeded = viewModel.uiState.first { it.allEntries.size == 2 && it.feeds.size == 2 }
+            val seeded = viewModel.uiState.first { it.allEntries.size == 3 && it.feeds.size == 2 }
 
             viewModel.dispatch(MainAction.AddToQueue("ep-stage-1"))
-            viewModel.dispatch(MainAction.AddToQueue("art-stage-2"))
+            viewModel.dispatch(MainAction.AddToQueue("ep-stage-2"))
             viewModel.uiState.first {
                 it.queueEntries.size == 2 && it.messageSequence >= seeded.messageSequence + 2L
             }
@@ -1286,14 +1301,14 @@ class MainViewModelTest {
                 viewModel.uiState.first {
                     it.queueEntries.size == 2 &&
                         it.searchQuery == "Systems" &&
-                        it.searchResults.size == 2 &&
-                        it.listeningHistoryEntries.size == 1 &&
+                        it.searchResults.size == 3 &&
+                        !it.allEntries.first { e -> e.id == "ep-stage-1" }.readAt.isNullOrBlank() &&
                         it.activePlayerNotesContent != null &&
                         it.isPlayerFullscreenOpen
                 }
             viewModel.playerController.cancelAutoTickerForTest()
-            assertEquals(2, beforeState.visibleEntries.size)
-            assertEquals(2, beforeState.searchResults.size)
+            assertEquals(3, beforeState.visibleEntries.size)
+            assertEquals(3, beforeState.searchResults.size)
             assertEquals(1, beforeState.activeFeeds.size)
             assertEquals(1, beforeState.archivedFeeds.size)
             assertEquals(1, beforeState.starredEntries.size)

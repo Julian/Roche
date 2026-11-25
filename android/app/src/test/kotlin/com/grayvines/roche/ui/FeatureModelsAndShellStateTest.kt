@@ -175,7 +175,7 @@ class FeatureModelsAndShellStateTest {
 
     @Test
     fun `UndoActionEvent restores removed queue item at original index`() = runTest {
-        seedFeedItems("f-q", listOf("q-1", "q-2", "q-3"))
+        seedAudioFeedItems("f-q", listOf("q-1", "q-2", "q-3"))
         env.settings.update { it.copy(queueItemIds = listOf("q-1", "q-2", "q-3")) }
         val collectJob = collectInBackground(viewModel.uiState)
         viewModel.uiState.first { it.queueEntries.size == 3 }
@@ -486,6 +486,44 @@ class FeatureModelsAndShellStateTest {
                     readProgress = 0.0,
                     thumbnailMediaId = null,
                     duration = null,
+                )
+            )
+        }
+    }
+
+    private suspend fun seedAudioFeedItems(feedId: String, ids: List<String>) {
+        val dao = env.database.dao()
+        dao.upsertFeed(
+            FeedRow(
+                id = feedId,
+                title = "Podcast $feedId",
+                url = "https://example.com/$feedId.xml",
+                siteUrl = "https://example.com",
+                feedType = "podcast",
+            )
+        )
+        ids.forEach { id ->
+            dao.upsertItem(
+                InboxItemRow(
+                    id = id,
+                    feedId = feedId,
+                    feedTitle = "Podcast $feedId",
+                    title = "Episode $id",
+                    url = "https://example.com/$id",
+                    author = null,
+                    summary = null,
+                    contentText = null,
+                    contentHtml = "<p>Notes</p>",
+                    contentType = "audio",
+                    status = "unread",
+                    isFavorite = false,
+                    isCachedOffline = false,
+                    publishedAt = "2026-01-01T00:00:00Z",
+                    createdAt = "2026-01-01T00:00:00Z",
+                    readProgress = 0.0,
+                    thumbnailMediaId = null,
+                    duration = "30:00",
+                    audioUrl = "https://example.com/$id.mp3",
                 )
             )
         }

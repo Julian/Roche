@@ -16,6 +16,7 @@ import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlin.math.roundToInt
 
 internal fun inferContentType(url: String): ContentType =
     ContentType.fromWireValue(inferContentTypeWireValue(url))
@@ -247,6 +248,7 @@ data class InboxEntry(
     val isFinished: Boolean = false,
     val discussions: List<DiscussionLink> = emptyList(),
     val releaseYear: Int? = null,
+    val interactionUpdatedAt: String? = null,
 ) {
     val isPlayableAudio: Boolean
         get() = contentType == ContentType.AUDIO || !audioUrl.isNullOrBlank()
@@ -265,6 +267,18 @@ data class InboxEntry(
 
     val isNew: Boolean
         get() = !isArchived && !isFinished
+
+    val isInProgress: Boolean
+        get() =
+            isNew &&
+                readProgress >= IN_PROGRESS_MIN_PROGRESS &&
+                readProgress < IN_PROGRESS_MAX_PROGRESS
+
+    val formattedProgressPct: Int
+        get() =
+            (readProgress.coerceIn(0.0, 1.0) * PERCENT_SCALE)
+                .roundToInt()
+                .coerceIn(1, MAX_PARTIAL_PCT)
 
     val isUnread: Boolean
         get() = status == ItemStatus.UNREAD && !isRead && !isFinished
@@ -468,7 +482,9 @@ private const val SECONDS_PER_MIN = 60L
 private const val SECONDS_PER_HOUR = 3_600L
 private const val SECONDS_PER_DAY = 86_400L
 private const val SECONDS_PER_MONTH = 2_592_000L
-private const val COMPLETED_PROGRESS_THRESHOLD = 0.98
+internal const val IN_PROGRESS_MIN_PROGRESS = 0.03
+internal const val IN_PROGRESS_MAX_PROGRESS = 0.98
+private const val COMPLETED_PROGRESS_THRESHOLD = IN_PROGRESS_MAX_PROGRESS
 private const val PERCENT_SCALE = 100
 private const val MAX_PARTIAL_PCT = 99
 private val IMG_SRC_REGEX =

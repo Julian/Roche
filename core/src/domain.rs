@@ -10,6 +10,10 @@ use crate::{
     identity::{WANT_TO_READ_SLUG, deterministic_system_collection_id},
 };
 
+/// Minimum reader scroll / playback progress (`>= 0.03`) for an item to count as "In Progress"
+/// (Continue Reading & Listening / Queue) across Web and Android.
+pub const IN_PROGRESS_MIN_PROGRESS: f64 = 0.03;
+
 /// Reader scroll / playback progress threshold (`>= 0.98`) at which an item is automatically
 /// marked Finished (logging `'consumed'` and clearing it from New / Want queues).
 pub const READER_AUTO_READ_THRESHOLD: f64 = 0.98;

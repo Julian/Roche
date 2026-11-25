@@ -190,7 +190,7 @@ class PodcastPlaybackOrchestrator(
         val currentId = playerController.state.value.currentEntryId
         val nextAudio = resolveNextQueuedAudioEntry(excludeEntryId = currentId)
         if (nextAudio == null) {
-            playerController.emitUiMessage("No next audio episode in Queue")
+            playerController.emitUiMessage("No next audio episode in Audio Up Next")
             return false
         }
         if (currentId != null) {

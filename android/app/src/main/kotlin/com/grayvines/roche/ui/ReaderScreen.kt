@@ -1552,10 +1552,10 @@ private fun resolveReaderEndCardModel(
         }
     val dismissLabel =
         when {
-            entry.isDismissed && isWantEntry -> "Restore to Want"
+            entry.isDismissed && isWantEntry -> "Restore to Queue"
             entry.isDismissed -> "Mark New"
             entry.isFinished && isWantEntry -> null
-            isWantEntry -> "Remove from Want"
+            isWantEntry -> "Remove from Queue"
             else -> "Dismiss"
         }
     return ReaderEndCardPresentation(

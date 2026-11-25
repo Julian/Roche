@@ -17,6 +17,7 @@ import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.DiaryEntryItem
 import com.grayvines.roche.data.catalog.DiaryKindFilter
 import com.grayvines.roche.data.catalog.EntryDiaryLogsResult
 import com.grayvines.roche.data.catalog.EntryKind
@@ -51,11 +52,23 @@ enum class CompanionSubTab(val label: String) {
     WANT("Want"),
 }
 
-@Serializable
-enum class QueueSubTab(val label: String) {
-    UP_NEXT("Up Next"),
-    WANT("Want"),
-    HISTORY("History"),
+sealed interface InProgressItem {
+    val entryId: String
+    val activityTs: String
+
+    data class ReaderItem(
+        val entry: InboxEntry,
+        override val activityTs: String,
+    ) : InProgressItem {
+        override val entryId: String = entry.id
+    }
+
+    data class StartedCatalogItem(
+        val item: DiaryEntryItem,
+        override val activityTs: String,
+    ) : InProgressItem {
+        override val entryId: String = item.entryId
+    }
 }
 
 enum class AddSheetMode {
@@ -120,6 +133,7 @@ sealed interface UndoActionKind {
         val collectionId: String,
         val entryId: String,
         val label: String,
+        val collectionIds: List<String> = listOf(collectionId),
     ) : UndoActionKind
 
     data class RestoreQueueItem(
@@ -208,7 +222,6 @@ data class MainUiState(
     val settings: Settings = Settings(),
     val hasBearerToken: Boolean = settings.bearerToken.isNotBlank(),
     val queueEntries: List<InboxEntry> = computeQueueEntries(allEntries, settings.queueItemIds),
-    val listeningHistoryEntries: List<InboxEntry> = computeListeningHistory(allEntries),
     val activeFeeds: List<FeedItem> = computeActiveFeeds(feeds),
     val archivedFeeds: List<FeedItem> = computeArchivedFeeds(feeds),
     val starredEntries: List<InboxEntry> = computeStarredEntries(allEntries),
@@ -216,6 +229,8 @@ data class MainUiState(
     val offlineBytesByEntryId: Map<String, Long> = emptyMap(),
     val totalOfflineCacheBytes: Long = 0L,
     val catalog: CatalogSnapshot = CatalogSnapshot(),
+    val inProgressItems: List<InProgressItem> =
+        computeInProgressItems(allEntries, catalog.activeStartedEntries),
     val diary: DiaryUiState = DiaryUiState(),
     val catalogDetailLogs: EntryDiaryLogsResult? = null,
     val activeCollection: CatalogCollectionUiState = CatalogCollectionUiState(),
@@ -226,7 +241,6 @@ data class MainUiState(
     val catalogBrowseSearch: CatalogSearchPageResult = CatalogSearchPageResult(),
     val resolvingMusicEntryId: String? = null,
     val companionSubTab: CompanionSubTab = CompanionSubTab.LISTS,
-    val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
     val catalogDetailEntryId: String? = null,
@@ -367,7 +381,9 @@ fun MainUiState.resolveNextQueuedAudioEntry(activeAudioEntryId: String?): InboxE
         excludeEntryId = activeAudioEntryId,
     )
 
-fun MainUiState.isEntryInQueue(entryId: String): Boolean = entryId in settings.queueItemIds
+fun MainUiState.isEntryInQueue(entryId: String): Boolean = entryId in catalog.wantEntryIds
+
+fun MainUiState.isEntryInAudioUpNext(entryId: String): Boolean = entryId in settings.queueItemIds
 
 enum class ConfigSaveFeedback {
     SHOW_BANNER,
@@ -612,8 +628,6 @@ sealed interface MainAction {
 
     data class SelectCompanionSubTab(val subTab: CompanionSubTab) : CatalogUi
 
-    data class SelectQueueSubTab(val subTab: QueueSubTab) : CatalogUi
-
     data class SelectCatalogCollection(val collectionId: String?) : CatalogUi
 
     data class SelectWantCollection(val collectionId: String) : CatalogUi
@@ -741,6 +755,10 @@ sealed interface MainAction {
     data class ToggleCatalogStar(val entryId: String) : CatalogMutation
 
     data class ToggleCatalogWant(val entryId: String) : CatalogMutation
+
+    data class ToggleWantToRead(val entryId: String) : CatalogMutation
+
+    data class SkipStartedEntry(val entryId: String) : CatalogMutation
 
     data class AddCatalogEntryToList(
         val collectionId: String,
@@ -939,7 +957,6 @@ internal data class TransientUiState(
     val prefilledShareIsFeed: Boolean = false,
     val isSyncing: Boolean = false,
     val companionSubTab: CompanionSubTab = CompanionSubTab.LISTS,
-    val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
     val selectedBoardId: String? = null,
@@ -990,7 +1007,6 @@ internal data class SavedNavigationUiState(
     val scopeOriginTab: AppTab? = null,
     val selectedReaderEntryId: String? = null,
     val companionSubTab: CompanionSubTab = CompanionSubTab.LISTS,
-    val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
     val selectedBoardId: String? = null,
@@ -1010,7 +1026,6 @@ internal fun TransientUiState.toSavedNavigationUiState(): SavedNavigationUiState
         scopeOriginTab = scopeOriginTab,
         selectedReaderEntryId = selectedReaderEntryId,
         companionSubTab = companionSubTab,
-        queueSubTab = queueSubTab,
         selectedCatalogCollectionId = selectedCatalogCollectionId,
         selectedWantCollectionId = selectedWantCollectionId,
         selectedBoardId = selectedBoardId,
@@ -1033,7 +1048,6 @@ internal fun SavedNavigationUiState.toInitialTransientUiState(
         selectedReaderEntryId = selectedReaderEntryId,
         hydratingEntryIds = setOfNotNull(selectedReaderEntryId),
         companionSubTab = companionSubTab,
-        queueSubTab = queueSubTab,
         selectedCatalogCollectionId = selectedCatalogCollectionId,
         selectedWantCollectionId = selectedWantCollectionId,
         selectedBoardId = selectedBoardId,
@@ -1131,6 +1145,11 @@ internal fun assembleMainUiState(
     resolvingMusicEntryId: String?,
     settingsHubResetTick: Int,
     onDemandCatalog: OnDemandCatalogUiState = OnDemandCatalogUiState(),
+    inProgressItems: List<InProgressItem> =
+        computeInProgressItems(
+            inboxDerived.entryProjections.entries,
+            catalogProjections.catalog.activeStartedEntries,
+        ),
 ): MainUiState {
     val isSyncing = local.isSyncing || inboxDerived.isSyncActive
     val visible =
@@ -1195,7 +1214,6 @@ internal fun assembleMainUiState(
         settings = settings.redactedForUi(),
         hasBearerToken = settings.bearerToken.isNotBlank(),
         queueEntries = inboxDerived.queueEntries,
-        listeningHistoryEntries = inboxDerived.entryProjections.listeningHistoryEntries,
         activeFeeds = inboxDerived.feedProjections.activeFeeds,
         archivedFeeds = inboxDerived.feedProjections.archivedFeeds,
         starredEntries = inboxDerived.entryProjections.starredEntries,
@@ -1203,6 +1221,7 @@ internal fun assembleMainUiState(
         offlineBytesByEntryId = inboxDerived.offlineSizes.bytesByEntryId,
         totalOfflineCacheBytes = inboxDerived.offlineSizes.totalBytes,
         catalog = catalogProjections.catalog,
+        inProgressItems = inProgressItems,
         diary = onDemandCatalog.diary,
         catalogDetailLogs = onDemandCatalog.catalogDetailLogs,
         activeCollection = onDemandCatalog.activeCollection,
@@ -1213,7 +1232,6 @@ internal fun assembleMainUiState(
         catalogBrowseSearch = onDemandCatalog.catalogBrowseSearch,
         resolvingMusicEntryId = resolvingMusicEntryId,
         companionSubTab = local.companionSubTab,
-        queueSubTab = local.queueSubTab,
         selectedCatalogCollectionId = local.selectedCatalogCollectionId,
         selectedWantCollectionId = local.selectedWantCollectionId,
         catalogDetailEntryId = local.catalogDetailEntryId,
@@ -1339,21 +1357,9 @@ internal fun computeQueueEntries(
 ): List<InboxEntry> {
     if (queueItemIds.isEmpty() || allEntries.isEmpty()) return emptyList()
     val byId = allEntries.associateBy { it.id }
-    return queueItemIds.mapNotNull { id -> byId[id]?.takeIf { !it.isArchived } }
-}
-
-internal fun computeListeningHistory(allEntries: List<InboxEntry>): List<InboxEntry> {
-    if (allEntries.isEmpty()) return emptyList()
-    return allEntries
-        .filter { entry ->
-            entry.isPlayableAudio &&
-                (!entry.readAt.isNullOrBlank() || entry.readProgress > 0.0 || entry.isArchived)
-        }
-        .sortedByDescending { entry ->
-            entry.readAt?.takeIf { it.isNotBlank() }
-                ?: entry.publishedAt?.takeIf { it.isNotBlank() }
-                ?: entry.createdAt
-        }
+    return queueItemIds.mapNotNull { id ->
+        byId[id]?.takeIf { !it.isArchived && !it.isFinished && it.isPlayableAudio }
+    }
 }
 
 internal fun computeActiveFeeds(feeds: List<FeedItem>): List<FeedItem> =

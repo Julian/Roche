@@ -23,7 +23,6 @@ internal data class EntryProjections(
     val entries: List<InboxEntry> = emptyList(),
     val entryById: Map<String, InboxEntry> = emptyMap(),
     val readableEntryIds: Set<String> = emptySet(),
-    val listeningHistoryEntries: List<InboxEntry> = emptyList(),
     val starredEntries: List<InboxEntry> = emptyList(),
     val offlineEntries: List<InboxEntry> = emptyList(),
 )
@@ -152,7 +151,6 @@ internal fun buildEntryProjections(effectiveEntries: List<InboxEntry>): EntryPro
         entries = effectiveEntries,
         entryById = byId,
         readableEntryIds = byId.keys,
-        listeningHistoryEntries = computeListeningHistory(effectiveEntries),
         starredEntries = computeStarredEntries(effectiveEntries),
         offlineEntries = computeOfflineEntries(effectiveEntries),
     )

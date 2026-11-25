@@ -3,7 +3,6 @@
 package com.grayvines.roche.data.catalog
 
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
-import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.local.CollectionAggregateRow
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
@@ -16,7 +15,8 @@ import com.grayvines.roche.ranking.EpRankingEngine
 import java.util.Locale
 
 internal const val OVERVIEW_PREVIEW_THUMBNAIL_LIMIT = 4
-internal const val HOME_WANT_TO_READ_PREVIEW_LIMIT = 6
+internal const val HOME_WANT_TO_READ_PREVIEW_LIMIT = 10
+internal const val ACTIVE_STARTED_OVERVIEW_LIMIT = 100
 internal const val CATALOG_SQL_BIND_CHUNK_SIZE = 450
 
 private data class OverviewLoadContext(
@@ -59,13 +59,18 @@ internal suspend fun loadCatalogOverviewSnapshot(
     epScoreCache?.evictUnusedScopes(buckets.activeWantScopeIds)
 
     val recentDiary =
-        dao.getDiaryLogPageNonSong(
+        dao.getDiaryLogPageNonSongByStatus(
+                status = ConsumptionStatus.CONSUMED.wireValue,
                 minTs = "",
                 maxTs = OVERVIEW_MAX_ISO_TS_BOUND,
                 limit = RECENT_DIARY_PREVIEW_LIMIT,
                 offset = 0,
             )
             .map { toDiaryEntryItem(it, globalTiers) }
+    val activeStartedEntries =
+        dao.getActiveStartedEntries(limit = ACTIVE_STARTED_OVERVIEW_LIMIT).map {
+            toDiaryEntryItem(it, globalTiers)
+        }
     val totalDiaryCount = dao.countDiaryLogsNonSong()
     val diaryConsumedCount =
         ctx.consumedCountByKind.entries.sumOf { (kind, count) ->
@@ -81,6 +86,7 @@ internal suspend fun loadCatalogOverviewSnapshot(
         lists = sortListSummaries(buckets.lists),
         wantQueues = sortWantSummaries(buckets.wantQueues),
         recentDiaryEntries = recentDiary,
+        activeStartedEntries = activeStartedEntries,
         totalDiaryCount = totalDiaryCount,
         consumedCount = diaryConsumedCount,
         globalTiers = globalTiers,
@@ -171,7 +177,7 @@ private suspend fun buildOverviewSummaries(ctx: OverviewLoadContext): OverviewSp
         val rawRole = CollectionRole.fromWireValue(spec.role)
         val role = if (spec.collectionId == STARRED_COLLECTION_ID) CollectionRole.LIST else rawRole
         if (role == CollectionRole.FEED || role == CollectionRole.TAG) continue
-        val isWant = role == CollectionRole.WANT || spec.collectionId == UP_NEXT_COLLECTION_ID
+        val isWant = role == CollectionRole.WANT
         if (isWant) activeWantScopeIds.add(spec.collectionId)
         val effectiveGen =
             ctx.generatorsByCollection[spec.collectionId]?.takeIf { isGeneratorEligible(spec) }

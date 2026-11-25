@@ -7,7 +7,8 @@ use super::{
     CatalogRepo,
     batch::BatchTxCache,
     models::{
-        CatalogError, CatalogResult, ConsumptionLogRow, ConsumptionLogView, UpsertEntryInput,
+        ActiveStartedEntry, CatalogError, CatalogResult, ConsumptionLogRow, ConsumptionLogView,
+        UpsertEntryInput,
     },
 };
 use crate::{
@@ -812,6 +813,122 @@ impl CatalogRepo<'_> {
                     created_at: row.created_at,
                 });
             }
+        }
+        Ok(out)
+    }
+
+    /// Lists non-merged, diary-visible entries whose latest `consumption_log` status is `started`
+    /// (with no subsequent or same-timestamp `consumed`/`abandoned` log), ordered by start time
+    /// descending.
+    pub async fn list_active_started_entries(
+        &self,
+        limit: Option<usize>,
+    ) -> CatalogResult<Vec<ActiveStartedEntry>> {
+        let cap = i64::try_from(limit.unwrap_or(100).clamp(1, 200)).unwrap_or(100);
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let log_rows: Vec<ConsumptionLogRow> = sqlx::query_as(
+            "WITH started_candidates AS (
+                 SELECT cl.id, cl.entry_id, cl.ts, cl.status, cl.notes, cl.created_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY cl.entry_id
+                            ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) DESC,
+                                     strftime('%Y-%m-%dT%H:%M:%fZ', cl.created_at) DESC,
+                                     cl.id DESC
+                        ) AS rn
+                 FROM consumption_log cl
+                 JOIN entries e ON e.id = cl.entry_id
+                 WHERE cl.status = 'started'
+                   AND e.merged_into_id IS NULL
+                   AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')
+             )
+             SELECT sc.id, sc.entry_id, sc.ts, sc.status, sc.notes, sc.created_at
+             FROM started_candidates sc
+             WHERE sc.rn = 1
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM consumption_log cl_later
+                   WHERE cl_later.entry_id = sc.entry_id
+                     AND cl_later.status IN ('consumed', 'abandoned')
+                     AND strftime('%Y-%m-%dT%H:%M:%fZ', cl_later.ts) >= strftime('%Y-%m-%dT%H:%M:%fZ', sc.ts)
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM entry_state es
+                   WHERE es.entry_id = sc.entry_id
+                     AND (
+                         es.inbox_state = 'dismissed'
+                         OR (
+                             COALESCE(es.inbox_state, 'none') = 'none'
+                             AND es.read_at IS NOT NULL
+                             AND NOT EXISTS (
+                                 SELECT 1
+                                 FROM collection_entries ce_w
+                                 WHERE ce_w.collection_id = ?
+                                   AND ce_w.entry_id = sc.entry_id
+                             )
+                         )
+                     )
+                     AND COALESCE(
+                         strftime('%Y-%m-%dT%H:%M:%fZ', es.interaction_updated_at),
+                         strftime('%Y-%m-%dT%H:%M:%fZ', es.read_at),
+                         strftime('%Y-%m-%dT%H:%M:%fZ', es.updated_at)
+                     ) >= strftime('%Y-%m-%dT%H:%M:%fZ', sc.ts)
+               )
+             ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', sc.ts) DESC, sc.id DESC
+             LIMIT ?",
+        )
+        .bind(crate::db::WANT_TO_READ_COLLECTION_ID)
+        .bind(cap)
+        .fetch_all(tx.conn())
+        .await?;
+
+        let unique_entry_ids: Vec<String> = log_rows
+            .iter()
+            .map(|r| r.entry_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let entry_map = Self::load_entries_by_ids_in_tx(tx.conn(), &unique_entry_ids).await?;
+        tx.commit().await?;
+
+        let mut out = Vec::with_capacity(log_rows.len());
+        for row in log_rows {
+            if let Some(entry) = entry_map.get(&row.entry_id) {
+                out.push(ActiveStartedEntry {
+                    log_id: row.id,
+                    entry: entry.clone(),
+                    ts: row.ts,
+                    notes: row.notes,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Returns the subset of `entry_ids` that belong to any active `want` collection
+    /// (excluding legacy `system` collections such as `up_next`).
+    pub async fn want_entry_ids_in(&self, entry_ids: &[String]) -> CatalogResult<HashSet<String>> {
+        if entry_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut out = HashSet::new();
+        for chunk in entry_ids.chunks(200) {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT DISTINCT ce.entry_id
+                 FROM collection_entries ce
+                 JOIN collection_specs cs ON cs.collection_id = ce.collection_id
+                 JOIN entries qc ON qc.id = cs.collection_id
+                 WHERE cs.collection_role = 'want'
+                   AND qc.merged_into_id IS NULL
+                   AND ce.entry_id IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+            qb.push(")");
+            let rows: Vec<String> = qb.build_query_scalar().fetch_all(self.pool).await?;
+            out.extend(rows);
         }
         Ok(out)
     }

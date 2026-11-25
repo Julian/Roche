@@ -1031,9 +1031,10 @@ private fun InboxEntryTextColumn(
                     "AUDIO" to colors.accentBlue
                 else -> null to colors.accentBlue
             }
+        val progressSuffix = resolveEntryProgressSuffix(entry)
         EntrySourceMetadataRow(
             entry = entry,
-            trailingMetaText = "· ${entry.formattedPublishedLabel}",
+            trailingMetaText = "· ${entry.formattedPublishedLabel}$progressSuffix",
             trailingMetaFontSize = 11.sp,
             trailingBadge = trailingBadge,
             trailingBadgeColor = trailingBadgeColor,
@@ -1112,3 +1113,16 @@ internal val MAX_FILTER_DRAWER_HEIGHT = 220.dp
 private const val PLAYING_ROW_BG_ALPHA = 0.12f
 private const val QUEUED_ROW_BG_ALPHA = 0.11f
 private const val DAYS_IN_WEEK = 7L
+
+private fun resolveEntryProgressSuffix(entry: InboxEntry): String {
+    val showsAudioHistoryLabel =
+        entry.contentType == ContentType.AUDIO && entry.formattedListeningHistoryLabel != null
+    if (showsAudioHistoryLabel || !entry.isInProgress) return ""
+    val verb =
+        when {
+            entry.isPlayableAudio -> "played"
+            entry.contentType == ContentType.VIDEO -> "watched"
+            else -> "read"
+        }
+    return " · ${entry.formattedProgressPct}% $verb"
+}

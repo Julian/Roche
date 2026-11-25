@@ -2,11 +2,7 @@
 
 package com.grayvines.roche.ui
 
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.spring
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -23,6 +19,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -42,25 +39,20 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.zIndex
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.data.catalog.CatalogListSummary
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.RankedCatalogEntry
@@ -69,10 +61,7 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.extractCleanDomain
 import com.grayvines.roche.ui.components.CatalogCoverThumbnail
-import com.grayvines.roche.ui.components.EntrySourceMetadataRow
-import com.grayvines.roche.ui.components.EntryThumbnailPreview
 import com.grayvines.roche.ui.components.HeaderActionButton
-import com.grayvines.roche.ui.components.MoreDotsIcon
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheMetaPill
@@ -703,22 +692,15 @@ private fun StarredCatalogMetaColumn(
 fun QueueTabContent(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
-    upNextListState: LazyListState = rememberLazyListState(),
-    wantListState: LazyListState = rememberLazyListState(),
-    historyListState: LazyListState = rememberLazyListState(),
+    listState: LazyListState = rememberLazyListState(),
     activeAudioEntryId: String? = null,
     onOpenExternalUrl: (String) -> Unit = {},
 ) {
-    var activeSubTab by rememberSaveable(state.queueSubTab) { mutableStateOf(state.queueSubTab) }
-    val nextQueuedAudio = state.resolveNextQueuedAudioEntry(activeAudioEntryId)
-    val countBadge =
-        when (activeSubTab) {
-            QueueSubTab.UP_NEXT -> state.queueEntries.size
-            QueueSubTab.WANT -> state.catalog.wantItemCount
-            QueueSubTab.HISTORY -> state.listeningHistoryEntries.size
+    val inProgressNotInWant =
+        remember(state.inProgressItems, state.catalog.wantEntryIds) {
+            state.inProgressItems.count { it.entryId !in state.catalog.wantEntryIds }
         }
-    val showPlayAudio =
-        activeSubTab == QueueSubTab.UP_NEXT && nextQueuedAudio != null && activeAudioEntryId == null
+    val countBadge = state.catalog.wantItemCount + inProgressNotInWant
 
     RocheRefreshableTabScaffold(
         isRefreshing = state.isManualRefreshing,
@@ -727,32 +709,16 @@ fun QueueTabContent(
         header = {
             QueueHeaderBar(
                 countBadge = countBadge,
-                showPlayAudio = showPlayAudio,
                 showBackToHome = state.isUnpinnedDestination(AppTab.QUEUE),
                 onBackToHome = { onAction(MainAction.SelectTab(AppTab.HOME)) },
-                onPlayAudio = { onAction(MainAction.SkipToNextQueuedAudio) },
                 onOpenSearch = { onAction(MainAction.OpenSearch) },
-            )
-            QueueModeFilterRow(
-                queueCount = state.queueEntries.size,
-                wantCount = state.catalog.wantItemCount,
-                historyCount = state.listeningHistoryEntries.size,
-                activeSubTab = activeSubTab,
-                onSelectSubTab = { subTab ->
-                    activeSubTab = subTab
-                    onAction(MainAction.SelectQueueSubTab(subTab))
-                },
             )
         },
     ) {
-        QueueTabBody(
-            activeSubTab = activeSubTab,
+        UnifiedQueuePane(
             state = state,
+            listState = listState,
             activeAudioEntryId = activeAudioEntryId,
-            nextQueuedAudioId = nextQueuedAudio?.id,
-            upNextListState = upNextListState,
-            wantListState = wantListState,
-            historyListState = historyListState,
             onAction = onAction,
             onOpenExternalUrl = onOpenExternalUrl,
         )
@@ -760,52 +726,10 @@ fun QueueTabContent(
 }
 
 @Composable
-private fun QueueTabBody(
-    activeSubTab: QueueSubTab,
-    state: MainUiState,
-    activeAudioEntryId: String?,
-    nextQueuedAudioId: String?,
-    upNextListState: LazyListState,
-    wantListState: LazyListState,
-    historyListState: LazyListState,
-    onAction: (MainAction) -> Unit,
-    onOpenExternalUrl: (String) -> Unit,
-) {
-    when (activeSubTab) {
-        QueueSubTab.UP_NEXT ->
-            UpNextQueueListContent(
-                queueEntries = state.queueEntries,
-                activeAudioEntryId = activeAudioEntryId,
-                nextQueuedAudioId = nextQueuedAudioId,
-                onAction = onAction,
-                listState = upNextListState,
-            )
-        QueueSubTab.WANT ->
-            WantQueuesPane(
-                state = state,
-                listState = wantListState,
-                onAction = onAction,
-                onOpenExternalUrl = onOpenExternalUrl,
-            )
-        QueueSubTab.HISTORY ->
-            ListeningHistoryListContent(
-                historyEntries = state.listeningHistoryEntries,
-                state = state,
-                activeAudioEntryId = activeAudioEntryId,
-                onAction = onAction,
-                listState = historyListState,
-            )
-    }
-}
-
-@Composable
-@Suppress("LongParameterList")
 private fun QueueHeaderBar(
     countBadge: Int,
-    showPlayAudio: Boolean,
     showBackToHome: Boolean,
     onBackToHome: () -> Unit,
-    onPlayAudio: () -> Unit,
     onOpenSearch: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -819,14 +743,6 @@ private fun QueueHeaderBar(
                 null
             },
     ) {
-        if (showPlayAudio) {
-            HeaderActionButton(
-                label = "▶ Play",
-                onClick = onPlayAudio,
-                horizontalPadding = 11.dp,
-                modifier = Modifier.testTag("queue_play_audio_btn"),
-            )
-        }
         RocheIconActionButton(
             contentDescription = "Search",
             outlined = true,
@@ -839,100 +755,279 @@ private fun QueueHeaderBar(
 }
 
 @Composable
-private fun QueueModeFilterRow(
-    queueCount: Int,
-    wantCount: Int,
-    historyCount: Int,
-    activeSubTab: QueueSubTab,
-    onSelectSubTab: (QueueSubTab) -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    Row(
-        modifier =
-            Modifier.fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 12.dp, vertical = 2.dp),
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        RocheStripTab(
-            label = "Up Next ($queueCount)",
-            selected = activeSubTab == QueueSubTab.UP_NEXT,
-            onClick = { onSelectSubTab(QueueSubTab.UP_NEXT) },
-            modifier = Modifier.testTag("queue_mode_up_next"),
-        )
-        RocheStripTab(
-            label = if (wantCount > 0) "Want ($wantCount)" else "Want",
-            selected = activeSubTab == QueueSubTab.WANT,
-            onClick = { onSelectSubTab(QueueSubTab.WANT) },
-            modifier = Modifier.testTag("queue_mode_want"),
-        )
-        RocheStripTab(
-            label = if (historyCount > 0) "History ($historyCount)" else "History",
-            selected = activeSubTab == QueueSubTab.HISTORY,
-            onClick = { onSelectSubTab(QueueSubTab.HISTORY) },
-            modifier = Modifier.testTag("queue_mode_history"),
-        )
-    }
-    HorizontalDivider(color = colors.border, thickness = 1.dp)
-}
-
-@Composable
-private fun WantQueuesPane(
+private fun UnifiedQueuePane(
     state: MainUiState,
     listState: LazyListState,
+    activeAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
     val queues = state.catalog.wantQueues
-    if (queues.isEmpty()) {
-        CompanionEmptyCard(
-            title = "Your Want Queue is clear",
-            body =
-                "Save articles, PDFs, movies, books, albums, or games you want to experience next and prioritize them locally.",
-            ctaLabel = "+ Add to Want to Read",
-            onCta = { onAction(MainAction.OpenAddSheet()) },
-        )
+    val inProgress = state.inProgressItems
+    if (inProgress.isEmpty() && queues.all { it.entryCount == 0 }) {
+        UnifiedQueueEmptyState(onAction = onAction)
         return
     }
     val activeQueue =
         remember(queues, state.selectedWantCollectionId) {
             resolveActiveWantQueue(queues, state.selectedWantCollectionId)
         }
-    val wantState = state.activeWantQueue
-    val entries =
-        if (activeQueue != null && wantState.collectionId == activeQueue.collectionId) {
-            wantState.entries
-        } else {
-            emptyList()
-        }
-    val isLoadingQueue =
-        activeQueue != null &&
-            activeQueue.entryCount > 0 &&
-            (!wantState.isLoaded || wantState.collectionId != activeQueue.collectionId)
+    val entries = resolveLoadedWantQueueEntries(activeQueue, state.activeWantQueue)
+    val isLoadingQueue = isWantQueueLoading(activeQueue, state.activeWantQueue)
+    val inProgressBadges = remember(inProgress) { buildInProgressBadgeMap(inProgress) }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        if (queues.size > 1) {
-            WantQueuePickerRow(
-                queues = queues,
-                activeCollectionId = activeQueue?.collectionId,
-                onSelect = { onAction(MainAction.SelectWantCollection(it)) },
+    UnifiedQueueLazyList(
+        state = state,
+        listState = listState,
+        inProgress = inProgress,
+        queues = queues,
+        activeQueue = activeQueue,
+        entries = entries,
+        isLoadingQueue = isLoadingQueue,
+        inProgressBadges = inProgressBadges,
+        activeAudioEntryId = activeAudioEntryId,
+        onAction = onAction,
+        onOpenExternalUrl = onOpenExternalUrl,
+    )
+}
+
+@Composable
+private fun UnifiedQueueEmptyState(onAction: (MainAction) -> Unit) {
+    val colors = LocalRocheColors.current
+    Box(
+        modifier =
+            Modifier.fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(24.dp)
+                .testTag("queue_empty_state"),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = "Your Queue is clear",
+                color = colors.textPrimary,
+                fontFamily = currentHeadlineFontFamily(),
+                fontSize = 18.sp,
             )
-        }
-        if (entries.isEmpty()) {
-            if (!isLoadingQueue) {
-                WantQueueEmptySection(activeQueue = activeQueue, onAction = onAction)
+            Text(
+                text =
+                    "Save articles, PDFs, movies, books, albums, or games you want to experience next, or start one to track it in progress.",
+                color = colors.textMuted,
+                fontSize = 13.sp,
+                textAlign = TextAlign.Center,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                HeaderActionButton(
+                    label = "+ Save URL",
+                    style = RocheButtonStyle.PRIMARY,
+                    onClick = { onAction(MainAction.OpenAddSheet()) },
+                    modifier = Modifier.testTag("queue_empty_add_url_btn"),
+                )
+                HeaderActionButton(
+                    label = "+ Add Work",
+                    onClick = { onAction(MainAction.OpenQuickLogSheet(defaultToWant = true)) },
+                    modifier = Modifier.testTag("queue_empty_add_work_btn"),
+                )
             }
-        } else {
-            WantQueueEntriesList(
-                activeQueue = activeQueue,
-                entries = entries,
+        }
+    }
+}
+
+private fun resolveLoadedWantQueueEntries(
+    activeQueue: CatalogListSummary?,
+    wantState: CatalogCollectionUiState,
+): List<RankedCatalogEntry> =
+    if (activeQueue != null && wantState.collectionId == activeQueue.collectionId) {
+        wantState.entries
+    } else {
+        emptyList()
+    }
+
+private fun isWantQueueLoading(
+    activeQueue: CatalogListSummary?,
+    wantState: CatalogCollectionUiState,
+): Boolean =
+    activeQueue != null &&
+        activeQueue.entryCount > 0 &&
+        (!wantState.isLoaded || wantState.collectionId != activeQueue.collectionId)
+
+private fun buildInProgressBadgeMap(inProgress: List<InProgressItem>): Map<String, String> =
+    inProgress.associate { item ->
+        item.entryId to
+            when (item) {
+                is InProgressItem.ReaderItem -> "${item.entry.formattedProgressPct}%"
+                is InProgressItem.StartedCatalogItem -> "Started"
+            }
+    }
+
+@Composable
+@Suppress("LongParameterList")
+private fun UnifiedQueueLazyList(
+    state: MainUiState,
+    listState: LazyListState,
+    inProgress: List<InProgressItem>,
+    queues: List<CatalogListSummary>,
+    activeQueue: CatalogListSummary?,
+    entries: List<RankedCatalogEntry>,
+    isLoadingQueue: Boolean,
+    inProgressBadges: Map<String, String>,
+    activeAudioEntryId: String?,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    LazyColumn(
+        state = listState,
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+        modifier = Modifier.fillMaxSize().testTag("queue_list"),
+    ) {
+        if (inProgress.isNotEmpty()) {
+            inProgressQueueItems(
+                inProgress = inProgress,
                 readableIds = state.readableEntryIds,
-                listState = listState,
+                activeAudioEntryId = activeAudioEntryId,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
+                colors = colors,
             )
         }
+        if (queues.size > 1) {
+            item(key = "want_queue_picker") {
+                WantQueuePickerRow(
+                    queues = queues,
+                    activeCollectionId = activeQueue?.collectionId,
+                    onSelect = { onAction(MainAction.SelectWantCollection(it)) },
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+            }
+        }
+        if (activeQueue != null) {
+            activeWantQueueItems(
+                activeQueue = activeQueue,
+                entries = entries,
+                isLoadingQueue = isLoadingQueue,
+                readableIds = state.readableEntryIds,
+                inProgressBadges = inProgressBadges,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+                colors = colors,
+            )
+        }
+        item(key = "want_bottom_spacer") { Spacer(modifier = Modifier.height(72.dp)) }
+    }
+}
+
+@Suppress("LongParameterList")
+private fun LazyListScope.inProgressQueueItems(
+    inProgress: List<InProgressItem>,
+    readableIds: Set<String>,
+    activeAudioEntryId: String?,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+    colors: com.grayvines.roche.ui.theme.RocheColors,
+) {
+    item(key = "queue_in_progress_head") {
+        InProgressSectionHeader(count = inProgress.size)
+        Spacer(modifier = Modifier.height(8.dp))
+    }
+    itemsIndexed(items = inProgress, key = { _, item -> "in_progress_${item.entryId}" }) { idx, item
+        ->
+        Column(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .lazyGroupedCardRow(
+                        isFirst = idx == 0,
+                        isLast = idx == inProgress.lastIndex,
+                        surfaceColor = colors.surface,
+                        borderColor = colors.border,
+                    )
+        ) {
+            if (idx > 0) HorizontalDivider(color = colors.border, thickness = 1.dp)
+            InProgressRowDispatcher(
+                item = item,
+                readableIds = readableIds,
+                activeAudioEntryId = activeAudioEntryId,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+                testTagPrefix = "queue_in_progress",
+            )
+        }
+    }
+    item(key = "queue_in_progress_spacer") { Spacer(modifier = Modifier.height(16.dp)) }
+}
+
+@Suppress("LongParameterList")
+private fun LazyListScope.activeWantQueueItems(
+    activeQueue: CatalogListSummary,
+    entries: List<RankedCatalogEntry>,
+    isLoadingQueue: Boolean,
+    readableIds: Set<String>,
+    inProgressBadges: Map<String, String>,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+    colors: com.grayvines.roche.ui.theme.RocheColors,
+) {
+    item(key = "want_head_${activeQueue.collectionId}") {
+        WantQueueSectionHeader(
+            queue = activeQueue,
+            hasEntries = entries.isNotEmpty(),
+            canPrioritize = entries.size >= 2,
+            onAction = onAction,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+    }
+    if (entries.isEmpty()) {
+        if (!isLoadingQueue) {
+            item(key = "want_empty_${activeQueue.collectionId}") {
+                WantQueueEmptySection(activeQueue = activeQueue, onAction = onAction)
+            }
+        }
+        return
+    }
+    itemsIndexed(
+        items = entries,
+        key = { _, item -> "${activeQueue.collectionId}_${item.entry.id}" },
+    ) { idx, item ->
+        WantQueueLazyRowItem(
+            item = item,
+            activeQueue = activeQueue,
+            readableIds = readableIds,
+            inProgressBadge = inProgressBadges[item.entry.id],
+            isFirst = idx == 0,
+            isLast = idx == entries.lastIndex,
+            onAction = onAction,
+            onOpenExternalUrl = onOpenExternalUrl,
+            colors = colors,
+        )
+    }
+}
+
+@Composable
+private fun InProgressSectionHeader(count: Int) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier =
+            Modifier.fillMaxWidth().padding(horizontal = 2.dp).testTag("queue_in_progress_section"),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "IN PROGRESS",
+            color = colors.textMuted,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.8.sp,
+            modifier = Modifier.semantics { heading() },
+        )
+        Text(
+            text = count.toString(),
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+        )
     }
 }
 
@@ -951,22 +1046,25 @@ private fun WantQueuePickerRow(
     onSelect: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    Row(
-        modifier =
-            Modifier.fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 12.dp, vertical = 2.dp),
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        queues.forEach { queue ->
-            RocheStripTab(
-                label = "${queue.title} (${queue.entryCount})",
-                selected = queue.collectionId == activeCollectionId,
-                onClick = { onSelect(queue.collectionId) },
-            )
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(vertical = 2.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            queues.forEach { queue ->
+                RocheStripTab(
+                    label = "${queue.title} (${queue.entryCount})",
+                    selected = queue.collectionId == activeCollectionId,
+                    onClick = { onSelect(queue.collectionId) },
+                    modifier = Modifier.testTag("want_queue_tab_${queue.slug}"),
+                )
+            }
         }
+        HorizontalDivider(color = colors.border, thickness = 1.dp)
     }
-    HorizontalDivider(color = colors.border, thickness = 1.dp)
 }
 
 @Composable
@@ -1000,56 +1098,13 @@ private fun WantQueueEmptySection(
     )
 }
 
-@Composable
-private fun WantQueueEntriesList(
-    activeQueue: CatalogListSummary?,
-    entries: List<RankedCatalogEntry>,
-    readableIds: Set<String>,
-    listState: LazyListState,
-    onAction: (MainAction) -> Unit,
-    onOpenExternalUrl: (String) -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    LazyColumn(
-        state = listState,
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-        modifier = Modifier.fillMaxSize(),
-    ) {
-        if (activeQueue != null) {
-            item(key = "want_head_${activeQueue.collectionId}") {
-                WantQueueSectionHeader(
-                    queue = activeQueue,
-                    canPrioritize = entries.size >= 2,
-                    onAction = onAction,
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-            }
-        }
-        itemsIndexed(
-            items = entries,
-            key = { _, item -> "${activeQueue?.collectionId ?: "all"}_${item.entry.id}" },
-        ) { idx, item ->
-            WantQueueLazyRowItem(
-                item = item,
-                activeQueue = activeQueue,
-                readableIds = readableIds,
-                isFirst = idx == 0,
-                isLast = idx == entries.lastIndex,
-                onAction = onAction,
-                onOpenExternalUrl = onOpenExternalUrl,
-                colors = colors,
-            )
-        }
-        item(key = "want_bottom_spacer") { Spacer(modifier = Modifier.height(72.dp)) }
-    }
-}
-
 @Suppress("LongParameterList")
 @Composable
 private fun WantQueueLazyRowItem(
     item: RankedCatalogEntry,
     activeQueue: CatalogListSummary?,
     readableIds: Set<String>,
+    inProgressBadge: String?,
     isFirst: Boolean,
     isLast: Boolean,
     onAction: (MainAction) -> Unit,
@@ -1079,8 +1134,12 @@ private fun WantQueueLazyRowItem(
         if (!isFirst) HorizontalDivider(color = colors.border, thickness = 1.dp)
         WantQueueRow(
             item = item,
+            inProgressBadge = inProgressBadge,
             onOpen = onOpen,
-            onComplete = {
+            onFinish = {
+                onAction(MainAction.CompleteWantEntry(item.entry.id, rankImmediately = false))
+            },
+            onFinishAndRank = {
                 onAction(MainAction.CompleteWantEntry(item.entry.id, rankImmediately = true))
             },
             onRemove = {
@@ -1095,6 +1154,7 @@ private fun WantQueueLazyRowItem(
 @Composable
 private fun WantQueueSectionHeader(
     queue: CatalogListSummary,
+    hasEntries: Boolean,
     canPrioritize: Boolean,
     onAction: (MainAction) -> Unit,
 ) {
@@ -1116,13 +1176,30 @@ private fun WantQueueSectionHeader(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (queue.collectionId == WANT_TO_READ_COLLECTION_ID) {
-                TextButton(
-                    onClick = { onAction(MainAction.OpenAddSheet()) },
-                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
-                    modifier = Modifier.testTag("want_to_read_add_url_btn"),
-                ) {
-                    Text(text = "+ Add URL", color = colors.accentBlue, fontSize = 12.sp)
+            if (hasEntries) {
+                if (queue.collectionId == WANT_TO_READ_COLLECTION_ID) {
+                    TextButton(
+                        onClick = { onAction(MainAction.OpenAddSheet()) },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                        modifier = Modifier.testTag("want_to_read_add_url_btn"),
+                    ) {
+                        Text(text = "+ Add URL", color = colors.accentBlue, fontSize = 12.sp)
+                    }
+                } else {
+                    TextButton(
+                        onClick = {
+                            onAction(
+                                MainAction.OpenQuickLogSheet(
+                                    defaultToWant = true,
+                                    prefillKind = EntryKind.inferForCollection(queue),
+                                )
+                            )
+                        },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                        modifier = Modifier.testTag("want_add_work_btn"),
+                    ) {
+                        Text(text = "+ Add", color = colors.accentBlue, fontSize = 12.sp)
+                    }
                 }
             }
             if (canPrioritize) {
@@ -1140,15 +1217,16 @@ private fun WantQueueSectionHeader(
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
+@Suppress("LongParameterList")
 private fun WantQueueRow(
     item: RankedCatalogEntry,
+    inProgressBadge: String?,
     onOpen: (() -> Unit)?,
-    onComplete: () -> Unit,
+    onFinish: () -> Unit,
+    onFinishAndRank: () -> Unit,
     onRemove: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily = currentHeadlineFontFamily()
-    val meta = remember(item.entry) { buildWantMetaLine(item) }
     var menuExpanded by rememberSaveable(item.entry.id) { mutableStateOf(false) }
 
     Row(
@@ -1173,16 +1251,49 @@ private fun WantQueueRow(
             textAlign = TextAlign.End,
             modifier = Modifier.width(20.dp),
         )
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-            Text(
-                text = item.entry.title,
-                color = colors.textPrimary,
-                fontFamily = headlineFamily,
-                fontSize = 14.5.sp,
-                fontWeight = FontWeight.Normal,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
+        WantQueueRowMetaColumn(
+            item = item,
+            inProgressBadge = inProgressBadge,
+            modifier = Modifier.weight(1f),
+        )
+        HeaderActionButton(label = "✓ Done", onClick = onFinish, horizontalPadding = 10.dp)
+        WantQueueRowOverflowMenu(
+            entryId = item.entry.id,
+            title = item.entry.title,
+            expanded = menuExpanded,
+            onExpandedChange = { menuExpanded = it },
+            onFinishAndRank = onFinishAndRank,
+            onRemove = onRemove,
+        )
+    }
+}
+
+@Composable
+private fun WantQueueRowMetaColumn(
+    item: RankedCatalogEntry,
+    inProgressBadge: String?,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    val meta = remember(item.entry) { buildWantMetaLine(item) }
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            text = remember(item.entry.title) { formatInlineMathAnnotated(item.entry.title) },
+            color = colors.textPrimary,
+            fontFamily = headlineFamily,
+            fontSize = 14.5.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (inProgressBadge != null) {
+                RocheMetaPill(text = inProgressBadge, textColor = colors.accentBlue)
+            }
             if (meta.isNotBlank()) {
                 Text(
                     text = meta,
@@ -1190,28 +1301,21 @@ private fun WantQueueRow(
                     fontSize = 11.5.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
                 )
             }
         }
-        HeaderActionButton(label = "✓ Done", onClick = onComplete, horizontalPadding = 10.dp)
-        WantQueueRowOverflowMenu(
-            entryId = item.entry.id,
-            title = item.entry.title,
-            expanded = menuExpanded,
-            onExpandedChange = { menuExpanded = it },
-            onComplete = onComplete,
-            onRemove = onRemove,
-        )
     }
 }
 
 @Composable
+@Suppress("LongParameterList")
 private fun WantQueueRowOverflowMenu(
     entryId: String,
     title: String,
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
-    onComplete: () -> Unit,
+    onFinishAndRank: () -> Unit,
     onRemove: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -1238,11 +1342,11 @@ private fun WantQueueRowOverflowMenu(
                 text = { Text("Finish & Rank", color = colors.textPrimary) },
                 onClick = {
                     onExpandedChange(false)
-                    onComplete()
+                    onFinishAndRank()
                 },
             )
             DropdownMenuItem(
-                text = { Text("Remove from Want Queue", color = colors.accentIndianRed) },
+                text = { Text("Remove from Queue", color = colors.accentIndianRed) },
                 onClick = {
                     onExpandedChange(false)
                     onRemove()
@@ -1260,606 +1364,3 @@ private fun buildWantMetaLine(item: RankedCatalogEntry): String = buildList {
     add(item.entry.kind.displayLabel)
 }
     .joinToString(" · ")
-
-@Composable
-private fun UpNextQueueListContent(
-    queueEntries: List<InboxEntry>,
-    activeAudioEntryId: String?,
-    nextQueuedAudioId: String?,
-    onAction: (MainAction) -> Unit,
-    listState: LazyListState,
-) {
-    if (queueEntries.isEmpty()) {
-        UpNextQueueEmptyState()
-        return
-    }
-    val dragState =
-        rememberQueueDragReorderState(
-            listState = listState,
-            entries = queueEntries,
-            onCommitReorder = { orderedIds -> onAction(MainAction.ReorderQueue(orderedIds)) },
-        )
-    val displayEntries = dragState.resolveDisplayEntries(queueEntries)
-    val currentIds = remember(displayEntries) { displayEntries.map { it.id } }
-    val canReorder = displayEntries.size > 1
-    val isAudioActuallyPlaying = LocalIsAudioActuallyPlaying.current ?: false
-
-    LazyColumn(
-        state = listState,
-        userScrollEnabled = dragState.draggedEntryId == null,
-        modifier = Modifier.fillMaxSize().testTag("queue_list"),
-        contentPadding = PaddingValues(bottom = 96.dp),
-    ) {
-        itemsIndexed(items = displayEntries, key = { _, item -> item.id }) { index, entry ->
-            val isDragging = dragState.draggedEntryId == entry.id
-            UpNextDraggableQueueSlot(
-                entry = entry,
-                index = index,
-                currentIds = currentIds,
-                canReorder = canReorder,
-                isDragging = isDragging,
-                dragState = dragState,
-                isPlayingAudio = entry.id == activeAudioEntryId,
-                isAudioActuallyPlaying = isAudioActuallyPlaying,
-                isQueuedNextAudio = activeAudioEntryId != null && entry.id == nextQueuedAudioId,
-                onAction = onAction,
-                modifier =
-                    Modifier.fillMaxWidth()
-                        .animateItem(
-                            placementSpec =
-                                if (isDragging) {
-                                    null
-                                } else {
-                                    spring<IntOffset>(stiffness = Spring.StiffnessMediumLow)
-                                }
-                        ),
-            )
-        }
-    }
-}
-
-@Composable
-private fun UpNextQueueEmptyState() {
-    val colors = LocalRocheColors.current
-    Box(
-        modifier =
-            Modifier.fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(32.dp)
-                .testTag("queue_empty_state"),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text =
-                "Your Queue is empty. Long-press any article, paper, video, or podcast episode in Inbox to add it to your Queue.",
-            color = colors.textMuted,
-            fontSize = 13.sp,
-        )
-    }
-}
-
-@Composable
-private fun UpNextDraggableQueueSlot(
-    entry: InboxEntry,
-    index: Int,
-    currentIds: List<String>,
-    canReorder: Boolean,
-    isDragging: Boolean,
-    dragState: QueueDragReorderState,
-    isPlayingAudio: Boolean,
-    isAudioActuallyPlaying: Boolean,
-    isQueuedNextAudio: Boolean,
-    onAction: (MainAction) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val colors = LocalRocheColors.current
-    Column(
-        modifier =
-            modifier.zIndex(if (isDragging) 1f else 0f).graphicsLayer {
-                if (isDragging) {
-                    translationY = dragState.dragOffsetY
-                    shadowElevation = QUEUE_DRAG_ELEVATION_DP.dp.toPx()
-                }
-            }
-    ) {
-        QueueEntryRowItem(
-            entry = entry,
-            queuePosition = index + 1,
-            totalCount = currentIds.size,
-            canReorder = canReorder,
-            canMoveUp = index > 0,
-            canMoveDown = index < currentIds.lastIndex,
-            isDragging = isDragging,
-            dragState = dragState,
-            isPlayingAudio = isPlayingAudio,
-            isAudioActuallyPlaying = isAudioActuallyPlaying,
-            isQueuedNextAudio = isQueuedNextAudio,
-            onOpen = { onAction(MainAction.OpenReader(entry.id)) },
-            onOpenContextSheet = { onAction(MainAction.OpenContextSheet(entry.id)) },
-            onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
-            onMoveToTop = { onAction(MainAction.MoveQueueItemToTop(entry.id)) },
-            onMoveUp = {
-                onAction(MainAction.ReorderQueue(moveItemInList(currentIds, index, index - 1)))
-            },
-            onMoveDown = {
-                onAction(MainAction.ReorderQueue(moveItemInList(currentIds, index, index + 1)))
-            },
-            onRemoveFromQueue = { onAction(MainAction.RemoveFromQueue(entry.id)) },
-            onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
-        )
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-    }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun ListeningHistoryListContent(
-    historyEntries: List<InboxEntry>,
-    state: MainUiState,
-    activeAudioEntryId: String?,
-    onAction: (MainAction) -> Unit,
-    listState: LazyListState = rememberLazyListState(),
-) {
-    val colors = LocalRocheColors.current
-    if (historyEntries.isEmpty()) {
-        Box(
-            modifier =
-                Modifier.fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(32.dp)
-                    .testTag("listening_history_empty"),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                text =
-                    "No podcast episodes played yet. Episodes you listen to appear here with their playback timestamp and progress.",
-                color = colors.textMuted,
-                fontSize = 13.sp,
-            )
-        }
-        return
-    }
-    LazyColumn(
-        state = listState,
-        modifier = Modifier.fillMaxSize().testTag("listening_history_list"),
-        contentPadding = PaddingValues(bottom = 96.dp),
-    ) {
-        items(items = historyEntries, key = { it.id }) { entry ->
-            ListeningHistoryRowItem(
-                entry = entry,
-                isPlaying = entry.id == activeAudioEntryId,
-                inQueue = state.isEntryInQueue(entry.id),
-                onAction = onAction,
-            )
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
-        }
-    }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun ListeningHistoryRowItem(
-    entry: InboxEntry,
-    isPlaying: Boolean,
-    inQueue: Boolean,
-    onAction: (MainAction) -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    val headlineFamily = currentHeadlineFontFamily()
-    val starTint = if (entry.isFavorite) colors.accentEcru else colors.textMuted
-    val isAudioActuallyPlaying = LocalIsAudioActuallyPlaying.current ?: false
-    val historyLabel = entry.formattedListeningHistoryLabel ?: "Played"
-    val rowBg =
-        if (isPlaying) colors.accentBlue.copy(alpha = ROW_HIGHLIGHT_ALPHA) else colors.background
-    val starDesc = if (entry.isFavorite) "Unstar ${entry.title}" else "Star ${entry.title}"
-    val playingBadge =
-        if (isPlaying) {
-            if (isAudioActuallyPlaying) "▶ PLAYING" else "⏸ PAUSED"
-        } else {
-            null
-        }
-
-    Row(
-        modifier =
-            Modifier.fillMaxWidth()
-                .background(rowBg)
-                .drawLeftAccentBar(if (isPlaying) colors.accentBlue else null)
-                .combinedClickable(
-                    onClick = { onAction(MainAction.PlayAudioEntry(entry.id)) },
-                    onLongClick = { onAction(MainAction.OpenContextSheet(entry.id)) },
-                )
-                .semantics { role = Role.Button }
-                .padding(start = 10.dp, end = 12.dp, top = 11.dp, bottom = 11.dp)
-                .testTag("history_row_${entry.id}"),
-        verticalAlignment = Alignment.Top,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        RocheIconActionButton(
-            contentDescription = starDesc,
-            onClick = { onAction(MainAction.ToggleStar(entry.id)) },
-            outlined = false,
-            modifier = Modifier.testTag("history_star_btn_${entry.id}"),
-        ) {
-            StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 17.dp)
-        }
-        EntryThumbnailPreview(entry = entry, modifier = Modifier.padding(top = 2.dp))
-        ListeningHistoryMetaColumn(
-            entry = entry,
-            headlineFamily = headlineFamily,
-            historyLabel = historyLabel,
-            playingBadge = playingBadge,
-            modifier = Modifier.weight(1f),
-        )
-        if (!inQueue) {
-            HeaderActionButton(
-                label = "+ Queue",
-                onClick = { onAction(MainAction.AddToQueue(entry.id)) },
-                modifier = Modifier.testTag("history_requeue_btn_${entry.id}"),
-            )
-        }
-    }
-}
-
-@Composable
-private fun ListeningHistoryMetaColumn(
-    entry: InboxEntry,
-    headlineFamily: FontFamily,
-    historyLabel: String,
-    playingBadge: String?,
-    modifier: Modifier = Modifier,
-) {
-    val colors = LocalRocheColors.current
-    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Text(
-            text = entry.title,
-            color = colors.textPrimary,
-            fontFamily = headlineFamily,
-            fontSize = 14.5.sp,
-            lineHeight = 19.sp,
-            fontWeight = FontWeight.Normal,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Text(
-            text = "${entry.feedTitle} · ${entry.readEstimateLabel}",
-            color = colors.textSecondary,
-            fontSize = 11.5.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = historyLabel,
-                color = colors.accentVerdigris,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier =
-                    Modifier.weight(1f, fill = false).testTag("history_timestamp_${entry.id}"),
-            )
-            if (playingBadge != null) {
-                Text(
-                    text = playingBadge,
-                    color = colors.accentBlue,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun QueueEntryRowItem(
-    entry: InboxEntry,
-    queuePosition: Int,
-    totalCount: Int,
-    canReorder: Boolean,
-    canMoveUp: Boolean,
-    canMoveDown: Boolean,
-    isDragging: Boolean,
-    dragState: QueueDragReorderState,
-    isPlayingAudio: Boolean,
-    isAudioActuallyPlaying: Boolean,
-    isQueuedNextAudio: Boolean,
-    onOpen: () -> Unit,
-    onOpenContextSheet: () -> Unit,
-    onToggleStar: () -> Unit,
-    onMoveToTop: () -> Unit,
-    onMoveUp: () -> Unit,
-    onMoveDown: () -> Unit,
-    onRemoveFromQueue: () -> Unit,
-    onToggleArchive: () -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    val (baseBg, leftAccentColor) = resolveQueueRowColors(colors, isPlayingAudio, isQueuedNextAudio)
-    val statusBadge =
-        resolveQueueRowStatusBadge(isPlayingAudio, isAudioActuallyPlaying, isQueuedNextAudio)
-    val rowStateDesc =
-        buildQueueRowStateDescription(
-            queuePosition,
-            totalCount,
-            isPlayingAudio,
-            isAudioActuallyPlaying,
-            isQueuedNextAudio,
-            entry.isFavorite,
-        )
-    val a11yActions =
-        buildQueueRowA11yActions(canMoveUp, canMoveDown, onMoveUp, onMoveDown, onMoveToTop)
-
-    Row(
-        modifier =
-            Modifier.fillMaxWidth()
-                .background(if (isDragging) colors.surfaceElevated else baseBg)
-                .drawLeftAccentBar(if (isDragging) colors.accentBlue else leftAccentColor)
-                .clickable(onClick = onOpen)
-                .queueLongPressDrag(enabled = canReorder, entryId = entry.id, dragState = dragState)
-                .semantics {
-                    role = Role.Button
-                    stateDescription = rowStateDesc
-                    if (a11yActions.isNotEmpty()) customActions = a11yActions
-                }
-                .padding(start = 12.dp, end = 4.dp, top = 11.dp, bottom = 11.dp)
-                .testTag("queue_row_${entry.id}"),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        QueueRowLeadingSlot(entry = entry, queuePosition = queuePosition)
-        QueueEntryTextColumn(entry, statusBadge, Modifier.weight(1f))
-        QueueRowTrailingControls(
-            entry,
-            canReorder,
-            canMoveUp,
-            isDragging,
-            dragState,
-            onMoveToTop,
-            onToggleStar,
-            onToggleArchive,
-            onOpenContextSheet,
-            onRemoveFromQueue,
-        )
-    }
-}
-
-private fun buildQueueRowA11yActions(
-    canMoveUp: Boolean,
-    canMoveDown: Boolean,
-    onMoveUp: () -> Unit,
-    onMoveDown: () -> Unit,
-    onMoveToTop: () -> Unit,
-): List<CustomAccessibilityAction> = buildList {
-    if (canMoveUp) {
-        add(
-            CustomAccessibilityAction("Move up in queue") {
-                onMoveUp()
-                true
-            }
-        )
-        add(
-            CustomAccessibilityAction("Move to top of queue") {
-                onMoveToTop()
-                true
-            }
-        )
-    }
-    if (canMoveDown) {
-        add(
-            CustomAccessibilityAction("Move down in queue") {
-                onMoveDown()
-                true
-            }
-        )
-    }
-}
-
-private fun resolveQueueRowColors(
-    colors: com.grayvines.roche.ui.theme.RocheColors,
-    isPlayingAudio: Boolean,
-    isQueuedNextAudio: Boolean,
-): Pair<androidx.compose.ui.graphics.Color, androidx.compose.ui.graphics.Color?> =
-    when {
-        isPlayingAudio -> colors.accentBlue.copy(alpha = ROW_HIGHLIGHT_ALPHA) to colors.accentBlue
-        isQueuedNextAudio ->
-            colors.accentVerdigris.copy(alpha = QUEUE_NEXT_ALPHA) to colors.accentVerdigris
-        else -> colors.background to null
-    }
-
-@Composable
-private fun QueueRowLeadingSlot(
-    entry: InboxEntry,
-    queuePosition: Int,
-) {
-    val colors = LocalRocheColors.current
-    Text(
-        text = "$queuePosition",
-        color = colors.textMuted,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 11.sp,
-        textAlign = TextAlign.End,
-        modifier = Modifier.width(18.dp),
-    )
-    if (entry.hasThumbnailSource()) {
-        EntryThumbnailPreview(entry = entry, modifier = Modifier.padding(top = 2.dp))
-    }
-}
-
-@Composable
-private fun QueueEntryTextColumn(
-    entry: InboxEntry,
-    statusBadge: QueueRowStatusBadge?,
-    modifier: Modifier = Modifier,
-) {
-    val colors = LocalRocheColors.current
-    val headlineFamily = currentHeadlineFontFamily()
-    val badgeColor =
-        when (statusBadge?.tone) {
-            QueueRowBadgeTone.ACTIVE_AUDIO -> colors.accentBlue
-            QueueRowBadgeTone.UP_NEXT_AUDIO -> colors.accentVerdigris
-            null -> null
-        }
-    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Text(
-            text = entry.title,
-            color = colors.textPrimary,
-            fontFamily = headlineFamily,
-            fontSize = 14.5.sp,
-            lineHeight = 19.sp,
-            fontWeight = FontWeight.Normal,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-        EntrySourceMetadataRow(
-            entry = entry,
-            trailingMetaText = "· ${entry.readEstimateLabel}",
-            trailingMetaFontSize = 11.sp,
-            trailingBadge = statusBadge?.label,
-            trailingBadgeColor = badgeColor,
-            showOfflineIndicator = true,
-            showStarDot = entry.isFavorite,
-        )
-    }
-}
-
-@Composable
-@Suppress("LongParameterList")
-private fun QueueRowTrailingControls(
-    entry: InboxEntry,
-    canReorder: Boolean,
-    canMoveUp: Boolean,
-    isDragging: Boolean,
-    dragState: QueueDragReorderState,
-    onMoveToTop: () -> Unit,
-    onToggleStar: () -> Unit,
-    onToggleArchive: () -> Unit,
-    onOpenContextSheet: () -> Unit,
-    onRemoveFromQueue: () -> Unit,
-) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(0.dp),
-    ) {
-        if (canReorder) {
-            QueueDragGripHandle(
-                entryId = entry.id,
-                isDragging = isDragging,
-                dragState = dragState,
-            )
-        }
-        QueueRowOverflowMenu(
-            entry = entry,
-            canMoveUp = canMoveUp,
-            onMoveToTop = onMoveToTop,
-            onToggleStar = onToggleStar,
-            onToggleArchive = onToggleArchive,
-            onOpenContextSheet = onOpenContextSheet,
-            onRemoveFromQueue = onRemoveFromQueue,
-        )
-    }
-}
-
-@Composable
-@Suppress("LongParameterList")
-private fun QueueRowOverflowMenu(
-    entry: InboxEntry,
-    canMoveUp: Boolean,
-    onMoveToTop: () -> Unit,
-    onToggleStar: () -> Unit,
-    onToggleArchive: () -> Unit,
-    onOpenContextSheet: () -> Unit,
-    onRemoveFromQueue: () -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    var expanded by rememberSaveable(entry.id) { mutableStateOf(false) }
-
-    Box {
-        RocheIconActionButton(
-            contentDescription = "Queue options for ${entry.title}",
-            onClick = { expanded = true },
-            outlined = false,
-            modifier = Modifier.testTag("queue_more_btn_${entry.id}"),
-        ) {
-            MoreDotsIcon(tint = colors.textSecondary, size = 16.dp)
-        }
-        DropdownMenu(
-            expanded = expanded,
-            onDismissRequest = { expanded = false },
-            containerColor = colors.surfaceElevated,
-        ) {
-            QueueOverflowMenuItems(
-                entry = entry,
-                canMoveUp = canMoveUp,
-                onDismiss = { expanded = false },
-                onMoveToTop = onMoveToTop,
-                onToggleStar = onToggleStar,
-                onToggleArchive = onToggleArchive,
-                onOpenContextSheet = onOpenContextSheet,
-                onRemoveFromQueue = onRemoveFromQueue,
-            )
-        }
-    }
-}
-
-@Composable
-@Suppress("LongParameterList")
-private fun QueueOverflowMenuItems(
-    entry: InboxEntry,
-    canMoveUp: Boolean,
-    onDismiss: () -> Unit,
-    onMoveToTop: () -> Unit,
-    onToggleStar: () -> Unit,
-    onToggleArchive: () -> Unit,
-    onOpenContextSheet: () -> Unit,
-    onRemoveFromQueue: () -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    if (canMoveUp) {
-        QueueOverflowOption("Move to Top", colors.textPrimary, "queue_move_top_item_${entry.id}") {
-            onDismiss()
-            onMoveToTop()
-        }
-    }
-    QueueOverflowOption(if (entry.isFavorite) "Remove Star" else "Star", colors.textPrimary) {
-        onDismiss()
-        onToggleStar()
-    }
-    QueueOverflowOption(if (entry.isDismissed) "Mark New" else "Dismiss", colors.textPrimary) {
-        onDismiss()
-        onToggleArchive()
-    }
-    QueueOverflowOption("Details & Tags…", colors.textPrimary) {
-        onDismiss()
-        onOpenContextSheet()
-    }
-    QueueOverflowOption(
-        "Remove from Queue",
-        colors.accentIndianRed,
-        "queue_remove_item_${entry.id}",
-    ) {
-        onDismiss()
-        onRemoveFromQueue()
-    }
-}
-
-@Composable
-private fun QueueOverflowOption(
-    label: String,
-    textColor: androidx.compose.ui.graphics.Color,
-    testTag: String? = null,
-    onClick: () -> Unit,
-) {
-    DropdownMenuItem(
-        text = { Text(label, color = textColor) },
-        onClick = onClick,
-        modifier = if (testTag != null) Modifier.testTag(testTag) else Modifier,
-    )
-}
-
-private const val ROW_HIGHLIGHT_ALPHA = 0.12f
-private const val QUEUE_NEXT_ALPHA = 0.11f
-private const val QUEUE_DRAG_ELEVATION_DP = 8

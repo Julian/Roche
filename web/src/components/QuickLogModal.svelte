@@ -102,7 +102,11 @@
         toast.show(
           res.action === 'want'
             ? `Added '${res.entry.title}' to ${res.queue_title ?? 'Queue'}`
-            : `Logged '${res.entry.title}' to Diary`,
+            : res.action === 'started'
+              ? `Started '${res.entry.title}'`
+              : res.action === 'abandoned'
+                ? `Skipped '${res.entry.title}'`
+                : `Logged '${res.entry.title}' to Diary`,
         );
         onSaved?.();
       }

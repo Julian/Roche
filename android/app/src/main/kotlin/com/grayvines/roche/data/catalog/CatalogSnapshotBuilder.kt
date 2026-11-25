@@ -2,7 +2,6 @@
 
 package com.grayvines.roche.data.catalog
 
-import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.buildYoutubeMusicAlbumUrl
 import com.grayvines.roche.core.coreJson
@@ -57,9 +56,7 @@ internal fun collectSummaryBucket(
     listSummaries: MutableList<CatalogListSummary>,
 ) {
     if (isWant) {
-        val isPinnedWant =
-            spec.collectionId == UP_NEXT_COLLECTION_ID ||
-                spec.collectionId == WANT_TO_READ_COLLECTION_ID
+        val isPinnedWant = spec.collectionId == WANT_TO_READ_COLLECTION_ID
         if (hasEntries || isPinnedWant) {
             wantSummaries.add(summary)
         }

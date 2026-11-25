@@ -381,6 +381,16 @@ pub struct WantSearchMatch {
     pub entry: CatalogEntry,
 }
 
+/// A non-merged, diary-visible catalog entry whose latest `consumption_log` status is `started`
+/// (with no subsequent or same-timestamp `consumed`/`abandoned` log).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveStartedEntry {
+    pub log_id: String,
+    pub entry: CatalogEntry,
+    pub ts: DateTime<Utc>,
+    pub notes: Option<String>,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(super) struct RawCollectionRow {
     pub id: String,

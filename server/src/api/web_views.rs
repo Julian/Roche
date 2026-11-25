@@ -35,7 +35,7 @@ use crate::{
     ranking::{MAX_FOCUSED_ROUNDS, MAX_K_DEFAULT, MIN_K},
     service::{
         AppError, BoardDismissOutcome, BoardPromoteResult, BoardReaderView, CatalogService,
-        ClusterSelectFilter, EntryListAppearance, ItemDetail, PrioritizedCluster,
+        ClusterSelectFilter, EntryListAppearance, InProgressRow, ItemDetail, PrioritizedCluster,
         RankedCollectionFilter, RankedCollectionView, RankedEntryRow, RocheService,
         WorkspaceSearchResults,
         enrich::{
@@ -117,14 +117,6 @@ where
     service.items().existing_ids(&candidate_ids).await.unwrap_or_default()
 }
 
-fn parse_consumption_status_str(raw: &str) -> ConsumptionStatus {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "started" => ConsumptionStatus::Started,
-        "abandoned" => ConsumptionStatus::Abandoned,
-        _ => ConsumptionStatus::Consumed,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Refresh All Sources
 // ---------------------------------------------------------------------------
@@ -146,7 +138,7 @@ pub(super) async fn refresh_all_sources(
 
 #[derive(Debug, Serialize)]
 pub(super) struct HomePayload {
-    in_progress: Vec<Item>,
+    in_progress: Vec<InProgressRow>,
     unread_items: Vec<Item>,
     unread_total: i64,
     want_to_read_items: Vec<Item>,
@@ -158,6 +150,7 @@ pub(super) struct HomePayload {
     recent_diary: Vec<ConsumptionLogView>,
     artist_links: HashMap<String, String>,
     diary_tiers: HashMap<String, char>,
+    reader_item_ids: HashSet<String>,
     title_html: HashMap<String, String>,
     is_refreshing: bool,
 }
@@ -173,17 +166,10 @@ pub(super) async fn home_get(
         per_page: Some(20),
         ..ItemFilter::default()
     };
-    let readable_filter = ItemFilter {
-        status: Some(ItemStatusFilter::Unread),
-        in_progress_only: Some(true),
-        include_content: Some(false),
-        per_page: Some(6),
-        ..ItemFilter::default()
-    };
     let wtr_filter = ItemFilter {
         collection_id: Some(WANT_TO_READ_COLLECTION_ID.to_owned()),
         include_content: Some(false),
-        per_page: Some(8),
+        per_page: Some(12),
         ..ItemFilter::default()
     };
 
@@ -192,7 +178,7 @@ pub(super) async fn home_get(
     let (
         active_generators_res,
         unread_page_res,
-        active_readable_page_res,
+        in_progress_res,
         want_to_read_page_res,
         sync_status_res,
         recent_diary_res,
@@ -200,32 +186,38 @@ pub(super) async fn home_get(
     ) = tokio::join!(
         catalog.list_collection_generators(true),
         service.items().query().with_filter(unread_filter).list_page(),
-        service.items().query().with_filter(readable_filter).list_page(),
+        service.list_in_progress(Some(6)),
         service.items().query().with_filter(wtr_filter).list_page(),
         sync.status(),
-        catalog.list_diary(None, None, 8),
+        catalog.list_diary(None, Some(ConsumptionStatus::Consumed), 8),
         catalog.list_collections(true, false),
     );
     let active_generators = active_generators_res?;
     let unread_page = unread_page_res?;
-    let active_readable_page = active_readable_page_res?;
+    let in_progress_all = in_progress_res?;
     let want_to_read_page = want_to_read_page_res?;
     let sync_status = sync_status_res?;
     let recent_diary = recent_diary_res?;
     let collections = collections_res?;
 
-    let in_progress: Vec<Item> = active_readable_page.items.into_iter().take(4).collect();
-    let in_progress_ids: HashSet<&str> = in_progress.iter().map(|i| i.id.as_str()).collect();
+    let in_progress: Vec<InProgressRow> = in_progress_all.into_iter().take(4).collect();
+    let in_progress_ids: HashSet<&str> = in_progress.iter().map(InProgressRow::entry_id).collect();
     let unread_items: Vec<Item> = unread_page
         .items
         .into_iter()
         .filter(|i| !in_progress_ids.contains(i.id.as_str()))
         .collect();
+    let want_to_read_items: Vec<Item> = want_to_read_page
+        .items
+        .into_iter()
+        .filter(|i| !in_progress_ids.contains(i.id.as_str()))
+        .take(6)
+        .collect();
 
     let wtr_total = collections
         .iter()
         .find(|c| c.id == WANT_TO_READ_COLLECTION_ID)
-        .map_or(want_to_read_page.items.len(), |c| c.member_count);
+        .map_or(want_to_read_items.len(), |c| c.member_count);
     let other_want_total: usize = collections
         .iter()
         .filter(|c| c.role == CollectionRole::Want && c.id != WANT_TO_READ_COLLECTION_ID)
@@ -238,10 +230,19 @@ pub(super) async fn home_get(
         .flat_map(|e| e.creators.iter().cloned())
         .collect();
     home_creators.extend(recent_diary.iter().flat_map(|d| d.entry.creators.iter().cloned()));
+    home_creators.extend(in_progress.iter().flat_map(|r| r.creators().iter().cloned()));
     let diary_entries: Vec<CatalogEntry> = recent_diary.iter().map(|d| d.entry.clone()).collect();
-    let (artist_links, diary_tiers) = tokio::join!(
+    let started_catalog_entries: Vec<&CatalogEntry> = in_progress
+        .iter()
+        .filter_map(|r| match r {
+            InProgressRow::Catalog { entry, .. } => Some(entry),
+            InProgressRow::Item { .. } => None,
+        })
+        .collect();
+    let (artist_links, diary_tiers, reader_item_ids) = tokio::join!(
         load_artist_id_by_lower_name(&service, &home_creators),
         catalog.load_tiers_for_entries(&diary_entries),
+        load_existing_reader_item_ids(&service, started_catalog_entries),
     );
 
     let mut generator_external_links = HashMap::new();
@@ -255,13 +256,13 @@ pub(super) async fn home_get(
     }
 
     let mut title_pairs: Vec<(&str, &str)> = Vec::new();
-    for item in &in_progress {
-        title_pairs.push((&item.id, &item.title));
+    for row in &in_progress {
+        title_pairs.push((row.entry_id(), row.title()));
     }
     for item in &unread_items {
         title_pairs.push((&item.id, &item.title));
     }
-    for item in &want_to_read_page.items {
+    for item in &want_to_read_items {
         title_pairs.push((&item.id, &item.title));
     }
     for g in &active_generators {
@@ -278,7 +279,7 @@ pub(super) async fn home_get(
         in_progress,
         unread_items,
         unread_total: sync_status.unread_items_count,
-        want_to_read_items: want_to_read_page.items.into_iter().take(6).collect(),
+        want_to_read_items,
         want_to_read_total: wtr_total,
         other_want_total,
         active_generators,
@@ -287,6 +288,7 @@ pub(super) async fn home_get(
         recent_diary,
         artist_links,
         diary_tiers,
+        reader_item_ids,
         title_html,
         is_refreshing: sync_status.is_refreshing,
     }))
@@ -1336,6 +1338,43 @@ pub(super) async fn entry_queue_toggle_post(
     }))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct EntryLogRequest {
+    status: String,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    rank_after: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct EntryLogResponse {
+    logged: ConsumptionLogView,
+    rank_slug: Option<String>,
+}
+
+pub(super) async fn entry_log_post(
+    State(service): State<Arc<RocheService>>,
+    ProblemPath(id): ProblemPath<String>,
+    ProblemJson(req): ProblemJson<EntryLogRequest>,
+) -> Result<Json<EntryLogResponse>, ApiError> {
+    let status: ConsumptionStatus =
+        req.status.parse().map_err(|e: anyhow::Error| ApiError::bad_request(e.to_string()))?;
+    let logged = if status == ConsumptionStatus::Consumed
+        && service.items().existing_ids(std::slice::from_ref(&id)).await?.contains(&id)
+    {
+        service.items().finish_reader_item(&id, req.notes.as_deref()).await?.logged
+    } else {
+        service.catalog().log_consumption(&id, status, req.notes.as_deref(), None).await?
+    };
+    let rank_slug = if status == ConsumptionStatus::Consumed && req.rank_after {
+        service.catalog().rank_target_after_consumption(&logged.entry).await.ok().flatten()
+    } else {
+        None
+    };
+    Ok(Json(EntryLogResponse { logged, rank_slug }))
+}
+
 // ---------------------------------------------------------------------------
 // Diary Page, Queues, Quick Log & Want Complete
 // ---------------------------------------------------------------------------
@@ -1373,11 +1412,12 @@ pub(super) async fn diary_page_get(
     State(service): State<Arc<RocheService>>,
     ProblemQuery(q): ProblemQuery<DiaryPageQuery>,
 ) -> Result<Json<DiaryPagePayload>, ApiError> {
-    let status_filter = match q.status.as_deref().map(str::trim) {
-        Some("consumed") => Some(ConsumptionStatus::Consumed),
+    let status_norm = q.status.as_deref().map(|s| s.trim().to_ascii_lowercase());
+    let status_filter = match status_norm.as_deref() {
+        Some("all") => None,
         Some("started") => Some(ConsumptionStatus::Started),
-        Some("abandoned") => Some(ConsumptionStatus::Abandoned),
-        _ => None,
+        Some("abandoned" | "skipped") => Some(ConsumptionStatus::Abandoned),
+        _ => Some(ConsumptionStatus::Consumed),
     };
     let kind_filter = DiaryKindFilter::parse_optional(q.kind.as_deref())
         .unwrap_or(DiaryKindFilter::DefaultNonSong);
@@ -1457,6 +1497,7 @@ pub(super) async fn diary_page_get(
 
 #[derive(Debug, Serialize)]
 pub(super) struct QueuesPayload {
+    in_progress: Vec<InProgressRow>,
     queues: Vec<RankedCollectionView>,
     total_items: usize,
     artist_links: HashMap<String, String>,
@@ -1467,7 +1508,11 @@ pub(super) struct QueuesPayload {
 pub(super) async fn queues_get(
     State(service): State<Arc<RocheService>>,
 ) -> Result<Json<QueuesPayload>, ApiError> {
-    let collections = service.catalog().list_collections(true, false).await?;
+    let catalog = service.catalog();
+    let (collections_res, in_progress_res) =
+        tokio::join!(catalog.list_collections(true, false), service.list_in_progress(Some(100)),);
+    let collections = collections_res?;
+    let in_progress = in_progress_res?;
     let mut want_cols: Vec<CollectionSummary> = collections
         .into_iter()
         .filter(|c| c.role == CollectionRole::Want && c.member_count > 0)
@@ -1488,23 +1533,46 @@ pub(super) async fn queues_get(
             queues.push(page.view);
         }
     }
-    let creators: Vec<String> = queues
+    let in_progress_ids: Vec<String> =
+        in_progress.iter().map(|row| row.entry_id().to_owned()).collect();
+    let in_progress_in_want = service.catalog().want_entry_ids_in(&in_progress_ids).await?;
+    let in_progress_only_count =
+        in_progress.iter().filter(|row| !in_progress_in_want.contains(row.entry_id())).count();
+    total_items = total_items.saturating_add(in_progress_only_count);
+
+    let mut creators: Vec<String> = queues
         .iter()
         .flat_map(|q| q.rows.iter().flat_map(|r| r.entry.creators.iter().cloned()))
         .collect();
-    let queue_entries: Vec<&CatalogEntry> =
+    creators.extend(in_progress.iter().flat_map(|r| r.creators().iter().cloned()));
+    let mut queue_entries: Vec<&CatalogEntry> =
         queues.iter().flat_map(|q| q.rows.iter().map(|r| &r.entry)).collect();
+    for row in &in_progress {
+        if let InProgressRow::Catalog { entry, .. } = row {
+            queue_entries.push(entry);
+        }
+    }
     let (artist_links, reader_item_ids) = tokio::join!(
         load_artist_id_by_lower_name(&service, &creators),
         load_existing_reader_item_ids(&service, queue_entries),
     );
-    let title_html = render_title_html_map(
-        queues
-            .iter()
-            .flat_map(|q| q.rows.iter().map(|r| (r.entry.id.as_str(), r.entry.title.as_str()))),
-    );
+    let mut title_pairs: Vec<(&str, &str)> = queues
+        .iter()
+        .flat_map(|q| q.rows.iter().map(|r| (r.entry.id.as_str(), r.entry.title.as_str())))
+        .collect();
+    for row in &in_progress {
+        title_pairs.push((row.entry_id(), row.title()));
+    }
+    let title_html = render_title_html_map(title_pairs);
 
-    Ok(Json(QueuesPayload { queues, total_items, artist_links, reader_item_ids, title_html }))
+    Ok(Json(QueuesPayload {
+        in_progress,
+        queues,
+        total_items,
+        artist_links,
+        reader_item_ids,
+        title_html,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1576,7 +1644,8 @@ pub(super) async fn quick_log_post(
             }),
         ))
     } else {
-        let status = parse_consumption_status_str(&req.action);
+        let status: ConsumptionStatus =
+            req.action.parse().map_err(|e: anyhow::Error| ApiError::bad_request(e.to_string()))?;
         let logged = service
             .catalog()
             .log_entry_resolved_or_upsert(None, Some(&input), status, req.notes.as_deref(), None)

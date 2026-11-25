@@ -269,6 +269,7 @@ impl ApiRoutes {
                 "/api/v1/catalog/entries/{id}/queue-toggle",
                 post(web_views::entry_queue_toggle_post),
             )
+            .route("/api/v1/catalog/entries/{id}/log", post(web_views::entry_log_post))
             .route("/api/v1/catalog/entries/{id}/merge", post(catalog::catalog_entry_merge))
             .route("/api/v1/catalog/diary", get(catalog::catalog_diary_list))
             .route("/api/v1/catalog/diary/page", get(web_views::diary_page_get))

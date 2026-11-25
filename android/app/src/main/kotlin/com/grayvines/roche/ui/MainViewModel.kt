@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
+import com.grayvines.roche.core.coreJson
 import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.catalog.EntryKind
@@ -233,6 +234,15 @@ class MainViewModel(
             snapshotFlow = sharedSnapshotFlow,
             transientFlow = transientState,
         )
+        viewModelScope.launch {
+            migrateLegacyNonAudioQueue(
+                repository = repository,
+                settingsRepository = settingsRepository,
+                playbackOrchestrator = playbackOrchestrator,
+                playerController = playerController,
+                snapshotFlow = sharedSnapshotFlow,
+            )
+        }
         restoredNavState?.let(::restoreNavigationSideEffects)
     }
 
@@ -751,6 +761,7 @@ private data class DerivedUiStateSlice(
     val queueEntries: List<InboxEntry>,
     val feedProjections: FeedProjections,
     val catalogProjections: CatalogProjections,
+    val inProgressItems: List<InProgressItem>,
     val searchProjection: SearchProjection,
     val uiState: MainUiState,
 )
@@ -763,18 +774,9 @@ private fun reduceDerivedUiStateSlice(
     val entryProj = resolveEntryProjectionsSlice(prev, input, entriesChanged)
     val buckets = resolveScopeBucketsSlice(prev, input, entryProj.entries, entriesChanged)
     val queue = resolveQueueSlice(prev, input, entryProj.entries, entriesChanged)
-    val feedProj =
-        if (prev == null || input.snapshot.feeds !== prev.rawFeeds) {
-            buildFeedProjections(input.snapshot.feeds)
-        } else {
-            prev.feedProjections
-        }
-    val catalogProj =
-        if (prev == null || input.snapshot.catalog !== prev.rawCatalog) {
-            buildCatalogProjections(input.snapshot.catalog)
-        } else {
-            prev.catalogProjections
-        }
+    val feedProj = resolveFeedProjectionsSlice(prev, input)
+    val (catalogProj, inProgress) =
+        resolveCatalogInProgress(prev, input, entryProj.entries, entriesChanged)
     val normQuery = input.local.searchQuery.trim().lowercase()
     val searchProj = resolveSearchSlice(prev, input, entryProj.entries, normQuery, entriesChanged)
     val inboxDerived = buildInboxDerivedState(entryProj, buckets, queue, feedProj, input.syncMeta)
@@ -789,6 +791,7 @@ private fun reduceDerivedUiStateSlice(
             resolvingMusicEntryId = input.auxMeta.resolvingMusicEntryId,
             settingsHubResetTick = input.auxMeta.settingsHubResetTick,
             onDemandCatalog = input.auxMeta.onDemandCatalog,
+            inProgressItems = inProgress,
         )
     return DerivedUiStateSlice(
         rawEntries = input.snapshot.entries,
@@ -805,9 +808,45 @@ private fun reduceDerivedUiStateSlice(
         queueEntries = queue,
         feedProjections = feedProj,
         catalogProjections = catalogProj,
+        inProgressItems = inProgress,
         searchProjection = searchProj,
         uiState = uiState,
     )
+}
+
+private fun resolveFeedProjectionsSlice(
+    prev: DerivedUiStateSlice?,
+    input: RootUiStateInput,
+): FeedProjections =
+    if (prev == null || input.snapshot.feeds !== prev.rawFeeds) {
+        buildFeedProjections(input.snapshot.feeds)
+    } else {
+        prev.feedProjections
+    }
+
+private fun resolveCatalogInProgress(
+    prev: DerivedUiStateSlice?,
+    input: RootUiStateInput,
+    effectiveEntries: List<InboxEntry>,
+    entriesChanged: Boolean,
+): Pair<CatalogProjections, List<InProgressItem>> {
+    val catalogChanged = prev == null || input.snapshot.catalog !== prev.rawCatalog
+    val catalogProj =
+        if (catalogChanged) {
+            buildCatalogProjections(input.snapshot.catalog)
+        } else {
+            prev.catalogProjections
+        }
+    val inProgress =
+        if (entriesChanged || catalogChanged) {
+            computeInProgressItems(
+                allEntries = effectiveEntries,
+                activeStartedEntries = catalogProj.catalog.activeStartedEntries,
+            )
+        } else {
+            prev.inProgressItems
+        }
+    return catalogProj to inProgress
 }
 
 private fun buildInboxDerivedState(
@@ -911,7 +950,8 @@ internal fun restoreSavedNavigationState(
     }
     val savedJson = savedStateHandle.remove<String>(MainViewModel.SAVED_NAV_JSON_KEY)
     return savedJson?.let { raw ->
-        runCatching { Json.decodeFromString(SavedNavigationUiState.serializer(), raw) }.getOrNull()
+        runCatching { coreJson.decodeFromString(SavedNavigationUiState.serializer(), raw) }
+            .getOrNull()
     }
 }
 

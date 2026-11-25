@@ -48,7 +48,12 @@
   let qlRankAfter = $state(true);
 
   let yearParam = $derived(router.route.query.get('year') ?? '');
-  let statusParam = $derived(router.route.query.get('status') ?? '');
+  let statusParam = $derived.by(() => {
+    const raw = (router.route.query.get('status') ?? '').trim().toLowerCase();
+    if (raw === 'all' || raw === 'started' || raw === 'abandoned') return raw;
+    if (raw === 'skipped') return 'abandoned';
+    return 'consumed';
+  });
   let kindParam = $derived(router.route.query.get('kind') ?? '');
   let pageParam = $derived(Math.max(1, Number.parseInt(router.route.query.get('page') ?? '1', 10) || 1));
 
@@ -89,7 +94,7 @@
     const nextPage = overrides.page !== undefined ? overrides.page : 1;
     const qs = buildQuery({
       year: nextYear || undefined,
-      status: nextStatus || undefined,
+      status: nextStatus && nextStatus !== 'consumed' ? nextStatus : undefined,
       kind: nextKind || undefined,
       page: nextPage && nextPage > 1 ? nextPage : undefined,
     });
@@ -239,15 +244,15 @@
     <div class="diary-toolbar">
       <div class="pill-bar diary-toolbar-pills mt-0 mb-0" role="group" aria-label="Filter by status">
         {#each [
-          { key: '', label: 'All' },
           { key: 'consumed', label: 'Finished' },
           { key: 'started', label: 'Started' },
           { key: 'abandoned', label: 'Skipped' },
+          { key: 'all', label: 'All' },
         ] as st (st.key)}
           <a
             class="pill"
             class:is-active={statusParam === st.key}
-            href={buildDiaryHref({ status: st.key || null, page: 1 })}
+            href={buildDiaryHref({ status: st.key, page: 1 })}
           >
             {st.label}
           </a>

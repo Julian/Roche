@@ -3,6 +3,7 @@ package com.grayvines.roche.ui
 import androidx.lifecycle.viewModelScope
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.TestRocheEnv
 import com.grayvines.roche.data.boards.BoardDedupKey
 import com.grayvines.roche.data.boards.BoardItemView
@@ -36,6 +37,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
@@ -296,7 +298,7 @@ class CatalogScaleAndOnDemandTest {
         }
 
     @Test
-    fun `scoped board dedup resolves reverse-merged aliases UP_NEXT want badges and preserves ephemeral isFinished`() =
+    fun `scoped board dedup resolves reverse-merged aliases want badges and preserves ephemeral isFinished`() =
         runTest {
             val canonId = "art-canon"
             seedMergedBoardAliasScenario(canonId = canonId, aliasId = "art-alias")
@@ -311,6 +313,15 @@ class CatalogScaleAndOnDemandTest {
             )
             assertTrue(canonId in lookup.inQueueEntryIds)
             assertTrue(canonId in lookup.finishedEntryIds)
+            // Legacy UP_NEXT_COLLECTION_ID alone must NOT show up as an active want badge
+            env.repository.catalog.removeCollectionEntry(WANT_TO_READ_COLLECTION_ID, canonId)
+            env.repository.catalog.addCollectionEntry(UP_NEXT_COLLECTION_ID, canonId)
+            val afterLegacyOnly =
+                loadScopedBoardDedupLookup(
+                    env.database.dao(),
+                    listOf(BoardDedupKey("hacker_news", "https://example.com/canon", "99")),
+                )
+            assertFalse(canonId in afterLegacyOnly.inQueueEntryIds)
 
             val snapshot = env.repository.snapshot.first()
             val ephemeral =
@@ -367,7 +378,7 @@ class CatalogScaleAndOnDemandTest {
         dao.insertEntryIdentifierIgnore(
             EntryIdentifierEntity("url", "https://example.com/canon", canonId)
         )
-        catalog.addCollectionEntry(UP_NEXT_COLLECTION_ID, aliasId)
+        catalog.addCollectionEntry(WANT_TO_READ_COLLECTION_ID, aliasId)
         dao.insertConsumptionLogsIgnore(
             listOf(
                 ConsumptionLogEntity(

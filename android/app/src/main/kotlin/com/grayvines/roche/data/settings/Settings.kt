@@ -31,6 +31,7 @@ data class Settings(
     val showCollectionDrawsOnHome: Boolean = true,
     val rankClusterSize: Int = DEFAULT_RANK_CLUSTER_SIZE,
     val hasUndecryptableToken: Boolean = false,
+    val migratedNonAudioQueueToWantRead: Boolean = false,
 ) {
     override fun toString(): String {
         val redactedToken = if (bearerToken.isBlank()) "" else "<redacted>"

@@ -173,7 +173,6 @@ class ReaderInboxRankUxTest {
         val state =
             MainUiState(
                 activeTab = AppTab.QUEUE,
-                queueSubTab = QueueSubTab.WANT,
                 selectedWantCollectionId = null,
                 catalog = CatalogSnapshot(wantQueues = listOf(wantToRead, wantMovies)),
             )

@@ -15,8 +15,17 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToIndex
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.data.catalog.CatalogEntryItem
+import com.grayvines.roche.data.catalog.CatalogListSummary
+import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
+import com.grayvines.roche.data.catalog.CollectionRole
+import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.DiaryEntryItem
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.RankedCatalogEntry
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
@@ -24,6 +33,7 @@ import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
+import com.grayvines.roche.ui.CatalogCollectionUiState
 import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainUiState
@@ -584,21 +594,70 @@ class MainScreenTest {
     }
 
     @Test
-    fun queueTabListeningHistoryModeDisplaysPlayedEpisodesAndTimestamps() {
-        val playedEpisode =
+    fun queueTabDisplaysUnifiedInProgressAndWantQueue() {
+        val inProgressArticle =
             createSampleEntry()
                 .copy(
-                    id = "ep-history-1",
-                    feedId = "feed-podcast-1",
-                    feedTitle = "Oxide and Friends",
-                    title = "Ep 42: Compiler Backends",
-                    contentType = ContentType.AUDIO,
-                    audioUrl = "https://cdn.oxide.computer/ep42.mp3",
-                    duration = "58:10",
-                    status = ItemStatus.ARCHIVED,
-                    readProgress = 1.0,
-                    readAt = java.time.Instant.now().toString(),
+                    id = "art-in-progress-1",
+                    title = "Halfway Through Compilers",
+                    status = ItemStatus.UNREAD,
+                    readProgress = 0.42,
                 )
+        val startedBook =
+            DiaryEntryItem(
+                id = "log-book-1",
+                entryId = "book-started-1",
+                kind = EntryKind.BOOK,
+                title = "The Brothers Karamazov",
+                creators = listOf("Fyodor Dostoevsky"),
+                releaseYear = 1880,
+                ts = "2026-11-20T10:00:00Z",
+                monthKey = "2026-11",
+                dateLabel = "Nov 20",
+                status = ConsumptionStatus.STARTED,
+                notes = "Part I",
+                tier = null,
+            )
+        val wantQueueSummary =
+            CatalogListSummary(
+                collectionId = WANT_TO_READ_COLLECTION_ID,
+                slug = "want:read",
+                title = "Want to Read",
+                isDynamic = false,
+                role = CollectionRole.WANT,
+                entryCount = 2,
+                isPriorityScoped = false,
+            )
+        val overlappingWantRow =
+            RankedCatalogEntry(
+                entry =
+                    CatalogEntryItem(
+                        id = "art-in-progress-1",
+                        kind = EntryKind.ARTICLE,
+                        title = "Halfway Through Compilers",
+                        creators = emptyList(),
+                        url = "https://example.com/compilers",
+                        publishedAt = null,
+                        releaseYear = null,
+                        summary = null,
+                        thumbnailUrl = null,
+                        identifiers = emptyList(),
+                    ),
+                rank = 1,
+                mean = 0.0,
+                variance = 1.0,
+                scoreOutOfTen = 5.0,
+                tier = null,
+            )
+        val freshWantRow =
+            overlappingWantRow.copy(
+                entry =
+                    overlappingWantRow.entry.copy(
+                        id = "art-queued-fresh",
+                        title = "Fresh Queued Essay",
+                    ),
+                rank = 2,
+            )
 
         composeRule.setContent {
             RocheTheme {
@@ -606,8 +665,24 @@ class MainScreenTest {
                     state =
                         MainUiState(
                             activeTab = AppTab.QUEUE,
-                            allEntries = listOf(playedEpisode),
-                            visibleEntries = emptyList(),
+                            allEntries = listOf(inProgressArticle),
+                            visibleEntries = listOf(inProgressArticle),
+                            selectedWantCollectionId = WANT_TO_READ_COLLECTION_ID,
+                            catalog =
+                                CatalogSnapshot(
+                                    wantQueues = listOf(wantQueueSummary),
+                                    activeStartedEntries = listOf(startedBook),
+                                    wantToReadEntryIds =
+                                        setOf("art-in-progress-1", "art-queued-fresh"),
+                                    wantEntryIds = setOf("art-in-progress-1", "art-queued-fresh"),
+                                ),
+                            activeWantQueue =
+                                CatalogCollectionUiState(
+                                    collectionId = WANT_TO_READ_COLLECTION_ID,
+                                    entries = listOf(overlappingWantRow, freshWantRow),
+                                    totalCount = 2,
+                                    isLoaded = true,
+                                ),
                         ),
                     onAction = {},
                     onShareEntry = {},
@@ -616,12 +691,91 @@ class MainScreenTest {
             }
         }
 
-        composeRule.onNodeWithTag("queue_mode_up_next").assertExists()
-        composeRule.onNodeWithTag("queue_mode_history").performClick()
-        composeRule.onNodeWithTag("listening_history_list").assertExists()
-        composeRule.onNodeWithTag("history_row_ep-history-1").assertExists()
+        composeRule.onNodeWithTag("queue_list").assertExists()
+        composeRule.onNodeWithTag("queue_in_progress_section").assertExists()
+        composeRule.onNodeWithTag("queue_in_progress_art-in-progress-1").assertExists()
+        composeRule.onNodeWithTag("queue_in_progress_book-started-1").assertExists()
+        composeRule.onNodeWithTag("want_row_art-in-progress-1").assertExists()
+        composeRule.onNodeWithTag("want_row_art-queued-fresh").assertExists()
+        composeRule.onNodeWithText("42%", useUnmergedTree = true).assertExists()
+    }
+
+    @Test
+    fun homeTabShowsContinueWidgetAndDeduplicatesInboxAndWantQueue() {
+        val inProgressArticle =
+            createSampleEntry()
+                .copy(
+                    id = "art-home-continue-1",
+                    title = "Halfway Through Distributed Systems",
+                    status = ItemStatus.UNREAD,
+                    readProgress = 0.55,
+                )
+        val wantQueueSummary =
+            CatalogListSummary(
+                collectionId = WANT_TO_READ_COLLECTION_ID,
+                slug = "want:read",
+                title = "Want to Read",
+                isDynamic = false,
+                role = CollectionRole.WANT,
+                entryCount = 1,
+                isPriorityScoped = false,
+            )
+        val queuedPreviewRow =
+            RankedCatalogEntry(
+                entry =
+                    CatalogEntryItem(
+                        id = "art-home-continue-1",
+                        kind = EntryKind.ARTICLE,
+                        title = "Halfway Through Distributed Systems",
+                        creators = emptyList(),
+                        url = "https://example.com/dist-sys",
+                        publishedAt = null,
+                        releaseYear = null,
+                        summary = null,
+                        thumbnailUrl = null,
+                        identifiers = emptyList(),
+                    ),
+                rank = 1,
+                mean = 0.0,
+                variance = 1.0,
+                scoreOutOfTen = 5.0,
+                tier = null,
+            )
+
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state =
+                        MainUiState(
+                            activeTab = AppTab.HOME,
+                            allEntries = listOf(inProgressArticle),
+                            visibleEntries = listOf(inProgressArticle),
+                            catalog =
+                                CatalogSnapshot(
+                                    wantQueues = listOf(wantQueueSummary),
+                                    wantToReadPreview = listOf(queuedPreviewRow),
+                                    wantToReadEntryIds = setOf("art-home-continue-1"),
+                                    wantEntryIds = setOf("art-home-continue-1"),
+                                ),
+                        ),
+                    onAction = {},
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("home_widget_continue").assertExists()
+        composeRule.onNodeWithTag("home_continue_item_art-home-continue-1").assertExists()
+        composeRule.onNodeWithTag("home_inbox_item_art-home-continue-1").assertDoesNotExist()
+        composeRule.onNodeWithTag("home_want_item_art-home-continue-1").assertDoesNotExist()
         composeRule
-            .onNodeWithTag("history_timestamp_ep-history-1", useUnmergedTree = true)
+            .onNodeWithText("All unread items are currently in Continue above.")
+            .performScrollTo()
+            .assertExists()
+        composeRule
+            .onNodeWithText("All saved items are currently in Continue above.")
+            .performScrollTo()
             .assertExists()
     }
 

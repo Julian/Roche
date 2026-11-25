@@ -23,8 +23,8 @@ pub use boards::{
     BoardPollCandidate, BoardPromoteAction, BoardPromoteContent, BoardPromoteOutcome, BoardRepo,
 };
 pub use catalog::{
-    BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
-    BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult,
+    ActiveStartedEntry, BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput,
+    BatchEntryInput, BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult,
     CatalogBatchStreamResult, CatalogEntry, CatalogError, CatalogExportSnapshot, CatalogRepo,
     CatalogResult, CollectionGeneratorState, CollectionPageMeta, CollectionRankingInputs,
     CollectionSummary, ComparisonRecord, ConsumptionLogRow, ConsumptionLogView, DiaryKindFilter,
@@ -60,8 +60,9 @@ pub use sync::{
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{
     ActivityAction, ActivityEntityType, ArchiveBatchScope, CollectionRole, ConsumptionStatus,
-    ContentType, EntryKind, EntryTriageState, FeedType, HexColor, InboxState, ItemSortField,
-    ItemStatus, ItemStatusFilter, MediaType, ReadAtPatch, SortOrder,
+    ContentType, EntryKind, EntryTriageState, FeedType, HexColor, IN_PROGRESS_MIN_PROGRESS,
+    InboxState, ItemSortField, ItemStatus, ItemStatusFilter, MediaType, READER_AUTO_READ_THRESHOLD,
+    ReadAtPatch, SortOrder,
 };
 
 /// Domain conflict error mapped to `409 Conflict` by `ApiError`.

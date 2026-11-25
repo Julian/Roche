@@ -14,9 +14,10 @@ use tokio::sync::Semaphore;
 use super::AppError;
 use crate::{
     db::{
-        CatalogBatchInput, CatalogBatchResult, CatalogEntry, CatalogRepo, CollectionGeneratorState,
-        CollectionSummary, ComparisonRecord, ConsumptionLogView, Db, DiaryKindFilter,
-        EntryDetailView, EntryIdentifier, UpdateEntryInput, UpsertEntryInput, WantSearchMatch,
+        ActiveStartedEntry, CatalogBatchInput, CatalogBatchResult, CatalogEntry, CatalogRepo,
+        CollectionGeneratorState, CollectionSummary, ComparisonRecord, ConsumptionLogView, Db,
+        DiaryKindFilter, EntryDetailView, EntryIdentifier, UpdateEntryInput, UpsertEntryInput,
+        WantSearchMatch,
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::{
@@ -378,6 +379,20 @@ impl<'a> CatalogService<'a> {
         limit: usize,
     ) -> Result<Vec<ConsumptionLogView>, AppError> {
         Ok(self.repo.search_diary_logs(query, limit).await?)
+    }
+
+    pub async fn list_active_started_entries(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<ActiveStartedEntry>, AppError> {
+        Ok(self.repo.list_active_started_entries(limit).await?)
+    }
+
+    pub async fn want_entry_ids_in(
+        &self,
+        entry_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, AppError> {
+        Ok(self.repo.want_entry_ids_in(entry_ids).await?)
     }
 
     pub async fn search_want_entries(
