@@ -30,10 +30,10 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 
-internal const val MAX_DELTA_CONTINUATION_PAGES = 20
+internal const val MAX_DELTA_CONTINUATION_PAGES = 250
 internal const val FLAG_LOCAL_THROUGHPUT_WEIGHT = "local_throughput_weight"
 internal const val MIN_SERVER_PAYLOAD_BYTES = 1_024
-private const val MAX_OVERFLOW_PUSH_ROUNDS = 25
+private const val MAX_OVERFLOW_PUSH_ROUNDS = 50
 private const val HTTP_PAYLOAD_TOO_LARGE = 413
 private const val COOPERATIVE_POLL_SLICE_SIZE = 4
 private const val NANOS_PER_SECOND = 1_000_000_000.0
@@ -160,54 +160,91 @@ internal class PeerSyncCoordinator(
         )
     }
 
+    private data class ContinuationOutcome(
+        val settings: Settings,
+        val resetTriggered: Boolean = false,
+    )
+
     private suspend fun runFullSyncCycle(
         currentSettings: Settings,
         weightOverride: Double?,
         sinceSeqOverride: Long? = null,
+        allowMidCycleReset: Boolean = true,
+        isResetRetry: Boolean = false,
     ): SyncCycleOutcome? {
         var workingSettings = currentSettings
+        var didReset = false
         var initialRound =
             executeSinglePeerSyncRound(
-                currentSettings = workingSettings,
-                weightOverride = weightOverride,
-                sinceSeqOverride = sinceSeqOverride,
+                workingSettings,
+                weightOverride,
+                sinceSeqOverride,
+                isResetRetry = isResetRetry,
             ) ?: return null
 
         if (initialRound.response.resetRequired) {
+            didReset = true
             onSyncCursorUpdated("0")
             workingSettings = workingSettings.copy(lastPeerSyncCursor = "0")
             initialRound =
                 executeSinglePeerSyncRound(
-                    currentSettings = workingSettings,
-                    weightOverride = weightOverride,
+                    workingSettings,
+                    weightOverride,
                     sinceSeqOverride = 0L,
+                    isResetRetry = true,
                 ) ?: return null
         }
 
-        var latestPeers = initialRound.response.activePeers
-        onPeersUpdated(latestPeers)
-        if (initialRound.response.resetRequired) {
-            return SyncCycleOutcome(settings = workingSettings, latestPeers = latestPeers)
-        }
-        workingSettings =
-            applyCursorAndContinuePages(
-                baseSettings = workingSettings,
-                round = initialRound,
-                weightOverride = weightOverride,
-            ) { peers ->
-                latestPeers = peers
-                onPeersUpdated(peers)
-            }
-        workingSettings =
-            drainOverflowEntryPushes(
-                initialSettings = workingSettings,
+        val initialPeers = initialRound.response.activePeers
+        onPeersUpdated(initialPeers)
+        return if (initialRound.response.resetRequired) {
+            SyncCycleOutcome(settings = workingSettings, latestPeers = initialPeers)
+        } else {
+            finishSyncCycle(
+                workingSettings = workingSettings,
                 initialRound = initialRound,
+                initialPeers = initialPeers,
                 weightOverride = weightOverride,
-            ) { peers ->
-                latestPeers = peers
-                onPeersUpdated(peers)
-            }
-        return SyncCycleOutcome(settings = workingSettings, latestPeers = latestPeers)
+                allowMidCycleReset = allowMidCycleReset && !didReset,
+            )
+        }
+    }
+
+    private suspend fun finishSyncCycle(
+        workingSettings: Settings,
+        initialRound: SinglePeerSyncResult,
+        initialPeers: List<PeerNodeDto>,
+        weightOverride: Double?,
+        allowMidCycleReset: Boolean,
+    ): SyncCycleOutcome? {
+        var latestPeers = initialPeers
+        val updatePeers: (List<PeerNodeDto>) -> Unit = { peers ->
+            latestPeers = peers
+            onPeersUpdated(peers)
+        }
+        val cont =
+            applyCursorAndContinuePages(workingSettings, initialRound, weightOverride, updatePeers)
+        return when {
+            cont.resetTriggered && allowMidCycleReset ->
+                runFullSyncCycle(
+                    cont.settings,
+                    weightOverride,
+                    sinceSeqOverride = 0L,
+                    allowMidCycleReset = false,
+                    isResetRetry = true,
+                )
+            cont.resetTriggered -> SyncCycleOutcome(cont.settings, latestPeers)
+            else ->
+                SyncCycleOutcome(
+                    drainOverflowEntryPushes(
+                        cont.settings,
+                        initialRound,
+                        weightOverride,
+                        updatePeers,
+                    ),
+                    latestPeers,
+                )
+        }
     }
 
     private suspend fun applyCursorAndContinuePages(
@@ -215,11 +252,12 @@ internal class PeerSyncCoordinator(
         round: SinglePeerSyncResult,
         weightOverride: Double?,
         onPagePeers: (List<PeerNodeDto>) -> Unit = onPeersUpdated,
-    ): Settings {
+    ): ContinuationOutcome {
         val firstResp = round.response
         var updatedSettings = advancePersistedSyncSeq(baseSettings, firstResp.syncSeq)
         var pageSeq = firstResp.syncSeq
         var hasMore = firstResp.hasMore && pageSeq > 0L
+        var resetTriggered = false
         var page = 0
         while (hasMore && page < MAX_DELTA_CONTINUATION_PAGES) {
             val pageResp =
@@ -228,17 +266,26 @@ internal class PeerSyncCoordinator(
                     sinceSeq = pageSeq,
                     weightOverride = weightOverride,
                 )
-            if (pageResp != null && !pageResp.resetRequired && pageResp.syncSeq > pageSeq) {
-                onPagePeers(pageResp.activePeers)
-                updatedSettings = advancePersistedSyncSeq(updatedSettings, pageResp.syncSeq)
-                pageSeq = pageResp.syncSeq
-                hasMore = pageResp.hasMore
-            } else {
-                hasMore = false
+            when {
+                pageResp?.resetRequired == true -> {
+                    onSyncCursorUpdated("0")
+                    updatedSettings = updatedSettings.copy(lastPeerSyncCursor = "0")
+                    resetTriggered = true
+                    hasMore = false
+                }
+                pageResp != null && pageResp.syncSeq > pageSeq -> {
+                    onPagePeers(pageResp.activePeers)
+                    updatedSettings = advancePersistedSyncSeq(updatedSettings, pageResp.syncSeq)
+                    pageSeq = pageResp.syncSeq
+                    hasMore = pageResp.hasMore
+                }
+                else -> {
+                    hasMore = false
+                }
             }
             page++
         }
-        return updatedSettings
+        return ContinuationOutcome(settings = updatedSettings, resetTriggered = resetTriggered)
     }
 
     private suspend fun advancePersistedSyncSeq(
@@ -327,7 +374,8 @@ internal class PeerSyncCoordinator(
                 }
                 else -> {
                     remainingIds = nextRound.byteOverflowEntryIds - alreadySentIds - quarantinedIds
-                    remainingIds.isNotEmpty() && remainingIds.size < prevCount
+                    remainingIds.isNotEmpty() &&
+                        (nextRound.sentEntryIds.isNotEmpty() || remainingIds.size < prevCount)
                 }
             }
         }
@@ -412,16 +460,24 @@ internal class PeerSyncCoordinator(
                 maxPayloadBytes = state.maxPayloadBytes,
                 maxEntries = state.maxEntries,
             )
-        if (nextRound == null || nextRound.response.resetRequired) return false
+        if (nextRound == null) return false
+        if (nextRound.response.resetRequired) {
+            onSyncCursorUpdated("0")
+            state.settings = state.settings.copy(lastPeerSyncCursor = "0")
+            onPagePeers(nextRound.response.activePeers)
+            return false
+        }
         state.alreadySentIds.addAll(nextRound.sentEntryIds)
         onPagePeers(nextRound.response.activePeers)
-        state.settings =
+        val contOutcome =
             applyCursorAndContinuePages(
                 baseSettings = state.settings,
                 round = nextRound,
                 weightOverride = weightOverride,
                 onPagePeers = onPagePeers,
             )
+        state.settings = contOutcome.settings
+        if (contOutcome.resetTriggered) return false
         return state.updateAfterRound(nextRound, prevCount, prevMaxPayloadBytes, prevMaxEntries)
     }
 
@@ -430,6 +486,7 @@ internal class PeerSyncCoordinator(
         currentSettings: Settings,
         weightOverride: Double? = null,
         sinceSeqOverride: Long? = null,
+        isResetRetry: Boolean = false,
         forcedEntryIds: Set<String> = emptySet(),
         excludeEntryIds: Set<String> = emptySet(),
         quarantinedEntryIds: Set<String> = emptySet(),
@@ -447,6 +504,7 @@ internal class PeerSyncCoordinator(
                         deviceName = currentSettings.deviceName,
                         networkTier = networkTier,
                         sinceSeq = effectiveSinceSeq,
+                        isResetRetry = isResetRetry,
                         weightOverride = weightOverride,
                         forcedEntryIds = forcedEntryIds,
                         excludeEntryIds = excludeEntryIds,
@@ -482,32 +540,6 @@ internal class PeerSyncCoordinator(
             byteOverflowEntryIds = effectiveTracked.byteOverflowEntryIds,
             droppedEntryIdsOn413 = droppedEntryIdsOn413,
             serverMaxPayloadBytes = roundCall.serverMaxPayloadBytes,
-        )
-    }
-
-    private fun buildRetriedTrackedRequest(
-        tracked: TrackedOutgoingSyncBatch,
-        retriedRequestAfter413: PeerSyncRequestDto,
-    ): TrackedOutgoingSyncBatch {
-        val droppedEntryIds = tracked.sentEntryIds
-        val keptGenIds =
-            retriedRequestAfter413.collectionGenerators.mapTo(HashSet()) { it.collectionId }
-        val keptLogIds = retriedRequestAfter413.consumptionLog.mapTo(HashSet()) { it.id }
-        val keptCompIds = retriedRequestAfter413.comparisons.mapTo(HashSet()) { it.id }
-        return tracked.copy(
-            request = retriedRequestAfter413,
-            sentEntryHlcById = emptyMap(),
-            sentStateHlcById = emptyMap(),
-            sentFeedSourceHlcById = emptyMap(),
-            sentMembershipHlcByKey =
-                tracked.sentMembershipHlcByKey.filterKeys { (colId, entryId) ->
-                    colId !in droppedEntryIds && entryId !in droppedEntryIds
-                },
-            sentGeneratorHlcById = tracked.sentGeneratorHlcById.filterKeys { it in keptGenIds },
-            sentLogHlcById = tracked.sentLogHlcById.filterKeys { it in keptLogIds },
-            sentComparisonHlcById = tracked.sentComparisonHlcById.filterKeys { it in keptCompIds },
-            sentBoardSnapshotHlcById = emptyMap(),
-            byteOverflowEntryIds = droppedEntryIds + tracked.byteOverflowEntryIds,
         )
     }
 
@@ -554,6 +586,32 @@ internal class PeerSyncCoordinator(
             }
         }
     }
+}
+
+internal fun buildRetriedTrackedRequest(
+    tracked: TrackedOutgoingSyncBatch,
+    retriedRequestAfter413: PeerSyncRequestDto,
+): TrackedOutgoingSyncBatch {
+    val droppedEntryIds = tracked.sentEntryIds
+    val keptGenIds =
+        retriedRequestAfter413.collectionGenerators.mapTo(HashSet()) { it.collectionId }
+    val keptLogIds = retriedRequestAfter413.consumptionLog.mapTo(HashSet()) { it.id }
+    val keptCompIds = retriedRequestAfter413.comparisons.mapTo(HashSet()) { it.id }
+    return tracked.copy(
+        request = retriedRequestAfter413,
+        sentEntryHlcById = emptyMap(),
+        sentStateHlcById = emptyMap(),
+        sentFeedSourceHlcById = emptyMap(),
+        sentMembershipHlcByKey =
+            tracked.sentMembershipHlcByKey.filterKeys { (colId, entryId) ->
+                colId !in droppedEntryIds && entryId !in droppedEntryIds
+            },
+        sentGeneratorHlcById = tracked.sentGeneratorHlcById.filterKeys { it in keptGenIds },
+        sentLogHlcById = tracked.sentLogHlcById.filterKeys { it in keptLogIds },
+        sentComparisonHlcById = tracked.sentComparisonHlcById.filterKeys { it in keptCompIds },
+        sentBoardSnapshotHlcById = emptyMap(),
+        byteOverflowEntryIds = droppedEntryIds + tracked.byteOverflowEntryIds,
+    )
 }
 
 internal fun stripEntriesFor413Retry(request: PeerSyncRequestDto): PeerSyncRequestDto {

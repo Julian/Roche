@@ -31,7 +31,6 @@ import com.grayvines.roche.core.mergeDiscussionIntoMetadata
 import com.grayvines.roche.core.newerIsoTimestamp
 import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.core.nowUtcIso
-import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.core.resolveArticleDuration
 import com.grayvines.roche.core.sanitizeHttpUrl
 import com.grayvines.roche.data.boards.BOARD_STATE_GRACE_HOURS
@@ -303,28 +302,8 @@ internal suspend fun pruneExpiredBoardStatesInDao(
     dao: RocheDao,
     nowInstant: Instant = Instant.now(),
 ): Int {
-    val allStates = dao.getAllBoardItemStates()
-    if (allStates.isEmpty()) return 0
-    val cutoff = nowInstant.minus(BOARD_STATE_GRACE_HOURS, ChronoUnit.HOURS)
-    val liveItemKeys =
-        dao.getAllBoardItems().mapTo(HashSet()) { item -> item.boardId to item.externalId }
-    var pruned = 0
-    for (state in allStates) {
-        val key = state.boardId to state.externalId
-        if (key in liveItemKeys) continue
-        val lastSeen = parseIsoInstant(state.lastSeenInSnapshotAt)
-        val updated = parseIsoInstant(state.updatedAt)
-        val isExpired =
-            lastSeen != null &&
-                updated != null &&
-                lastSeen.isBefore(cutoff) &&
-                updated.isBefore(cutoff)
-        if (isExpired) {
-            dao.deleteBoardItemState(state.boardId, state.externalId)
-            pruned++
-        }
-    }
-    return pruned
+    val cutoffIso = nowInstant.minus(BOARD_STATE_GRACE_HOURS, ChronoUnit.HOURS).toString()
+    return dao.pruneExpiredBoardItemStates(cutoffIso)
 }
 
 internal suspend fun resolveDedupEntryIdInDao(

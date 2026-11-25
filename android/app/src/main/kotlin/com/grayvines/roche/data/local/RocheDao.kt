@@ -314,10 +314,31 @@ interface RocheDao {
 
     @Query("SELECT id FROM entries") suspend fun getAllEntryIds(): List<String>
 
+    @Query("SELECT id FROM entries WHERE id IN (:ids)")
+    suspend fun getExistingEntryIdsIn(ids: List<String>): List<String>
+
     @Query(
-        "SELECT id, mergedIntoId FROM entries " +
-            "WHERE mergedIntoId IS NOT NULL AND mergedIntoId != ''"
+        "SELECT e.* FROM entry_state es " +
+            "CROSS JOIN entries e ON e.id = es.entryId " +
+            "WHERE es.inboxState IN ('unread', 'dismissed', 'none')"
     )
+    suspend fun getEntriesWithInboxState(): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM entry_state es " +
+            "CROSS JOIN entries e ON e.id = es.entryId " +
+            "WHERE es.inboxState IN ('unread', 'dismissed', 'none') " +
+            "AND e.url IS NOT NULL AND e.url != ''"
+    )
+    suspend fun getInboxStateEntriesWithUrl(): List<EntryEntity>
+
+    @Query("SELECT * FROM entries WHERE isLocalDirty = 1 ORDER BY updatedAt DESC LIMIT :limit")
+    suspend fun getDirtyEntriesPage(limit: Int): List<EntryEntity>
+
+    @Query("SELECT * FROM entries WHERE +isLocalDirty = 0 ORDER BY updatedAt DESC LIMIT :limit")
+    suspend fun getCleanEntriesByUpdatedPage(limit: Int): List<EntryEntity>
+
+    @Query("SELECT id, mergedIntoId FROM entries WHERE mergedIntoId > ''")
     suspend fun getMergedEntryRedirects(): List<MergeRedirectRow>
 
     @Query("SELECT id, title FROM entries WHERE id IN (:ids)")
@@ -639,7 +660,7 @@ interface RocheDao {
     @Query("SELECT * FROM entries WHERE id IN (:ids)")
     suspend fun getEntriesByIds(ids: List<String>): List<EntryEntity>
 
-    @Query("SELECT * FROM entries WHERE mergedIntoId IS NOT NULL AND mergedIntoId != ''")
+    @Query("SELECT * FROM entries WHERE mergedIntoId > ''")
     suspend fun getMergedEntries(): List<EntryEntity>
 
     @Query("SELECT * FROM entries WHERE id = :id LIMIT 1")
@@ -690,10 +711,7 @@ interface RocheDao {
     @Query("UPDATE entries SET isLocalDirty = 1 WHERE id IN (:ids)")
     suspend fun markEntriesDirty(ids: List<String>)
 
-    @Query(
-        "UPDATE collection_entries SET isLocalDirty = 1 " +
-            "WHERE entryId IN (:ids) OR collectionId IN (:ids)"
-    )
+    @Query("UPDATE collection_entries SET isLocalDirty = 1 WHERE entryId IN (:ids)")
     suspend fun markMembershipsDirtyForEntries(ids: List<String>)
 
     // --- Satellite `entry_content` (FTS-safe upserts) ---
@@ -760,6 +778,9 @@ interface RocheDao {
     @Query("SELECT * FROM entry_state WHERE isLocalDirty = 1")
     suspend fun getDirtyEntryStates(): List<EntryStateEntity>
 
+    @Query("SELECT * FROM entry_state ORDER BY interactionUpdatedAt DESC LIMIT :limit")
+    suspend fun getRecentEntryStatesPage(limit: Int): List<EntryStateEntity>
+
     @Query("SELECT * FROM entry_state WHERE entryId = :entryId LIMIT 1")
     suspend fun getEntryStateById(entryId: String): EntryStateEntity?
 
@@ -780,7 +801,8 @@ interface RocheDao {
 
     // --- Inbox Projections & Search ---
 
-    @Query("SELECT COUNT(*) $INBOX_FROM_WHERE") suspend fun countItems(): Int
+    @Query("$LIVE_INBOX_IDS_CTE SELECT COUNT(*) $INBOX_CTE_FROM_WHERE")
+    suspend fun countItems(): Int
 
     @Query("$INBOX_SELECT_FULL_PREFIX AND e.id = :id LIMIT 1")
     suspend fun getItemById(id: String): InboxItemRow?
@@ -1246,8 +1268,33 @@ interface RocheDao {
     @Query("SELECT * FROM collection_entries WHERE isLocalDirty = 1")
     suspend fun getDirtyCollectionEntries(): List<CollectionEntryEntity>
 
+    @Query("SELECT * FROM collection_entries WHERE isLocalDirty = 1 ORDER BY hlc ASC LIMIT :limit")
+    suspend fun getDirtyMembershipsPage(limit: Int): List<CollectionEntryEntity>
+
+    @Query(
+        "SELECT * FROM collection_entries " +
+            "WHERE entryId IN (:entryIds) AND +isLocalDirty = 0 LIMIT :limit"
+    )
+    suspend fun getCleanMembershipsForEntries(
+        entryIds: List<String>,
+        limit: Int,
+    ): List<CollectionEntryEntity>
+
     @Query("SELECT * FROM collection_entries WHERE collectionId IN (:collectionIds)")
     suspend fun getMembershipsByColIds(collectionIds: List<String>): List<CollectionEntryEntity>
+
+    @Query("SELECT * FROM collection_entries WHERE entryId IN (:entryIds)")
+    suspend fun getMembershipsByEntryIds(entryIds: List<String>): List<CollectionEntryEntity>
+
+    @Query("SELECT DISTINCT collectionId FROM collection_entries")
+    suspend fun getDistinctCollectionParents(): List<String>
+
+    @Query(
+        "SELECT * FROM collection_entries WHERE collectionId = :entryId " +
+            "UNION " +
+            "SELECT * FROM collection_entries WHERE entryId = :entryId"
+    )
+    suspend fun getMembershipsInvolvingEntry(entryId: String): List<CollectionEntryEntity>
 
     @Query(
         "SELECT * FROM collection_entries WHERE collectionId = :collectionId " +
@@ -1462,6 +1509,18 @@ interface RocheDao {
     @Query("SELECT * FROM consumption_log ORDER BY ts DESC")
     suspend fun getAllConsumptionLogs(): List<ConsumptionLogEntity>
 
+    @Query("SELECT * FROM consumption_log WHERE isLocalDirty = 1 ORDER BY hlc ASC LIMIT :limit")
+    suspend fun getDirtyLogsPage(limit: Int): List<ConsumptionLogEntity>
+
+    @Query(
+        "SELECT * FROM consumption_log " +
+            "WHERE entryId IN (:entryIds) AND +isLocalDirty = 0 LIMIT :limit"
+    )
+    suspend fun getCleanLogsForEntries(
+        entryIds: List<String>,
+        limit: Int,
+    ): List<ConsumptionLogEntity>
+
     @Query("SELECT DISTINCT entryId, status FROM consumption_log")
     suspend fun getDistinctEntryLogStatuses(): List<EntryStatusRow>
 
@@ -1650,6 +1709,21 @@ interface RocheDao {
 
     @Query("SELECT * FROM comparisons WHERE isLocalDirty = 1")
     suspend fun getDirtyComparisons(): List<ComparisonEntity>
+
+    @Query("SELECT * FROM comparisons WHERE isLocalDirty = 1 ORDER BY hlc ASC LIMIT :limit")
+    suspend fun getDirtyComparisonsPage(limit: Int): List<ComparisonEntity>
+
+    @Query("SELECT * FROM comparisons WHERE +isLocalDirty = 0 ORDER BY ts DESC LIMIT :limit")
+    suspend fun getCleanComparisonsByTsPage(limit: Int): List<ComparisonEntity>
+
+    @Query(
+        "SELECT * FROM comparisons " +
+            "WHERE scopeCollectionId = :entryId OR orderingJson LIKE :likePattern ESCAPE '\\'"
+    )
+    suspend fun getComparisonsInvolvingEntry(
+        entryId: String,
+        likePattern: String,
+    ): List<ComparisonEntity>
 
     @Query("SELECT * FROM comparisons WHERE id = :id LIMIT 1")
     suspend fun getComparisonById(id: String): ComparisonEntity?

@@ -71,6 +71,7 @@ import com.grayvines.roche.data.local.LIST_PREVIEW_SUMMARY_CHARS
 import com.grayvines.roche.data.local.LIST_PREVIEW_TEXT_CHARS
 import com.grayvines.roche.data.local.MAX_SQLITE_HTML_CHARS
 import com.grayvines.roche.data.local.MAX_SQLITE_SUMMARY_CHARS
+import com.grayvines.roche.data.local.MergeRedirectRow
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.SQLITE_DELETE_CHUNK_SIZE
 import com.grayvines.roche.data.local.TombstoneEntity
@@ -324,6 +325,14 @@ private class TombstoneBatchCache(private val dao: RocheDao) {
         entriesById.remove(entryId)
     }
 
+    fun onMembershipDeleted(collectionId: String, entryId: String) {
+        membershipsByEntry[entryId]?.remove(collectionId)
+    }
+
+    suspend fun onEntryDeleted(entryId: String) {
+        refreshItemAfterDelete(entryId)
+    }
+
     private suspend fun loadTagEntriesFromDao():
         MutableList<Pair<CollectionSpecEntity, EntryEntity>> {
         val specs =
@@ -352,13 +361,10 @@ private class TombstoneBatchCache(private val dao: RocheDao) {
         for (src in dao.getAllFeedSources()) {
             feedUrlsByColId[src.collectionId] = canonicalizeSyncUrl(src.feedUrl)
         }
-        for (mem in dao.getAllCollectionEntries()) {
-            membershipsByEntry.getOrPut(mem.entryId) { ArrayList() }.add(mem.collectionId)
-        }
         for (state in dao.getAllEntryStates()) {
             statesById[state.entryId] = state
         }
-        for (entry in dao.getAllEntries()) {
+        for (entry in dao.getEntriesWithInboxState()) {
             entriesById[entry.id] = entry
             val canonUrl = canonicalizeSyncUrl(entry.url.orEmpty())
             if (canonUrl.isNotEmpty()) {
@@ -368,7 +374,13 @@ private class TombstoneBatchCache(private val dao: RocheDao) {
         itemIndexLoaded = true
     }
 
-    private fun matchesItemTombstone(
+    private suspend fun membershipsForEntry(entryId: String): List<String> =
+        membershipsByEntry[entryId]
+            ?: dao.getCollectionEntriesForEntry(entryId)
+                .mapTo(ArrayList()) { it.collectionId }
+                .also { membershipsByEntry[entryId] = it }
+
+    private suspend fun matchesItemTombstone(
         entry: EntryEntity,
         detId: String,
         canonFeed: String?,
@@ -381,7 +393,7 @@ private class TombstoneBatchCache(private val dao: RocheDao) {
                     state.inboxState == INBOX_STATE_DISMISSED ||
                     canonFeed == null && state.inboxState == INBOX_STATE_NONE)
         if (!validInboxState) return false
-        val entryColIds = membershipsByEntry[entry.id].orEmpty()
+        val entryColIds = membershipsForEntry(entry.id)
         val entryFeeds = entryColIds.mapNotNull { feedUrlsByColId[it] }
         if (entry.id == detId) {
             return if (canonFeed == null) entryFeeds.isEmpty() else true
@@ -414,13 +426,13 @@ private suspend fun applyIncomingTombstonesInTx(
             TOMBSTONE_ENTITY_ITEM -> applyItemTombstone(dao, cache, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_TAG -> applyTagTombstone(dao, cache, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_COLLECTION_ENTRY ->
-                applyCollectionEntryTombstone(dao, rawKey, deletedAt, tombHlc)
+                applyCollectionEntryTombstone(dao, cache, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_COLLECTION_GENERATOR ->
                 applyGeneratorTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_CONSUMPTION_LOG ->
                 applyConsumptionLogTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_COMPARISON -> applyComparisonTombstone(dao, rawKey, deletedAt, tombHlc)
-            TOMBSTONE_ENTITY_ENTRY -> applyEntryTombstone(dao, rawKey, deletedAt, tombHlc)
+            TOMBSTONE_ENTITY_ENTRY -> applyEntryTombstone(dao, cache, rawKey, deletedAt, tombHlc)
             TOMBSTONE_TYPE_BOARD -> applyBoardTombstoneInTx(dao, rawKey, deletedAt, tombHlc)
         }
     }
@@ -507,6 +519,7 @@ private suspend fun applyTagTombstone(
 
 private suspend fun applyCollectionEntryTombstone(
     dao: RocheDao,
+    cache: TombstoneBatchCache,
     rawKey: String,
     deletedAt: String,
     tombHlc: String,
@@ -519,6 +532,7 @@ private suspend fun applyCollectionEntryTombstone(
     val existing = dao.getCollectionEntry(colId, entryId)
     if (existing != null && compareHlc(existing.hlc, tombHlc) > 0) return
     dao.deleteCollectionEntry(colId, entryId)
+    cache.onMembershipDeleted(colId, entryId)
     upsertCleanTombstone(dao, TOMBSTONE_ENTITY_COLLECTION_ENTRY, canonKey, deletedAt, tombHlc)
 }
 
@@ -572,6 +586,7 @@ private suspend fun isProtectedTombstoneTarget(dao: RocheDao, entryId: String): 
 
 private suspend fun applyEntryTombstone(
     dao: RocheDao,
+    cache: TombstoneBatchCache,
     rawKey: String,
     deletedAt: String,
     tombHlc: String,
@@ -590,9 +605,11 @@ private suspend fun applyEntryTombstone(
                 )
             }
             dao.deleteEntryContentById(rawKey)
+            cache.onEntryDeleted(rawKey)
             false
         } else {
             dao.deleteEntryCascade(rawKey)
+            cache.onEntryDeleted(rawKey)
             true
         }
     if (shouldRecordTombstone) {
@@ -658,11 +675,24 @@ private suspend fun mergeIncomingEntriesInTx(
     nowIso: String,
     nowMs: Long,
 ): MergedIncomingEntriesResult {
+    if (response.entries.isEmpty()) {
+        val needsRedirects =
+            response.collectionEntries.isNotEmpty() ||
+                response.consumptionLog.isNotEmpty() ||
+                response.comparisons.isNotEmpty() ||
+                response.collectionGenerators.isNotEmpty()
+        val mergeRedirects =
+            if (needsRedirects) buildMergeRedirectMap(dao.getMergedEntryRedirects()) else emptyMap()
+        return MergedIncomingEntriesResult(
+            redirects = mergeRedirects,
+            suppressedEntryIds = emptySet(),
+        )
+    }
     val ctx = buildIncomingEntriesMergeCtx(dao, response, serverNode, nowIso, nowMs)
     val explicitMerges = ArrayList<Pair<String, String>>()
     mergeOrderedIncomingEntries(dao, response.entries, ctx, explicitMerges)
 
-    val mergeRedirects = buildMergeRedirectMap(dao.getMergedEntries())
+    val mergeRedirects = buildMergeRedirectMap(dao.getMergedEntryRedirects())
     val combinedRedirects = ctx.idRemap + mergeRedirects
     val arrivedIds = HashSet<String>(response.entries.size + ctx.idRemap.size)
     for (rec in response.entries) {
@@ -835,7 +865,12 @@ private suspend fun buildIncomingEntriesMergeCtx(
     }
     val feedUrlsByColId = buildFeedUrlLookup(existingFeedSources, response.entries)
     val parentFeedsByEntryId =
-        buildParentFeedUrlsByEntry(dao, response.collectionEntries, feedUrlsByColId)
+        buildParentFeedUrlsByEntry(
+            dao = dao,
+            incomingEntries = response.entries,
+            incomingMemberships = response.collectionEntries,
+            feedUrlsByColId = feedUrlsByColId,
+        )
     val incomingWtrEntryIds =
         response.collectionEntries
             .filter { it.collectionId.trim() == WANT_TO_READ_COLLECTION_ID }
@@ -897,13 +932,29 @@ private fun buildFeedUrlLookup(
 
 private suspend fun buildParentFeedUrlsByEntry(
     dao: RocheDao,
+    incomingEntries: List<SyncEntryRecordDto>,
     incomingMemberships: List<SyncCollectionEntryDto>,
     feedUrlsByColId: Map<String, String>,
 ): Map<String, Set<String>> {
+    if (feedUrlsByColId.isEmpty()) return emptyMap()
     val result = HashMap<String, MutableSet<String>>()
-    for (mem in dao.getAllCollectionEntries()) {
-        val feedUrl = feedUrlsByColId[mem.collectionId] ?: continue
-        result.getOrPut(mem.entryId) { HashSet() }.add(feedUrl)
+    val candidateEntryIds =
+        incomingEntries
+            .asSequence()
+            .filter {
+                it.feedSource == null &&
+                    it.collectionSpec == null &&
+                    (it.state != null || it.content != null)
+            }
+            .map { it.id.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .toList()
+    for (chunk in candidateEntryIds.chunked(SQLITE_DELETE_CHUNK_SIZE)) {
+        for (mem in dao.getMembershipsByEntryIds(chunk)) {
+            val feedUrl = feedUrlsByColId[mem.collectionId] ?: continue
+            result.getOrPut(mem.entryId) { HashSet() }.add(feedUrl)
+        }
     }
     for (ce in incomingMemberships) {
         val feedUrl = feedUrlsByColId[ce.collectionId.trim()] ?: continue
@@ -2473,10 +2524,10 @@ internal fun isProtectedSpec(spec: CollectionSpecEntity): Boolean =
         CollectionRole.fromWireValue(spec.role) == CollectionRole.SYSTEM ||
         spec.isDynamic
 
-private fun buildMergeRedirectMap(entries: Collection<EntryEntity>): Map<String, String> =
+private fun buildMergeRedirectMap(entries: Collection<MergeRedirectRow>): Map<String, String> =
     buildMap {
         for (entry in entries) {
-            val target = entry.mergedIntoId?.trim()?.takeIf { it.isNotEmpty() && it != entry.id }
+            val target = entry.mergedIntoId.trim().takeIf { it.isNotEmpty() && it != entry.id }
             if (target != null) {
                 put(entry.id, target)
             }

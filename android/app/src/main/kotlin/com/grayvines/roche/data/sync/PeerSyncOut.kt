@@ -55,6 +55,8 @@ internal const val MAX_PEER_SYNC_ENTRIES = 2_000
 private const val MAX_SYNC_COLLECTION_ENTRIES = 8_000
 private const val MAX_SYNC_CONSUMPTION_LOG = 8_000
 private const val MAX_SYNC_COMPARISONS = 8_000
+private const val MAX_SYNC_TOMBSTONES = 8_000
+private const val SYNC_FULL_BUFFER_SLACK = 512
 private const val MAX_SYNC_BOARD_ITEM_STATES = 8_000
 private const val ENTRY_JSON_BASE_BYTES = 512
 private const val BOARD_ITEM_JSON_BASE_BYTES = 256
@@ -66,6 +68,7 @@ internal data class PeerSyncRequestConfig(
     val deviceName: String,
     val networkTier: NetworkTier = NetworkTier.WIFI,
     val sinceSeq: Long = 0L,
+    val isResetRetry: Boolean = false,
     val weightOverride: Double? = null,
     val forcedEntryIds: Set<String> = emptySet(),
     val excludeEntryIds: Set<String> = emptySet(),
@@ -105,12 +108,12 @@ internal data class TrackedOutgoingSyncBatch(
 private data class OutgoingGraphSnapshot(
     val entries: List<EntryEntity>,
     val statesById: Map<String, EntryStateEntity>,
-    val identsByEntryId: Map<String, List<EntryIdentifierDto>>,
     val specsById: Map<String, CollectionSpecEntity>,
     val feedSourcesById: Map<String, FeedSourceEntity>,
     val unsyncedFeedIds: Set<String>,
     val entryIdsInUnsyncedFeeds: Set<String>,
     val catalogRefIds: Set<String>,
+    val dirtyChildRefIds: Set<String> = emptySet(),
     val memberships: List<CollectionEntryEntity>,
     val generators: List<CollectionGeneratorEntity>,
     val logs: List<ConsumptionLogEntity>,
@@ -134,11 +137,13 @@ internal suspend fun buildTrackedPeerSyncRequest(
     var snap: OutgoingGraphSnapshot? = null
     var slices: PreparedOutgoingSlices? = null
     var contentsById: Map<String, EntryContentEntity> = emptyMap()
+    var identsByEntryId: Map<String, List<EntryIdentifierDto>> = emptyMap()
     dao.executeInTransaction {
         val loadedSnap = loadOutgoingGraphSnapshot(dao, config)
         val loadedSlices = prepareOutgoingSlices(loadedSnap, config)
         val cappedIds = loadedSlices.eligibleEntries.take(MAX_PEER_SYNC_ENTRIES).map { it.id }
         contentsById = loadEntryContentsByIds(dao, cappedIds, loadedSlices.unsyncedFeedIds)
+        identsByEntryId = loadDeltaIdentsByEntryId(dao, cappedIds.toSet())
         snap = loadedSnap
         slices = loadedSlices
     }
@@ -149,6 +154,7 @@ internal suspend fun buildTrackedPeerSyncRequest(
             resolvedSlices.eligibleEntries,
             resolvedSnap,
             contentsById,
+            identsByEntryId,
             resolvedSlices.unsyncedFeedIds,
             config.maxPayloadBytes,
             config.maxEntries,
@@ -232,7 +238,7 @@ private fun prepareOutgoingSlices(
     snap: OutgoingGraphSnapshot,
     config: PeerSyncRequestConfig,
 ): PreparedOutgoingSlices {
-    val isInitial = config.sinceSeq <= 0L
+    val isInitial = config.sinceSeq <= 0L && !config.isResetRetry
     val unsyncedFeedIds = snap.unsyncedFeedIds
     val localOnlyPdfIds = collectLocalOnlyPdfIds(snap)
     val catalogRefIds = snap.catalogRefIds - localOnlyPdfIds
@@ -320,6 +326,7 @@ private fun partitionOutgoingEntries(
     eligibleEntries: List<EntryEntity>,
     snap: OutgoingGraphSnapshot,
     contentsById: Map<String, EntryContentEntity>,
+    identsByEntryId: Map<String, List<EntryIdentifierDto>>,
     unsyncedFeedIds: Set<String>,
     maxPayloadBytes: Int,
     maxEntries: Int,
@@ -336,7 +343,7 @@ private fun partitionOutgoingEntries(
             maxEntries = maxEntries,
         )
     val wireEntries = budgetEntries.map {
-        toSyncEntryRecordDto(it, snap, contentsById, unsyncedFeedIds)
+        toSyncEntryRecordDto(it, snap, contentsById, identsByEntryId, unsyncedFeedIds)
     }
     val usedBytes = budgetEntries.sumOf {
         estimateSyncEntryBytes(it, contentsById, unsyncedFeedIds)
@@ -385,57 +392,192 @@ private suspend fun loadOutgoingGraphSnapshot(
     dao: RocheDao,
     config: PeerSyncRequestConfig,
 ): OutgoingGraphSnapshot =
-    if (config.sinceSeq <= 0L) {
-        loadFullOutgoingSnapshot(dao, config.peerId)
+    if (config.sinceSeq <= 0L && !config.isResetRetry) {
+        loadFullOutgoingSnapshot(dao, config)
     } else {
         loadDeltaOutgoingSnapshot(dao, config)
     }
 
 private suspend fun loadFullOutgoingSnapshot(
     dao: RocheDao,
-    peerId: String,
+    config: PeerSyncRequestConfig,
 ): OutgoingGraphSnapshot {
-    val entries = dao.getAllEntries()
-    val statesById = dao.getAllEntryStates().associateBy { it.entryId }
-    val identsByEntryId =
-        dao.getAllEntryIdentifiers()
-            .groupBy { it.entryId }
-            .mapValues { (_, list) -> list.map { EntryIdentifierDto(it.scheme, it.value) } }
     val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
     val feedSourcesById = dao.getAllFeedSources().associateBy { it.collectionId }
     val unsyncedFeedIds = collectUnsyncedFeedIds(feedSourcesById)
-    val memberships = dao.getAllCollectionEntries()
+    val entryIdsInUnsyncedFeeds = loadEntryIdsInUnsyncedFeeds(dao, unsyncedFeedIds)
+    val dirtyMemberships =
+        dao.getDirtyMembershipsPage(MAX_SYNC_COLLECTION_ENTRIES + SYNC_FULL_BUFFER_SLACK)
+    val dirtyLogs = dao.getDirtyLogsPage(MAX_SYNC_CONSUMPTION_LOG + SYNC_FULL_BUFFER_SLACK)
+    val dirtyComparisons =
+        dao.getDirtyComparisonsPage(MAX_SYNC_COMPARISONS + SYNC_FULL_BUFFER_SLACK)
     val generators = dao.getAllCollectionGenerators()
-    val logs = dao.getAllConsumptionLogs()
-    val comparisons = dao.getAllComparisons()
-    val tombstones = dao.getAllTombstones()
-    val boards = dao.getAllBoards()
-    val boardItemsByBoardId = dao.getAllBoardItems().groupBy { it.boardId }
-    val boardItemStates = dao.getAllBoardItemStates()
-    val entryIdsInUnsyncedFeeds =
-        memberships.filter { it.collectionId in unsyncedFeedIds }.mapTo(HashSet()) { it.entryId }
-    val catalogRefIds =
-        collectCatalogHistoryIds(logs, generators, memberships, specsById, comparisons)
-    val clientHlc = resolveOutgoingClientHlc(dao, peerId)
+    val dirtyChildRefIds =
+        collectReferencedIdsFromSlices(
+            dirtyMemberships,
+            generators.filter { it.isLocalDirty },
+            dirtyLogs,
+            dirtyComparisons,
+        )
+    val dirtyStates = dao.getDirtyEntryStates()
+    val dirtyFeedSources = dao.getDirtyFeedSources()
+    val entries =
+        loadBoundedFullEntries(
+            dao = dao,
+            config = config,
+            specsById = specsById,
+            feedSourcesById = feedSourcesById,
+            dirtyStates = dirtyStates,
+            dirtyFeedSources = dirtyFeedSources,
+            dirtyChildRefIds = dirtyChildRefIds,
+        )
+    val loadedIds = entries.mapTo(LinkedHashSet(entries.size)) { it.id }
+    val statesById = loadDeltaStatesById(dao, dirtyStates, loadedIds)
     return OutgoingGraphSnapshot(
         entries = entries,
         statesById = statesById,
-        identsByEntryId = identsByEntryId,
         specsById = specsById,
         feedSourcesById = feedSourcesById,
         unsyncedFeedIds = unsyncedFeedIds,
         entryIdsInUnsyncedFeeds = entryIdsInUnsyncedFeeds,
-        catalogRefIds = catalogRefIds,
-        memberships = memberships,
+        catalogRefIds =
+            loadDeltaCatalogRefIds(
+                dao,
+                entries,
+                statesById,
+                unsyncedFeedIds,
+                entryIdsInUnsyncedFeeds,
+            ),
+        dirtyChildRefIds = dirtyChildRefIds,
+        memberships = loadFullCleanMemberships(dao, dirtyMemberships, loadedIds),
         generators = generators,
-        logs = logs,
-        comparisons = comparisons,
-        tombstones = tombstones,
-        boards = boards,
-        boardItemsByBoardId = boardItemsByBoardId,
-        boardItemStates = boardItemStates,
-        clientHlc = clientHlc,
+        logs = loadFullCleanLogs(dao, dirtyLogs, loadedIds),
+        comparisons = loadFullCleanComparisons(dao, dirtyComparisons, loadedIds),
+        tombstones = dao.getAllTombstones(),
+        boards = dao.getAllBoards(),
+        boardItemsByBoardId = dao.getAllBoardItems().groupBy { it.boardId },
+        boardItemStates = dao.getAllBoardItemStates(),
+        clientHlc = resolveOutgoingClientHlc(dao, config.peerId),
     )
+}
+
+private suspend fun loadFullCleanMemberships(
+    dao: RocheDao,
+    dirty: List<CollectionEntryEntity>,
+    loadedEntryIds: Set<String>,
+): List<CollectionEntryEntity> {
+    val budget = MAX_SYNC_COLLECTION_ENTRIES + SYNC_FULL_BUFFER_SLACK
+    val remaining = (budget - dirty.size).coerceAtLeast(0)
+    if (remaining == 0 || loadedEntryIds.isEmpty()) return dirty
+    val seen = dirty.mapTo(HashSet(dirty.size)) { it.collectionId to it.entryId }
+    val clean = ArrayList<CollectionEntryEntity>()
+    for (chunk in loadedEntryIds.chunked(SQLITE_CONTENT_CHUNK_SIZE)) {
+        val left = remaining - clean.size
+        if (left <= 0) break
+        for (mem in dao.getCleanMembershipsForEntries(chunk, left)) {
+            val parentOk =
+                mem.collectionId in loadedEntryIds ||
+                    mem.collectionId in PROTECTED_SYSTEM_COLLECTION_IDS
+            if (parentOk && seen.add(mem.collectionId to mem.entryId)) {
+                clean.add(mem)
+            }
+        }
+    }
+    return dirty + clean
+}
+
+private suspend fun loadFullCleanLogs(
+    dao: RocheDao,
+    dirty: List<ConsumptionLogEntity>,
+    loadedEntryIds: Set<String>,
+): List<ConsumptionLogEntity> {
+    val budget = MAX_SYNC_CONSUMPTION_LOG + SYNC_FULL_BUFFER_SLACK
+    val remaining = (budget - dirty.size).coerceAtLeast(0)
+    if (remaining == 0 || loadedEntryIds.isEmpty()) return dirty
+    val seen = dirty.mapTo(HashSet(dirty.size)) { it.id }
+    val clean = ArrayList<ConsumptionLogEntity>()
+    for (chunk in loadedEntryIds.chunked(SQLITE_CONTENT_CHUNK_SIZE)) {
+        val left = remaining - clean.size
+        if (left <= 0) break
+        for (log in dao.getCleanLogsForEntries(chunk, left)) {
+            if (seen.add(log.id)) {
+                clean.add(log)
+            }
+        }
+    }
+    return dirty + clean
+}
+
+private suspend fun loadFullCleanComparisons(
+    dao: RocheDao,
+    dirty: List<ComparisonEntity>,
+    loadedEntryIds: Set<String>,
+): List<ComparisonEntity> {
+    val budget = MAX_SYNC_COMPARISONS + SYNC_FULL_BUFFER_SLACK
+    val remaining = (budget - dirty.size).coerceAtLeast(0)
+    if (remaining == 0 || loadedEntryIds.isEmpty()) return dirty
+    val seen = dirty.mapTo(HashSet(dirty.size)) { it.id }
+    val clean =
+        dao.getCleanComparisonsByTsPage(remaining).filter { comp ->
+            val scopeOk =
+                comp.scopeCollectionId.isNullOrBlank() || comp.scopeCollectionId in loadedEntryIds
+            val ids = decodeComparisonOrdering(comp.orderingJson)?.flatten()
+            scopeOk && ids != null && ids.all { it.trim() in loadedEntryIds } && seen.add(comp.id)
+        }
+    return dirty + clean
+}
+
+@Suppress("LongParameterList")
+private suspend fun loadBoundedFullEntries(
+    dao: RocheDao,
+    config: PeerSyncRequestConfig,
+    specsById: Map<String, CollectionSpecEntity>,
+    feedSourcesById: Map<String, FeedSourceEntity>,
+    dirtyStates: List<EntryStateEntity>,
+    dirtyFeedSources: List<FeedSourceEntity>,
+    dirtyChildRefIds: Set<String>,
+): List<EntryEntity> {
+    val entryBudget = MAX_PEER_SYNC_ENTRIES + SYNC_FULL_BUFFER_SLACK
+    val dirtyEntries = dao.getDirtyEntriesPage(entryBudget)
+    val byId = LinkedHashMap<String, EntryEntity>(entryBudget)
+    dirtyEntries.forEach { byId[it.id] = it }
+    val priorityIds = buildSet {
+        dirtyStates.forEach { add(it.entryId) }
+        dirtyFeedSources.forEach { add(it.collectionId) }
+        addAll(config.forcedEntryIds)
+        addAll(dirtyChildRefIds)
+        addAll(feedSourcesById.keys)
+        addAll(specsById.keys)
+    }
+    fetchMissingEntriesInto(dao, priorityIds, byId)
+    val remainingAfterPriority = (entryBudget - byId.size).coerceAtLeast(0)
+    if (remainingAfterPriority > 0) {
+        val recentStateIds = dao.getRecentEntryStatesPage(remainingAfterPriority).map { it.entryId }
+        fetchMissingEntriesInto(dao, recentStateIds, byId, maxTotal = entryBudget)
+    }
+    if (byId.size < entryBudget) {
+        for (entry in dao.getCleanEntriesByUpdatedPage(entryBudget)) {
+            if (byId.size >= entryBudget) break
+            byId.putIfAbsent(entry.id, entry)
+        }
+    }
+    return byId.values.toList()
+}
+
+private suspend fun fetchMissingEntriesInto(
+    dao: RocheDao,
+    ids: Collection<String>,
+    byId: MutableMap<String, EntryEntity>,
+    maxTotal: Int = Int.MAX_VALUE,
+) {
+    val missing = ids.filter { it !in byId }
+    for (chunk in missing.chunked(SQLITE_CONTENT_CHUNK_SIZE)) {
+        if (byId.size >= maxTotal) break
+        for (entry in dao.getEntriesByIds(chunk)) {
+            if (byId.size >= maxTotal) break
+            byId.putIfAbsent(entry.id, entry)
+        }
+    }
 }
 
 private suspend fun loadDeltaOutgoingSnapshot(
@@ -445,46 +587,48 @@ private suspend fun loadDeltaOutgoingSnapshot(
     val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
     val feedSourcesById = dao.getAllFeedSources().associateBy { it.collectionId }
     val unsyncedFeedIds = collectUnsyncedFeedIds(feedSourcesById)
-    val dirtyEntries = dao.getDirtyEntries()
+    val dirtyEntries = dao.getDirtyEntriesPage(MAX_PEER_SYNC_ENTRIES + SYNC_FULL_BUFFER_SLACK)
     val dirtyStates = dao.getDirtyEntryStates()
     val dirtyFeedSources = dao.getDirtyFeedSources()
-    val dirtyMemberships = dao.getDirtyCollectionEntries()
+    val dirtyMemberships =
+        dao.getDirtyMembershipsPage(MAX_SYNC_COLLECTION_ENTRIES + SYNC_FULL_BUFFER_SLACK)
     val dirtyGenerators = dao.getDirtyCollectionGenerators()
-    val dirtyLogs = dao.getDirtyConsumptionLogs()
-    val dirtyComparisons = dao.getDirtyComparisons()
+    val dirtyLogs = dao.getDirtyLogsPage(MAX_SYNC_CONSUMPTION_LOG + SYNC_FULL_BUFFER_SLACK)
+    val dirtyComparisons =
+        dao.getDirtyComparisonsPage(MAX_SYNC_COMPARISONS + SYNC_FULL_BUFFER_SLACK)
     val dirtyTombstones = dao.getDirtyTombstones()
     val dirtyBoards = dao.getDirtyBoards()
     val boardItemsByBoardId = loadDeltaBoardItemsByBoardId(dao, dirtyBoards)
     val dirtyBoardItemStates = dao.getDirtyBoardItemStates()
     val entryIdsInUnsyncedFeeds = loadEntryIdsInUnsyncedFeeds(dao, unsyncedFeedIds)
+    val dirtyChildRefIds =
+        collectReferencedIdsFromSlices(
+            dirtyMemberships,
+            dirtyGenerators,
+            dirtyLogs,
+            dirtyComparisons,
+        )
     val candidateEntryIds =
         collectDeltaCandidateEntryIds(
             dirtyEntries = dirtyEntries,
             dirtyStates = dirtyStates,
             dirtyFeedSources = dirtyFeedSources,
             forcedEntryIds = config.forcedEntryIds,
-            childRefIds =
-                collectReferencedIdsFromSlices(
-                    dirtyMemberships,
-                    dirtyGenerators,
-                    dirtyLogs,
-                    dirtyComparisons,
-                ),
+            childRefIds = dirtyChildRefIds,
         )
     val entries = loadDeltaEntries(dao, dirtyEntries, candidateEntryIds)
     val statesById = loadDeltaStatesById(dao, dirtyStates, candidateEntryIds)
-    val identsByEntryId = loadDeltaIdentsByEntryId(dao, candidateEntryIds)
     val catalogRefIds =
         loadDeltaCatalogRefIds(dao, entries, statesById, unsyncedFeedIds, entryIdsInUnsyncedFeeds)
     return OutgoingGraphSnapshot(
         entries = entries,
         statesById = statesById,
-        identsByEntryId = identsByEntryId,
         specsById = specsById,
         feedSourcesById = feedSourcesById,
         unsyncedFeedIds = unsyncedFeedIds,
         entryIdsInUnsyncedFeeds = entryIdsInUnsyncedFeeds,
         catalogRefIds = catalogRefIds,
+        dirtyChildRefIds = dirtyChildRefIds,
         memberships = dirtyMemberships,
         generators = dirtyGenerators,
         logs = dirtyLogs,
@@ -630,29 +774,6 @@ private fun hasBadSyncItemUrl(entry: EntryEntity, state: EntryStateEntity?): Boo
     return (isInbox || isLocalPdf) && !isSyncableItemUrl(entry.url.orEmpty())
 }
 
-private fun collectCatalogHistoryIds(
-    logs: List<ConsumptionLogEntity>,
-    generators: List<CollectionGeneratorEntity>,
-    memberships: List<CollectionEntryEntity>,
-    specsById: Map<String, CollectionSpecEntity>,
-    comparisons: List<ComparisonEntity>,
-): Set<String> = buildSet {
-    logs.forEach { add(it.entryId) }
-    generators.mapNotNullTo(this) { it.currentEntryId }
-    memberships.forEach { mem ->
-        val role = specsById[mem.collectionId]?.let { CollectionRole.fromWireValue(it.role) }
-        if (role == CollectionRole.LIST || role == CollectionRole.WANT) {
-            add(mem.entryId)
-        }
-    }
-    comparisons.forEach { comp ->
-        comp.scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }?.let(::add)
-        decodeComparisonOrdering(comp.orderingJson)?.flatten()?.forEach { id ->
-            id.trim().takeIf { it.isNotEmpty() }?.let(::add)
-        }
-    }
-}
-
 private fun collectUnsyncedInboxOnlyIds(
     snap: OutgoingGraphSnapshot,
     catalogRefIds: Set<String>,
@@ -696,7 +817,14 @@ private fun selectOutgoingGenerators(
 private fun selectOutgoingTombstones(
     tombstones: List<TombstoneEntity>,
     isInitial: Boolean,
-): List<TombstoneEntity> = tombstones.filter { isInitial || it.isLocalDirty }
+): List<TombstoneEntity> =
+    tombstones
+        .filter { isInitial || it.isLocalDirty }
+        .sortedWith(
+            compareByDescending<TombstoneEntity> { it.isLocalDirty }
+                .thenComparator { a, b -> compareHlc(a.hlc, b.hlc) }
+        )
+        .take(MAX_SYNC_TOMBSTONES)
 
 private fun collectReferencedIdsFromSlices(
     memberships: List<CollectionEntryEntity>,
@@ -746,7 +874,10 @@ private fun selectEligibleOutgoingEntries(
         }
         .sortedWith(
             compareByDescending<EntryEntity> { entry ->
-                    isAnyPartDirty(entry, snap)
+                    isAnyPartDirty(entry, snap) || entry.id in snap.dirtyChildRefIds
+                }
+                .thenByDescending { entry ->
+                    entry.id in snap.specsById || entry.id in snap.feedSourcesById
                 }
                 .thenByDescending { snap.statesById[it.id]?.interactionUpdatedAt ?: it.updatedAt }
         )
@@ -844,6 +975,7 @@ private fun toSyncEntryRecordDto(
     entry: EntryEntity,
     snap: OutgoingGraphSnapshot,
     contentsById: Map<String, EntryContentEntity>,
+    identsByEntryId: Map<String, List<EntryIdentifierDto>>,
     unsyncedFeedIds: Set<String>,
 ): SyncEntryRecordDto {
     val isUnsyncedFeed = entry.id in unsyncedFeedIds
@@ -859,7 +991,7 @@ private fun toSyncEntryRecordDto(
     val rawFeedSource = if (isUnsyncedFeed) null else snap.feedSourcesById[entry.id]
     val safeUrl = resolveSafeOutgoingEntryUrl(entry.url, stripInboxPayload)
     val safeIdents =
-        filterSyncableIdentifiers(snap.identsByEntryId[entry.id].orEmpty(), stripInboxPayload)
+        filterSyncableIdentifiers(identsByEntryId[entry.id].orEmpty(), stripInboxPayload)
 
     return SyncEntryRecordDto(
         id = entry.id,
