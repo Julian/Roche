@@ -480,6 +480,67 @@ where
     }
 }
 
+/// RFC 9457-compliant optional JSON extractor: treats empty/whitespace bodies as `T::default()`,
+/// enforces `Content-Type: application/json` and [`RouteBodyLimit`] on non-empty bodies, and maps
+/// rejections into `application/problem+json`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OptionalProblemJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for OptionalProblemJson<T>
+where
+    T: DeserializeOwned + Default,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let max_bytes = req.extensions().get::<RouteBodyLimit>().map(|limit| limit.0);
+        let has_json_content_type =
+            req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(
+                |ct| {
+                    ct.split(';')
+                        .next()
+                        .map(str::trim)
+                        .is_some_and(|mime| mime.eq_ignore_ascii_case("application/json"))
+                },
+            );
+        let bytes = match axum::body::Bytes::from_request(req, state).await {
+            Ok(b) => b,
+            Err(rejection) => {
+                if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    return Err(max_bytes.map_or_else(
+                        || {
+                            ApiError::payload_too_large(
+                                "Request body exceeded maximum allowed size",
+                            )
+                        },
+                        |limit| {
+                            ApiError::payload_too_large_with_limit(
+                                format!(
+                                    "Request body exceeded maximum allowed size of {limit} bytes"
+                                ),
+                                limit,
+                            )
+                        },
+                    ));
+                }
+                return Err(ApiError::bad_request(rejection.body_text()));
+            }
+        };
+        if !bytes.iter().any(|b| !b.is_ascii_whitespace()) {
+            return Ok(Self(T::default()));
+        }
+        if !has_json_content_type {
+            return Err(ApiError::UnsupportedMediaType(
+                "Expected request with `Content-Type: application/json`".to_owned(),
+            ));
+        }
+        let parsed = serde_json::from_slice::<T>(&bytes)
+            .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?;
+        Ok(Self(parsed))
+    }
+}
+
 /// RFC 9457-compliant UTF-8 String body extractor that converts `StringRejection` into
 /// `application/problem+json` and attaches [`RouteBodyLimit`] to `413 Payload Too Large` responses.
 #[derive(Debug, Clone, Default)]

@@ -818,10 +818,29 @@ impl<'a> BoardRepo<'a> {
         offset: usize,
         limit: usize,
     ) -> Result<BoardItemsSlice> {
+        self.list_items_view_filtered(board_id, order_mode, include_dismissed, false, offset, limit)
+            .await
+    }
+
+    pub async fn list_items_view_filtered(
+        &self,
+        board_id: &str,
+        order_mode: BoardOrderMode,
+        include_dismissed: bool,
+        dismissed_only: bool,
+        offset: usize,
+        limit: usize,
+    ) -> Result<BoardItemsSlice> {
         let safe_limit = limit.max(1);
         let mut tx = crate::db::begin_read(self.pool).await?;
 
-        let count_sql = if include_dismissed {
+        let count_sql = if dismissed_only {
+            "SELECT COUNT(*)
+             FROM board_items bi
+             INNER JOIN board_item_states bis
+               ON bis.board_id = bi.board_id AND bis.external_id = bi.external_id
+             WHERE bi.board_id = ? AND bis.dismissed_at IS NOT NULL"
+        } else if include_dismissed {
             "SELECT COUNT(*) FROM board_items bi WHERE bi.board_id = ?"
         } else {
             "SELECT COUNT(*)
@@ -852,7 +871,9 @@ impl<'a> BoardRepo<'a> {
              WHERE bi.board_id = ",
         );
         qb.push_bind(board_id);
-        if !include_dismissed {
+        if dismissed_only {
+            qb.push(" AND bis.dismissed_at IS NOT NULL");
+        } else if !include_dismissed {
             qb.push(" AND bis.dismissed_at IS NULL");
         }
         qb.push(" ")

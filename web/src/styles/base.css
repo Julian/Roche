@@ -1,0 +1,212 @@
+/* Base Editorial Typography, Page Shell & Accessibility Defaults */
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 17px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "kern" 1, "liga" 1, "onum" 1;
+}
+
+body {
+  margin: 0 auto;
+  max-width: 84rem;
+  padding: 2.25rem 2.25rem 6rem;
+}
+
+html.has-player-bar,
+html:has(body.has-player-bar) {
+  scroll-padding-bottom: 10rem;
+}
+
+body.has-player-bar {
+  padding-bottom: 10rem;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0.5rem;
+  background: var(--ink);
+  color: var(--paper);
+  padding: 0.45rem 0.85rem;
+  font-size: 0.85rem;
+  text-decoration: none;
+  z-index: 100;
+}
+
+.skip-link:focus {
+  left: 0.5rem;
+}
+
+a:focus-visible,
+button:focus-visible,
+summary:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+audio:focus-visible,
+video:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+main#roche-main:focus {
+  outline: none;
+}
+
+main#roche-main:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+
+/* Headings & Links */
+
+h2 {
+  font-family: var(--display);
+  font-weight: 400;
+  font-size: 1.5rem;
+  letter-spacing: -0.005em;
+  margin: 2rem 0 0.4rem;
+  line-height: 1.2;
+}
+
+main > h2:first-child,
+section:first-child > h2:first-child {
+  margin-top: 0;
+}
+
+h3 {
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-feature-settings: "kern" 1, "liga" 1, "lnum" 1, "tnum" 1;
+  font-variant-numeric: lining-nums tabular-nums;
+  color: var(--ink-soft);
+  margin: 2rem 0 0.65rem;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 0.3rem;
+}
+
+p.lede,
+p.meta {
+  color: var(--ink-soft);
+  font-size: 0.92rem;
+  margin: 0.25rem 0 1.35rem;
+}
+
+p.lede em,
+p.meta em {
+  color: var(--ink);
+}
+
+a {
+  color: var(--link);
+  text-decoration: underline;
+  text-decoration-color: var(--control-border);
+  text-underline-offset: 0.18em;
+  text-decoration-thickness: 1px;
+  transition: color 120ms ease, text-decoration-color 120ms ease;
+}
+
+a:hover {
+  color: var(--link-hover);
+  text-decoration-color: var(--link-hover);
+}
+
+/* Accessibility Media Queries */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .rank-card.is-selected,
+  .pill.is-active {
+    outline: 2px solid Highlight;
+  }
+}
+
+@media (pointer: coarse) {
+  .btn-small,
+  .pill,
+  .util-btn {
+    min-height: 40px;
+  }
+  .item-byline a.board-comments-link {
+    min-height: 40px;
+    padding: 0.25rem 0.65rem;
+  }
+  .rail-icon-btn,
+  .inbox-star-btn,
+  .rank-controls .btn-small {
+    min-width: 42px;
+    min-height: 42px;
+  }
+}
+
+@media (max-width: 600px) {
+  html {
+    font-size: 16px;
+  }
+  html.has-player-bar,
+  html:has(body.has-player-bar) {
+    scroll-padding-bottom: 12.5rem;
+  }
+  body {
+    padding: 1.45rem 1.05rem 6.5rem;
+  }
+  body.has-player-bar {
+    padding-bottom: 12.5rem;
+  }
+}
+
+/* Server-rendered fallback HTML error pages (404 / 408 / 503) */
+.page-shell {
+  max-width: 44rem;
+  margin: 4rem auto;
+  padding: 0 1.25rem;
+}
+
+.empty-state {
+  padding: 2rem;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--paper-deep);
+}
+
+.empty-state .eyebrow {
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin: 0 0 0.4rem;
+}

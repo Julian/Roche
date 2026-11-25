@@ -8,8 +8,8 @@ use crate::{
 /// Transport-agnostic application error returned by all `service::*` operations.
 ///
 /// Normalizes `ConflictError`, `SsrfBlockedError`, `CatalogError`, and `sqlx` unique-constraint
-/// violations in one place so both `api::error::ApiError` and `web::html::WebError` can map
-/// directly without re-downcasting inner error chains.
+/// violations in one place so `api::error::ApiError` can map directly without re-downcasting
+/// inner error chains.
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("Bad request: {0}")]

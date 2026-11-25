@@ -24,6 +24,10 @@ local.properties
 *.iml
 android/app/src/release/generated/baselineProfiles/
 
+# Web frontend (Svelte + Vite) build artifacts
+/web/node_modules/
+/web/dist/
+
 # Web accessibility (Playwright) artifacts
 /web-a11y/node_modules/
 /web-a11y/playwright-report/

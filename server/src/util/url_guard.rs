@@ -1,6 +1,6 @@
 pub use roche_core::url_guard::{
-    SsrfBlockedError, bracket_ipv6_host, decode_percent_utf8, is_global_ip,
-    is_local_or_tailnet_domain, parse_public_url, sanitize_public_http_href, validate_public_url,
+    SsrfBlockedError, bracket_ipv6_host, decode_percent_utf8, is_global_ip, parse_public_url,
+    sanitize_public_http_href, validate_public_url,
 };
 
 /// Sanitizes an upstream fetch/parse error before returning it to HTTP clients or persisting it

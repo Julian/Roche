@@ -14,7 +14,7 @@ pub(super) const MAX_ITUNES_JSON_BYTES: usize = 512 * 1024;
 pub(super) const MAX_ALBUM_TRACKS: usize = 120;
 const MAX_DISCOGRAPHY_ALBUMS: usize = 40;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AlbumTrack {
     pub number: u32,
     pub disc: u32,
@@ -23,17 +23,6 @@ pub struct AlbumTrack {
     pub artists: Vec<String>,
     pub spotify_uri: Option<String>,
     pub entry_id: Option<String>,
-}
-
-impl AlbumTrack {
-    #[must_use]
-    pub fn spotify_web_url(&self) -> Option<String> {
-        let uri = self.spotify_uri.as_deref()?.trim();
-        let id = uri.strip_prefix("spotify:track:")?;
-        let valid =
-            !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric());
-        valid.then(|| format!("https://open.spotify.com/track/{id}"))
-    }
 }
 
 /// Returns the album's tracks from either explicit child `Song` entries or cached `metadata.tracks`.
@@ -196,7 +185,7 @@ pub fn parse_itunes_lookup_tracks(json_str: &str) -> Vec<AlbumTrack> {
     out
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DiscographyAlbum {
     pub title: String,
     pub release_year: Option<i32>,

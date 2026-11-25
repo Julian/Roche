@@ -1,208 +1,99 @@
-mod auth;
-mod html;
-mod links;
+pub mod auth;
+pub mod links;
 #[cfg(test)]
 mod tests;
-mod views_boards;
-mod views_catalog;
-mod views_home;
-mod views_rank;
-mod views_reader;
-mod views_search;
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, OnceLock},
 };
 
 use axum::{
     Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Query, Request, rejection::QueryRejection},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    extract::{
+        ConnectInfo, Path, Query, Request, State,
+        rejection::{ExtensionRejection, QueryRejection},
+    },
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{get, post},
+    response::{Html, IntoResponse, Response},
+    routing::get,
 };
 use serde::Deserialize;
-use tower_http::limit::RequestBodyLimitLayer;
 
+use self::auth::{
+    HOST_SESSION_COOKIE_NAME, append_session_set_cookies, authenticate_request_session,
+    extract_named_cookie, extract_theme_cookie, has_logged_out_cookie,
+    is_navigational_tailscale_auto_login, redirect_see_other, safe_login_return_to, urlencode,
+    verified_tailscale_login,
+};
 use crate::{
+    content::reader_html::Esc,
     service::RocheService,
-    util::{hash::sha256_hex, http_security::is_forwarded_https},
+    util::{hash::sha256_bytes_hex, http_security::is_forwarded_https},
 };
 
-const ROCHE_CSS: &str = include_str!("roche.css");
-const ROCHE_JS: &str = include_str!("roche.js");
-const MAX_WEB_FORM_BODY_BYTES: usize = 128 * 1024;
-const MAX_WEB_OPML_BODY_BYTES: usize = 4 * 1024 * 1024;
-const OPML_UPLOAD_PATH: &str = "/web/feeds/opml";
+mod spa_assets {
+    include!(concat!(env!("OUT_DIR"), "/spa_assets.rs"));
+}
 
-struct StaticAssetMeta {
-    version: String,
+struct CompiledAsset {
+    asset: &'static spa_assets::EmbeddedAsset,
     etag: HeaderValue,
-    href: String,
 }
 
-fn build_asset_meta(path: &str, body: &str) -> StaticAssetMeta {
-    let digest = sha256_hex(body);
-    let version = digest[..12].to_owned();
-    // Weak ETag per RFC 9110 §8.8.3.3 because `CompressionLayer` may serve gzip/br/zstd or
-    // identity representations for the same underlying asset.
-    let etag_raw = format!("W/\"{version}\"");
-    let etag = HeaderValue::from_str(&etag_raw)
-        .unwrap_or_else(|_| HeaderValue::from_static("W/\"roche\""));
-    let href = format!("{path}?v={version}");
-    StaticAssetMeta { version, etag, href }
-}
-
-fn css_asset_meta() -> &'static StaticAssetMeta {
-    static META: OnceLock<StaticAssetMeta> = OnceLock::new();
-    META.get_or_init(|| build_asset_meta("/static/roche.css", ROCHE_CSS))
-}
-
-fn js_asset_meta() -> &'static StaticAssetMeta {
-    static META: OnceLock<StaticAssetMeta> = OnceLock::new();
-    META.get_or_init(|| build_asset_meta("/static/roche.js", ROCHE_JS))
-}
-
-fn css_href() -> &'static str {
-    &css_asset_meta().href
-}
-
-fn js_href() -> &'static str {
-    &js_asset_meta().href
+fn asset_index() -> &'static HashMap<&'static str, CompiledAsset> {
+    static INDEX: OnceLock<HashMap<&'static str, CompiledAsset>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut map = HashMap::with_capacity(spa_assets::EMBEDDED_ASSETS.len());
+        for asset in spa_assets::EMBEDDED_ASSETS {
+            let digest = sha256_bytes_hex(asset.bytes);
+            let version = &digest[..12];
+            // Weak ETag per RFC 9110 §8.8.3.3 because `CompressionLayer` may serve gzip/br/zstd or
+            // identity representations for the same underlying asset.
+            let etag_raw = format!("W/\"{version}\"");
+            let etag = HeaderValue::from_str(&etag_raw)
+                .unwrap_or_else(|_| HeaderValue::from_static("W/\"roche\""));
+            map.insert(asset.path, CompiledAsset { asset, etag });
+        }
+        map
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct StaticAssetQuery {
+struct LoginQuery {
     #[serde(default)]
-    v: Option<String>,
+    return_to: Option<String>,
 }
 
 pub fn router(service: Arc<RocheService>) -> Router<Arc<RocheService>> {
-    let static_routes = Router::new()
-        .route("/static/roche.css", get(serve_css))
-        .route("/static/roche.js", get(serve_js));
-
-    let public_login = Router::new()
-        .route("/login", get(auth::login_get).post(auth::login_post))
-        .route("/login/tailscale", post(auth::login_tailscale_post))
-        .layer(DefaultBodyLimit::max(16 * 1024))
-        .layer(RequestBodyLimitLayer::new(16 * 1024));
-
-    let opml_upload = Router::new()
-        .route(OPML_UPLOAD_PATH, post(views_reader::post_feed_opml))
-        .route_layer(middleware::from_fn_with_state(
-            Arc::clone(&service),
-            auth::require_web_auth_and_csrf,
-        ))
-        .layer(DefaultBodyLimit::max(MAX_WEB_OPML_BODY_BYTES))
-        .layer(RequestBodyLimitLayer::new(MAX_WEB_OPML_BODY_BYTES));
-
-    let protected = Router::new()
-        .route("/logout", post(auth::logout_post))
-        // Home, Global Search & Active Collection Draws
-        .route("/", get(views_home::home_get))
-        .route("/search", get(views_search::search_get))
-        .route("/web/lists/{slug}/generator/toggle", post(views_home::post_generator_toggle))
-        .route("/web/lists/{slug}/generator/finish", post(views_home::post_generator_finish))
-        .route("/web/lists/{slug}/generator/abandon", post(views_home::post_generator_abandon))
-        // Reader, Inbox, Boards, Starred, Feeds & Media Streaming
-        .route("/inbox", get(views_reader::inbox_get))
-        .merge(board_web_routes())
-        .route("/starred", get(views_reader::starred_get))
-        .route("/feeds", get(views_reader::feeds_get))
-        .route("/reader/{id}", get(views_reader::reader_get))
-        .route("/web/items/{id}/audio", get(views_reader::item_audio_get))
-        .route("/web/media/{id}", get(views_reader::web_media_get))
-        .route("/web/feeds/export.opml", get(views_reader::export_opml_get))
-        .route("/web/items/save", post(views_reader::post_item_save))
-        .route("/web/items/archive-batch", post(views_reader::post_item_archive_batch))
-        .route("/web/items/dismiss-batch", post(views_reader::post_item_archive_batch))
-        .route("/web/items/{id}/star", post(views_reader::post_item_star))
-        .route("/web/items/{id}/archive", post(views_reader::post_item_archive))
-        .route("/web/items/{id}/dismiss", post(views_reader::post_item_archive))
-        .route("/web/items/{id}/unarchive", post(views_reader::post_item_unarchive))
-        .route("/web/items/{id}/mark-new", post(views_reader::post_item_unarchive))
-        .route("/web/items/{id}/progress", post(views_reader::post_item_progress))
-        .route("/web/items/{id}/finish", post(views_reader::post_item_finish))
-        .route("/web/items/{id}/unfinish", post(views_reader::post_item_unfinish))
-        .route("/web/items/{id}/tags", post(views_reader::post_item_tag_add))
-        .route("/web/items/{id}/tags/{tag_id}/remove", post(views_reader::post_item_tag_remove))
-        .route("/web/feeds/create", post(views_reader::post_feed_create))
-        .route("/web/feeds/refresh-all", post(views_reader::post_feed_refresh_all))
-        .route("/web/feeds/{id}/refresh", post(views_reader::post_feed_refresh))
-        .route("/web/feeds/{id}/edit", post(views_reader::post_feed_edit))
-        .route("/web/feeds/{id}/toggle-active", post(views_reader::post_feed_toggle_active))
-        .route("/web/feeds/{id}/delete", post(views_reader::post_feed_delete))
-        .route("/web/refresh-status", get(views_reader::refresh_status_get))
-        // Catalog Lists, Entries, Diary, Want Queues & Ranking
-        .route("/lists", get(views_catalog::lists_get))
-        .route("/web/lists/create", post(views_catalog::post_list_create))
-        .route("/lists/{slug}", get(views_catalog::list_detail_get))
-        .route("/web/lists/{slug}/add", post(views_catalog::post_list_add_entry))
-        .route("/web/lists/{slug}/remove/{entry_id}", post(views_catalog::post_list_remove_entry))
-        .route("/entries/{id}", get(views_catalog::entry_detail_get))
-        .route("/web/entries/{id}/edit", post(views_catalog::post_entry_edit))
-        .route(
-            "/web/entries/{id}/refresh-metadata",
-            post(views_catalog::post_entry_refresh_metadata),
-        )
-        .route("/web/entries/{id}/log", post(views_catalog::post_entry_log))
-        .route("/web/entries/{id}/list-add", post(views_catalog::post_entry_list_add))
-        .route("/web/entries/{id}/queue-toggle", post(views_catalog::post_entry_queue_toggle))
-        .route("/web/entries/{id}/enrich", post(views_catalog::post_entry_enrich))
-        .route("/web/entries/{id}/add-album", post(views_catalog::post_artist_add_album))
-        .route("/web/entries/{id}/merge", post(views_catalog::post_entry_merge))
-        .route("/diary", get(views_catalog::diary_get))
-        .route("/web/diary/{id}/edit", post(views_catalog::post_diary_edit))
-        .route("/web/diary/{id}/delete", post(views_catalog::post_diary_delete))
-        .route("/queue", get(views_catalog::queue_get))
-        .route("/web/log", post(views_catalog::post_quick_log))
-        .route("/web/want/{queue}/complete/{entry_id}", post(views_catalog::post_want_complete))
-        .route("/web/want/{queue}/remove/{entry_id}", post(views_catalog::post_want_remove))
-        .route("/rank", get(views_rank::rank_picker_get))
-        .route(
-            "/rank/{slug}",
-            get(views_rank::rank_session_get).post(views_rank::rank_session_post),
-        )
-        .route("/web/comparisons/{id}/undo", post(views_rank::post_comparison_undo))
-        .route_layer(middleware::from_fn_with_state(service, auth::require_web_auth_and_csrf))
-        .layer(DefaultBodyLimit::max(MAX_WEB_FORM_BODY_BYTES))
-        .layer(RequestBodyLimitLayer::new(MAX_WEB_FORM_BODY_BYTES));
-
     Router::new()
-        .merge(static_routes)
-        .merge(public_login)
-        .merge(protected)
-        .merge(opml_upload)
+        // Embedded Vite static assets
+        .route("/assets/{*path}", get(serve_vite_asset))
+        .route("/favicon.svg", get(serve_favicon))
+        // Public login SPA route (redirects away if already authenticated)
+        .route("/login", get(spa_login_get))
+        // Canonical redirects for legacy shortcuts
+        .route("/starred", get(spa_redirect_starred))
+        .route("/rank", get(spa_redirect_rank))
+        // Protected SPA routes
+        .route("/", get(spa_shell_get))
+        .route("/search", get(spa_shell_get))
+        .route("/inbox", get(spa_shell_get))
+        .route("/feeds", get(spa_shell_get))
+        .route("/reader/{id}", get(spa_shell_get))
+        .route("/boards", get(spa_shell_get))
+        .route("/boards/{id}", get(spa_shell_get))
+        .route("/boards/{id}/read/{external_id}", get(spa_shell_get))
+        .route("/lists", get(spa_shell_get))
+        .route("/lists/{slug}", get(spa_shell_get))
+        .route("/entries/{id}", get(spa_shell_get))
+        .route("/diary", get(spa_shell_get))
+        .route("/queue", get(spa_shell_get))
+        .route("/rank/{slug}", get(spa_shell_get))
         .route_layer(middleware::from_fn(attach_web_security_headers))
-}
-
-fn board_web_routes() -> Router<Arc<RocheService>> {
-    Router::new()
-        .route("/boards", get(views_boards::boards_get))
-        .route("/boards/{id}", get(views_boards::board_detail_get))
-        .route("/boards/{id}/read/{external_id}", get(views_boards::board_reader_get))
-        .route("/web/boards/create", post(views_boards::post_board_create))
-        .route("/web/boards/refresh-all", post(views_boards::post_board_refresh_all))
-        .route("/web/boards/{id}/items", get(views_boards::board_items_fragment_get))
-        .route("/web/boards/{id}/refresh", post(views_boards::post_board_refresh))
-        .route("/web/boards/{id}/edit", post(views_boards::post_board_edit))
-        .route("/web/boards/{id}/toggle-active", post(views_boards::post_board_toggle_active))
-        .route("/web/boards/{id}/delete", post(views_boards::post_board_delete))
-        .route(
-            "/web/boards/{id}/items/{external_id}/dismiss",
-            post(views_boards::post_board_item_dismiss),
-        )
-        .route(
-            "/web/boards/{id}/items/{external_id}/undismiss",
-            post(views_boards::post_board_item_undismiss),
-        )
-        .route(
-            "/web/boards/{id}/items/{external_id}/promote",
-            post(views_boards::post_board_item_promote),
-        )
+        .with_state(service)
 }
 
 fn strip_weak_etag_prefix(tag: &str) -> &str {
@@ -222,24 +113,21 @@ fn if_none_match_matches(headers: &HeaderMap, etag: &HeaderValue) -> bool {
     })
 }
 
-fn serve_static_asset(
-    headers: &HeaderMap,
-    query: Option<&StaticAssetQuery>,
-    meta: &'static StaticAssetMeta,
-    content_type: &'static str,
-    body: &'static str,
-) -> Response {
-    let cache_control = if query.and_then(|q| q.v.as_deref()) == Some(meta.version.as_str()) {
+fn serve_embedded_path(path: &str, headers: &HeaderMap) -> Response {
+    let Some(entry) = asset_index().get(path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let cache_control = if entry.asset.immutable {
         HeaderValue::from_static("public, max-age=31536000, immutable")
     } else {
         HeaderValue::from_static("public, max-age=3600")
     };
     let vary = HeaderValue::from_static("Accept-Encoding");
-    if if_none_match_matches(headers, &meta.etag) {
+    if if_none_match_matches(headers, &entry.etag) {
         return (
             StatusCode::NOT_MODIFIED,
             [
-                (header::ETAG, meta.etag.clone()),
+                (header::ETAG, entry.etag.clone()),
                 (header::CACHE_CONTROL, cache_control),
                 (header::VARY, vary),
             ],
@@ -248,36 +136,166 @@ fn serve_static_asset(
     }
     (
         [
-            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
-            (header::ETAG, meta.etag.clone()),
+            (header::CONTENT_TYPE, HeaderValue::from_static(entry.asset.content_type)),
+            (header::ETAG, entry.etag.clone()),
             (header::CACHE_CONTROL, cache_control),
             (header::VARY, vary),
         ],
-        body,
+        entry.asset.bytes,
     )
         .into_response()
 }
 
-async fn serve_css(
-    headers: HeaderMap,
-    query: Result<Query<StaticAssetQuery>, QueryRejection>,
-) -> Response {
-    let q = query.ok().map(|Query(q)| q);
-    serve_static_asset(&headers, q.as_ref(), css_asset_meta(), "text/css; charset=utf-8", ROCHE_CSS)
+async fn serve_vite_asset(Path(path): Path<String>, headers: HeaderMap) -> Response {
+    let full = format!("/assets/{path}");
+    serve_embedded_path(&full, &headers)
 }
 
-async fn serve_js(
+async fn serve_favicon(headers: HeaderMap) -> Response {
+    serve_embedded_path("/favicon.svg", &headers)
+}
+
+fn render_spa_index_html(theme: Option<&'static str>) -> Html<String> {
+    let html = theme.map_or_else(
+        || spa_assets::INDEX_HTML.to_owned(),
+        |t| {
+            let replacement = format!("<html lang=\"en\" data-theme=\"{t}\">");
+            spa_assets::INDEX_HTML.replacen("<html lang=\"en\">", &replacement, 1)
+        },
+    );
+    Html(html)
+}
+
+enum ShellAuthOutcome {
+    Authenticated { newly_minted_token: Option<String>, secure: bool, had_host_session: bool },
+    RedirectToLogin(Response),
+}
+
+async fn check_spa_shell_auth(
+    service: &RocheService,
+    peer_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> ShellAuthOutcome {
+    let secure = is_forwarded_https(peer_addr, headers);
+    let had_host_session = extract_named_cookie(headers, HOST_SESSION_COOKIE_NAME).is_some();
+
+    if authenticate_request_session(service, headers, secure).await.is_some() {
+        return ShellAuthOutcome::Authenticated {
+            newly_minted_token: None,
+            secure,
+            had_host_session,
+        };
+    }
+
+    if !has_logged_out_cookie(headers, secure)
+        && is_navigational_tailscale_auto_login(headers)
+        && let Some(ts_login) = verified_tailscale_login(service, peer_addr, headers)
+        && let Ok(minted) = service.auth().mint_tailscale_web_session(&ts_login).await
+    {
+        return ShellAuthOutcome::Authenticated {
+            newly_minted_token: Some(minted),
+            secure,
+            had_host_session,
+        };
+    }
+
+    let return_to =
+        safe_login_return_to(uri.path_and_query().map(axum::http::uri::PathAndQuery::as_str));
+    let dest = if return_to == "/" {
+        "/login".to_owned()
+    } else {
+        format!("/login?return_to={}", urlencode(&return_to))
+    };
+    ShellAuthOutcome::RedirectToLogin(redirect_see_other(&dest))
+}
+
+async fn spa_login_get(
+    State(service): State<Arc<RocheService>>,
+    connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     headers: HeaderMap,
-    query: Result<Query<StaticAssetQuery>, QueryRejection>,
+    query: Result<Query<LoginQuery>, QueryRejection>,
 ) -> Response {
-    let q = query.ok().map(|Query(q)| q);
-    serve_static_asset(
-        &headers,
-        q.as_ref(),
-        js_asset_meta(),
-        "application/javascript; charset=utf-8",
-        ROCHE_JS,
-    )
+    let return_to =
+        safe_login_return_to(query.ok().as_ref().and_then(|Query(q)| q.return_to.as_deref()));
+    let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
+    let secure = is_forwarded_https(peer_addr, &headers);
+    let theme = extract_theme_cookie(&headers);
+
+    if authenticate_request_session(&service, &headers, secure).await.is_some() {
+        return redirect_see_other(&return_to);
+    }
+
+    let had_host_session = extract_named_cookie(&headers, HOST_SESSION_COOKIE_NAME).is_some();
+    if !has_logged_out_cookie(&headers, secure)
+        && is_navigational_tailscale_auto_login(&headers)
+        && let Some(ts_login) = verified_tailscale_login(&service, peer_addr, &headers)
+        && let Ok(minted) = service.auth().mint_tailscale_web_session(&ts_login).await
+    {
+        let mut resp = redirect_see_other(&return_to);
+        append_session_set_cookies(&mut resp, &minted, secure, had_host_session);
+        return resp;
+    }
+
+    render_spa_index_html(theme).into_response()
+}
+
+async fn spa_shell_get(
+    State(service): State<Arc<RocheService>>,
+    connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
+    let theme = extract_theme_cookie(&headers);
+    match check_spa_shell_auth(&service, peer_addr, &headers, &uri).await {
+        ShellAuthOutcome::RedirectToLogin(resp) => resp,
+        ShellAuthOutcome::Authenticated { newly_minted_token, secure, had_host_session } => {
+            let mut resp = render_spa_index_html(theme).into_response();
+            if let Some(minted) = newly_minted_token {
+                append_session_set_cookies(&mut resp, &minted, secure, had_host_session);
+            }
+            resp
+        }
+    }
+}
+
+async fn spa_redirect_starred(
+    State(service): State<Arc<RocheService>>,
+    connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
+    match check_spa_shell_auth(&service, peer_addr, &headers, &uri).await {
+        ShellAuthOutcome::RedirectToLogin(resp) => resp,
+        ShellAuthOutcome::Authenticated { newly_minted_token, secure, had_host_session } => {
+            let mut resp = redirect_see_other("/lists/starred");
+            if let Some(minted) = newly_minted_token {
+                append_session_set_cookies(&mut resp, &minted, secure, had_host_session);
+            }
+            resp
+        }
+    }
+}
+
+async fn spa_redirect_rank(
+    State(service): State<Arc<RocheService>>,
+    connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
+    match check_spa_shell_auth(&service, peer_addr, &headers, &uri).await {
+        ShellAuthOutcome::RedirectToLogin(resp) => resp,
+        ShellAuthOutcome::Authenticated { newly_minted_token, secure, had_host_session } => {
+            let mut resp = redirect_see_other("/lists");
+            if let Some(minted) = newly_minted_token {
+                append_session_set_cookies(&mut resp, &minted, secure, had_host_session);
+            }
+            resp
+        }
+    }
 }
 
 const WEB_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; media-src 'self' https: http:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'";
@@ -311,23 +329,51 @@ fn apply_web_security_headers(resp: &mut Response, forwarded_https: bool) {
     }
 }
 
-/// Renders a browser-friendly HTML error page with full web security headers.
+/// Renders a browser-friendly HTML error page with full web security headers and zero inline CSS/JS.
 #[must_use]
 pub fn render_status_html(
     status: StatusCode,
     heading: &str,
     detail: &str,
-    headers: &axum::http::HeaderMap,
+    headers: &HeaderMap,
 ) -> Response {
-    let theme = auth::extract_theme_cookie(headers);
-    let mut resp = html::render_error_page(status, heading, detail, None, theme);
+    let theme_attr =
+        extract_theme_cookie(headers).map_or_else(String::new, |t| format!(" data-theme=\"{t}\""));
+    let css_link = spa_assets::MAIN_CSS_HREF
+        .map_or_default(|href| format!("<link rel=\"stylesheet\" href=\"{href}\" />"));
+    let code = status.as_u16();
+    let body = format!(
+        "<!doctype html>\
+         <html lang=\"en\"{theme_attr}>\
+         <head>\
+           <meta charset=\"utf-8\" />\
+           <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\
+           <title>{heading} — Roche</title>\
+           <link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\" />\
+           {css_link}\
+         </head>\
+         <body>\
+           <main class=\"page-shell\">\
+             <section class=\"empty-state\">\
+               <p class=\"eyebrow\">HTTP {code}</p>\
+               <h1>{heading}</h1>\
+               <p>{detail}</p>\
+               <p><a class=\"btn btn-primary\" href=\"/\">Return to Roche</a></p>\
+             </section>\
+           </main>\
+         </body>\
+         </html>",
+        heading = Esc(heading),
+        detail = Esc(detail),
+    );
+    let mut resp = (status, Html(body)).into_response();
     apply_web_security_headers(&mut resp, false);
     resp
 }
 
 /// Renders a browser-friendly HTML 404 page with full web security headers.
 #[must_use]
-pub fn render_not_found_html(headers: &axum::http::HeaderMap) -> Response {
+pub fn render_not_found_html(headers: &HeaderMap) -> Response {
     render_status_html(
         StatusCode::NOT_FOUND,
         "Not Found",
@@ -339,27 +385,7 @@ pub fn render_not_found_html(headers: &axum::http::HeaderMap) -> Response {
 async fn attach_web_security_headers(req: Request, next: Next) -> Response {
     let peer_addr = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0);
     let forwarded_https = is_forwarded_https(peer_addr, req.headers());
-    let theme = auth::extract_theme_cookie(req.headers());
     let mut resp = next.run(req).await;
-    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        let is_html = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("text/html"));
-        if !is_html {
-            resp = html::render_error_page(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Payload Too Large",
-                "The submitted request exceeded the maximum allowed size.",
-                None,
-                theme,
-            );
-        }
-    }
-    if let Some(pending_flash) = resp.extensions_mut().remove::<html::PendingFlash>() {
-        auth::append_flash_set_cookie(&mut resp, &pending_flash, forwarded_https);
-    }
     apply_web_security_headers(&mut resp, forwarded_https);
     resp
 }

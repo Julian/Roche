@@ -1,0 +1,340 @@
+/* Reader Prose, Warm Editorial Syntax Tokens & Native HTML5 MathML Styling */
+
+.reader-prose {
+  font-size: 1.06rem;
+  line-height: 1.72;
+  color: var(--ink);
+  overflow-wrap: break-word;
+}
+
+.reader-article[data-reader-size="0"] .reader-prose { font-size: 0.95rem; }
+.reader-article[data-reader-size="1"] .reader-prose { font-size: 1.06rem; }
+.reader-article[data-reader-size="2"] .reader-prose { font-size: 1.18rem; }
+.reader-article[data-reader-size="3"] .reader-prose { font-size: 1.3rem; }
+
+.reader-prose p {
+  margin: 0 0 1.1em;
+}
+
+.reader-prose p:empty {
+  display: none;
+}
+
+.reader-prose ul,
+.reader-prose ol {
+  margin: 0.9em 0 1.15em;
+  padding-left: 1.6rem;
+}
+
+.reader-prose li {
+  margin-bottom: 0.42em;
+}
+
+.reader-prose li > p {
+  margin: 0 0 0.55em;
+}
+
+.reader-prose li > p:last-child {
+  margin-bottom: 0;
+}
+
+.reader-prose li > ul,
+.reader-prose li > ol {
+  margin: 0.4em 0;
+}
+
+.reader-prose dl {
+  margin: 1rem 0 1.25rem;
+}
+
+.reader-prose dt {
+  font-weight: 600;
+  color: var(--ink);
+  margin-top: 0.85em;
+}
+
+.reader-prose dd {
+  margin: 0.2em 0 0.65em 1.4rem;
+}
+
+.reader-prose sup,
+.reader-prose sub {
+  font-size: 0.74em;
+  line-height: 0;
+  position: relative;
+  vertical-align: baseline;
+}
+
+.reader-prose sup { top: -0.45em; }
+.reader-prose sub { bottom: -0.25em; }
+
+.reader-prose [id] {
+  scroll-margin-top: 76px;
+}
+
+.reader-prose sup a,
+.reader-prose a[href^="#prose-"] {
+  text-decoration: none;
+  padding: 0 0.1em;
+}
+
+.reader-prose sup a:hover,
+.reader-prose a[href^="#prose-"]:hover {
+  text-decoration: underline;
+}
+
+.reader-prose small {
+  font-size: 0.88em;
+  color: var(--ink-soft);
+}
+
+.reader-prose mark {
+  background: var(--badge-bg);
+  color: var(--ink);
+  padding: 0.05em 0.25em;
+  border-radius: 2px;
+  border-bottom: 1.5px solid var(--accent);
+}
+
+.reader-prose del,
+.reader-prose s {
+  color: var(--ink-soft);
+}
+
+.reader-prose ins {
+  text-decoration: underline;
+  text-decoration-color: var(--tier-A);
+  text-underline-offset: 0.16em;
+}
+
+.reader-prose kbd {
+  font-family: var(--mono);
+  font-size: 0.82em;
+  background: var(--paper-deep);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 0.08em 0.32em;
+}
+
+.reader-prose abbr[title] {
+  text-decoration: underline dotted var(--control-border);
+  text-underline-offset: 0.16em;
+  cursor: help;
+}
+
+.reader-prose details {
+  border: 1px solid var(--rule);
+  background: var(--paper-deep);
+  padding: 0.6rem 0.9rem;
+  margin: 1.1rem 0;
+  border-radius: 2px;
+}
+
+.reader-prose details > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.reader-prose details[open] > summary {
+  margin-bottom: 0.65rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.reader-prose h1,
+.reader-prose h2,
+.reader-prose h3 {
+  font-family: var(--display);
+  font-size: 1.42rem;
+  font-weight: 600;
+  line-height: 1.25;
+  text-transform: none;
+  letter-spacing: -0.005em;
+  color: var(--ink);
+  border-bottom: none;
+  padding-bottom: 0;
+  margin: 2rem 0 0.65rem;
+}
+
+.reader-prose h4 {
+  font-family: var(--display);
+  font-size: 1.18rem;
+  font-weight: 600;
+  line-height: 1.3;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--ink);
+  border-bottom: none;
+  padding-bottom: 0;
+  margin: 1.65rem 0 0.5rem;
+}
+
+.reader-prose h5 {
+  font-family: var(--serif);
+  font-size: 1.05rem;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--ink-soft);
+  margin: 1.35rem 0 0.4rem;
+}
+
+.reader-prose h6 {
+  font-family: var(--serif);
+  font-size: 0.96rem;
+  font-weight: 600;
+  font-style: italic;
+  color: var(--ink-soft);
+  margin: 1.2rem 0 0.35rem;
+}
+
+.reader-prose hr {
+  border: none;
+  border-top: 1px solid var(--rule);
+  margin: 2rem auto;
+  width: 40%;
+}
+
+.reader-prose figure {
+  margin: 1.4rem 0;
+}
+
+.reader-prose figcaption {
+  font-size: 0.84rem;
+  font-style: italic;
+  color: var(--ink-faint);
+  margin-top: 0.4rem;
+}
+
+.reader-prose img,
+.reader-prose video {
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--rule-soft);
+  border-radius: 2px;
+  margin: 1rem 0;
+}
+
+.reader-prose blockquote {
+  margin: 1.35rem 0;
+  padding: 0.2rem 0 0.2rem 1.15rem;
+  border-left: 2.5px solid var(--accent);
+  color: var(--ink-soft);
+  font-style: italic;
+}
+
+.reader-prose blockquote > p:last-child {
+  margin-bottom: 0;
+}
+
+.reader-prose blockquote em,
+.reader-prose blockquote i,
+.reader-prose blockquote cite,
+.reader-prose blockquote dfn,
+.reader-prose figcaption em,
+.reader-prose figcaption i {
+  font-style: normal;
+}
+
+.reader-prose blockquote > cite,
+.reader-prose blockquote > footer {
+  display: block;
+  margin-top: 0.55rem;
+  font-style: normal;
+  font-size: 0.88em;
+  color: var(--ink-faint);
+}
+
+.reader-prose pre {
+  background: var(--paper-deep);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 0.85rem 1rem;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  margin: 1.25rem 0;
+}
+
+.reader-prose code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  background: var(--paper-deep);
+  padding: 0.08rem 0.28rem;
+  border-radius: 2px;
+}
+
+.reader-prose pre code {
+  background: none;
+  padding: 0;
+}
+
+.reader-prose table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 1.2rem 0;
+}
+
+.reader-prose th,
+.reader-prose td {
+  border: 1px solid var(--rule);
+  padding: 0.35rem 0.55rem;
+  text-align: left;
+}
+
+.reader-prose th {
+  background: var(--paper-deep);
+  font-weight: 600;
+}
+
+.reader-prose table caption {
+  font-size: 0.88em;
+  font-style: italic;
+  color: var(--ink-soft);
+  text-align: left;
+  margin-bottom: 0.4rem;
+}
+
+/* Warm editorial syntax tokens */
+.syn-cm { color: var(--ink-faint); font-style: italic; }
+.syn-kw { color: var(--accent); font-weight: 600; }
+.syn-str { color: var(--tier-A); }
+.syn-num { color: var(--tier-B); }
+.syn-fn { color: var(--link); }
+
+/* Native HTML5 MathML editorial styling */
+math {
+  font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", math, serif;
+  font-size: 1.03em;
+}
+
+h2 math,
+.entry-hero-main h2 math,
+.reader-header h2 math {
+  font-size: 0.98em;
+  font-weight: 400;
+}
+
+.reader-prose math[display="block"] {
+  display: block;
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-width: 100%;
+  padding: 0.35rem 0;
+}
+
+.reader-prose figure.paper-equation {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1.15rem 0;
+  padding: 0.5rem 0.75rem;
+  background: var(--paper-deep);
+  border-left: 2px solid var(--rule);
+  border-radius: 2px;
+  overflow-x: auto;
+}

@@ -158,7 +158,6 @@ impl Drop for ActiveRefreshGuard {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RefreshAllSourcesOutcome {
     pub feeds: usize,
@@ -293,13 +292,56 @@ impl RocheService {
 
     /// Triggers background refreshes for all active feeds AND all active boards (used by global
     /// masthead Refresh).
-    #[allow(dead_code)]
     pub async fn refresh_all_sources_in_background(
         &self,
     ) -> Result<RefreshAllSourcesOutcome, AppError> {
         let feeds = self.feeds().refresh_all_in_background().await?;
         let boards = self.boards().refresh_all_in_background().await?;
         Ok(RefreshAllSourcesOutcome { feeds, boards, total: feeds.saturating_add(boards) })
+    }
+
+    /// Computes exact per-month diary counts (`(month_1_to_12, count)`) for `year` in SQL so
+    /// monthly cadence charts remain exact even across multi-page (>200 entry) diary years.
+    pub async fn diary_month_counts_for_year(
+        &self,
+        year: i32,
+        status: Option<crate::domain::ConsumptionStatus>,
+        kind_filter: crate::db::DiaryKindFilter,
+    ) -> Result<Vec<(u32, usize)>, AppError> {
+        use sqlx::{QueryBuilder, Sqlite};
+
+        let year_str = format!("{year:04}");
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT CAST(strftime('%m', cl.ts) AS INTEGER) AS mo, COUNT(*) AS cnt
+             FROM entries e
+             CROSS JOIN consumption_log cl ON cl.entry_id = e.id
+             WHERE e.merged_into_id IS NULL
+               AND strftime('%Y', cl.ts) = ",
+        );
+        qb.push_bind(year_str);
+        match kind_filter {
+            crate::db::DiaryKindFilter::DefaultNonSong => {
+                qb.push(" AND e.kind != 'song'");
+            }
+            crate::db::DiaryKindFilter::Only(k) => {
+                qb.push(" AND e.kind = ").push_bind(k);
+            }
+            crate::db::DiaryKindFilter::All => {}
+        }
+        if let Some(st) = status {
+            qb.push(" AND cl.status = ").push_bind(st);
+        }
+        qb.push(" AND strftime('%m', cl.ts) IS NOT NULL GROUP BY mo ORDER BY mo ASC");
+        let mut tx = self.db.begin_read().await.map_err(anyhow::Error::from)?;
+        let rows: Vec<(i64, i64)> =
+            qb.build_query_as().fetch_all(tx.conn()).await.map_err(anyhow::Error::from)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(mo, cnt)| {
+                let m = u32::try_from(mo).ok()?;
+                (1..=12).contains(&m).then(|| (m, usize::try_from(cnt).unwrap_or(0)))
+            })
+            .collect())
     }
 
     #[must_use]

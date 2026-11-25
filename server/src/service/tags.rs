@@ -10,10 +10,6 @@ impl TagService<'_> {
         Ok(self.service.db.tags().list().await?)
     }
 
-    pub async fn list_id_name_pairs(&self) -> Result<Vec<(String, String)>, AppError> {
-        Ok(self.service.db.tags().list_id_name_pairs().await?)
-    }
-
     pub async fn get(&self, id: &str) -> Result<Tag, AppError> {
         self.service.db.tags().get(id).await?.ok_or_else(|| AppError::not_found("Tag not found"))
     }

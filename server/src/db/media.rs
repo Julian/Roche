@@ -16,6 +16,7 @@ pub struct Media {
     pub id: String,
     pub item_id: String,
     pub media_type: MediaType,
+    #[serde(default, skip_serializing)]
     pub path: String,
     pub file_size: Option<i64>,
     pub duration: Option<i64>,

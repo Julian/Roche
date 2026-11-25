@@ -176,7 +176,7 @@ pub struct RankedCollectionPage {
 }
 
 /// Summary of an entry's rank, list size, and optional quality tier on a global list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EntryListAppearance {
     pub slug: String,
     pub title: String,

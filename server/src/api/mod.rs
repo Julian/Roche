@@ -9,6 +9,7 @@ mod sync;
 mod tags;
 #[cfg(test)]
 mod tests;
+mod web_views;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -85,11 +86,17 @@ impl ApiRoutes {
 
         let protected = Self::with_body_limit(
             Router::new()
-                // Auth Devices
+                // Auth Devices & Browser Logout
                 .route("/api/v1/auth/devices", get(auth::devices_list))
                 .route("/api/v1/auth/devices/{id}", delete(auth::devices_revoke))
+                .route("/api/v1/auth/logout", post(auth::auth_logout_post))
+                // Dashboard, Global Refresh & Rich Search
+                .route("/api/v1/home", get(web_views::home_get))
+                .route("/api/v1/refresh-all", post(web_views::refresh_all_sources))
+                .route("/api/v1/search/rich", get(web_views::search_rich_get))
                 // Feeds
                 .route("/api/v1/feeds", get(feeds::feeds_list).post(feeds::feeds_create))
+                .route("/api/v1/feeds/refresh-all", post(feeds::feeds_refresh_all))
                 .route(
                     "/api/v1/feeds/{id}",
                     get(feeds::feeds_get).patch(feeds::feeds_update).delete(feeds::feeds_delete),
@@ -100,6 +107,7 @@ impl ApiRoutes {
                 .route("/api/v1/feeds/{id}/items", get(feeds::feeds_items))
                 // Items
                 .route("/api/v1/items", get(items::items_list))
+                .route("/api/v1/items/inbox", get(web_views::inbox_page_get))
                 .route("/api/v1/items/save", post(items::items_save))
                 .route("/api/v1/items/archive-batch", post(items::items_archive_batch))
                 .route("/api/v1/items/dismiss-batch", post(items::items_archive_batch))
@@ -107,6 +115,10 @@ impl ApiRoutes {
                     "/api/v1/items/{id}",
                     get(items::items_get).patch(items::items_update).delete(items::items_delete),
                 )
+                .route("/api/v1/items/{id}/reader", get(web_views::item_reader_get))
+                .route("/api/v1/items/{id}/audio", get(web_views::item_audio_get))
+                .route("/api/v1/items/{id}/finish", post(web_views::item_finish_post))
+                .route("/api/v1/items/{id}/unfinish", post(web_views::item_unfinish_post))
                 .route("/api/v1/items/{id}/archive", post(items::items_archive))
                 .route("/api/v1/items/{id}/dismiss", post(items::items_archive))
                 .route("/api/v1/items/{id}/unarchive", post(items::items_unarchive))
@@ -136,7 +148,10 @@ impl ApiRoutes {
         let public_pair = Self::with_body_limit(
             Router::new()
                 .route("/auth/pair", post(auth::auth_pair))
-                .route("/api/v1/auth/pair", post(auth::auth_pair)),
+                .route("/api/v1/auth/pair", post(auth::auth_pair))
+                .route("/api/v1/auth/session", get(auth::auth_session_get))
+                .route("/api/v1/auth/login", post(auth::auth_login_post))
+                .route("/api/v1/auth/login/tailscale", post(auth::auth_login_tailscale_post)),
             API_PAIR_BODY_LIMIT,
         );
 
@@ -183,18 +198,34 @@ impl ApiRoutes {
                 "/api/v1/boards/{id}/items/{external_id}/reader",
                 get(boards::boards_item_reader),
             )
+            .route(
+                "/api/v1/boards/{id}/items/{external_id}/reader-view",
+                get(web_views::board_reader_view_get),
+            )
             .route("/api/v1/boards/{id}/items/{external_id}/seen", post(boards::boards_item_seen))
             .route(
                 "/api/v1/boards/{id}/items/{external_id}/dismiss",
                 post(boards::boards_item_dismiss),
             )
             .route(
+                "/api/v1/boards/{id}/items/{external_id}/dismiss-view",
+                post(web_views::board_dismiss_view_post),
+            )
+            .route(
                 "/api/v1/boards/{id}/items/{external_id}/undismiss",
                 post(boards::boards_item_undismiss),
             )
             .route(
+                "/api/v1/boards/{id}/items/{external_id}/undismiss-view",
+                post(web_views::board_undismiss_view_post),
+            )
+            .route(
                 "/api/v1/boards/{id}/items/{external_id}/promote",
                 post(boards::boards_item_promote),
+            )
+            .route(
+                "/api/v1/boards/{id}/items/{external_id}/promote-view",
+                post(web_views::board_promote_view_post),
             )
     }
 
@@ -205,10 +236,16 @@ impl ApiRoutes {
                 "/api/v1/catalog/lists",
                 get(catalog::catalog_lists).post(catalog::catalog_lists_create),
             )
+            .route("/api/v1/catalog/lists/overview", get(web_views::lists_overview_get))
             .route("/api/v1/catalog/lists/{slug_or_id}", get(catalog::catalog_list_get))
+            .route("/api/v1/catalog/lists/{slug_or_id}/detail", get(web_views::list_detail_get))
             .route(
                 "/api/v1/catalog/lists/{slug_or_id}/entries",
                 post(catalog::catalog_list_add_entry),
+            )
+            .route(
+                "/api/v1/catalog/lists/{slug_or_id}/entries/resolve",
+                post(web_views::list_add_resolved_entry),
             )
             .route(
                 "/api/v1/catalog/lists/{slug_or_id}/entries/{entry_id}",
@@ -222,18 +259,37 @@ impl ApiRoutes {
                 "/api/v1/catalog/entries/{id}",
                 get(catalog::catalog_entry_get).patch(catalog::catalog_entry_update),
             )
+            .route("/api/v1/catalog/entries/{id}/detail", get(web_views::entry_detail_rich_get))
             .route("/api/v1/catalog/entries/{id}/enrich", post(catalog::catalog_entry_enrich))
+            .route(
+                "/api/v1/catalog/entries/{id}/refresh-metadata",
+                post(web_views::entry_refresh_metadata_post),
+            )
+            .route(
+                "/api/v1/catalog/entries/{id}/queue-toggle",
+                post(web_views::entry_queue_toggle_post),
+            )
             .route("/api/v1/catalog/entries/{id}/merge", post(catalog::catalog_entry_merge))
             .route("/api/v1/catalog/diary", get(catalog::catalog_diary_list))
+            .route("/api/v1/catalog/diary/page", get(web_views::diary_page_get))
             .route(
                 "/api/v1/catalog/diary/{id}",
                 patch(catalog::catalog_diary_update).delete(catalog::catalog_diary_delete),
             )
             .route("/api/v1/catalog/log", post(catalog::catalog_log_create))
+            .route("/api/v1/catalog/quick-log", post(web_views::quick_log_post))
+            .route("/api/v1/catalog/queues", get(web_views::queues_get))
             .route("/api/v1/catalog/want", post(catalog::catalog_want_add))
+            .route(
+                "/api/v1/catalog/want/{queue}/complete/{entry_id}",
+                post(web_views::want_complete_post),
+            )
             .route("/api/v1/catalog/want/{queue}/{entry_id}", delete(catalog::catalog_want_remove))
             .route("/api/v1/catalog/rank/{slug_or_id}/cluster", get(catalog::catalog_rank_cluster))
+            .route("/api/v1/catalog/rank/{slug_or_id}/session", get(web_views::rank_session_get))
+            .route("/api/v1/catalog/rank/{slug_or_id}/submit", post(web_views::rank_session_submit))
             .route("/api/v1/catalog/comparisons", post(catalog::catalog_comparisons_create))
+            .route("/api/v1/catalog/comparisons/{id}/undo", post(web_views::comparison_undo_post))
             .route("/api/v1/catalog/generators", get(catalog::catalog_generators_list))
             .route(
                 "/api/v1/catalog/lists/{slug_or_id}/generator",
@@ -293,8 +349,7 @@ impl ApiRoutes {
         let is_read_stream = matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD);
         if is_read_stream
             && (path.starts_with("/api/v1/media/")
-                || path.starts_with("/web/media/")
-                || (path.starts_with("/web/items/") && path.ends_with("/audio")))
+                || (path.starts_with("/api/v1/items/") && path.ends_with("/audio")))
         {
             return None;
         }
@@ -303,16 +358,17 @@ impl ApiRoutes {
             "/api/v1/sync/peer"
                 | "/api/v1/catalog/batch"
                 | "/api/v1/import/opml"
+                | "/api/v1/refresh-all"
+                | "/api/v1/feeds/refresh-all"
                 | "/api/v1/boards/refresh-all"
-                | "/web/feeds/opml"
-                | "/web/feeds/refresh-all"
-                | "/web/boards/refresh-all"
                 | "/api/v1/export/data"
                 | "/api/v1/export/feeds"
-                | "/web/feeds/export.opml"
         ) || path.ends_with("/refresh")
             || path.ends_with("/enrich")
-            || (path.starts_with("/api/v1/boards/") && path.ends_with("/reader"))
+            || path.ends_with("/refresh-metadata")
+            || (path.starts_with("/api/v1/items/") && path.ends_with("/reader"))
+            || (path.starts_with("/api/v1/boards/")
+                && (path.ends_with("/reader") || path.ends_with("/reader-view")))
         {
             return Some(LONG_REQUEST_TIMEOUT);
         }
@@ -392,11 +448,45 @@ impl ApiRoutes {
         mut req: Request,
         next: Next,
     ) -> Result<Response, ApiError> {
-        let TypedHeader(Authorization(bearer)) =
-            auth.map_err(|_| ApiError::unauthorized("Missing or invalid Authorization header"))?;
+        // Strict precedence: if an `Authorization` header is present at all, authenticate
+        // exclusively against `device_tokens` and never fall back to ambient session cookies.
+        if req.headers().contains_key(header::AUTHORIZATION) {
+            let TypedHeader(Authorization(bearer)) = auth
+                .map_err(|_| ApiError::unauthorized("Missing or invalid Authorization header"))?;
+            let token_id = service.auth().authenticate_device(bearer.token()).await?;
+            req.extensions_mut().insert(AuthenticatedDevice { token_id });
+            return Ok(next.run(req).await);
+        }
 
-        let token_id = service.auth().authenticate_device(bearer.token()).await?;
-        req.extensions_mut().insert(AuthenticatedDevice { token_id });
+        // Otherwise accept a scoped browser `web_sessions` cookie (with strict CSRF verification
+        // on all state-changing methods).
+        let peer_addr = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0);
+        let secure = crate::util::http_security::is_forwarded_https(peer_addr, req.headers());
+        let Some(raw_token) =
+            crate::web::auth::authenticate_request_session(&service, req.headers(), secure).await
+        else {
+            return Err(ApiError::unauthorized("Missing or invalid Authorization header"));
+        };
+
+        let is_safe = matches!(
+            *req.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+        );
+        if !is_safe {
+            if !crate::web::auth::is_valid_same_origin_fetch_metadata(req.headers()) {
+                return Err(ApiError::forbidden("Cross-site state-changing request blocked"));
+            }
+            let valid_csrf = req
+                .headers()
+                .get(crate::web::auth::CSRF_HEADER_NAME)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|hdr| service.auth().verify_csrf_token(&raw_token, hdr));
+            if !valid_csrf {
+                return Err(ApiError::forbidden("Missing or invalid CSRF token"));
+            }
+        }
+
+        req.extensions_mut().insert(crate::web::auth::AuthenticatedWebSession { raw_token });
         Ok(next.run(req).await)
     }
 

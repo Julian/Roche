@@ -330,21 +330,63 @@ impl BoardService<'_> {
         }
     }
 
+    /// Spawns a tracked, deduplicated background refresh for a single board.
+    ///
+    /// Acquires `feed_poll_locks.try_acquire` and `ActiveRefreshGuard` synchronously before
+    /// returning so duplicate refreshes never pile up and `is_refreshing()` is immediately `true`.
+    pub async fn refresh_in_background(&self, id: &str) -> Result<Board, AppError> {
+        let board = self.get(id).await?;
+        let lock_key = board_poll_lock_key(&board.id);
+        let Some(poll_guard) = self.service.feed_poll_locks.try_acquire(&lock_key) else {
+            return Ok(board);
+        };
+        let refresh_guard = ActiveRefreshGuard::acquire(&self.service.active_refreshes);
+        let poll_sem = Arc::clone(&self.service.poll_semaphore);
+        let service_bg = self.service.clone();
+        let board_bg = board.clone();
+        self.service.spawn_background(async move {
+            let _refresh_guard = refresh_guard;
+            let Ok(_permit) = poll_sem.acquire_owned().await else {
+                drop(poll_guard);
+                return;
+            };
+            let _ = BoardIngester::poll_and_record(
+                &service_bg.db,
+                &service_bg.fetcher,
+                &board_bg,
+                "background_refresh",
+                true,
+            )
+            .await;
+            drop(poll_guard);
+        });
+        Ok(board)
+    }
+
     pub async fn refresh_all_in_background(&self) -> Result<usize, AppError> {
         let active_boards: Vec<Board> =
             self.list().await?.into_iter().filter(|b| b.is_active).collect();
         let count = active_boards.len();
         if !active_boards.is_empty() {
+            let bootstrap_guard = ActiveRefreshGuard::acquire(&self.service.active_refreshes);
             let service_bg = self.service.clone();
             self.service.spawn_background(async move {
-                service_bg.boards().poll_boards_concurrently(active_boards).await;
+                service_bg
+                    .boards()
+                    .poll_boards_concurrently_with_guard(active_boards, Some(bootstrap_guard))
+                    .await;
             });
         }
         Ok(count)
     }
 
-    pub async fn poll_boards_concurrently(&self, boards: Vec<Board>) {
+    async fn poll_boards_concurrently_with_guard(
+        &self,
+        boards: Vec<Board>,
+        bootstrap_guard: Option<ActiveRefreshGuard>,
+    ) {
         if boards.is_empty() {
+            drop(bootstrap_guard);
             return;
         }
         let poll_sem = Arc::clone(&self.service.poll_semaphore);
@@ -375,6 +417,7 @@ impl BoardService<'_> {
                 drop(poll_guard);
             });
         }
+        drop(bootstrap_guard);
         while join_set.join_next().await.is_some() {}
     }
 
@@ -385,6 +428,7 @@ impl BoardService<'_> {
         page: Option<usize>,
         per_page: Option<usize>,
         include_dismissed: bool,
+        dismissed_only: bool,
         live_more: bool,
         live_offset: Option<usize>,
     ) -> Result<BoardItemsPage, AppError> {
@@ -393,7 +437,7 @@ impl BoardService<'_> {
         let safe_page = page.unwrap_or(1).max(1);
         let offset = safe_page.saturating_sub(1).saturating_mul(safe_per_page);
 
-        if live_more {
+        if live_more && !dismissed_only {
             let buffered_count = usize::try_from(board.item_count.max(0)).unwrap_or(0);
             let upstream_offset = live_offset.unwrap_or_else(|| offset.max(buffered_count));
             let live_fetch = BoardIngester::fetch_live_page(
@@ -438,11 +482,18 @@ impl BoardService<'_> {
             .service
             .db
             .boards()
-            .list_items_view(&board.id, board.order_mode, include_dismissed, offset, safe_per_page)
+            .list_items_view_filtered(
+                &board.id,
+                board.order_mode,
+                include_dismissed,
+                dismissed_only,
+                offset,
+                safe_per_page,
+            )
             .await?;
 
         let buffered_raw_count = usize::try_from(board.item_count.max(0)).unwrap_or(0);
-        let has_more_live = !slice.has_more_buffered && buffered_raw_count > 0;
+        let has_more_live = !dismissed_only && !slice.has_more_buffered && buffered_raw_count > 0;
         let next_live_offset = has_more_live.then_some(buffered_raw_count);
 
         Ok(BoardItemsPage {

@@ -360,6 +360,22 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
   let serverLogs = '';
   let serverExitInfo: string | null = null;
   let sessionCookies: Awaited<ReturnType<Page['context']['cookies']>> = [];
+  let pageErrors: string[] = [];
+
+  test.beforeEach(async ({ page }) => {
+    pageErrors = [];
+    page.on('pageerror', (err) => {
+      pageErrors.push(`pageerror: ${err.message}`);
+    });
+    await page.addInitScript(() => {
+      (window as unknown as { __rocheCspViolations?: string[] }).__rocheCspViolations = [];
+      document.addEventListener('securitypolicyviolation', (ev) => {
+        (window as unknown as { __rocheCspViolations?: string[] }).__rocheCspViolations?.push(
+          `${ev.violatedDirective}: ${ev.blockedURI || '(inline)'}`
+        );
+      });
+    });
+  });
 
   test.beforeAll(async ({ browser }) => {
     serverBin = resolveServerBinary();
@@ -436,7 +452,14 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     }
   });
 
-  test.afterEach(async ({}, testInfo) => {
+  test.afterEach(async ({ page }, testInfo) => {
+    const cspViolations = await page
+      .evaluate(
+        () =>
+          (window as unknown as { __rocheCspViolations?: string[] }).__rocheCspViolations ?? []
+      )
+      .catch(() => [] as string[]);
+
     if (testInfo.status !== testInfo.expectedStatus) {
       const diag = formatServerDiagnostics(serverProcess, serverExitInfo, serverLogs);
       await testInfo.attach('roche-server-diagnostics', {
@@ -447,6 +470,9 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
         console.error(diag);
       }
     }
+
+    expect(pageErrors, `Uncaught JS runtime errors in ${testInfo.title}`).toEqual([]);
+    expect(cspViolations, `CSP violations detected in ${testInfo.title}`).toEqual([]);
   });
 
   test.afterAll(async () => {
@@ -461,11 +487,14 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
   }) => {
     const resp = await page.goto(`${baseUrl}/login`, { waitUntil: 'load' });
     expect(resp?.status()).toBe(200);
+    await expect(page.locator('#pairing_code')).toBeVisible();
     await assertAccessible(page, '/login');
 
     await page.fill('#pairing_code', 'definitely-invalid-code');
     const [errResp] = await Promise.all([
-      page.waitForResponse((r) => new URL(r.url()).pathname === '/login' && r.request().method() === 'POST'),
+      page.waitForResponse(
+        (r) => new URL(r.url()).pathname === '/api/v1/auth/login' && r.request().method() === 'POST'
+      ),
       page.click('button[type="submit"]'),
     ]);
     expect(errResp.status()).toBe(401);
@@ -476,15 +505,15 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
 
   const populatedRoutes: Array<{ route: string; expectedPath?: string; checkSelector: string }> = [
     { route: '/', expectedPath: '/', checkSelector: '.album-sleeve' },
-    { route: '/inbox', expectedPath: '/inbox', checkSelector: 'main#roche-main h2' },
+    { route: '/inbox', expectedPath: '/inbox', checkSelector: ':is(.inbox-row, p.empty)' },
     {
       route: '/inbox?kind=article&q=Accessibility',
       expectedPath: '/inbox',
       checkSelector: '.active-filters',
     },
-    { route: '/starred', expectedPath: '/lists/starred', checkSelector: 'main#roche-main h2' },
+    { route: '/starred', expectedPath: '/lists/starred', checkSelector: 'h2:has-text("Starred")' },
     { route: '/feeds', expectedPath: '/feeds', checkSelector: 'text=Editorial Essays' },
-    { route: '/lists', expectedPath: '/lists', checkSelector: 'text=Design Classics' },
+    { route: '/lists', expectedPath: '/lists', checkSelector: 'text=By Media Type' },
     {
       route: '/lists?q=Design',
       expectedPath: '/lists',
@@ -493,10 +522,10 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     {
       route: '/lists/design-classics',
       expectedPath: '/lists/design-classics',
-      checkSelector: 'table.ranked',
+      checkSelector: 'table.ranked tbody tr',
     },
     { route: '/diary', expectedPath: '/diary', checkSelector: '.diary-entry-row' },
-    { route: '/queue', expectedPath: '/queue', checkSelector: 'main#roche-main h2' },
+    { route: '/queue', expectedPath: '/queue', checkSelector: '.queue-item-row' },
     { route: '/rank', expectedPath: '/lists', checkSelector: 'text=Design Classics' },
   ];
 
@@ -505,6 +534,10 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
       await page.context().addCookies(sessionCookies);
       await gotoAndAssertOk(page, baseUrl, route, expectedPath);
       await expect(page.locator(checkSelector).first()).toBeVisible();
+      if (route === '/lists') {
+        await expect(page.locator('text=Design Classics').first()).toBeVisible();
+        await expect(page.locator('a.list-row-title', { hasText: 'Books' })).toBeVisible();
+      }
       await assertAccessible(page, route);
     });
   }
@@ -536,7 +569,7 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     await listTitleInput.fill('Accessibility Audit List');
     await Promise.all([
       page.waitForURL((url) => url.pathname.startsWith('/lists/') && url.pathname !== '/lists/'),
-      page.locator('form[action="/web/lists/create"] button[type="submit"]').click(),
+      page.locator('form[data-list-form="create"] button[type="submit"]').click(),
     ]);
     const createdListPath = new URL(page.url()).pathname;
     await expect(page.locator('main#roche-main h2')).toContainText('Accessibility Audit List');
@@ -546,8 +579,10 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     await expect(addTitleInput).toBeVisible();
     await addTitleInput.fill('A Pattern Language');
     await Promise.all([
-      page.waitForResponse((r) => r.request().method() === 'POST' && r.url().endsWith('/add')),
-      page.locator('form[action^="/web/lists/"][action$="/add"] button[type="submit"]').click(),
+      page.waitForResponse(
+        (r) => r.request().method() === 'POST' && r.url().endsWith('/entries/resolve')
+      ),
+      page.locator('form[data-list-form="add"] button[type="submit"]').click(),
     ]);
     await expect(page.locator('table.ranked')).toContainText('A Pattern Language');
     await assertAccessible(page, `${createdListPath} (populated manual list)`);
@@ -608,9 +643,32 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     await page.keyboard.press('+');
     await expect(page.locator('.js-rank-card')).toHaveCount(4);
 
+    // Submit the comparison, verify Undo banner, then verify RankedTable renders numeric ScoreMark values cleanly
+    const [submitResp] = await Promise.all([
+      page.waitForResponse(
+        (r) => r.request().method() === 'POST' && r.url().includes('/submit')
+      ),
+      page.locator('.rank-actions button.btn-primary').click(),
+    ]);
+    expect(submitResp.status()).toBe(201);
+    await expect(page.locator('.undo-banner')).toBeVisible();
+
+    await gotoAndAssertOk(page, baseUrl, '/lists/design-classics', '/lists/design-classics');
+    await expect(page.locator('table.ranked tbody tr').first()).toBeVisible();
+    const scoreCells = page.locator('table.ranked .score-num');
+    await expect(scoreCells).toHaveCount(4);
+    const firstScoreText = (await scoreCells.first().textContent())?.trim() ?? '';
+    expect(firstScoreText).toMatch(/^\d+\.\d$/);
+    const vpWidth = page.viewportSize()?.width ?? 1280;
+    if (vpWidth > 600) {
+      await expect(scoreCells.first()).toBeVisible();
+    }
+    await assertAccessible(page, '/lists/design-classics (ranked with ScoreMark)');
+
     // 4. Global search (/search), masthead + Log modal, unified Diary status labels
     await gotoAndAssertOk(page, baseUrl, '/search?q=Design', '/search');
     await expect(page.locator('#roche-global-search')).toHaveValue('Design');
+    await expect(page.locator('#search-catalog')).toBeVisible();
     await assertAccessible(page, '/search?q=Design');
 
     await page.locator('#roche-quick-log-btn').click();
@@ -824,7 +882,7 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     // 4. Instant dismiss + backfill of #31 + Undo, then concurrent double-dismiss backfilling #31 & #32
     const thirdRow = page.locator('#roche-board-list .board-row[data-external-id="40003"]');
     const fourthRow = page.locator('#roche-board-list .board-row[data-external-id="40004"]');
-    await thirdRow.locator('form[data-triage-kind="board-dismiss"] button[type="submit"]').click();
+    await thirdRow.locator('button[data-board-action="board-dismiss"]').click();
     await expect(thirdRow).toBeHidden();
     await expect(
       page.locator('#roche-board-list .board-row[data-external-id="40031"]')
@@ -839,14 +897,14 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
 
     // Trigger two simultaneous dismisses in the same tick to exercise pendingBackfills tracking
     await page.evaluate(() => {
-      const f3 = document.querySelector(
-        '#roche-board-list .board-row[data-external-id="40003"] form[data-triage-kind="board-dismiss"]'
-      ) as HTMLFormElement | null;
-      const f4 = document.querySelector(
-        '#roche-board-list .board-row[data-external-id="40004"] form[data-triage-kind="board-dismiss"]'
-      ) as HTMLFormElement | null;
-      f3?.requestSubmit();
-      f4?.requestSubmit();
+      const b3 = document.querySelector(
+        '#roche-board-list .board-row[data-external-id="40003"] button[data-board-action="board-dismiss"]'
+      ) as HTMLButtonElement | null;
+      const b4 = document.querySelector(
+        '#roche-board-list .board-row[data-external-id="40004"] button[data-board-action="board-dismiss"]'
+      ) as HTMLButtonElement | null;
+      b3?.click();
+      b4?.click();
     });
     await expect(thirdRow).toBeHidden();
     await expect(fourthRow).toBeHidden();
@@ -861,15 +919,29 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     await undoBtn.click();
     await expect(page.locator('#roche-board-list .board-row:not([hidden])')).toHaveCount(30);
 
-    // 5. Optimistic Star & + Queue toggles pass axe WCAG AA
+    // 5. Optimistic Star & + Queue toggles persist across reload and pass axe WCAG AA
     const firstRow = page.locator('#roche-board-list .board-row[data-external-id="40001"]');
-    await firstRow.locator('.inbox-star-btn').click();
+    await Promise.all([
+      page.waitForResponse(
+        (r) => r.request().method() === 'POST' && r.url().includes('/promote-view')
+      ),
+      firstRow.locator('.inbox-star-btn').click(),
+    ]);
     await expect(firstRow.locator('.inbox-star-btn')).toHaveAttribute('aria-pressed', 'true');
-    await firstRow.locator('form[data-triage-kind="board-queue"] button[type="submit"]').click();
-    await expect(firstRow.locator('form[data-triage-kind="unqueue"] button[type="submit"]')).toContainText(
-      'In Queue'
-    );
+    await Promise.all([
+      page.waitForResponse(
+        (r) => r.request().method() === 'POST' && r.url().includes('/promote-view')
+      ),
+      firstRow.locator('button[data-board-action="board-queue"]').click(),
+    ]);
+    await expect(firstRow.locator('button[data-board-action="unqueue"]')).toContainText('In Queue');
     await assertAccessible(page, '/boards (after star & queue)');
+
+    // Reload and verify Star + Queue hydrated accurately from server `is_favorite` / `in_want_to_read`
+    await page.reload({ waitUntil: 'load' });
+    const reloadedFirstRow = page.locator('#roche-board-list .board-row[data-external-id="40001"]');
+    await expect(reloadedFirstRow.locator('.inbox-star-btn')).toHaveAttribute('aria-pressed', 'true');
+    await expect(reloadedFirstRow.locator('button[data-board-action="unqueue"]')).toContainText('In Queue');
 
     // 6. Dismissed view passes axe WCAG AA & restoring last item reveals empty state cleanly
     await gotoAndAssertOk(
@@ -878,11 +950,11 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
       `/boards/${boardId}?view=dismissed`,
       `/boards/${boardId}`
     );
-    await assertAccessible(page, '/boards (dismissed view)');
     const restoreBtn = page
-      .locator('#roche-board-list form[data-triage-kind="board-restore"] button[type="submit"]')
+      .locator('#roche-board-list button[data-board-action="board-restore"]')
       .first();
     await expect(restoreBtn).toBeVisible();
+    await assertAccessible(page, '/boards (dismissed view)');
     await restoreBtn.click();
     await expect(page.locator('#roche-board-dismissed-empty')).toBeVisible();
     await assertAccessible(page, '/boards (dismissed empty after restore)');
@@ -896,6 +968,8 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     );
     await expect(page.locator('.reader-prose')).toContainText('print-inspired type scales');
     await expect(page.locator('.reader-discussion-link')).toContainText('Hacker News (38 comments)');
+    await expect(page.locator('.reader-star-btn')).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.locator('.reader-quick-tools')).toContainText('In Queue');
     await assertAccessible(page, '/boards/{id}/read/40001 (Ask HN prose)');
 
     await gotoAndAssertOk(

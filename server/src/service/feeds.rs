@@ -342,14 +342,57 @@ impl FeedService<'_> {
         self.get(id).await
     }
 
+    /// Spawns a tracked, deduplicated background refresh for a single feed.
+    ///
+    /// Acquires `feed_poll_locks.try_acquire` and `ActiveRefreshGuard` synchronously before
+    /// returning so duplicate refreshes never pile up and `is_refreshing()` is immediately `true`
+    /// before the HTTP response leaves the handler.
+    pub async fn refresh_in_background(&self, id: &str) -> Result<Feed, AppError> {
+        let feed = self.get(id).await?;
+        let Some(poll_guard) = self.service.feed_poll_locks.try_acquire(&feed.id) else {
+            return Ok(feed);
+        };
+        let refresh_guard = ActiveRefreshGuard::acquire(&self.service.active_refreshes);
+        let poll_sem = Arc::clone(&self.service.poll_semaphore);
+        let service_bg = self.service.clone();
+        let feed_bg = feed.clone();
+        self.service.spawn_background(async move {
+            let _refresh_guard = refresh_guard;
+            let ctx = service_bg.media_ingest_context();
+            let poll_res = {
+                let Ok(_permit) = poll_sem.acquire_owned().await else {
+                    drop(poll_guard);
+                    return;
+                };
+                FeedIngester::poll_xml_and_record_outcome(
+                    ctx.db,
+                    ctx.fetcher,
+                    &feed_bg,
+                    "background_refresh",
+                    true,
+                )
+                .await
+            };
+            drop(poll_guard);
+            if let Ok(outcome) = poll_res {
+                FeedIngester::ingest_items_concurrently(&ctx, &outcome.inserted).await;
+            }
+        });
+        Ok(feed)
+    }
+
     pub async fn refresh_all_in_background(&self) -> Result<usize, AppError> {
         let active_feeds: Vec<Feed> =
             self.list().await?.into_iter().filter(|f| f.is_active).collect();
         let count = active_feeds.len();
         if !active_feeds.is_empty() {
+            let bootstrap_guard = ActiveRefreshGuard::acquire(&self.service.active_refreshes);
             let service_bg = self.service.clone();
             self.service.spawn_background(async move {
-                service_bg.feeds().poll_feeds_concurrently(active_feeds).await;
+                service_bg
+                    .feeds()
+                    .poll_feeds_concurrently_with_guard(active_feeds, Some(bootstrap_guard))
+                    .await;
             });
         }
         Ok(count)
@@ -364,7 +407,16 @@ impl FeedService<'_> {
     }
 
     pub async fn poll_feeds_concurrently(&self, feeds: Vec<Feed>) {
+        self.poll_feeds_concurrently_with_guard(feeds, None).await;
+    }
+
+    async fn poll_feeds_concurrently_with_guard(
+        &self,
+        feeds: Vec<Feed>,
+        bootstrap_guard: Option<ActiveRefreshGuard>,
+    ) {
         if feeds.is_empty() {
+            drop(bootstrap_guard);
             return;
         }
         let poll_sem = Arc::clone(&self.service.poll_semaphore);
@@ -400,6 +452,7 @@ impl FeedService<'_> {
                 }
             });
         }
+        drop(bootstrap_guard);
         while join_set.join_next().await.is_some() {}
     }
 

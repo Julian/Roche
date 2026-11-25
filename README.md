@@ -7,7 +7,7 @@ Track RSS/Atom blogs, arXiv papers, podcast episodes, YouTube subscriptions, boo
 ## Overview & Capabilities
 
 - **Stack**:
-  - **Server & CLI (`server/`)**: Rust 2024 (`axum`, `sqlx` compile-time checked queries over `STRICT` SQLite WAL + FTS5 tables, embedded SSR + ES2022 PJAX Web UI, `ratatui` + `crossterm` terminal TUI, and background feed/media workers).
+  - **Server & CLI (`server/`)**: Rust 2024 (`axum`, `sqlx` compile-time checked queries over `STRICT` SQLite WAL + FTS5 tables, embedded Svelte 5 + TypeScript SPA Web UI built from `web/`, `ratatui` + `crossterm` terminal TUI, and background feed/media workers).
   - **Android (`android/`)**: Local-first Kotlin client (`Jetpack Compose`, `Navigation 3` with predictive back, `Room 3` + bundled SQLite FTS5, platform `HttpEngine` HTTP/2+HTTP/3 transport, `ImageDecoder` hardware bitmaps, `AndroidX Media3` `ExoPlayer` + `MediaSessionService` background audio with silence-skipping, cooperative HRW feed polling, and bidirectional peer sync).
 - **Unified Media Catalog & Dual Ranking Model**:
   - **Shared Entry Graph**: Feed items, saved articles/PDFs/videos/episodes, manual media logs (`album`, `book`, `movie`, `tv`, `song`), and collections share a unified entry & scheme-normalized identifier space (`spotify`, `musicbrainz_release`, `imdb`, `wikipedia`, `url`, `feed_url`, `slug`) with tombstone-aware deduplication and merge convergence across peers.

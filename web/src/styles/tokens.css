@@ -1,0 +1,139 @@
+/* Roche Editorial Design Tokens
+   Verified against WCAG 2.1/2.2 AA contrast in both light and dark modes. */
+
+:root {
+  color-scheme: light;
+  --paper: #fbf7ed;
+  --paper-deep: #f3eddc;
+  --paper-input: #fffdf7;
+  --ink: #1a1611;
+  --ink-soft: #433c32;
+  --ink-faint: #635b4d;
+  --rule: #d8d0bd;
+  --rule-soft: #ebe5d3;
+  --control-border: #827968;
+  --link: #7c3512;
+  --link-hover: #471d05;
+  --accent: #8f1d18;
+  --accent-fill: #8f1d18;
+  --accent-fill-hover: #53120e;
+  --accent-on-fill: #fbf7ed;
+  --badge-bg: #f1ead8;
+  --shadow-art: rgba(26, 22, 17, 0.14);
+
+  --tier-S: #8f1d18;
+  --tier-A: #345c2c;
+  --tier-B: #244f7a;
+  --tier-C: #5c5852;
+  --tier-D: #865239;
+
+  --fav-tone-0-bg: #efe0d6;
+  --fav-tone-0-fg: #7c3512;
+  --fav-tone-0-bd: #d9bfa9;
+  --fav-tone-1-bg: #dce7d9;
+  --fav-tone-1-fg: #2f5727;
+  --fav-tone-1-bd: #bdd0b8;
+  --fav-tone-2-bg: #d9e4ef;
+  --fav-tone-2-fg: #234c75;
+  --fav-tone-2-bd: #b7cadc;
+  --fav-tone-3-bg: #f0dcda;
+  --fav-tone-3-fg: #8a1f1a;
+  --fav-tone-3-bd: #ddb8b4;
+  --fav-tone-4-bg: #ebe3d0;
+  --fav-tone-4-fg: #6e4a22;
+  --fav-tone-4-bd: #d6c8a8;
+
+  --serif: Charter, "Bitstream Charter", "Iowan Old Style", "Sitka Text",
+    Cambria, Georgia, serif;
+  --display: "Iowan Old Style", "Sitka Display", "Palatino Linotype",
+    Palatino, "Book Antiqua", Georgia, serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --paper: #171411;
+    --paper-deep: #211d18;
+    --paper-input: #1c1814;
+    --ink: #f3ede0;
+    --ink-soft: #cabfae;
+    --ink-faint: #a19684;
+    --rule: #3a3329;
+    --rule-soft: #2b251e;
+    --control-border: #7c7261;
+    --link: #e69d67;
+    --link-hover: #f5c39b;
+    --accent: #e57068;
+    --accent-fill: #a52b24;
+    --accent-fill-hover: #87201a;
+    --accent-on-fill: #fbf7ed;
+    --badge-bg: #2a241d;
+    --shadow-art: rgba(0, 0, 0, 0.45);
+
+    --tier-S: #eb7870;
+    --tier-A: #86ba7a;
+    --tier-B: #78abd8;
+    --tier-C: #b0aba2;
+    --tier-D: #cf9c80;
+
+    --fav-tone-0-bg: #36251c;
+    --fav-tone-0-fg: #e8a472;
+    --fav-tone-0-bd: #543a2b;
+    --fav-tone-1-bg: #213020;
+    --fav-tone-1-fg: #8cc280;
+    --fav-tone-1-bd: #354c33;
+    --fav-tone-2-bg: #1e2c3a;
+    --fav-tone-2-fg: #7db1df;
+    --fav-tone-2-bd: #32485d;
+    --fav-tone-3-bg: #38201f;
+    --fav-tone-3-fg: #ec7c74;
+    --fav-tone-3-bd: #573331;
+    --fav-tone-4-bg: #312a1d;
+    --fav-tone-4-fg: #d8b37b;
+    --fav-tone-4-bd: #4d422e;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #171411;
+  --paper-deep: #211d18;
+  --paper-input: #1c1814;
+  --ink: #f3ede0;
+  --ink-soft: #cabfae;
+  --ink-faint: #a19684;
+  --rule: #3a3329;
+  --rule-soft: #2b251e;
+  --control-border: #7c7261;
+  --link: #e69d67;
+  --link-hover: #f5c39b;
+  --accent: #e57068;
+  --accent-fill: #a52b24;
+  --accent-fill-hover: #87201a;
+  --accent-on-fill: #fbf7ed;
+  --badge-bg: #2a241d;
+  --shadow-art: rgba(0, 0, 0, 0.45);
+
+  --tier-S: #eb7870;
+  --tier-A: #86ba7a;
+  --tier-B: #78abd8;
+  --tier-C: #b0aba2;
+  --tier-D: #cf9c80;
+
+  --fav-tone-0-bg: #36251c;
+  --fav-tone-0-fg: #e8a472;
+  --fav-tone-0-bd: #543a2b;
+  --fav-tone-1-bg: #213020;
+  --fav-tone-1-fg: #8cc280;
+  --fav-tone-1-bd: #354c33;
+  --fav-tone-2-bg: #1e2c3a;
+  --fav-tone-2-fg: #7db1df;
+  --fav-tone-2-bd: #32485d;
+  --fav-tone-3-bg: #38201f;
+  --fav-tone-3-fg: #ec7c74;
+  --fav-tone-3-bd: #573331;
+  --fav-tone-4-bg: #312a1d;
+  --fav-tone-4-fg: #d8b37b;
+  --fav-tone-4-bd: #4d422e;
+}

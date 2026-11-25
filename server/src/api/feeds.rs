@@ -45,8 +45,15 @@ pub(super) async fn feeds_list(
     Ok(Json(serde_json::json!({ "feeds": feeds })))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct BackgroundQuery {
+    #[serde(default)]
+    background: bool,
+}
+
 pub(super) async fn feeds_create(
     State(service): State<Arc<RocheService>>,
+    ProblemQuery(q): ProblemQuery<BackgroundQuery>,
     ProblemJson(req): ProblemJson<CreateFeedRequest>,
 ) -> Result<(StatusCode, Json<Feed>), ApiError> {
     let source = FeedService::parse_source(&req.url)?;
@@ -54,6 +61,9 @@ pub(super) async fn feeds_create(
         .feeds()
         .create(req.feed_type, source, req.title.as_deref(), req.description.as_deref())
         .await?;
+    if q.background {
+        let _ = service.feeds().refresh_in_background(&feed.id).await;
+    }
     Ok((StatusCode::CREATED, Json(feed)))
 }
 
@@ -68,8 +78,14 @@ pub(super) async fn feeds_get(
 pub(super) async fn feeds_update(
     State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
+    ProblemQuery(q): ProblemQuery<BackgroundQuery>,
     ProblemJson(req): ProblemJson<UpdateFeedRequest>,
 ) -> Result<Json<Feed>, ApiError> {
+    let previous_url = if q.background && req.url.is_some() {
+        Some(service.feeds().get(&id).await?.url)
+    } else {
+        None
+    };
     let updated = service
         .feeds()
         .update(
@@ -81,6 +97,10 @@ pub(super) async fn feeds_update(
             req.url.as_deref(),
         )
         .await?;
+    let url_changed = previous_url.as_ref().is_some_and(|prev| prev != &updated.url);
+    if q.background && url_changed && updated.is_active {
+        let _ = service.feeds().refresh_in_background(&updated.id).await;
+    }
     Ok(Json(updated))
 }
 
@@ -111,9 +131,21 @@ pub(super) async fn feeds_unarchive(
 pub(super) async fn feeds_refresh(
     State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
+    ProblemQuery(q): ProblemQuery<BackgroundQuery>,
 ) -> Result<Json<Feed>, ApiError> {
+    if q.background {
+        let feed = service.feeds().refresh_in_background(&id).await?;
+        return Ok(Json(feed));
+    }
     let refreshed = service.feeds().refresh(&id).await?;
     Ok(Json(refreshed))
+}
+
+pub(super) async fn feeds_refresh_all(
+    State(service): State<Arc<RocheService>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let refreshed_count = service.feeds().refresh_all_in_background().await?;
+    Ok(Json(serde_json::json!({ "refreshed_count": refreshed_count })))
 }
 
 pub(super) async fn feeds_items(
@@ -135,6 +167,7 @@ pub(super) async fn feeds_items(
 
 pub(super) async fn import_opml(
     State(service): State<Arc<RocheService>>,
+    ProblemQuery(q): ProblemQuery<BackgroundQuery>,
     ProblemString(body): ProblemString,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let opml_str = tokio::task::spawn_blocking(move || -> Result<String, ApiError> {
@@ -150,6 +183,9 @@ pub(super) async fn import_opml(
     .map_err(|e| ApiError::Internal(anyhow::anyhow!("OPML request decode task failed: {e}")))??;
 
     let imported = service.feeds().import_opml(opml_str).await?;
+    if q.background && !imported.is_empty() {
+        let _ = service.feeds().refresh_all_in_background().await;
+    }
     Ok(Json(serde_json::json!({
         "imported_count": imported.len(),
         "feeds": imported,
@@ -160,7 +196,14 @@ pub(super) async fn export_feeds_opml(
     State(service): State<Arc<RocheService>>,
 ) -> Result<Response, ApiError> {
     let xml = service.feeds().export_opml().await?;
-    Ok(([(header::CONTENT_TYPE, "text/x-opml; charset=utf-8")], xml).into_response())
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/x-opml; charset=utf-8"),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"roche-feeds.opml\""),
+        ],
+        xml,
+    )
+        .into_response())
 }
 
 pub(super) async fn export_data(

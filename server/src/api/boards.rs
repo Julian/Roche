@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use axum::{Json, body::Bytes, extract::State, http::StatusCode};
+use axum::{Json, extract::State, http::StatusCode};
 use roche_core::boards::{BoardOrderMode, BoardType};
 use serde::Deserialize;
 
-use super::error::{ApiError, ProblemJson, ProblemPath, ProblemQuery};
+use super::error::{ApiError, OptionalProblemJson, ProblemJson, ProblemPath, ProblemQuery};
 use crate::{
     db::{Board, BoardItemState, BoardPromoteAction},
     service::{
@@ -51,6 +51,8 @@ pub(super) struct BoardItemsQuery {
     per_page: Option<usize>,
     #[serde(default)]
     include_dismissed: Option<bool>,
+    #[serde(default)]
+    dismissed_only: Option<bool>,
     #[serde(default)]
     live_more: Option<bool>,
     #[serde(default)]
@@ -133,10 +135,21 @@ pub(super) async fn boards_unarchive(
     Ok(Json(unarchived))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct BoardRefreshQuery {
+    #[serde(default)]
+    background: bool,
+}
+
 pub(super) async fn boards_refresh(
     State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
+    ProblemQuery(q): ProblemQuery<BoardRefreshQuery>,
 ) -> Result<Json<Board>, ApiError> {
+    if q.background {
+        let board = service.boards().refresh_in_background(&id).await?;
+        return Ok(Json(board));
+    }
     let refreshed = service.boards().refresh(&id).await?;
     Ok(Json(refreshed))
 }
@@ -160,6 +173,7 @@ pub(super) async fn boards_items(
             query.page,
             query.per_page,
             query.include_dismissed.unwrap_or(false),
+            query.dismissed_only.unwrap_or(false),
             query.live_more.unwrap_or(false),
             query.live_offset,
         )
@@ -187,17 +201,12 @@ pub(super) async fn boards_item_dismiss(
     State(service): State<Arc<RocheService>>,
     ProblemPath((id, external_id)): ProblemPath<(String, String)>,
     ProblemQuery(query): ProblemQuery<DismissBoardItemParams>,
-    body: Bytes,
+    OptionalProblemJson(body_params): OptionalProblemJson<DismissBoardItemParams>,
 ) -> Result<Json<BoardDismissOutcome>, ApiError> {
-    let body_offset = if body.iter().any(|b| !b.is_ascii_whitespace()) {
-        let parsed: DismissBoardItemParams = serde_json::from_slice(&body)
-            .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?;
-        parsed.backfill_offset
-    } else {
-        None
-    };
-    let outcome =
-        service.boards().dismiss(&id, &external_id, body_offset.or(query.backfill_offset)).await?;
+    let outcome = service
+        .boards()
+        .dismiss(&id, &external_id, body_params.backfill_offset.or(query.backfill_offset))
+        .await?;
     Ok(Json(outcome))
 }
 

@@ -35,9 +35,11 @@ pub(super) async fn sync_changes(
 
 pub(super) async fn sync_peer(
     State(service): State<Arc<RocheService>>,
-    Extension(device): Extension<AuthenticatedDevice>,
+    device: Option<Extension<AuthenticatedDevice>>,
     ProblemJson(req): ProblemJson<PeerSyncRequest>,
 ) -> Result<Json<PeerSyncResponse>, ApiError> {
+    let Extension(device) =
+        device.ok_or_else(|| ApiError::forbidden("Peer sync requires a device bearer token"))?;
     service.auth().verify_sync_peer_binding(&device.token_id, &req.peer_id).await?;
     let res = service.sync().peer_sync(req).await?;
     Ok(Json(res))

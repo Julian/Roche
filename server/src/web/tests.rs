@@ -1,77 +1,68 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::too_many_lines)]
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::{Duration, Instant},
+};
 
 use axum::{
     Router,
     body::{Body, to_bytes},
     extract::ConnectInfo,
-    http::{Request, StatusCode, header},
+    http::{HeaderMap, Request, StatusCode, header},
     response::Response,
 };
-use tower::ServiceExt;
+use tower::ServiceExt as _;
 use url::Url;
 
 use crate::{
-    api::ApiRoutes,
     auth::pairing::PairingManager,
     config::Config,
-    db::{ConsumptionStatus, ContentType, Db, EntryKind, FeedType, NewItem},
-    ingest::FeedFetcher,
-    service::RocheService,
+    db::{CatalogEntry, Db, EntryIdentifier, NewItem},
+    domain::{ContentType, EntryKind, FeedType},
+    service::{
+        RocheService,
+        enrich::{
+            ArtistEnricher, EnrichAttemptCache, MAX_CONCURRENT_ENRICH_TASKS, WikipediaSearchHit,
+            decode_html_entities, encode_wiki_path_segment,
+            extract_spotify_artist_uri_from_album_html, parse_itunes_artist_discography,
+            parse_itunes_lookup_tracks, parse_spotify_embed_tracks,
+            parse_wikipedia_artist_summary_json, select_best_artist_wikipedia_slug,
+        },
+    },
+    web::{
+        auth::{
+            CSRF_HEADER_NAME, is_same_origin_post, redirect_see_other, safe_local_redirect,
+            safe_login_return_to,
+        },
+        links::{WebLinkIcon, collect_web_external_links, sanitize_non_local_href},
+    },
 };
 
-#[derive(Clone)]
 struct DummyWebFetcher;
 
-impl FeedFetcher for DummyWebFetcher {
-    fn fetch_feed(
-        &self,
-        _url: &Url,
-    ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send {
-        std::future::ready(Ok(r#"<?xml version="1.0" encoding="UTF-8"?>
-        <rss version="2.0">
-          <channel>
-            <title>Editorial Feed</title>
-            <link>https://editorial.example</link>
-            <description>Warm essays</description>
-            <item>
-              <title>Longform Essay</title>
-              <link>https://editorial.example/essay-1</link>
-              <description>Paragraph one.</description>
-            </item>
-          </channel>
-        </rss>"#
-            .to_string()))
+impl crate::ingest::FeedFetcher for DummyWebFetcher {
+    fn fetch_feed(&self, _url: &Url) -> impl std::future::Future<Output = anyhow::Result<String>> {
+        std::future::ready(Err(anyhow::anyhow!("no network in tests")))
     }
 
     fn fetch_html(
         &self,
         _url: &Url,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<String>>> + Send {
-        std::future::ready(Ok(Some(
-            "<html><head><title>Saved Essay</title></head><body><script>evil()</script><p>Clean body.</p></body></html>"
-                .to_string(),
-        )))
-    }
-
-    fn fetch_pdf(
-        &self,
-        _url: &Url,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<Vec<u8>>>> + Send {
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<String>>> {
         std::future::ready(Ok(None))
     }
 }
 
 async fn setup_web_app(cfg: Config) -> (Db, Router) {
     let db = Db::connect("sqlite::memory:").await.unwrap();
-    let svc = RocheService::new(db.clone(), DummyWebFetcher, cfg);
-    let app = ApiRoutes::router_with_service(svc);
+    let service = RocheService::new(db.clone(), DummyWebFetcher, cfg);
+    let app = crate::api::ApiRoutes::router_with_service(service);
     (db, app)
 }
 
 fn extract_cookie_header(set_cookie: &str) -> String {
-    set_cookie.split(';').next().unwrap().trim().to_string()
+    set_cookie.split(';').next().unwrap_or("").trim().to_owned()
 }
 
 fn find_set_cookie<'a>(resp: &'a Response, prefix: &str) -> Option<&'a str> {
@@ -79,14 +70,15 @@ fn find_set_cookie<'a>(resp: &'a Response, prefix: &str) -> Option<&'a str> {
         .get_all(header::SET_COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .find(|s| s.starts_with(prefix))
+        .find(|v| v.starts_with(prefix))
 }
 
-fn extract_csrf_token(html: &str) -> String {
-    let needle = "data-csrf=\"";
-    let start = html.find(needle).expect("body data-csrf attribute present") + needle.len();
-    let end = html[start..].find('"').unwrap() + start;
-    html[start..end].to_string()
+async fn read_body_text(resp: Response) -> String {
+    String::from_utf8(to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap()
+}
+
+async fn read_body_json(resp: Response) -> serde_json::Value {
+    serde_json::from_slice(&to_bytes(resp.into_body(), 1024 * 1024).await.unwrap()).unwrap()
 }
 
 async fn get_authed(app: &Router, uri: &str, cookie: &str) -> Response {
@@ -98,96 +90,96 @@ async fn get_authed(app: &Router, uri: &str, cookie: &str) -> Response {
         .unwrap()
 }
 
-fn encode_form(fields: &[(&str, &str)]) -> String {
-    let mut ser = url::form_urlencoded::Serializer::new(String::new());
-    for (k, v) in fields {
-        ser.append_pair(k, v);
+async fn post_json_authed(
+    app: &Router,
+    uri: &str,
+    cookie: &str,
+    csrf: Option<&str>,
+    body: serde_json::Value,
+) -> Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("sec-fetch-site", "same-origin");
+    if let Some(tok) = csrf {
+        builder = builder.header(CSRF_HEADER_NAME, tok);
     }
-    ser.finish()
-}
-
-async fn post_form(app: &Router, uri: &str, cookie: &str, fields: &[(&str, &str)]) -> Response {
-    let body = encode_form(fields);
-    app.clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header(header::COOKIE, cookie)
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap()
+    app.clone().oneshot(builder.body(Body::from(body.to_string())).unwrap()).await.unwrap()
 }
 
 async fn login_browser(db: &Db, app: &Router) -> (String, String) {
     let code = PairingManager::new(db.auth()).create_code(300).await.unwrap();
-    let body = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("pairing_code", &code)
-        .append_pair("device_name", "Test Browser")
-        .finish();
-    let mut req = Request::builder()
+    let mut login_req = Request::builder()
         .method("POST")
-        .uri("/login")
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .uri("/api/v1/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
         .header("sec-fetch-site", "same-origin")
         .header("x-forwarded-proto", "https")
-        .body(Body::from(body))
+        .body(Body::from(serde_json::json!({ "pairing_code": code }).to_string()))
         .unwrap();
-    req.extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000)));
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/");
-
-    let set_cookie = resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
-    assert!(set_cookie.starts_with("__Host-roche_session="), "got: {set_cookie}");
-    assert!(set_cookie.contains("Path=/"));
+    login_req
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41000)));
+    let login_resp = app.clone().oneshot(login_req).await.unwrap();
+    assert_eq!(login_resp.status(), StatusCode::OK);
+    let set_cookie = find_set_cookie(&login_resp, "__Host-roche_session=")
+        .expect("missing __Host-roche_session Set-Cookie")
+        .to_owned();
     assert!(set_cookie.contains("HttpOnly"));
     assert!(set_cookie.contains("SameSite=Lax"));
     assert!(set_cookie.contains("Secure"));
-    assert!(!set_cookie.contains("Domain="));
-    let cookie = extract_cookie_header(set_cookie);
-
-    let home_resp = get_authed(app, "/", &cookie).await;
-    assert_eq!(home_resp.status(), StatusCode::OK);
-    let home_bytes = to_bytes(home_resp.into_body(), 256 * 1024).await.unwrap();
-    let home_html = String::from_utf8(home_bytes.to_vec()).unwrap();
-    let csrf = extract_csrf_token(&home_html);
+    let cookie = extract_cookie_header(&set_cookie);
+    let payload = read_body_json(login_resp).await;
+    assert_eq!(payload["authenticated"], true);
+    let csrf = payload["csrf_token"].as_str().unwrap().to_owned();
+    assert_eq!(csrf.len(), 128);
     (cookie, csrf)
 }
 
 #[tokio::test]
-async fn test_web_static_login_csrf_and_logout_revocation() {
+async fn test_spa_assets_etag_immutable_cache_and_login_csrf_logout() {
     let (db, app) = setup_web_app(Config::default()).await;
+
+    // 1. Embedded hashed Vite CSS & JS assets serve with weak ETag, immutable cache, and 304 support
+    let css_path = super::spa_assets::MAIN_CSS_HREF.expect("expected embedded Vite CSS bundle");
+    let js_path = super::spa_assets::EMBEDDED_ASSETS
+        .iter()
+        .find(|a| {
+            a.path.starts_with("/assets/")
+                && std::path::Path::new(a.path)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("js"))
+        })
+        .expect("expected embedded Vite JS bundle")
+        .path;
 
     let css_resp = app
         .clone()
-        .oneshot(Request::builder().uri("/static/roche.css").body(Body::empty()).unwrap())
+        .oneshot(Request::builder().uri(css_path).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(css_resp.status(), StatusCode::OK);
     assert_eq!(css_resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
     assert_eq!(css_resp.headers().get(header::X_FRAME_OPTIONS).unwrap(), "SAMEORIGIN");
     assert_eq!(css_resp.headers().get(header::REFERRER_POLICY).unwrap(), "same-origin");
+    assert_eq!(
+        css_resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
     let css_etag = css_resp.headers().get(header::ETAG).unwrap().to_str().unwrap().to_owned();
     assert!(css_etag.starts_with("W/\""), "expected weak ETag under compression, got {css_etag}");
     assert_eq!(css_resp.headers().get(header::VARY).unwrap(), "Accept-Encoding");
-    let css_body =
-        String::from_utf8(to_bytes(css_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
+    let css_body = read_body_text(css_resp).await;
     assert!(css_body.contains("#fbf7ed"));
 
-    // Both exact weak ETag and stripped strong form must match per RFC 9110 §8.8.3.2 weak comparison,
-    // and 304 must retain `Vary: Accept-Encoding` per RFC 9110 §15.4.5.
     for inm in [css_etag.as_str(), css_etag.trim_start_matches("W/")] {
         let css_304 = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/static/roche.css")
+                    .uri(css_path)
                     .header(header::IF_NONE_MATCH, inm)
                     .body(Body::empty())
                     .unwrap(),
@@ -198,24 +190,49 @@ async fn test_web_static_login_csrf_and_logout_revocation() {
         assert_eq!(css_304.headers().get(header::VARY).unwrap(), "Accept-Encoding");
     }
 
-    let css_versioned = app
-        .clone()
-        .oneshot(Request::builder().uri(super::css_href()).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(css_versioned.status(), StatusCode::OK);
-    assert_eq!(
-        css_versioned.headers().get(header::CACHE_CONTROL).unwrap(),
-        "public, max-age=31536000, immutable"
-    );
-
     let js_resp = app
         .clone()
-        .oneshot(Request::builder().uri("/static/roche.js").body(Body::empty()).unwrap())
+        .oneshot(Request::builder().uri(js_path).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(js_resp.status(), StatusCode::OK);
+    assert_eq!(
+        js_resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
 
+    let fav_resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/favicon.svg").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(fav_resp.status(), StatusCode::OK);
+    assert_eq!(fav_resp.headers().get(header::CONTENT_TYPE).unwrap(), "image/svg+xml");
+    assert_eq!(fav_resp.headers().get(header::CACHE_CONTROL).unwrap(), "public, max-age=3600");
+
+    // 2. Unauthenticated login shell serves strict CSP with zero inline scripts/styles + FOUC-free theme
+    let login_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/login")
+                .header(header::COOKIE, "roche_theme=dark")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_resp.status(), StatusCode::OK);
+    let csp = login_resp.headers().get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap();
+    assert!(csp.contains("script-src 'self'"));
+    assert!(csp.contains("style-src 'self'"));
+    assert!(!csp.contains("'unsafe-inline'"));
+    let login_html = read_body_text(login_resp).await;
+    assert!(login_html.contains("<html lang=\"en\" data-theme=\"dark\">"));
+    assert!(login_html.contains("<div id=\"app\"></div>"));
+    assert!(!login_html.contains("style=\""));
+
+    // 3. Unauthenticated protected routes redirect to /login with safe return_to
     let unauth = app
         .clone()
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -224,10 +241,34 @@ async fn test_web_static_login_csrf_and_logout_revocation() {
     assert_eq!(unauth.status(), StatusCode::SEE_OTHER);
     assert_eq!(unauth.headers().get(header::LOCATION).unwrap(), "/login");
 
+    let unauth_inbox = app
+        .clone()
+        .oneshot(Request::builder().uri("/inbox?q=rust").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(unauth_inbox.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        unauth_inbox.headers().get(header::LOCATION).unwrap(),
+        "/login?return_to=%2Finbox%3Fq%3Drust"
+    );
+
+    // 4. Authenticated SPA shell routes & canonical redirects
     let (cookie, csrf) = login_browser(&db, &app).await;
-    for path in ["/inbox", "/boards", "/lists/starred", "/feeds", "/lists", "/diary", "/queue"] {
+    for path in [
+        "/",
+        "/inbox",
+        "/boards",
+        "/lists/starred",
+        "/feeds",
+        "/lists",
+        "/diary",
+        "/queue",
+        "/search",
+    ] {
         let resp = get_authed(&app, path, &cookie).await;
         assert_eq!(resp.status(), StatusCode::OK, "expected 200 OK on {path}");
+        let html = read_body_text(resp).await;
+        assert!(html.contains("<div id=\"app\"></div>"), "missing SPA root on {path}");
     }
     let starred_redir = get_authed(&app, "/starred", &cookie).await;
     assert_eq!(starred_redir.status(), StatusCode::SEE_OTHER);
@@ -237,37 +278,221 @@ async fn test_web_static_login_csrf_and_logout_revocation() {
     assert_eq!(rank_redir.status(), StatusCode::SEE_OTHER);
     assert_eq!(rank_redir.headers().get(header::LOCATION).unwrap(), "/lists");
 
-    let missing_csrf = post_form(&app, "/web/lists/create", &cookie, &[("title", "My List")]).await;
+    // 5. CSRF enforcement on mutating /api/v1/* requests with browser cookies
+    let missing_csrf = post_json_authed(
+        &app,
+        "/api/v1/catalog/lists",
+        &cookie,
+        None,
+        serde_json::json!({"title": "No CSRF"}),
+    )
+    .await;
     assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
 
-    let bad_csrf = post_form(
+    let bad_csrf = post_json_authed(
         &app,
-        "/web/lists/create",
+        "/api/v1/catalog/lists",
         &cookie,
-        &[("title", "My List"), ("_csrf", "deadbeef")],
+        Some("deadbeef"),
+        serde_json::json!({"title": "Bad CSRF"}),
     )
     .await;
     assert_eq!(bad_csrf.status(), StatusCode::FORBIDDEN);
 
-    let logout_resp = post_form(&app, "/logout", &cookie, &[("_csrf", &csrf)]).await;
-    assert_eq!(logout_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(logout_resp.headers().get(header::LOCATION).unwrap(), "/login");
+    let cross_site = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/catalog/lists")
+                .header(header::COOKIE, &cookie)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(CSRF_HEADER_NAME, &csrf)
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::from(serde_json::json!({"title": "Cross Site"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_site.status(), StatusCode::FORBIDDEN);
 
-    let after_logout = get_authed(&app, "/", &cookie).await;
-    assert_eq!(after_logout.status(), StatusCode::SEE_OTHER);
-    assert_eq!(after_logout.headers().get(header::LOCATION).unwrap(), "/login");
+    let valid_create = post_json_authed(
+        &app,
+        "/api/v1/catalog/lists",
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({"title": "Valid SPA List"}),
+    )
+    .await;
+    assert_eq!(valid_create.status(), StatusCode::CREATED);
+
+    // 6. Logout revokes session and sets logged_out cookie
+    let logout_resp =
+        post_json_authed(&app, "/api/v1/auth/logout", &cookie, Some(&csrf), serde_json::json!({}))
+            .await;
+    assert_eq!(logout_resp.status(), StatusCode::NO_CONTENT);
+    assert!(find_set_cookie(&logout_resp, "roche_logged_out=1").is_some());
+
+    let after_logout_page = get_authed(&app, "/", &cookie).await;
+    assert_eq!(after_logout_page.status(), StatusCode::SEE_OTHER);
+    assert_eq!(after_logout_page.headers().get(header::LOCATION).unwrap(), "/login");
+
+    let after_logout_api = get_authed(&app, "/api/v1/items", &cookie).await;
+    assert_eq!(after_logout_api.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
-async fn test_tailscale_auto_auth_strictly_requires_loopback_and_allowlist() {
+async fn test_dual_auth_isolation_precedence_peer_sync_expiry_and_masked_csrf() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (web_cookie, csrf_first) = login_browser(&db, &app).await;
+
+    // 1. Browser login mints a `web_sessions` row, NEVER a `device_tokens` row
+    assert_eq!(db.auth().count_web_sessions().await.unwrap(), 1);
+    assert_eq!(db.auth().count_devices().await.unwrap(), 0);
+
+    // 2. Web session raw token CANNOT authenticate as Authorization: Bearer
+    let web_raw_token = web_cookie.split_once('=').unwrap().1;
+    let api_with_web_bearer = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/items")
+                .header(header::AUTHORIZATION, format!("Bearer {web_raw_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(api_with_web_bearer.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Strict precedence: invalid Authorization header alongside valid browser cookie MUST fail (never fall back)
+    let bad_bearer_with_cookie = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/items")
+                .header(header::AUTHORIZATION, "Bearer invalid-device-token")
+                .header(header::COOKIE, &web_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_bearer_with_cookie.status(), StatusCode::UNAUTHORIZED);
+
+    // 4. Browser session cookie + valid CSRF is FORBIDDEN from calling peer-to-peer sync
+    let peer_sync_cookie = post_json_authed(
+        &app,
+        "/api/v1/sync/peer",
+        &web_cookie,
+        Some(&csrf_first),
+        serde_json::json!({"peer_id": "browser", "since_seq": 0}),
+    )
+    .await;
+    assert_eq!(peer_sync_cookie.status(), StatusCode::FORBIDDEN);
+
+    // 5. Device token CANNOT authenticate browser routes or browser logout
+    let pair_code = PairingManager::new(db.auth()).create_code(300).await.unwrap();
+    let pair_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/pair")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "device_name": "Android Phone",
+                        "pairing_code": pair_code,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pair_resp.status(), StatusCode::OK);
+    let pair_json = read_body_json(pair_resp).await;
+    let api_token = pair_json["token"].as_str().unwrap();
+
+    let web_with_api_token = get_authed(&app, "/", &format!("roche_session={api_token}")).await;
+    assert_eq!(web_with_api_token.status(), StatusCode::SEE_OTHER);
+    assert_eq!(web_with_api_token.headers().get(header::LOCATION).unwrap(), "/login");
+
+    let device_logout = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/logout")
+                .header(header::AUTHORIZATION, format!("Bearer {api_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(device_logout.status(), StatusCode::FORBIDDEN);
+
+    // 6. Per-request masked CSRF tokens differ across GET /api/v1/auth/session and BOTH verify
+    let session2_resp = get_authed(&app, "/api/v1/auth/session", &web_cookie).await;
+    assert_eq!(session2_resp.status(), StatusCode::OK);
+    let session2 = read_body_json(session2_resp).await;
+    assert_eq!(session2["authenticated"], true);
+    let csrf_second = session2["csrf_token"].as_str().unwrap().to_owned();
+    assert_eq!(csrf_second.len(), 128);
+    assert_ne!(csrf_first, csrf_second, "CSRF token must be freshly masked per request");
+
+    let post_first = post_json_authed(
+        &app,
+        "/api/v1/catalog/lists",
+        &web_cookie,
+        Some(&csrf_first),
+        serde_json::json!({"title": "List One"}),
+    )
+    .await;
+    assert_eq!(post_first.status(), StatusCode::CREATED);
+    let post_second = post_json_authed(
+        &app,
+        "/api/v1/catalog/lists",
+        &web_cookie,
+        Some(&csrf_second),
+        serde_json::json!({"title": "List Two"}),
+    )
+    .await;
+    assert_eq!(post_second.status(), StatusCode::CREATED);
+
+    // 7. Expired web sessions are rejected immediately and pruned by WorkerManager
+    sqlx::query(
+        "UPDATE web_sessions SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 minute')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let expired_get = get_authed(&app, "/", &web_cookie).await;
+    assert_eq!(expired_get.status(), StatusCode::SEE_OTHER);
+    let expired_api = get_authed(&app, "/api/v1/items", &web_cookie).await;
+    assert_eq!(expired_api.status(), StatusCode::UNAUTHORIZED);
+
+    let workers =
+        crate::workers::WorkerManager::new(db.clone(), 30, "/tmp/roche-test-session-prune");
+    workers.run_once().await.unwrap();
+    assert_eq!(db.auth().count_web_sessions().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_tailscale_auto_auth_strictly_requires_loopback_navigation_and_allowlist() {
     let mut cfg = Config::default();
     cfg.tailscale.enabled = true;
-    cfg.tailscale.auto_auth_users = vec!["reader@example.ts.net".to_string()];
+    cfg.tailscale.auto_auth_users = vec!["reader@example.ts.net".to_owned()];
     let (_db, app) = setup_web_app(cfg).await;
 
+    // Non-loopback peer is rejected
     let mut remote_req = Request::builder()
         .uri("/")
         .header("Tailscale-User-Login", "reader@example.ts.net")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Site", "none")
         .body(Body::empty())
         .unwrap();
     remote_req
@@ -277,9 +502,13 @@ async fn test_tailscale_auto_auth_strictly_requires_loopback_and_allowlist() {
     assert_eq!(remote_resp.status(), StatusCode::SEE_OTHER);
     assert_eq!(remote_resp.headers().get(header::LOCATION).unwrap(), "/login");
 
+    // Non-allowlisted loopback user is rejected
     let mut stranger_req = Request::builder()
         .uri("/")
         .header("Tailscale-User-Login", "intruder@example.ts.net")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Site", "none")
         .body(Body::empty())
         .unwrap();
     stranger_req
@@ -287,18 +516,36 @@ async fn test_tailscale_auto_auth_strictly_requires_loopback_and_allowlist() {
         .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51235)));
     assert_eq!(app.clone().oneshot(stranger_req).await.unwrap().status(), StatusCode::SEE_OTHER);
 
+    // Passive GET /api/v1/auth/session does NOT auto-mint a cookie (reports tailscale_user for explicit button)
+    let mut session_probe = Request::builder()
+        .uri("/api/v1/auth/session")
+        .header("Tailscale-User-Login", "reader@example.ts.net")
+        .body(Body::empty())
+        .unwrap();
+    session_probe
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51236)));
+    let probe_resp = app.clone().oneshot(session_probe).await.unwrap();
+    assert_eq!(probe_resp.status(), StatusCode::OK);
+    assert!(probe_resp.headers().get(header::SET_COOKIE).is_none());
+    let probe_json = read_body_json(probe_resp).await;
+    assert_eq!(probe_json["authenticated"], false);
+    assert_eq!(probe_json["tailscale_user"], "reader@example.ts.net");
+
+    // Forged state-changing API POST cannot ride Tailscale header
     let mut forged_post = Request::builder()
         .method("POST")
-        .uri("/web/lists/test_list/generator/toggle")
+        .uri("/api/v1/catalog/lists")
         .header("Tailscale-User-Login", "reader@example.ts.net")
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(Body::from("enabled=true"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::json!({"title": "Forged"}).to_string()))
         .unwrap();
     forged_post
         .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51236)));
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51237)));
     assert_eq!(app.clone().oneshot(forged_post).await.unwrap().status(), StatusCode::UNAUTHORIZED);
 
+    // Valid top-level navigational GET mints a session cookie
     let mut valid_ts_req = Request::builder()
         .uri("/")
         .header("Tailscale-User-Login", "READER@example.ts.net")
@@ -309,17 +556,44 @@ async fn test_tailscale_auto_auth_strictly_requires_loopback_and_allowlist() {
         .unwrap();
     valid_ts_req
         .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51237)));
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51238)));
     let valid_ts_resp = app.clone().oneshot(valid_ts_req).await.unwrap();
     assert_eq!(valid_ts_resp.status(), StatusCode::OK);
+    assert!(find_set_cookie(&valid_ts_resp, "roche_session=").is_some());
+
+    // Explicit roche_logged_out=1 suppresses passive auto-login; explicit POST /api/v1/auth/login/tailscale re-authenticates
+    let mut logged_out_nav = Request::builder()
+        .uri("/")
+        .header("Tailscale-User-Login", "reader@example.ts.net")
+        .header(header::COOKIE, "roche_logged_out=1")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Site", "none")
+        .body(Body::empty())
+        .unwrap();
+    logged_out_nav
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51239)));
+    let logged_out_resp = app.clone().oneshot(logged_out_nav).await.unwrap();
+    assert_eq!(logged_out_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(logged_out_resp.headers().get(header::LOCATION).unwrap(), "/login");
+
+    let mut ts_explicit = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login/tailscale")
+        .header("Tailscale-User-Login", "reader@example.ts.net")
+        .header("sec-fetch-site", "same-origin")
+        .header(header::COOKIE, "roche_logged_out=1")
+        .body(Body::empty())
+        .unwrap();
+    ts_explicit
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51240)));
+    let ts_explicit_resp = app.clone().oneshot(ts_explicit).await.unwrap();
+    assert_eq!(ts_explicit_resp.status(), StatusCode::OK);
+    assert!(find_set_cookie(&ts_explicit_resp, "roche_session=").is_some());
     assert!(
-        valid_ts_resp
-            .headers()
-            .get(header::SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("roche_session=")
+        find_set_cookie(&ts_explicit_resp, "roche_logged_out=;").unwrap().contains("Max-Age=0")
     );
 }
 
@@ -327,10 +601,10 @@ async fn test_tailscale_auto_auth_strictly_requires_loopback_and_allowlist() {
 async fn test_tailscale_auto_auth_blocks_subresource_dup_headers_and_accepts_mapped_ipv6() {
     let mut cfg = Config::default();
     cfg.tailscale.enabled = true;
-    cfg.tailscale.auto_auth_users = vec!["reader@example.ts.net".to_string()];
+    cfg.tailscale.auto_auth_users = vec!["reader@example.ts.net".to_owned()];
     let (_db, app) = setup_web_app(cfg).await;
 
-    // Cross-site subresource GET (without roche_logged_out cookie) must NOT mint a session
+    // Cross-site subresource GET must NOT mint a session
     let mut cross_site_img = Request::builder()
         .uri("/")
         .header("Tailscale-User-Login", "reader@example.ts.net")
@@ -341,10 +615,9 @@ async fn test_tailscale_auto_auth_blocks_subresource_dup_headers_and_accepts_map
         .unwrap();
     cross_site_img
         .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51238)));
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51241)));
     let cross_site_resp = app.clone().oneshot(cross_site_img).await.unwrap();
     assert_eq!(cross_site_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(cross_site_resp.headers().get(header::LOCATION).unwrap(), "/login");
     assert!(cross_site_resp.headers().get(header::SET_COOKIE).is_none());
 
     // Duplicate Tailscale-User-Login headers are rejected
@@ -359,10 +632,8 @@ async fn test_tailscale_auto_auth_blocks_subresource_dup_headers_and_accepts_map
         .unwrap();
     dup_ts_req
         .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51239)));
-    let dup_ts_resp = app.clone().oneshot(dup_ts_req).await.unwrap();
-    assert_eq!(dup_ts_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(dup_ts_resp.headers().get(header::LOCATION).unwrap(), "/login");
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51242)));
+    assert_eq!(app.clone().oneshot(dup_ts_req).await.unwrap().status(), StatusCode::SEE_OTHER);
 
     // IPv4-mapped IPv6 loopback (::ffff:127.0.0.1) is recognized as loopback on dual-stack hosts
     let mut mapped_v6_req = Request::builder()
@@ -376,7 +647,7 @@ async fn test_tailscale_auto_auth_blocks_subresource_dup_headers_and_accepts_map
         .unwrap();
     mapped_v6_req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
         IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
-        51240,
+        51243,
     )));
     let mapped_v6_resp = app.clone().oneshot(mapped_v6_req).await.unwrap();
     assert_eq!(mapped_v6_resp.status(), StatusCode::OK);
@@ -390,990 +661,861 @@ async fn test_tailscale_auto_auth_blocks_subresource_dup_headers_and_accepts_map
     );
 }
 
-async fn seed_album_queue_pool(db: &crate::db::Db) {
-    let pool = db
-        .catalog()
-        .create_manual_collection(
-            "Album Queue",
-            Some("album_queue"),
-            crate::db::CollectionRole::List,
-            None,
-            None,
-        )
-        .await
+#[tokio::test]
+async fn test_security_headers_breach_and_host_cookie_enforcement() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (host_cookie, _csrf) = login_browser(&db, &app).await;
+    let raw_token = host_cookie.split_once('=').unwrap().1;
+
+    // 1. HTML responses are never compressed (BREACH mitigation) and carry Permissions-Policy + HSTS over forwarded HTTPS
+    let mut https_home_req = Request::builder()
+        .uri("/")
+        .header(header::COOKIE, &host_cookie)
+        .header(header::ACCEPT_ENCODING, "gzip, br, deflate")
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
         .unwrap();
-    for (pos, title) in
-        [(1.0, "Kind of Blue"), (2.0, "Time Out"), (3.0, "Mingus Ah Um"), (4.0, "Blue Train")]
+    https_home_req
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42001)));
+    let https_home = app.clone().oneshot(https_home_req).await.unwrap();
+    assert_eq!(https_home.status(), StatusCode::OK);
+    assert!(
+        https_home.headers().get(header::CONTENT_ENCODING).is_none(),
+        "text/html must not be compressed"
+    );
+    assert_eq!(
+        https_home.headers().get("permissions-policy").unwrap(),
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+    );
+    assert_eq!(
+        https_home.headers().get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
+        "max-age=31536000"
+    );
+
+    // 2. Over forwarded HTTPS, unprefixed `roche_session` cookie is rejected (blocks HTTP cookie-tossing)
+    for (uri, expected_status) in
+        [("/", StatusCode::SEE_OTHER), ("/api/v1/items", StatusCode::UNAUTHORIZED)]
     {
-        db.catalog()
-            .upsert_entry(&crate::db::UpsertEntryInput {
-                kind: Some(crate::db::EntryKind::Album),
-                title: title.to_owned(),
-                parent_collection_id: Some(pool.id.clone()),
-                parent_position: Some(pos),
-                ..Default::default()
-            })
-            .await
+        let mut tossed_req = Request::builder()
+            .uri(uri)
+            .header(header::COOKIE, format!("roche_session={raw_token}"))
+            .header("x-forwarded-proto", "https")
+            .body(Body::empty())
             .unwrap();
+        tossed_req
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42002)));
+        let tossed_resp = app.clone().oneshot(tossed_req).await.unwrap();
+        assert_eq!(tossed_resp.status(), expected_status, "cookie tossing failed on {uri}");
     }
-}
 
-#[tokio::test]
-async fn test_web_collection_generator_finish_rank_and_abandon_flows() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-    seed_album_queue_pool(&db).await;
-
-    let toggle_resp = post_form(
-        &app,
-        "/web/lists/album_queue/generator/toggle",
-        &cookie,
-        &[("_csrf", &csrf), ("enabled", "true")],
-    )
-    .await;
-    assert_eq!(toggle_resp.status(), StatusCode::SEE_OTHER);
-
-    let state1 = db.catalog().get_collection_generator("album_queue").await.unwrap();
-    assert!(state1.enabled);
-    let first_id = state1.current_entry.as_ref().unwrap().id.clone();
-
-    let finish1_resp = post_form(
-        &app,
-        "/web/lists/album_queue/generator/finish",
-        &cookie,
-        &[("_csrf", &csrf), ("notes", "Great opener <script>xss()</script>")],
-    )
-    .await;
-    assert_eq!(finish1_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(finish1_resp.headers().get(header::LOCATION).unwrap(), "/");
-    let finish1_flash = find_set_cookie(&finish1_resp, "roche_flash=n:").unwrap();
-    assert!(finish1_flash.contains("HttpOnly"));
-
-    let state2 = db.catalog().get_collection_generator("album_queue").await.unwrap();
-    let second_id = state2.current_entry.as_ref().unwrap().id.clone();
-    assert_ne!(first_id, second_id);
-    assert_eq!(state2.consumed_count, 1);
-
-    let finish2_resp =
-        post_form(&app, "/web/lists/album_queue/generator/finish", &cookie, &[("_csrf", &csrf)])
-            .await;
-    assert_eq!(finish2_resp.status(), StatusCode::SEE_OTHER);
-    let loc2 = finish2_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert!(loc2.starts_with(&format!("/rank/album_queue?focus={second_id}")), "got: {loc2}");
-
-    let ord_json = serde_json::to_string(&vec![vec![&second_id], vec![&first_id]]).unwrap();
-    let rank_post_resp = post_form(
-        &app,
-        "/rank/album_queue",
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("ordering_json", &ord_json),
-            ("want", "false"),
-            ("focus", &second_id),
-            ("round", "0"),
-        ],
-    )
-    .await;
-    assert_eq!(rank_post_resp.status(), StatusCode::SEE_OTHER);
-
-    let ranked_albums = crate::service::CatalogService::new(&db)
-        .get_ranked_collection("album-queue", false)
-        .await
+    // 3. Direct non-loopback peer spoofing X-Forwarded-Proto: https does NOT receive HSTS
+    let mut spoofed_https_req = Request::builder()
+        .uri("/health")
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
         .unwrap();
-    assert_eq!(ranked_albums.rows.len(), 2);
-    assert_eq!(ranked_albums.rows[0].entry.id, second_id);
+    spoofed_https_req
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 55)), 42003)));
+    let spoofed_health = app.clone().oneshot(spoofed_https_req).await.unwrap();
+    assert_eq!(spoofed_health.status(), StatusCode::OK);
+    assert_eq!(spoofed_health.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    assert_eq!(spoofed_health.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert!(spoofed_health.headers().get(header::STRICT_TRANSPORT_SECURITY).is_none());
 
-    let third_id = db
-        .catalog()
-        .get_collection_generator("album_queue")
-        .await
-        .unwrap()
-        .current_entry
-        .unwrap()
-        .id;
-    let abandon_resp = post_form(
-        &app,
-        "/web/lists/album_queue/generator/abandon",
-        &cookie,
-        &[("_csrf", &csrf), ("notes", "Not my style")],
-    )
-    .await;
-    assert_eq!(abandon_resp.status(), StatusCode::SEE_OTHER);
-    let state4 = db.catalog().get_collection_generator("album_queue").await.unwrap();
-    assert_eq!(state4.consumed_count, 2);
-    assert_eq!(state4.abandoned_count, 1);
-    assert_ne!(state4.current_entry.as_ref().unwrap().id, third_id);
-
-    let diary_resp = get_authed(&app, "/diary", &cookie).await;
-    let diary_html =
-        String::from_utf8(to_bytes(diary_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
-    assert!(!diary_html.contains("<script>xss()</script>"));
-    assert!(diary_html.contains("&lt;script&gt;xss()&lt;/script&gt;"));
-}
-
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_web_feed_completion_auto_logging_podcast_and_article() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    let podcast_feed_url = Url::parse("https://podcasts.example/rss").unwrap();
-    let podcast_feed = db
-        .feeds()
-        .create(FeedType::Rss, &podcast_feed_url, Some("Systems Cast"), None)
-        .await
-        .unwrap();
-    let ep_url = Url::parse("https://podcasts.example/ep-1").unwrap();
-    let ep_item = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&podcast_feed.id),
-            title: "Episode 1: Storage Engines",
-            url: &ep_url,
-            author: None,
-            published_at: None,
-            summary: None,
-            content_type: ContentType::Audio,
-        })
-        .await
-        .unwrap();
-
-    let prog_resp = app
+    // 4. Browser HTML 404 fallback renders escaped HTML with full security headers and zero inline CSS/JS
+    let not_found_resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("POST")
-                .uri(format!("/web/items/{}/progress", ep_item.id))
-                .header(header::COOKIE, &cookie)
-                .header("x-roche-csrf", &csrf)
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("progress=0.99"))
+                .uri("/does-not-exist-route")
+                .header(header::ACCEPT, "text/html")
+                .header(header::COOKIE, "roche_theme=dark")
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(prog_resp.status(), StatusCode::NO_CONTENT);
-
-    let read_url = Url::parse("https://blog.example/read").unwrap();
-    let read_article = db
-        .items()
-        .create(&NewItem {
-            feed_id: None,
-            title: "Read Essay",
-            url: &read_url,
-            author: Some("A. Writer"),
-            published_at: None,
-            summary: None,
-            content_type: ContentType::Article,
-        })
-        .await
-        .unwrap();
-    let unread_url = Url::parse("https://blog.example/unread").unwrap();
-    let unread_article = db
-        .items()
-        .create(&NewItem {
-            feed_id: None,
-            title: "Unread Skipped Essay",
-            url: &unread_url,
-            author: None,
-            published_at: None,
-            summary: None,
-            content_type: ContentType::Article,
-        })
-        .await
-        .unwrap();
-
-    // Scrolling an article to >= 0.98 auto-Finishes it (logs consumed + clears from New)
-    assert_eq!(
-        post_form(
-            &app,
-            &format!("/web/items/{}/progress", read_article.id),
-            &cookie,
-            &[("_csrf", &csrf), ("progress", "0.99"), ("source", "reader")],
-        )
-        .await
-        .status(),
-        StatusCode::NO_CONTENT
-    );
-    // Dismissing an article NEVER logs consumed, even if progress had previously reached 0.95
-    assert_eq!(
-        post_form(
-            &app,
-            &format!("/web/items/{}/progress", unread_article.id),
-            &cookie,
-            &[("_csrf", &csrf), ("progress", "0.95"), ("source", "reader")],
-        )
-        .await
-        .status(),
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        post_form(
-            &app,
-            &format!("/web/items/{}/dismiss", unread_article.id),
-            &cookie,
-            &[("_csrf", &csrf)],
-        )
-        .await
-        .status(),
-        StatusCode::SEE_OTHER
-    );
-
-    let diary = db.catalog().list_diary(None, None, 20).await.unwrap();
-    assert!(
-        diary.iter().any(|d| d.entry.id == ep_item.id && d.status == ConsumptionStatus::Consumed)
-    );
-    assert!(diary.iter().any(|d| d.entry.id == read_article.id));
-    assert!(!diary.iter().any(|d| d.entry.id == unread_article.id));
-
-    // Verify 3-state Inbox filter partitioning: New / Finished / Dismissed / All
-    let new_html = read_body_html(get_authed(&app, "/inbox?status=new", &cookie).await).await;
-    assert!(!new_html.contains("Episode 1: Storage Engines"));
-    let fin_html = read_body_html(get_authed(&app, "/inbox?status=finished", &cookie).await).await;
-    assert!(fin_html.contains("Episode 1: Storage Engines"));
-    assert!(fin_html.contains("badge-finished"));
-
-    // Dismissing a Finished item deletes its consumed log and moves it to Dismissed
-    assert_eq!(
-        post_form(
-            &app,
-            &format!("/web/items/{}/dismiss", ep_item.id),
-            &cookie,
-            &[("_csrf", &csrf)],
-        )
-        .await
-        .status(),
-        StatusCode::SEE_OTHER
-    );
-    let diary_after_dismiss = db.catalog().list_diary(None, None, 20).await.unwrap();
-    assert!(!diary_after_dismiss.iter().any(|d| d.entry.id == ep_item.id));
-    let dismissed_html =
-        read_body_html(get_authed(&app, "/inbox?status=dismissed", &cookie).await).await;
-    assert!(dismissed_html.contains("Episode 1: Storage Engines"));
-    assert!(dismissed_html.contains("badge-dismissed"));
+    assert_eq!(not_found_resp.status(), StatusCode::NOT_FOUND);
+    assert!(not_found_resp.headers().get(header::CONTENT_SECURITY_POLICY).is_some());
+    let nf_html = read_body_text(not_found_resp).await;
+    assert!(nf_html.contains("data-theme=\"dark\""));
+    assert!(nf_html.contains("Not Found"));
+    assert!(!nf_html.contains("<style"));
+    assert!(!nf_html.contains("<script"));
 }
 
 #[tokio::test]
-async fn test_web_video_archive_never_logs_while_explicit_finish_logs() {
+async fn test_mixed_https_http_localhost_cookie_precedence_and_cleanup() {
     let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
+    let (dead_host_cookie, csrf1) = login_browser(&db, &app).await;
 
-    let vid1_url = Url::parse("https://videos.example/v1").unwrap();
-    let vid_archived = db
-        .items()
-        .create(&NewItem {
-            feed_id: None,
-            title: "Dismissed Video",
-            url: &vid1_url,
-            author: None,
-            published_at: None,
-            summary: None,
-            content_type: ContentType::Video,
-        })
-        .await
-        .unwrap();
-    let vid2_url = Url::parse("https://videos.example/v2").unwrap();
-    let vid_finished = db
-        .items()
-        .create(&NewItem {
-            feed_id: None,
-            title: "Watched Lecture",
-            url: &vid2_url,
-            author: None,
-            published_at: None,
-            summary: None,
-            content_type: ContentType::Video,
-        })
-        .await
-        .unwrap();
-
-    let _ = post_form(
+    // 1. HTTP logout while carrying __Host-roche_session and legacy __Host-roche_flash clears BOTH
+    let logout_resp = post_json_authed(
         &app,
-        &format!("/web/items/{}/archive", vid_archived.id),
-        &cookie,
-        &[("_csrf", &csrf), ("progress", "1.0")],
+        "/api/v1/auth/logout",
+        &format!("{dead_host_cookie}; __Host-roche_flash=n:Leftover"),
+        Some(&csrf1),
+        serde_json::json!({}),
     )
     .await;
-    assert_eq!(
-        post_form(
-            &app,
-            &format!("/web/items/{}/finish", vid_finished.id),
-            &cookie,
-            &[("_csrf", &csrf)],
-        )
-        .await
-        .status(),
-        StatusCode::SEE_OTHER
-    );
+    assert_eq!(logout_resp.status(), StatusCode::NO_CONTENT);
+    assert!(find_set_cookie(&logout_resp, "__Host-roche_session=;").unwrap().contains("Max-Age=0"));
+    assert!(find_set_cookie(&logout_resp, "roche_session=;").unwrap().contains("Max-Age=0"));
+    assert!(find_set_cookie(&logout_resp, "__Host-roche_flash=;").unwrap().contains("Max-Age=0"));
+    assert!(find_set_cookie(&logout_resp, "roche_flash=;").unwrap().contains("Max-Age=0"));
 
-    let diary = db.catalog().list_diary(None, None, 20).await.unwrap();
-    assert!(!diary.iter().any(|d| d.entry.id == vid_archived.id));
-    assert!(diary.iter().any(|d| d.entry.id == vid_finished.id));
-}
-
-#[tokio::test]
-async fn test_web_want_queue_local_priority_noscript_and_entry_merge() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    for title in ["Stalker", "Solaris"] {
-        let resp = post_form(
-            &app,
-            "/web/log",
-            &cookie,
-            &[
-                ("_csrf", &csrf),
-                ("kind", "movie"),
-                ("action", "want"),
-                ("title", title),
-                ("creators", "Andrei Tarkovsky"),
-            ],
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    }
-
-    let want_detail = crate::service::CatalogService::new(&db)
-        .get_ranked_collection("movies", true)
-        .await
-        .unwrap();
-    assert_eq!(want_detail.rows.len(), 2);
-    let m1 = want_detail.rows[0].entry.id.clone();
-    let m2 = want_detail.rows[1].entry.id.clone();
-
-    // Test `<noscript>` `pos_<id>` override precedence over default `ordering_json`
-    let default_ord = serde_json::to_string(&vec![vec![&m1], vec![&m2]]).unwrap();
-    let pos_m1 = format!("pos_{m1}");
-    let pos_m2 = format!("pos_{m2}");
-    let prio_resp = post_form(
-        &app,
-        "/rank/want%3Amovies",
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("ordering_json", &default_ord),
-            (&pos_m2, "1"),
-            (&pos_m1, "2"),
-            ("want", "true"),
-            ("round", "0"),
-        ],
-    )
-    .await;
-    assert_eq!(prio_resp.status(), StatusCode::SEE_OTHER);
-
-    let want_ranked = crate::service::CatalogService::new(&db)
-        .get_ranked_collection("movies", true)
-        .await
-        .unwrap();
-    assert_eq!(want_ranked.rows[0].entry.id, m2);
-    assert!(want_ranked.rows[0].tier.is_none(), "want queues never assign S-D tiers");
-
-    let _ = post_form(
-        &app,
-        "/web/log",
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("kind", "movie"),
-            ("action", "consumed"),
-            ("title", "Solaris (Duplicate)"),
-        ],
-    )
-    .await;
-    let found_dup = db
-        .catalog()
-        .search_entries(Some("Solaris (Duplicate)"), Some(EntryKind::Movie), 5)
-        .await
-        .unwrap();
-    let dup_id = found_dup[0].id.clone();
-
-    let merge_resp = post_form(
-        &app,
-        &format!("/web/entries/{dup_id}/merge"),
-        &cookie,
-        &[("_csrf", &csrf), ("canonical_query", &m2)],
-    )
-    .await;
-    assert_eq!(merge_resp.status(), StatusCode::SEE_OTHER);
-    assert!(
-        merge_resp
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with(&format!("/entries/{m2}"))
-    );
-}
-
-#[tokio::test]
-async fn test_web_filtered_inbox_batch_archive_unconsumed_focus_and_restart_csrf() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    let feed_url = Url::parse("https://blog.example/rss").unwrap();
-    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Essay Feed"), None).await.unwrap();
-    let art_url = Url::parse("https://blog.example/a1").unwrap();
-    let art = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&feed.id),
-            title: "Keep Me Unread",
-            url: &art_url,
-            author: None,
-            published_at: None,
-            summary: None,
-            content_type: ContentType::Article,
-        })
-        .await
-        .unwrap();
-    let vid_url = Url::parse("https://videos.example/v-only").unwrap();
-    let vid = db
-        .items()
-        .create(&NewItem {
-            feed_id: None,
-            title: "Filtered Video",
-            url: &vid_url,
-            author: None,
-            published_at: None,
-            summary: None,
-            content_type: ContentType::Video,
-        })
-        .await
-        .unwrap();
-
-    // Feed filter stays preserved in Inbox filter links & search form
-    let feed_inbox =
-        get_authed(&app, &format!("/inbox?status=all&feed={}", feed.id), &cookie).await;
-    let feed_inbox_html =
-        String::from_utf8(to_bytes(feed_inbox.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
-    assert!(feed_inbox_html.contains(&format!("name=\"feed\" value=\"{}\"", feed.id)));
-
-    // Scoped batch archive with explicit `ids` archives only the filtered video, leaving article unread
-    let batch_resp = post_form(
-        &app,
-        "/web/items/archive-batch",
-        &cookie,
-        &[("_csrf", &csrf), ("ids", &vid.id), ("return_to", "/inbox?kind=video")],
-    )
-    .await;
-    assert_eq!(batch_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        db.items().get(&art.id).await.unwrap().unwrap().status,
-        crate::db::ItemStatus::Unread
-    );
-    assert_eq!(
-        db.items().get(&vid.id).await.unwrap().unwrap().status,
-        crate::db::ItemStatus::Archived
-    );
-
-    // Unconsumed item omits "Compare" in Reader and shows non-member guidance on /rank/articles?focus=...
-    let reader_resp = get_authed(&app, &format!("/reader/{}", art.id), &cookie).await;
-    let reader_html =
-        String::from_utf8(to_bytes(reader_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
-    assert!(!reader_html.contains(">Compare</a>"));
-    let rank_focus_resp =
-        get_authed(&app, &format!("/rank/articles?focus={}", art.id), &cookie).await;
-    let rank_focus_html = String::from_utf8(
-        to_bytes(rank_focus_resp.into_body(), 256 * 1024).await.unwrap().to_vec(),
-    )
-    .unwrap();
-    assert!(rank_focus_html.contains("not in <strong>Articles</strong> yet"));
-
-    // Simulated server restart preserves session + CSRF token validity without requiring tab reload
-    let restarted_app = ApiRoutes::router_with_service(RocheService::new(
-        db.clone(),
-        DummyWebFetcher,
-        Config::default(),
-    ));
-    let post_after_restart = post_form(
-        &restarted_app,
-        "/web/lists/create",
-        &cookie,
-        &[("_csrf", &csrf), ("title", "Survives Restart")],
-    )
-    .await;
-    assert_eq!(post_after_restart.status(), StatusCode::SEE_OTHER);
-}
-
-#[tokio::test]
-async fn test_web_cache_control_tailscale_session_reuse_and_explicit_logout() {
-    let mut cfg = Config::default();
-    cfg.tailscale.enabled = true;
-    cfg.tailscale.auto_auth_users = vec!["reader@example.ts.net".to_string()];
-    let (db, app) = setup_web_app(cfg).await;
-
-    // Static assets keep public caching, while HTML pages enforce `private, no-store`
-    let js_resp = app
+    // 2. HTTP login while browser still sends stale __Host-roche_session and __Host-roche_logged_out=1
+    //    clears both stale __Host-* cookies and mints a fresh unprefixed roche_session
+    let code = PairingManager::new(db.auth()).create_code(300).await.unwrap();
+    let http_login_resp = app
         .clone()
-        .oneshot(Request::builder().uri("/static/roche.js").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .header(header::COOKIE, format!("{dead_host_cookie}; __Host-roche_logged_out=1"))
+                .body(Body::from(serde_json::json!({"pairing_code": code}).to_string()))
+                .unwrap(),
+        )
         .await
         .unwrap();
-    assert_eq!(js_resp.headers().get(header::CACHE_CONTROL).unwrap(), "public, max-age=3600");
+    assert_eq!(http_login_resp.status(), StatusCode::OK);
+    assert!(
+        find_set_cookie(&http_login_resp, "__Host-roche_session=;").unwrap().contains("Max-Age=0")
+    );
+    assert!(
+        find_set_cookie(&http_login_resp, "__Host-roche_logged_out=;")
+            .unwrap()
+            .contains("Max-Age=0")
+    );
+    let fresh_plain_cookie =
+        extract_cookie_header(find_set_cookie(&http_login_resp, "roche_session=").unwrap());
 
-    let ts_get = |cookie_hdr: Option<String>| {
-        let mut builder = Request::builder()
-            .uri("/")
-            .header("Tailscale-User-Login", "reader@example.ts.net")
-            .header("Sec-Fetch-Mode", "navigate")
-            .header("Sec-Fetch-Dest", "document")
-            .header("Sec-Fetch-Site", "none");
-        if let Some(c) = cookie_hdr {
-            builder = builder.header(header::COOKIE, c);
-        }
-        let mut req = builder.body(Body::empty()).unwrap();
-        req.extensions_mut()
-            .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51900)));
-        req
-    };
-
-    let r1 = app.clone().oneshot(ts_get(None)).await.unwrap();
-    assert_eq!(r1.status(), StatusCode::OK);
-    assert_eq!(r1.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
-    let cookie1 =
-        extract_cookie_header(r1.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap());
-    let html1 =
-        String::from_utf8(to_bytes(r1.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
-    let csrf = extract_csrf_token(&html1);
-
-    // Second unauthenticated Tailscale GET reuses the cached web session instead of minting duplicates
-    // and keeps API `device_tokens` completely isolated from browser sessions.
-    let r2 = app.clone().oneshot(ts_get(None)).await.unwrap();
-    assert_eq!(r2.status(), StatusCode::OK);
-    let cookie2 =
-        extract_cookie_header(r2.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap());
-    assert_eq!(cookie1, cookie2);
-    assert_eq!(db.auth().list_devices().await.unwrap().len(), 0);
-    assert_eq!(db.auth().count_web_sessions().await.unwrap(), 1);
-
-    // Explicit POST /logout revokes the session AND sets `roche_logged_out=1`
-    let logout_resp = post_form(&app, "/logout", &cookie1, &[("_csrf", &csrf)]).await;
-    assert_eq!(logout_resp.status(), StatusCode::SEE_OTHER);
-    let set_cookies: Vec<String> = logout_resp
-        .headers()
-        .get_all(header::SET_COOKIE)
-        .iter()
-        .map(|v| extract_cookie_header(v.to_str().unwrap()))
-        .collect();
-    assert!(set_cookies.iter().any(|c| c == "roche_logged_out=1"));
-
-    // With `roche_logged_out=1`, Tailscale auto-auth does NOT silently re-login on `GET /`
-    let after_logout =
-        app.clone().oneshot(ts_get(Some("roche_logged_out=1".to_string()))).await.unwrap();
-    assert_eq!(after_logout.status(), StatusCode::SEE_OTHER);
-    assert_eq!(after_logout.headers().get(header::LOCATION).unwrap(), "/login");
-
-    // Explicit `POST /login/tailscale` clears `roche_logged_out` and issues a fresh session
-    let mut ts_relogin = Request::builder()
-        .method("POST")
-        .uri("/login/tailscale")
-        .header("Tailscale-User-Login", "reader@example.ts.net")
-        .header("sec-fetch-site", "same-origin")
-        .header(header::COOKIE, "roche_logged_out=1")
-        .body(Body::empty())
-        .unwrap();
-    ts_relogin
-        .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51901)));
-    let relogin_resp = app.clone().oneshot(ts_relogin).await.unwrap();
-    assert_eq!(relogin_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(relogin_resp.headers().get(header::LOCATION).unwrap(), "/");
+    // 3. Even if a browser sends revoked __Host-roche_session alongside valid roche_session over HTTP,
+    //    both SPA shell and API authenticate cleanly without looping to /login
+    let combined = format!("{dead_host_cookie}; {fresh_plain_cookie}");
+    assert_eq!(get_authed(&app, "/", &combined).await.status(), StatusCode::OK);
+    assert_eq!(get_authed(&app, "/api/v1/items", &combined).await.status(), StatusCode::OK);
 }
 
 #[tokio::test]
-async fn test_entry_detail_excludes_tag_and_feed_collections_from_rankings() {
+async fn test_item_audio_blocks_local_redirect_and_allows_public() {
     let (db, app) = setup_web_app(Config::default()).await;
     let (cookie, _csrf) = login_browser(&db, &app).await;
 
-    let feed_url = Url::parse("https://essays.example/rss").unwrap();
-    let feed =
-        db.feeds().create(FeedType::Rss, &feed_url, Some("UniqueFeedTitle"), None).await.unwrap();
-    let art_url = Url::parse("https://essays.example/post-1").unwrap();
-    let art = db
+    let local_url = Url::parse("https://pod.example/ep-local").unwrap();
+    let (local_item, _) = db
         .items()
-        .create(&NewItem {
-            feed_id: Some(&feed.id),
-            title: "Tagged Essay",
-            url: &art_url,
-            author: None,
-            published_at: None,
+        .save_manual_input_with_tags(&crate::db::ManualItemInput {
+            url: &local_url,
+            title: "Local Audio Ep",
             summary: None,
-            content_type: ContentType::Article,
+            content_html: None,
+            thumbnail_url: None,
+            audio_url: Some("http://127.0.0.1:9999/secret.mp3"),
+            duration: None,
+            content_type: ContentType::Audio,
+            tags: &[],
         })
         .await
         .unwrap();
-    let tag = db.tags().create("UniqueTagBadge", None).await.unwrap();
-    db.tags().add_to_item(&art.id, &tag.id).await.unwrap();
-    db.catalog().log_consumption(&art.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
 
-    let detail_resp = get_authed(&app, &format!("/entries/{}", art.id), &cookie).await;
-    assert_eq!(detail_resp.status(), StatusCode::OK);
-    let html =
-        String::from_utf8(to_bytes(detail_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
-    // Appears in system `Articles` ranking, never in `tag:` or `feed` collections!
-    assert!(html.contains(">Articles</a>"));
-    assert!(!html.contains(">UniqueTagBadge</a>"));
-}
+    let blocked_resp =
+        get_authed(&app, &format!("/api/v1/items/{}/audio", local_item.id), &cookie).await;
+    assert_eq!(blocked_resp.status(), StatusCode::NOT_FOUND);
 
-#[tokio::test]
-async fn test_web_csp_and_sanitized_reader_image_privacy_attributes() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, _csrf) = login_browser(&db, &app).await;
-
-    let art_url = Url::parse("https://essays.example/with-image").unwrap();
-    let art = db
+    let pub_url = Url::parse("https://pod.example/ep-public").unwrap();
+    let (pub_item, _) = db
         .items()
-        .create(&NewItem {
-            feed_id: None,
-            title: "Illustrated Essay",
-            url: &art_url,
-            author: None,
-            published_at: None,
+        .save_manual_input_with_tags(&crate::db::ManualItemInput {
+            url: &pub_url,
+            title: "Public Audio Ep",
             summary: None,
-            content_type: ContentType::Article,
+            content_html: None,
+            thumbnail_url: None,
+            audio_url: Some("https://cdn.pod.example/ep1.mp3"),
+            duration: None,
+            content_type: ContentType::Audio,
+            tags: &[],
         })
         .await
         .unwrap();
-    let raw_html = "<p>Body with <img src=\"/fig1.png\" referrerpolicy=\"unsafe-url\"></p>";
-    sqlx::query!(
-        "INSERT OR REPLACE INTO entry_content (entry_id, content_html) VALUES (?, ?)",
-        art.id,
-        raw_html,
-    )
-    .execute(db.pool())
-    .await
-    .unwrap();
 
-    let resp = get_authed(&app, &format!("/reader/{}", art.id), &cookie).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let csp = resp
-        .headers()
-        .get(header::CONTENT_SECURITY_POLICY)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(csp.contains("default-src 'self'"));
-    assert!(csp.contains("script-src 'self'"));
-    assert!(csp.contains("frame-ancestors 'self'"));
-
-    let html =
-        String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
-    assert!(html.contains("src=\"https://essays.example/fig1.png\""));
-    assert!(html.contains("referrerpolicy=\"no-referrer\""));
-    assert!(html.contains("loading=\"lazy\""));
-    assert!(!html.contains("unsafe-url"));
-}
-
-fn ident(scheme: &str, value: &str) -> crate::db::EntryIdentifier {
-    crate::db::EntryIdentifier { scheme: scheme.to_owned(), value: value.to_owned() }
+    let ok_resp = get_authed(&app, &format!("/api/v1/items/{}/audio", pub_item.id), &cookie).await;
+    assert_eq!(ok_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(ok_resp.headers().get(header::LOCATION).unwrap(), "https://cdn.pod.example/ep1.mp3");
 }
 
 #[tokio::test]
-async fn test_web_music_links_only_show_wikipedia_and_spotify_with_lucide_icons() {
+async fn test_spa_api_home_reader_finish_unfinish_and_rank_session() {
     let (db, app) = setup_web_app(Config::default()).await;
     let (cookie, csrf) = login_browser(&db, &app).await;
 
-    let pool = db
+    // Seed feed + article item with heading/code/image/script for reader sanitization test
+    let feed_url = Url::parse("https://editorial.example/rss.xml").unwrap();
+    let feed =
+        db.feeds().create(FeedType::Rss, &feed_url, Some("Editorial Feed"), None).await.unwrap();
+    let item_url = Url::parse("https://editorial.example/spa-essay").unwrap();
+    let item = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "SPA Architecture Notes",
+            url: &item_url,
+            author: Some("Ada Lovelace"),
+            published_at: None,
+            summary: Some("Short abstract."),
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    db.items()
+        .apply_background_enrichment(
+            &item.id,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            Some(
+                "<h1>Embedded Heading</h1><script>alert(1)</script><p>Body</p><pre><code>fn main() {}</code></pre><img src=\"https://editorial.example/fig.png\">",
+            ),
+        )
+        .await
+        .unwrap();
+
+    // 1. GET /api/v1/home
+    let home_resp = get_authed(&app, "/api/v1/home", &cookie).await;
+    assert_eq!(home_resp.status(), StatusCode::OK);
+    let home_json = read_body_json(home_resp).await;
+    assert_eq!(home_json["unread_total"], 1);
+
+    // 2. GET /api/v1/items/{id}/reader verifies sanitization & accessibility hardening
+    let reader_resp = get_authed(&app, &format!("/api/v1/items/{}/reader", item.id), &cookie).await;
+    assert_eq!(reader_resp.status(), StatusCode::OK);
+    let reader_json = read_body_json(reader_resp).await;
+    let prose = reader_json["content_html"].as_str().unwrap();
+    assert!(!prose.contains("<script"), "script tag leaked into reader HTML");
+    assert!(prose.contains("<h3>Embedded Heading</h3>"), "embedded h1 must demote to h3");
+    assert!(prose.contains("<pre tabindex=\"0\">"), "pre blocks must be keyboard focusable");
+    assert!(prose.contains("alt=\"\""), "untitled images must receive empty alt");
+    assert!(prose.contains("referrerpolicy=\"no-referrer\""), "images must protect referrer");
+
+    // 3. Finish & Unfinish reader item
+    let fin_resp = post_json_authed(
+        &app,
+        &format!("/api/v1/items/{}/finish", item.id),
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(fin_resp.status(), StatusCode::OK);
+    let fin_json = read_body_json(fin_resp).await;
+    assert_eq!(fin_json["has_feed"], true);
+    assert_eq!(fin_json["item"]["is_finished"], true);
+
+    let unfin_resp = post_json_authed(
+        &app,
+        &format!("/api/v1/items/{}/unfinish", item.id),
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({"requeue": true}),
+    )
+    .await;
+    assert_eq!(unfin_resp.status(), StatusCode::OK);
+
+    // 4. Rank session GET + submit + roche_rank_k preference cookie
+    let col = db
         .catalog()
         .create_manual_collection(
-            "Album Draw",
-            Some("album_draw"),
+            "SPA Rank List",
+            None,
             crate::db::CollectionRole::List,
             None,
             None,
         )
         .await
         .unwrap();
+    let slug = col.slug.as_deref().unwrap_or(&col.id).to_owned();
+    let mut ids = Vec::new();
+    for title in ["Work Alpha", "Work Beta", "Work Gamma"] {
+        let entry = db
+            .catalog()
+            .upsert_entry(&crate::db::UpsertEntryInput {
+                kind: Some(EntryKind::Book),
+                title: title.to_owned(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.catalog().add_collection_entry(&slug, &entry.id, None).await.unwrap();
+        ids.push(entry.id);
+    }
 
-    let album1 = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Album),
-            title: "21".to_owned(),
-            creators: vec!["Adele".to_owned()],
-            parent_collection_id: Some(pool.id.clone()),
-            parent_position: Some(1.0),
-            identifiers: vec![
-                ident("wikipedia", "21_(Adele_album)"),
-                ident("spotify", "spotify:album:5duyQokC4FMcWPYTV9Gpf9"),
-                ident("youtube_music", "OLAK5uy_lT9WWb7WZ6MOzwNkItv6Azu835h17W_L0"),
-                ident("apple_music", "1544491232"),
-                ident("tidal", "165813921"),
-                ident("deezer", "746059"),
-                ident("qobuz", "0634904052065"),
-                ident("amazon_music", "B08QDQMVJ1"),
-                ident("musicbrainz_release", "8ef859e3-3204-4b23-85c7-0f3202d8a812"),
-                ident("discogs", "2666996"),
-            ],
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+    let rank_get = get_authed(&app, &format!("/api/v1/catalog/rank/{slug}/session"), &cookie).await;
+    assert_eq!(rank_get.status(), StatusCode::OK);
+    let rank_json = read_body_json(rank_get).await;
+    assert_eq!(rank_json["cluster"].as_array().unwrap().len(), 3);
 
-    let toggle = post_form(
+    let rank_submit = post_json_authed(
         &app,
-        "/web/lists/album_draw/generator/toggle",
+        &format!("/api/v1/catalog/rank/{slug}/submit"),
         &cookie,
-        &[("_csrf", &csrf), ("enabled", "true")],
+        Some(&csrf),
+        serde_json::json!({
+            "ordering": [[&ids[0]], [&ids[1], &ids[2]]],
+            "k": 3
+        }),
     )
     .await;
-    assert_eq!(toggle.status(), StatusCode::SEE_OTHER);
+    assert_eq!(rank_submit.status(), StatusCode::CREATED);
+    assert!(find_set_cookie(&rank_submit, "roche_rank_k=3").is_some());
+    let submit_json = read_body_json(rank_submit).await;
+    assert!(submit_json["comparison"]["id"].as_str().is_some());
 
-    let artists = db.catalog().find_artist_ids_by_names(&["Adele".to_owned()]).await.unwrap();
-    let adele_id = artists.get("adele").expect("synthesized artist entry for Adele");
-    let expected_artist_link = format!("<a href=\"/entries/{adele_id}\">Adele</a>");
-
-    for path in ["/", "/lists/album_draw", &format!("/entries/{}", album1.id)] {
-        let resp = get_authed(&app, path, &cookie).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let html =
-            String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-                .unwrap();
-
-        assert!(html.contains(&expected_artist_link), "missing artist link on {path}");
-        assert!(html.contains("https://en.wikipedia.org/wiki/21_(Adele_album)"));
-        assert!(html.contains("https://open.spotify.com/album/5duyQokC4FMcWPYTV9Gpf9"));
-        assert!(html.contains("<svg class=\"icon\""));
-        if path.starts_with("/entries/") {
-            assert!(html.contains("<span>Wikipedia</span>"));
-            assert!(html.contains("<span>Spotify</span>"));
-        } else {
-            assert!(html.contains("title=\"Wikipedia\""));
-            assert!(html.contains("title=\"Listen on Spotify\""));
-        }
-        assert!(!html.contains(">Pause draw<"), "draw card must not show Pause draw on {path}");
-        if path == "/" {
-            assert!(!html.contains("/generator/toggle"));
-        } else if path == "/lists/album_draw" {
-            assert!(html.contains(">Pause Draw</button>"));
-        }
-
-        for unwanted in [
-            "YouTube Music",
-            "Apple Music",
-            "Tidal",
-            "Deezer",
-            "Qobuz",
-            "Amazon Music",
-            "MusicBrainz",
-            "Discogs",
-            "music.apple.com",
-            "tidal.com",
-            "deezer.com",
-            "open.qobuz.com",
-            "music.youtube.com",
-            "music.amazon.com",
-        ] {
-            assert!(!html.contains(unwanted), "unexpected '{unwanted}' rendered on {path}");
-        }
+    // 5. Rich read endpoints for SPA views
+    for uri in [
+        "/api/v1/search/rich?q=Alpha".to_owned(),
+        "/api/v1/catalog/lists/overview".to_owned(),
+        format!("/api/v1/catalog/lists/{slug}/detail"),
+        format!("/api/v1/catalog/entries/{}/detail", ids[0]),
+        "/api/v1/catalog/diary/page".to_owned(),
+        "/api/v1/catalog/queues".to_owned(),
+    ] {
+        let resp = get_authed(&app, &uri, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::OK, "expected 200 OK on {uri}");
     }
 }
 
 #[tokio::test]
-async fn test_web_unused_music_suppression_spotify_dedup_and_non_music_icons() {
+async fn test_spa_api_contracts_security_and_background_refresh() {
     let (db, app) = setup_web_app(Config::default()).await;
     let (cookie, csrf) = login_browser(&db, &app).await;
 
-    let album1 = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Album),
-            title: "21".to_owned(),
-            identifiers: vec![ident("wikipedia", "21_(Adele_album)")],
-            ..Default::default()
+    // 1. Fetch-metadata enforcement: same-site & duplicate Sec-Fetch-Site must be blocked on mutations
+    for headers in [vec!["same-site"], vec!["same-origin", "same-origin"]] {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalog/lists")
+            .header(header::COOKIE, &cookie)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(CSRF_HEADER_NAME, &csrf);
+        for val in headers {
+            req = req.header("sec-fetch-site", val);
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                req.body(Body::from(serde_json::json!({"title": "Blocked"}).to_string())).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // 2. Seed feed + article + local media row -> test /api/v1/items/inbox, /reader sanitization & media path hiding
+    let feed_url = Url::parse("https://journal.example/feed.xml").unwrap();
+    let feed =
+        db.feeds().create(FeedType::Rss, &feed_url, Some("Journal Feed"), None).await.unwrap();
+    let item_url = Url::parse("https://journal.example/math-essay").unwrap();
+    let item = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Essay on $E=mc^2$ & <Markup>",
+            url: &item_url,
+            author: Some("Emmy Noether"),
+            published_at: None,
+            summary: Some("Abstract"),
+            content_type: ContentType::Article,
         })
         .await
         .unwrap();
-    let album2 = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Album),
-            title: "Tidal Only Album".to_owned(),
-            identifiers: vec![ident("apple_music", "999999"), ident("tidal", "888888")],
-            ..Default::default()
-        })
+    db.items()
+        .apply_background_enrichment(
+            &item.id,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            Some("<p>Safe</p><script>alert(1)</script>"),
+        )
+        .await
+        .unwrap();
+    db.media()
+        .create_batch(
+            &item.id,
+            &[crate::db::NewMediaSpec {
+                media_type: crate::domain::MediaType::Pdf,
+                path: "/var/lib/roche/secret/internal.pdf",
+                file_size: Some(4096),
+                duration: None,
+            }],
+        )
         .await
         .unwrap();
 
-    let a2_resp = get_authed(&app, &format!("/entries/{}", album2.id), &cookie).await;
-    let a2_html =
-        String::from_utf8(to_bytes(a2_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
-    assert!(!a2_html.contains("external-links"));
-    assert!(!a2_html.contains("music.apple.com"));
-    assert!(!a2_html.contains("tidal.com"));
+    let inbox_resp =
+        get_authed(&app, "/api/v1/items/inbox?status=unread&inbox_only=true", &cookie).await;
+    assert_eq!(inbox_resp.status(), StatusCode::OK);
+    let inbox_json = read_body_json(inbox_resp).await;
+    assert_eq!(inbox_json["items"].as_array().unwrap().len(), 1);
+    let inbox_title_html = inbox_json["title_html"][&item.id].as_str().unwrap();
+    assert!(inbox_title_html.contains("&lt;Markup&gt;"));
 
-    db.catalog()
-        .log_consumption(&album1.id, ConsumptionStatus::Consumed, None, None)
+    let reader_resp = get_authed(&app, &format!("/api/v1/items/{}/reader", item.id), &cookie).await;
+    assert_eq!(reader_resp.status(), StatusCode::OK);
+    let reader_json = read_body_json(reader_resp).await;
+    assert!(reader_json["content_html"].as_str().unwrap().contains("<p>Safe</p>"));
+    assert!(!reader_json["content_html"].as_str().unwrap().contains("<script"));
+    assert!(
+        reader_json["detail"]["content_html"].is_null(),
+        "nested detail.content_html must be cleared to prevent raw HTML leakage"
+    );
+    let media_arr = reader_json["detail"]["media"].as_array().unwrap();
+    assert_eq!(media_arr.len(), 1);
+    assert!(
+        media_arr[0].get("path").is_none(),
+        "Media.path must not serialize server filesystem paths"
+    );
+
+    // 3. OptionalProblemJson rejects malformed JSON / wrong Content-Type with RFC 9457 Problem Details
+    let bad_json_finish = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/items/{}/finish", item.id))
+                .header(header::COOKIE, &cookie)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(CSRF_HEADER_NAME, &csrf)
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from("{broken json"))
+                .unwrap(),
+        )
         .await
         .unwrap();
-    db.catalog()
-        .log_consumption(&album2.id, ConsumptionStatus::Consumed, None, None)
+    assert_eq!(bad_json_finish.status(), StatusCode::BAD_REQUEST);
+    let bad_ct_finish = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/items/{}/finish", item.id))
+                .header(header::COOKIE, &cookie)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .header(CSRF_HEADER_NAME, &csrf)
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from("hello"))
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let rank_resp = get_authed(&app, "/rank/albums", &cookie).await;
-    let rank_html =
-        String::from_utf8(to_bytes(rank_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
-    assert!(rank_html.contains("data-open-url=\"https://en.wikipedia.org/wiki/21_(Adele_album)\""));
-    assert!(!rank_html.contains("music.apple.com"));
-    assert!(!rank_html.contains("tidal.com"));
+    assert_eq!(bad_ct_finish.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
-    // Quick-logging a Spotify URL deduplicates cleanly into a single Spotify link
-    let ql_resp = post_form(
+    // 4. Quick-log + Lists overview/detail contracts + Diary cadence + Queues + Search + Want complete
+    let ql_want = post_json_authed(
         &app,
-        "/web/log",
+        "/api/v1/catalog/quick-log",
         &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("kind", "album"),
-            ("action", "want"),
-            ("title", "The Dark Side of the Moon"),
-            ("identifier", "https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv?si=abc123"),
-        ],
+        Some(&csrf),
+        serde_json::json!({
+            "title": "Design Patterns Queued",
+            "kind": "book",
+            "action": "want",
+            "creators": ["Gamma"],
+            "release_year": 1994
+        }),
     )
     .await;
-    assert_eq!(ql_resp.status(), StatusCode::SEE_OTHER);
-    let dsotm = db
-        .catalog()
-        .search_entries(Some("The Dark Side of the Moon"), Some(EntryKind::Album), 5)
-        .await
-        .unwrap();
-    let dsotm_resp = get_authed(&app, &format!("/entries/{}", dsotm[0].id), &cookie).await;
-    let dsotm_html =
-        String::from_utf8(to_bytes(dsotm_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
-    assert!(dsotm_html.contains("https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv"));
-    assert!(dsotm_html.contains("<span>Spotify</span>"));
-    assert!(!dsotm_html.contains("Open Source"));
+    assert_eq!(ql_want.status(), StatusCode::CREATED);
+    let ql_want_json = read_body_json(ql_want).await;
+    let queued_entry_id = ql_want_json["entry"]["id"].as_str().unwrap().to_owned();
 
-    // Non-music entries still show their non-music external identifiers with Lucide icons
-    let movie = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Movie),
-            title: "Stalker".to_owned(),
-            identifiers: vec![
-                ident("wikipedia", "Stalker_(1979_film)"),
-                ident("imdb", "tt0079944"),
-            ],
-            ..Default::default()
-        })
+    let queues_resp = get_authed(&app, "/api/v1/catalog/queues", &cookie).await;
+    assert_eq!(queues_resp.status(), StatusCode::OK);
+    let queues_json = read_body_json(queues_resp).await;
+    assert_eq!(queues_json["total_items"], 1);
+    assert!(queues_json["title_html"][&queued_entry_id].is_string());
+
+    let search_resp = get_authed(&app, "/api/v1/search/rich?q=Design+Patterns", &cookie).await;
+    assert_eq!(search_resp.status(), StatusCode::OK);
+    let search_json = read_body_json(search_resp).await;
+    let want_hits = search_json["results"]["want_entries"].as_array().unwrap();
+    assert_eq!(want_hits.len(), 1);
+    assert!(want_hits[0]["queue_id"].is_string());
+    assert!(want_hits[0]["queue_title"].is_string());
+    let actual_queue_slug = want_hits[0]["queue_slug"].as_str().unwrap().to_owned();
+
+    // Unknown queue slug returns 404; valid queue slug succeeds with empty body
+    let bad_queue_complete = post_json_authed(
+        &app,
+        &format!("/api/v1/catalog/want/nonexistent-queue/complete/{queued_entry_id}"),
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(bad_queue_complete.status(), StatusCode::NOT_FOUND);
+
+    let ok_queue_complete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/catalog/want/{actual_queue_slug}/complete/{queued_entry_id}"))
+                .header(header::COOKIE, &cookie)
+                .header(CSRF_HEADER_NAME, &csrf)
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let movie_resp = get_authed(&app, &format!("/entries/{}", movie.id), &cookie).await;
-    let movie_html =
-        String::from_utf8(to_bytes(movie_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
-    assert!(movie_html.contains("<span>Wikipedia</span>"));
-    assert!(movie_html.contains("<span>IMDb</span>"));
-    assert!(movie_html.contains("<svg class=\"icon\""));
+    assert_eq!(ok_queue_complete.status(), StatusCode::OK);
+
+    // Log second book + manual list + comparison to check RankedEntryRow & is_dynamic / dynamic_collection_ids
+    let ql_book2 = post_json_authed(
+        &app,
+        "/api/v1/catalog/quick-log",
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({
+            "title": "Structure and Interpretation",
+            "kind": "book",
+            "action": "consumed",
+            "creators": ["Abelson"],
+            "release_year": 1985
+        }),
+    )
+    .await;
+    assert_eq!(ql_book2.status(), StatusCode::CREATED);
+    let book2_id = read_body_json(ql_book2).await["entry"]["id"].as_str().unwrap().to_owned();
+
+    let manual = db
+        .catalog()
+        .create_manual_collection(
+            "Manual Contract List",
+            None,
+            crate::db::CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let manual_slug = manual.slug.as_deref().unwrap_or(&manual.id).to_owned();
+    db.catalog().add_collection_entry(&manual_slug, &queued_entry_id, None).await.unwrap();
+    db.catalog().add_collection_entry(&manual_slug, &book2_id, None).await.unwrap();
+
+    // GET rank session must NOT emit Set-Cookie even with ?k=2
+    let rank_get =
+        get_authed(&app, &format!("/api/v1/catalog/rank/{manual_slug}/session?k=2"), &cookie).await;
+    assert_eq!(rank_get.status(), StatusCode::OK);
+    assert!(
+        rank_get.headers().get(header::SET_COOKIE).is_none(),
+        "GET rank session must not mutate cookies"
+    );
+
+    let rank_post = post_json_authed(
+        &app,
+        &format!("/api/v1/catalog/rank/{manual_slug}/submit"),
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({"ordering": [[&queued_entry_id], [&book2_id]], "k": 2}),
+    )
+    .await;
+    assert_eq!(rank_post.status(), StatusCode::CREATED);
+
+    let overview_resp = get_authed(&app, "/api/v1/catalog/lists/overview", &cookie).await;
+    assert_eq!(overview_resp.status(), StatusCode::OK);
+    let overview_json = read_body_json(overview_resp).await;
+    let dyn_ids: Vec<&str> = overview_json["dynamic_collection_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        !dyn_ids.is_empty(),
+        "built-in media collections must appear in dynamic_collection_ids"
+    );
+    assert!(!dyn_ids.contains(&manual.id.as_str()), "manual list must not be marked dynamic");
+
+    let manual_detail = read_body_json(
+        get_authed(&app, &format!("/api/v1/catalog/lists/{manual_slug}/detail"), &cookie).await,
+    )
+    .await;
+    assert_eq!(manual_detail["is_dynamic"], false);
+    let first_row = &manual_detail["view"]["rows"][0];
+    assert!(first_row["score"]["mean"].is_number());
+    assert!(first_row["score"]["variance"].is_number());
+    assert!(first_row["bar_pct"].is_number());
+
+    let books_detail =
+        read_body_json(get_authed(&app, "/api/v1/catalog/lists/books/detail", &cookie).await).await;
+    assert_eq!(books_detail["is_dynamic"], true);
+
+    // Entry detail merge preview error is sanitized + log_history has ConsumptionLogRow fields
+    let entry_detail = read_body_json(
+        get_authed(
+            &app,
+            &format!(
+                "/api/v1/catalog/entries/{queued_entry_id}/detail?merge_preview=no-such-entry-xyz"
+            ),
+            &cookie,
+        )
+        .await,
+    )
+    .await;
+    assert!(entry_detail["merge_preview_error"].as_str().is_some());
+    assert_eq!(entry_detail["detail"]["log_history"].as_array().unwrap().len(), 1);
+
+    // Diary page includes SQL-grouped active-month cadence counts summing to our 2 logged books
+    let diary_json =
+        read_body_json(get_authed(&app, "/api/v1/catalog/diary/page", &cookie).await).await;
+    let cadence = diary_json["cadence_months"].as_array().unwrap();
+    assert_eq!(cadence.len(), 1);
+    let cadence_sum: i64 = cadence.iter().filter_map(|m| m[1].as_i64()).sum();
+    assert_eq!(cadence_sum, 2);
+
+    // 5. Board dismissed_only=true returns dismissed item past rank #30 + background refresh returns 200 OK
+    let board_spec = roche_core::boards::BoardSourceSpec::for_hacker_news(
+        roche_core::boards::HackerNewsSection::Top,
+    );
+    let board = db.boards().create(&board_spec, Some("HN Contract"), None, 30).await.unwrap();
+    let candidates: Vec<crate::db::BoardPollCandidate> = (1..=35_i64)
+        .map(|rank| crate::db::BoardPollCandidate {
+            external_id: format!("ext-{rank}"),
+            rank,
+            title: format!("Story #{rank}"),
+            url: format!("https://example.org/story-{rank}"),
+            discussion_url: Some(format!("https://news.ycombinator.com/item?id={rank}")),
+            author: Some("alice".to_owned()),
+            domain: Some("example.org".to_owned()),
+            published_at: None,
+            score: Some(100 - rank),
+            comment_count: Some(rank),
+            summary: None,
+            self_text_html: None,
+            metadata_json: "{}".to_owned(),
+        })
+        .collect();
+    db.boards()
+        .record_poll_batch(&board.id, &crate::db::BoardPollBatch { items: candidates })
+        .await
+        .unwrap();
+    db.boards().dismiss_item(&board.id, "ext-35").await.unwrap();
+
+    let dismissed_resp = get_authed(
+        &app,
+        &format!("/api/v1/boards/{}/items?page=1&per_page=30&dismissed_only=true", board.id),
+        &cookie,
+    )
+    .await;
+    assert_eq!(dismissed_resp.status(), StatusCode::OK);
+    let dismissed_json = read_body_json(dismissed_resp).await;
+    let dismissed_items = dismissed_json["items"].as_array().unwrap();
+    assert_eq!(dismissed_items.len(), 1);
+    assert_eq!(dismissed_items[0]["external_id"], "ext-35");
+    assert_eq!(dismissed_items[0]["is_dismissed"], true);
+    assert!(dismissed_items[0]["is_favorite"].is_boolean());
+    assert!(dismissed_items[0]["in_want_to_read"].is_boolean());
+
+    let feed_bg = post_json_authed(
+        &app,
+        &format!("/api/v1/feeds/{}/refresh?background=true", feed.id),
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(feed_bg.status(), StatusCode::OK);
+    assert_eq!(read_body_json(feed_bg).await["id"], feed.id);
+
+    let board_bg = post_json_authed(
+        &app,
+        &format!("/api/v1/boards/{}/refresh?background=true", board.id),
+        &cookie,
+        Some(&csrf),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(board_bg.status(), StatusCode::OK);
+    assert_eq!(read_body_json(board_bg).await["id"], board.id);
 }
 
-#[tokio::test]
-async fn test_entry_detail_renders_artwork_and_metadata_genres() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, _csrf) = login_browser(&db, &app).await;
+// ---------------------------------------------------------------------------
+// WCAG 2.1 AA CSS Palette Contrast Guard (against web/src/styles/*)
+// ---------------------------------------------------------------------------
 
-    let album = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Album),
-            title: "Kind of Blue".to_owned(),
-            creators: vec!["Miles Davis".to_owned()],
-            release_year: Some(1959),
-            thumbnail_url: Some("https://i.scdn.co/image/ab67616d0000b273kindofblue".to_owned()),
-            metadata: Some(serde_json::json!({
-                "genres": ["Modal Jazz", "Cool Jazz"],
-                "styles": ["Post-Bop", "modal jazz"]
-            })),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+const WEB_TOKENS_CSS: &str = include_str!("../../../web/src/styles/tokens.css");
+const WEB_BASE_CSS: &str = include_str!("../../../web/src/styles/base.css");
+const WEB_PRIMITIVES_CSS: &str = include_str!("../../../web/src/styles/primitives.css");
 
-    let resp = get_authed(&app, &format!("/entries/{}", album.id), &cookie).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let html =
-        String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
-    assert!(html.contains("<div class=\"entry-hero\">"));
-    assert!(html.contains("class=\"entry-artwork\""));
-    assert!(html.contains("src=\"https://i.scdn.co/image/ab67616d0000b273kindofblue\""));
-    assert!(html.contains("referrerpolicy=\"no-referrer\""));
-    assert!(html.contains("<dt>Genres</dt><dd>Modal Jazz · Cool Jazz · Post-Bop</dd>"));
+fn strip_css_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        if let Some(end) = rest[start + 2..].find("*/") {
+            rest = &rest[start + 2 + end + 2..];
+        } else {
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
-#[tokio::test]
-async fn test_lists_overview_catalog_search_and_kind_filter() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, _csrf) = login_browser(&db, &app).await;
+fn parse_css_theme_blocks(css: &str) -> Vec<(String, std::collections::HashMap<String, String>)> {
+    let cleaned = strip_css_comments(css);
+    let mut blocks = Vec::new();
+    let mut search = cleaned.as_str();
+    while let Some(root_start) = search.find(":root") {
+        let after_root = &search[root_start..];
+        let Some(open) = after_root.find('{') else {
+            break;
+        };
+        let selector = after_root[..open].trim().to_owned();
+        let Some(close) = after_root[open + 1..].find('}') else {
+            break;
+        };
+        let mut vars = std::collections::HashMap::new();
+        for decl in after_root[open + 1..open + 1 + close].split(';') {
+            let trimmed = decl.trim();
+            if let Some(prop) = trimmed.strip_prefix("--")
+                && let Some((name, value)) = prop.split_once(':')
+            {
+                vars.insert(format!("--{}", name.trim()), value.trim().to_owned());
+            }
+        }
+        if !vars.is_empty() {
+            blocks.push((selector, vars));
+        }
+        search = &after_root[open + 1 + close + 1..];
+    }
+    blocks
+}
 
-    let album = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Album),
-            title: "Vespertine".to_owned(),
-            creators: vec!["Björk".to_owned()],
-            release_year: Some(2001),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let movie = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Movie),
-            title: "Dancer in the Dark".to_owned(),
-            creators: vec!["Lars von Trier".to_owned()],
-            release_year: Some(2000),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+fn parse_hex_rgb(hex: &str) -> (f64, f64, f64) {
+    let h = hex.strip_prefix('#').expect("hex color starts with #");
+    assert_eq!(h.len(), 6, "expected 6-digit hex color, got {hex}");
+    let r = u8::from_str_radix(&h[0..2], 16).unwrap();
+    let g = u8::from_str_radix(&h[2..4], 16).unwrap();
+    let b = u8::from_str_radix(&h[4..6], 16).unwrap();
+    (f64::from(r) / 255.0, f64::from(g) / 255.0, f64::from(b) / 255.0)
+}
 
-    let artists = db.catalog().find_artist_ids_by_names(&["Björk".to_owned()]).await.unwrap();
-    let bjork_id = artists.get("björk").expect("synthesized artist for Björk");
+fn wcag_relative_luminance(hex: &str) -> f64 {
+    fn linearize(channel: f64) -> f64 {
+        if channel <= 0.04045 { channel / 12.92 } else { ((channel + 0.055) / 1.055).powf(2.4) }
+    }
+    let (r, g, b) = parse_hex_rgb(hex);
+    0.2126_f64.mul_add(linearize(r), 0.7152_f64.mul_add(linearize(g), 0.0722 * linearize(b)))
+}
 
-    let q_resp = get_authed(&app, "/lists?q=Vespertine", &cookie).await;
-    assert_eq!(q_resp.status(), StatusCode::OK);
-    let q_html =
-        String::from_utf8(to_bytes(q_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
-    assert!(q_html.contains("Search Results (1)"));
-    assert!(q_html.contains(&format!("/entries/{}\">Vespertine</a>", album.id)));
-    assert!(q_html.contains(&format!("<a href=\"/entries/{bjork_id}\">Björk</a>")));
-    assert!(q_html.contains("(2001)"));
-    assert!(q_html.contains("<span class=\"badge\">Album</span>"));
-    assert!(!q_html.contains("Dancer in the Dark"));
-
-    let kind_resp = get_authed(&app, "/lists?kind=artist", &cookie).await;
-    let kind_html =
-        String::from_utf8(to_bytes(kind_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
-    assert!(kind_html.contains(&format!("/entries/{bjork_id}\">Björk</a>")));
-    assert!(!kind_html.contains(&format!("/entries/{}\">Dancer in the Dark</a>", movie.id)));
-
-    let bogus_resp = get_authed(&app, "/lists?q=Vespertine&kind=bogus", &cookie).await;
-    let bogus_html =
-        String::from_utf8(to_bytes(bogus_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
-            .unwrap();
-    assert!(bogus_html.contains("Unknown entry kind filter &#39;bogus&#39;"));
-    assert!(bogus_html.contains("Search Results (0)"));
-    assert!(!bogus_html.contains(&format!("/entries/{}\">Vespertine</a>", album.id)));
+fn wcag_contrast_ratio(foreground_hex: &str, background_hex: &str) -> f64 {
+    let lum_a = wcag_relative_luminance(foreground_hex);
+    let lum_b = wcag_relative_luminance(background_hex);
+    let (lighter, darker) = if lum_a >= lum_b { (lum_a, lum_b) } else { (lum_b, lum_a) };
+    (lighter + 0.05) / (darker + 0.05)
 }
 
 #[test]
-fn test_artist_enrichment_wikipedia_and_spotify_parsers() {
-    use super::links::sanitize_non_local_href;
-    use crate::service::enrich::{
-        WikipediaSearchHit, encode_wiki_path_segment, extract_spotify_artist_uri_from_album_html,
-        parse_wikipedia_artist_summary_json, select_best_artist_wikipedia_slug,
-    };
+fn web_css_palette_meets_wcag_aa_contrast() {
+    let blocks = parse_css_theme_blocks(WEB_TOKENS_CSS);
+    assert!(
+        blocks.len() >= 2,
+        "web/src/styles/tokens.css must define light and dark :root theme blocks"
+    );
 
+    let normal_text_tokens = [
+        "--ink",
+        "--ink-soft",
+        "--ink-faint",
+        "--link",
+        "--link-hover",
+        "--accent",
+        "--tier-S",
+        "--tier-A",
+        "--tier-B",
+        "--tier-C",
+        "--tier-D",
+    ];
+
+    for (selector, vars) in &blocks {
+        let get = |name: &str| -> &str {
+            vars.get(name)
+                .map_or_else(|| panic!("missing CSS token {name} in {selector}"), String::as_str)
+        };
+
+        let surfaces = [
+            ("--paper", get("--paper")),
+            ("--paper-deep", get("--paper-deep")),
+            ("--paper-input", get("--paper-input")),
+        ];
+
+        for (surface_label, surface_hex) in surfaces {
+            for text_token in normal_text_tokens {
+                let text_hex = get(text_token);
+                let ratio = wcag_contrast_ratio(text_hex, surface_hex);
+                assert!(
+                    ratio >= 4.5,
+                    "tokens.css ({selector}) {text_token} ({text_hex}) on {surface_label} ({surface_hex}) has contrast {ratio:.2}:1 (WCAG AA requires >= 4.5:1)"
+                );
+            }
+
+            for ui_token in ["--control-border", "--accent"] {
+                let ui_hex = get(ui_token);
+                let ratio = wcag_contrast_ratio(ui_hex, surface_hex);
+                assert!(
+                    ratio >= 3.0,
+                    "tokens.css ({selector}) {ui_token} ({ui_hex}) on {surface_label} ({surface_hex}) has contrast {ratio:.2}:1 (WCAG 1.4.11 requires >= 3.0:1)"
+                );
+            }
+        }
+
+        for (foreground_token, background_token) in [
+            ("--paper", "--ink"),
+            ("--accent-on-fill", "--accent-fill"),
+            ("--accent-on-fill", "--accent-fill-hover"),
+        ] {
+            let ratio = wcag_contrast_ratio(get(foreground_token), get(background_token));
+            assert!(
+                ratio >= 4.5,
+                "tokens.css ({selector}) {foreground_token} on {background_token} has contrast {ratio:.2}:1 (WCAG AA requires >= 4.5:1)"
+            );
+        }
+    }
+
+    let combined_global_css = format!("{WEB_BASE_CSS}\n{WEB_PRIMITIVES_CSS}");
+    assert!(
+        combined_global_css.contains("::placeholder"),
+        "global CSS must explicitly style ::placeholder"
+    );
+    assert!(
+        combined_global_css.contains(":disabled"),
+        "global CSS must explicitly style :disabled controls"
+    );
+    assert!(
+        combined_global_css.contains("scroll-padding-bottom"),
+        "global CSS must reserve scroll-padding-bottom when fixed player bar is visible"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pure Security, Sanitization, Link Filtering & Enrichment Unit Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_artist_enrichment_wikipedia_and_spotify_parsers() {
     assert_eq!(sanitize_non_local_href("HTTPS://ROCHE.LOCAL/entry/123"), None);
     assert_eq!(sanitize_non_local_href("http://127.0.0.1:8080/thumb.jpg"), None);
     assert_eq!(encode_wiki_path_segment("AC/DC"), "AC%2FDC");
@@ -1392,7 +1534,6 @@ fn test_artist_enrichment_wikipedia_and_spotify_parsers() {
             snippet: "British progressive rock band formed in London in 1967.".to_owned(),
         },
     ];
-    // Equal-score tie breaks in favor of Wikipedia's top-ranked hit (`Nirvana (band)`)
     assert_eq!(
         select_best_artist_wikipedia_slug(&nirvana_hits, "Nirvana", &[]),
         Some("Nirvana_(band)".to_owned())
@@ -1413,7 +1554,6 @@ fn test_artist_enrichment_wikipedia_and_spotify_parsers() {
         Some("Elvis_Presley".to_owned())
     );
 
-    // `<script>if (x<a && y>z)` must not corrupt anchor scanning or numeric HTML entity decoding
     let collab_html = r#"
         <script>if (x<a && y>z) { console.log("ok"); }</script>
         <meta name="music:musician" content="https://open.spotify.com/artist/1111111111111111111111"/>
@@ -1431,7 +1571,6 @@ fn test_artist_enrichment_wikipedia_and_spotify_parsers() {
     );
     assert_eq!(extract_spotify_artist_uri_from_album_html(collab_html, "Unknown", true), None);
 
-    // Mid-paragraph "debut album by" and "step by step" must NOT reject valid artist summaries
     let arctic_json = r#"{"type":"standard","description":"English rock band","extract":"Arctic Monkeys are an English rock band formed in Sheffield in 2002. Moving step by step, their 2006 record became the fastest-selling debut album by a band in UK chart history."}"#;
     assert!(parse_wikipedia_artist_summary_json(arctic_json, true).is_some());
 
@@ -1439,251 +1578,18 @@ fn test_artist_enrichment_wikipedia_and_spotify_parsers() {
     assert_eq!(parse_wikipedia_artist_summary_json(furniture_json, true), None);
 }
 
-#[tokio::test]
-async fn test_artist_detail_enrichment_persists_links_portrait_and_bio() {
-    use crate::service::enrich::enrich_artist_detail_with_fetcher;
-
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, _csrf) = login_browser(&db, &app).await;
-
-    db.catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Album),
-            title: "21".to_owned(),
-            creators: vec!["Adele".to_owned()],
-            identifiers: vec![ident("spotify", "spotify:album:5duyQokC4FMcWPYTV9Gpf9")],
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    let artists = db.catalog().find_artist_ids_by_names(&["Adele".to_owned()]).await.unwrap();
-    let adele_id = artists.get("adele").unwrap().clone();
-    let mut detail = db.catalog().get_entry_detail(&adele_id).await.unwrap().unwrap();
-
-    let service = RocheService::new(db.clone(), DummyWebFetcher, Config::default());
-    let mock_fetcher = |url: &Url| -> Option<String> {
-        let s = url.as_str();
-        if s.contains("open.spotify.com/album/") {
-            Some(r#"<meta name="music:musician" content="https://open.spotify.com/artist/4dpARuHxo51G3z768sgnrY"/><a href="/artist/4dpARuHxo51G3z768sgnrY">Adele</a>"#.to_owned())
-        } else if s.contains("w/api.php") {
-            Some(r#"{"query":{"search":[{"title":"Adele","snippet":"English singer-songwriter (born 1988)."}]}}"#.to_owned())
-        } else if s.contains("api/rest_v1/page/summary/Adele") {
-            Some(r#"{"type":"standard","description":"English singer-songwriter","extract":"Adele Laurie Blue Adkins is an English singer-songwriter.","thumbnail":{"source":"https://upload.wikimedia.org/wikipedia/commons/adele.jpg"}}"#.to_owned())
-        } else {
-            None
-        }
-    };
-    enrich_artist_detail_with_fetcher(&service, &mut detail, &mock_fetcher).await;
-
-    let resp = get_authed(&app, &format!("/entries/{adele_id}"), &cookie).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let html =
-        String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
-    assert!(html.contains("https://en.wikipedia.org/wiki/Adele"));
-    assert!(html.contains("https://open.spotify.com/artist/4dpARuHxo51G3z768sgnrY"));
-    assert!(html.contains("src=\"https://upload.wikimedia.org/wikipedia/commons/adele.jpg\""));
-    assert!(html.contains("Adele Laurie Blue Adkins is an English singer-songwriter."));
-}
-
-struct DiscoveryWebFetcher;
-
-impl crate::ingest::FeedFetcher for DiscoveryWebFetcher {
-    fn fetch_feed(&self, url: &Url) -> impl std::future::Future<Output = anyhow::Result<String>> {
-        let res = match url.as_str() {
-            "https://danluu.com/" => Ok(r#"<!doctype html><html><head><title>Dan Luu</title>
-                   <link rel="alternate" type="application/atom+xml" href="/atom.xml">
-                   </head><body><p>Essays</p></body></html>"#
-                .to_owned()),
-            "https://danluu.com/atom.xml" => Ok(r#"<?xml version="1.0" encoding="utf-8"?>
-                   <feed xmlns="http://www.w3.org/2005/Atom">
-                     <title>Dan Luu</title>
-                     <entry>
-                       <id>https://danluu.com/latency-mitigations/</id>
-                       <title>Latency Mitigations</title>
-                       <link href="https://danluu.com/latency-mitigations/"/>
-                     </entry>
-                   </feed>"#
-                .to_owned()),
-            "https://www.youtube.com/@Computerphile" => Ok(r#"<!doctype html><html><head>
-                   <meta itemprop="channelId" content="UC9-y-6csu5WGm29I7JiwpnA">
-                   </head><body></body></html>"#
-                .to_owned()),
-            other => Err(anyhow::anyhow!("unexpected fetch_feed url: {other}")),
-        };
-        std::future::ready(res)
-    }
-
-    fn fetch_html(
-        &self,
-        url: &Url,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<String>>> {
-        let res = if url.as_str() == "https://essays.example.com/lsm" {
-            Ok(Some(
-                r#"<!doctype html><html><head><title>LSM Compaction</title>
-                   <meta name="author" content="Pat O'Neil">
-                   <meta name="description" content="Write amplification tradeoffs.">
-                   </head><body><p>Full saved essay text.</p></body></html>"#
-                    .to_owned(),
-            ))
-        } else {
-            Ok(None)
-        };
-        std::future::ready(res)
-    }
-}
-
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_want_to_read_readonly_inbox_starred_list_and_homepage_feed_discovery() {
-    assert_eq!(
-        crate::db::deterministic_system_collection_id("want:read"),
-        crate::db::WANT_TO_READ_COLLECTION_ID
-    );
-
-    let db = Db::connect("sqlite::memory:").await.unwrap();
-    let service = RocheService::new(db.clone(), DiscoveryWebFetcher, Config::default());
-    let app = crate::api::ApiRoutes::router_with_service(service.clone());
-    let (cookie, csrf) = login_browser(&db, &app).await;
-    let resp_html = async |resp: axum::response::Response| -> String {
-        String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap()
-    };
-
-    // 1. Save standalone URL from Home -> lands in Want to Read (`inbox_state = 'none'`), NOT Feed Inbox
-    let save_resp = post_form(
-        &app,
-        "/web/items/save",
-        &cookie,
-        &[("_csrf", &csrf), ("url", "essays.example.com/lsm"), ("return_to", "/")],
-    )
-    .await;
-    assert_eq!(save_resp.status(), StatusCode::SEE_OTHER);
-
-    for _ in 0..30 {
-        if !service.is_refreshing() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    let home_html = resp_html(get_authed(&app, "/", &cookie).await).await;
-    assert!(home_html.contains("Queue (1)"));
-    assert!(home_html.contains("LSM Compaction"));
-    assert!(home_html.contains("Feed Inbox (<span class=\"js-unread-count\">0</span>)"));
-
-    let inbox_html = resp_html(get_authed(&app, "/inbox", &cookie).await).await;
-    assert!(!inbox_html.contains("Save URL to Inbox"));
-    assert!(!inbox_html.contains("LSM Compaction"));
-
-    let queue_html = resp_html(get_authed(&app, "/queue", &cookie).await).await;
-    assert!(queue_html.contains("Want to Read <span class=\"list-count-badge\">1</span>"));
-    assert!(queue_html.contains("LSM Compaction"));
-    assert!(queue_html.contains(">Read</a>"));
-
-    let wtr_items = db
-        .items()
-        .list_filtered(&crate::db::ItemFilter {
-            collection_id: Some(crate::db::WANT_TO_READ_COLLECTION_ID.to_owned()),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    assert_eq!(wtr_items.len(), 1);
-    let saved_id = wtr_items[0].id.clone();
-    assert_eq!(wtr_items[0].author.as_deref(), Some("Pat O'Neil"));
-
-    // Media attached to a `want:read` item (`inbox_state = 'none'`) must NEVER be treated as orphaned!
-    db.media()
-        .create(&saved_id, crate::db::MediaType::Pdf, "pdfs/lsm.pdf", Some(2048), None)
-        .await
-        .unwrap();
-    assert!(db.media().find_orphaned().await.unwrap().is_empty());
-
-    // 2. Star the item -> `/lists` and `/lists/starred` treat Starred as a normal manual list (no Enable Draw)
-    let star_resp = post_form(
-        &app,
-        &format!("/web/items/{saved_id}/star"),
-        &cookie,
-        &[("_csrf", &csrf), ("return_to", "/lists/starred")],
-    )
-    .await;
-    assert_eq!(star_resp.status(), StatusCode::SEE_OTHER);
-
-    let lists_html = resp_html(get_authed(&app, "/lists", &cookie).await).await;
-    assert!(lists_html.contains("/lists/starred"));
-
-    let starred_list_html = resp_html(get_authed(&app, "/lists/starred", &cookie).await).await;
-    assert!(starred_list_html.contains("LSM Compaction"));
-    assert!(starred_list_html.contains("Read &rarr;"));
-    assert!(!starred_list_html.contains("Enable Draw"));
-
-    // 3. Homepage & YouTube `@handle` RSS autodiscovery on `/web/feeds/create`
-    let sub_blog = post_form(
-        &app,
-        "/web/feeds/create",
-        &cookie,
-        &[("_csrf", &csrf), ("url", "danluu.com"), ("feed_type", "rss")],
-    )
-    .await;
-    assert_eq!(sub_blog.status(), StatusCode::SEE_OTHER);
-
-    let sub_yt = post_form(
-        &app,
-        "/web/feeds/create",
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("url", "https://www.youtube.com/@Computerphile"),
-            ("feed_type", "rss"),
-        ],
-    )
-    .await;
-    assert_eq!(sub_yt.status(), StatusCode::SEE_OTHER);
-
-    let feeds = db.feeds().list().await.unwrap();
-    assert!(feeds.iter().any(|f| f.url.as_str() == "https://danluu.com/atom.xml"));
-    assert!(feeds.iter().any(|f| {
-        f.feed_type == FeedType::Youtube
-            && f.url.as_str()
-                == "https://www.youtube.com/feeds/videos.xml?channel_id=UC9-y-6csu5WGm29I7JiwpnA"
-    }));
-
-    // 4. Non-blocking background refresh endpoint + JSON status route
-    let refresh_all = post_form(
-        &app,
-        "/web/feeds/refresh-all",
-        &cookie,
-        &[("_csrf", &csrf), ("return_to", "/inbox")],
-    )
-    .await;
-    assert_eq!(refresh_all.status(), StatusCode::SEE_OTHER);
-
-    let status_resp = get_authed(&app, "/web/refresh-status", &cookie).await;
-    assert_eq!(status_resp.status(), StatusCode::OK);
-    let status_json: serde_json::Value =
-        serde_json::from_slice(&to_bytes(status_resp.into_body(), 16 * 1024).await.unwrap())
-            .unwrap();
-    assert!(status_json["is_refreshing"].is_boolean());
-}
-
 #[test]
 fn test_decode_html_entities_multibyte_utf8_no_panic() {
-    use crate::service::enrich::decode_html_entities;
-
-    // '&' followed by 10 ASCII bytes + a 3-byte UTF-8 char straddling byte 12 (bytes 10..13)
     let input = "A &0123456789\u{2014}end &amp; &quot;Bj\u{00f6}rk&quot; &#x27;ok&#x27;";
     let decoded = decode_html_entities(input);
     assert_eq!(decoded, "A &0123456789\u{2014}end & \"Bj\u{00f6}rk\" 'ok'");
 
-    // Multi-byte chars immediately after '&' with no semicolon
     let no_semi = "&日本語テスト文字列";
     assert_eq!(decode_html_entities(no_semi), no_semi);
 }
 
 #[test]
 fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat() {
-    use super::links::sanitize_non_local_href;
-
     for blocked in [
         "http://0.0.0.0/a",
         "http://0.1.2.3/a",
@@ -1747,11 +1653,6 @@ fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat
 
 #[test]
 fn test_is_same_origin_post_origin_and_referer_fallback() {
-    use axum::http::HeaderMap;
-
-    use super::auth::is_same_origin_post;
-
-    // Sec-Fetch-Site present
     let mut h = HeaderMap::new();
     h.insert("sec-fetch-site", "same-origin".parse().unwrap());
     assert!(is_same_origin_post(&h, true));
@@ -1761,7 +1662,6 @@ fn test_is_same_origin_post_origin_and_referer_fallback() {
     h.insert("sec-fetch-site", "cross-site".parse().unwrap());
     assert!(!is_same_origin_post(&h, true));
 
-    // Sec-Fetch-Site absent -> falls back to Origin vs Host with strict scheme check
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "roche.example:8080".parse().unwrap());
     h.insert(header::ORIGIN, "https://roche.example:8080".parse().unwrap());
@@ -1774,12 +1674,6 @@ fn test_is_same_origin_post_origin_and_referer_fallback() {
     assert!(is_same_origin_post(&h, false));
     assert!(!is_same_origin_post(&h, true));
 
-    let mut h = HeaderMap::new();
-    h.insert(header::HOST, "roche.example:8080".parse().unwrap());
-    h.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
-    assert!(!is_same_origin_post(&h, true));
-
-    // Reject malformed Host headers containing `?`, `#`, `/`, or `@`
     for bad_host in
         ["roche.example?x=1", "roche.example#frag", "roche.example/path", "u@roche.example"]
     {
@@ -1792,35 +1686,37 @@ fn test_is_same_origin_post_origin_and_referer_fallback() {
         );
     }
 
-    // Sec-Fetch-Site & Origin absent -> falls back to Referer vs Host with strict scheme check
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "roche.example".parse().unwrap());
     h.insert(header::REFERER, "https://roche.example/login".parse().unwrap());
     assert!(is_same_origin_post(&h, true));
     assert!(!is_same_origin_post(&h, false));
 
-    let mut h = HeaderMap::new();
-    h.insert(header::HOST, "roche.example".parse().unwrap());
-    h.insert(header::REFERER, "http://roche.example/login".parse().unwrap());
-    assert!(is_same_origin_post(&h, false));
-    assert!(!is_same_origin_post(&h, true));
-
-    let mut h = HeaderMap::new();
-    h.insert(header::HOST, "roche.example".parse().unwrap());
-    h.insert(header::REFERER, "https://evil.example/login".parse().unwrap());
-    assert!(!is_same_origin_post(&h, true));
-
-    // All absent -> rejected
     assert!(!is_same_origin_post(&HeaderMap::new(), true));
     assert!(!is_same_origin_post(&HeaderMap::new(), false));
 }
 
 #[test]
+fn test_safe_local_redirect_and_login_return_to() {
+    assert_eq!(safe_local_redirect(Some("/inbox?q=caf\u{00e9}"), "/fallback"), "/fallback");
+    assert_eq!(safe_local_redirect(Some("/inbox?q=ok"), "/fallback"), "/inbox?q=ok");
+    assert_eq!(safe_local_redirect(Some("//evil.example/x"), "/fallback"), "/fallback");
+    assert_eq!(safe_local_redirect(Some("https://evil.example"), "/fallback"), "/fallback");
+
+    let non_ascii_resp = redirect_see_other("/inbox?q=caf\u{00e9}");
+    assert_eq!(non_ascii_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(non_ascii_resp.headers().get(header::LOCATION).unwrap(), "/");
+
+    assert_eq!(safe_login_return_to(Some("/login")), "/");
+    assert_eq!(safe_login_return_to(Some("/api")), "/");
+    assert_eq!(safe_login_return_to(Some("/api/v1/items")), "/");
+    assert_eq!(safe_login_return_to(Some("/web")), "/");
+    assert_eq!(safe_login_return_to(Some("/web/foo")), "/");
+    assert_eq!(safe_login_return_to(Some("/inbox?kind=article")), "/inbox?kind=article");
+}
+
+#[test]
 fn test_enrich_attempt_cache_ttl() {
-    use std::time::{Duration, Instant};
-
-    use crate::service::enrich::EnrichAttemptCache;
-
     let mut cache = EnrichAttemptCache::default();
     let t0 = Instant::now();
     let ttl = Duration::from_secs(60);
@@ -1838,653 +1734,8 @@ fn test_enrich_attempt_cache_ttl() {
     ));
 }
 
-async fn read_body_html(resp: Response) -> String {
-    String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap()
-}
-
-#[tokio::test]
-async fn test_item_audio_blocks_local_redirect_and_allows_public() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, _csrf) = login_browser(&db, &app).await;
-
-    let local_url = Url::parse("https://pod.example/ep-local").unwrap();
-    let (local_item, _) = db
-        .items()
-        .save_manual_input_with_tags(&crate::db::ManualItemInput {
-            url: &local_url,
-            title: "Local Audio Ep",
-            summary: None,
-            content_html: None,
-            thumbnail_url: None,
-            audio_url: Some("http://127.0.0.1:9999/secret.mp3"),
-            duration: None,
-            content_type: ContentType::Audio,
-            tags: &[],
-        })
-        .await
-        .unwrap();
-
-    let blocked_resp =
-        get_authed(&app, &format!("/web/items/{}/audio", local_item.id), &cookie).await;
-    assert_eq!(blocked_resp.status(), StatusCode::NOT_FOUND);
-
-    let pub_url = Url::parse("https://pod.example/ep-public").unwrap();
-    let (pub_item, _) = db
-        .items()
-        .save_manual_input_with_tags(&crate::db::ManualItemInput {
-            url: &pub_url,
-            title: "Public Audio Ep",
-            summary: None,
-            content_html: None,
-            thumbnail_url: None,
-            audio_url: Some("https://cdn.pod.example/ep1.mp3"),
-            duration: None,
-            content_type: ContentType::Audio,
-            tags: &[],
-        })
-        .await
-        .unwrap();
-
-    let ok_resp = get_authed(&app, &format!("/web/items/{}/audio", pub_item.id), &cookie).await;
-    assert_eq!(ok_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(ok_resp.headers().get(header::LOCATION).unwrap(), "https://cdn.pod.example/ep1.mp3");
-}
-
-#[tokio::test]
-async fn test_web_csp_a11y_and_reader_link_existence() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, _csrf) = login_browser(&db, &app).await;
-
-    // 1. Strict CSP without 'unsafe-inline' on style-src
-    let home_resp = get_authed(&app, "/", &cookie).await;
-    let csp = home_resp
-        .headers()
-        .get(header::CONTENT_SECURITY_POLICY)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(csp.contains("style-src 'self'"));
-    assert!(!csp.contains("'unsafe-inline'"));
-    let home_html = read_body_html(home_resp).await;
-    assert!(home_html.contains("class=\"skip-link\""));
-    assert!(home_html.contains("aria-label=\"Primary\""));
-    assert!(home_html.contains("aria-current=\"page\""));
-    assert!(home_html.contains("<main id=\"roche-main\" tabindex=\"-1\">"));
-
-    // 2. Unauthenticated error page includes viewport meta tag
-    let unauth_post = app
-        .clone()
-        .oneshot(Request::builder().method("POST").uri("/web/log").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(unauth_post.status(), StatusCode::UNAUTHORIZED);
-    let err_html = read_body_html(unauth_post).await;
-    assert!(err_html.contains("name=\"viewport\""));
-
-    // 3. Reader link existence check for system list vs manual list
-    let quick_logged_art = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Article),
-            title: "Quick Logged Article".to_owned(),
-            url: Some("https://example.org/quick-logged-article".to_owned()),
-            ..crate::db::UpsertEntryInput::default()
-        })
-        .await
-        .unwrap();
-    db.catalog()
-        .log_consumption(&quick_logged_art.id, ConsumptionStatus::Consumed, None, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        get_authed(&app, &format!("/reader/{}", quick_logged_art.id), &cookie).await.status(),
-        StatusCode::NOT_FOUND
-    );
-    let articles_list_html =
-        read_body_html(get_authed(&app, "/lists/articles", &cookie).await).await;
-    assert!(articles_list_html.contains("Quick Logged Article"));
-    assert!(!articles_list_html.contains(&format!("/reader/{}", quick_logged_art.id)));
-    // Unranked lists omit empty Tier/Score columns until comparisons exist
-    assert!(!articles_list_html.contains("<span class=\"sr-only\">Score "));
-
-    let second_art = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Article),
-            title: "Second Logged Article".to_owned(),
-            ..crate::db::UpsertEntryInput::default()
-        })
-        .await
-        .unwrap();
-    db.catalog()
-        .log_consumption(&second_art.id, ConsumptionStatus::Consumed, None, None)
-        .await
-        .unwrap();
-    db.catalog()
-        .append_comparison(
-            None,
-            &[vec![quick_logged_art.id.clone()], vec![second_art.id.clone()]],
-            None,
-        )
-        .await
-        .unwrap();
-    let ranked_articles_html =
-        read_body_html(get_authed(&app, "/lists/articles", &cookie).await).await;
-    assert!(ranked_articles_html.contains("<span class=\"sr-only\">Score "));
-
-    let manual_list = db
-        .catalog()
-        .create_manual_collection("Custom List", None, crate::db::CollectionRole::List, None, None)
-        .await
-        .unwrap();
-    db.catalog()
-        .add_collection_entry(
-            manual_list.slug.as_deref().unwrap_or(&manual_list.id),
-            &quick_logged_art.id,
-            None,
-        )
-        .await
-        .unwrap();
-    let list_html = read_body_html(
-        get_authed(
-            &app,
-            &format!("/lists/{}", manual_list.slug.as_deref().unwrap_or(&manual_list.id)),
-            &cookie,
-        )
-        .await,
-    )
-    .await;
-    assert!(list_html.contains("aria-label=\"Remove Quick Logged Article from list\""));
-}
-
-#[tokio::test]
-async fn test_web_filters_labels_and_destructive_confirmations() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, _csrf) = login_browser(&db, &app).await;
-
-    // 1. Queue remove button aria-label & Want list rank link stripping `want:` prefix
-    let want_video_input = crate::db::UpsertEntryInput {
-        kind: Some(EntryKind::Video),
-        title: "Queued Reader Video".to_owned(),
-        url: Some("https://example.org/reader-video".to_owned()),
-        ..crate::db::UpsertEntryInput::default()
-    };
-    let (_, catalog_only) = db.catalog().want_entry(&want_video_input, None).await.unwrap();
-    let queue_html = read_body_html(get_authed(&app, "/queue", &cookie).await).await;
-    assert!(queue_html.contains("Queued Reader Video"));
-    assert!(queue_html.contains("aria-label=\"Remove Queued Reader Video from queue\""));
-
-    let second_vid_input = crate::db::UpsertEntryInput {
-        kind: Some(EntryKind::Video),
-        title: "Second Queued Video".to_owned(),
-        ..crate::db::UpsertEntryInput::default()
-    };
-    let (want_col, _) = db.catalog().want_entry(&second_vid_input, None).await.unwrap();
-    let want_slug = want_col.slug.as_deref().unwrap_or(&want_col.id);
-    let base_want_slug = want_slug.strip_prefix("want:").unwrap_or(want_slug);
-
-    let want_list_html =
-        read_body_html(get_authed(&app, &format!("/lists/{want_slug}"), &cookie).await).await;
-    assert!(want_list_html.contains(&format!("/rank/{base_want_slug}?want=true")));
-    assert!(!want_list_html.contains("/rank/want%3A"));
-
-    // 2. Diary status pills preserve `year` query parameter
-    let diary_html = read_body_html(get_authed(&app, "/diary?year=2025", &cookie).await).await;
-    assert!(diary_html.contains("/diary?year=2025&amp;status=consumed"));
-    assert!(diary_html.contains("/diary?year=2025&amp;status=started"));
-    assert!(diary_html.contains("/diary?year=2025&amp;status=abandoned"));
-
-    // 3. Inbox active filter chips, accessible labels, proper ContentType label, and destructive confirm
-    let yt_url = Url::parse("https://www.youtube.com/feeds/videos.xml?channel_id=UC123").unwrap();
-    let feed =
-        db.feeds().create(FeedType::Youtube, &yt_url, Some("Tech Channel"), None).await.unwrap();
-    let pdf_url = Url::parse("https://example.org/pdf-item").unwrap();
-    db.items()
-        .create(&NewItem {
-            feed_id: Some(&feed.id),
-            title: "A PDF Paper",
-            url: &pdf_url,
-            author: None,
-            published_at: None,
-            summary: None,
-            content_type: ContentType::Pdf,
-        })
-        .await
-        .unwrap();
-
-    let inbox_html = read_body_html(get_authed(&app, "/inbox", &cookie).await).await;
-    assert!(inbox_html.contains(">PDF</span>"));
-    assert!(inbox_html.contains("aria-label=\"Filter stream\""));
-    assert!(inbox_html.contains("aria-pressed=\"false\""));
-    assert!(inbox_html.contains("data-confirm=\"Dismiss all "));
-
-    let filtered_inbox = read_body_html(
-        get_authed(&app, &format!("/inbox?feed={}&kind=article", feed.id), &cookie).await,
-    )
-    .await;
-    assert!(filtered_inbox.contains("active-filters"));
-    assert!(filtered_inbox.contains("Clear filters"));
-
-    // 4. Feeds display label (`YouTube`) and destructive delete confirmation
-    let feeds_html = read_body_html(get_authed(&app, "/feeds", &cookie).await).await;
-    assert!(feeds_html.contains(">YouTube</span>"));
-    assert!(feeds_html.contains("data-confirm=\"Delete this feed subscription?"));
-
-    // 5. Entry page 2-step merge preview flow and accessible labels
-    let entry_html =
-        read_body_html(get_authed(&app, &format!("/entries/{}", catalog_only.id), &cookie).await)
-            .await;
-    assert!(entry_html.contains("Preview Merge"));
-    assert!(entry_html.contains("aria-label=\"Canonical entry UUID, URL, or exact title\""));
-}
-
-fn strip_css_comments(css: &str) -> String {
-    let mut out = String::with_capacity(css.len());
-    let mut rest = css;
-    while let Some(start) = rest.find("/*") {
-        out.push_str(&rest[..start]);
-        if let Some(end) = rest[start + 2..].find("*/") {
-            rest = &rest[start + 2 + end + 2..];
-        } else {
-            return out;
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-fn parse_css_theme_blocks(css: &str) -> Vec<(String, std::collections::HashMap<String, String>)> {
-    let cleaned = strip_css_comments(css);
-    let mut blocks = Vec::new();
-    let mut search = cleaned.as_str();
-    while let Some(root_start) = search.find(":root") {
-        let after_root = &search[root_start..];
-        let Some(open) = after_root.find('{') else {
-            break;
-        };
-        let selector = after_root[..open].trim().to_owned();
-        let Some(close) = after_root[open + 1..].find('}') else {
-            break;
-        };
-        let mut vars = std::collections::HashMap::new();
-        for decl in after_root[open + 1..open + 1 + close].split(';') {
-            let trimmed = decl.trim();
-            if let Some(prop) = trimmed.strip_prefix("--")
-                && let Some((name, value)) = prop.split_once(':')
-            {
-                vars.insert(format!("--{}", name.trim()), value.trim().to_string());
-            }
-        }
-        if !vars.is_empty() {
-            blocks.push((selector, vars));
-        }
-        search = &after_root[open + 1 + close + 1..];
-    }
-    blocks
-}
-
-fn parse_hex_rgb(hex: &str) -> (f64, f64, f64) {
-    let h = hex.strip_prefix('#').expect("hex color starts with #");
-    assert_eq!(h.len(), 6, "expected 6-digit hex color, got {hex}");
-    let r = u8::from_str_radix(&h[0..2], 16).unwrap();
-    let g = u8::from_str_radix(&h[2..4], 16).unwrap();
-    let b = u8::from_str_radix(&h[4..6], 16).unwrap();
-    (f64::from(r) / 255.0, f64::from(g) / 255.0, f64::from(b) / 255.0)
-}
-
-fn wcag_relative_luminance(hex: &str) -> f64 {
-    fn linearize(channel: f64) -> f64 {
-        if channel <= 0.04045 { channel / 12.92 } else { ((channel + 0.055) / 1.055).powf(2.4) }
-    }
-    let (r, g, b) = parse_hex_rgb(hex);
-    0.2126_f64.mul_add(linearize(r), 0.7152_f64.mul_add(linearize(g), 0.0722 * linearize(b)))
-}
-
-fn wcag_contrast_ratio(foreground_hex: &str, background_hex: &str) -> f64 {
-    let lum_a = wcag_relative_luminance(foreground_hex);
-    let lum_b = wcag_relative_luminance(background_hex);
-    let (lighter, darker) = if lum_a >= lum_b { (lum_a, lum_b) } else { (lum_b, lum_a) };
-    (lighter + 0.05) / (darker + 0.05)
-}
-
-fn extract_heading_levels(html: &str) -> Vec<usize> {
-    let mut levels = Vec::new();
-    let bytes = html.as_bytes();
-    let mut i = 0;
-    while i + 2 < bytes.len() {
-        if bytes[i] == b'<'
-            && (bytes[i + 1] == b'h' || bytes[i + 1] == b'H')
-            && bytes[i + 2].is_ascii_digit()
-        {
-            let level = usize::from(bytes[i + 2] - b'0');
-            let next = bytes.get(i + 3).copied();
-            if (1..=6).contains(&level)
-                && matches!(next, Some(b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/'))
-            {
-                levels.push(level);
-            }
-        }
-        i += 1;
-    }
-    levels
-}
-
-fn assert_valid_heading_hierarchy(route: &str, html: &str) {
-    let levels = extract_heading_levels(html);
-    let h1_count = levels.iter().filter(|&&l| l == 1).count();
-    assert_eq!(h1_count, 1, "{route} must contain exactly one <h1>, got levels {levels:?}");
-    for pair in levels.windows(2) {
-        assert!(
-            pair[1] <= pair[0] + 1,
-            "{route} skips heading levels (h{} -> h{}) in sequence {levels:?}",
-            pair[0],
-            pair[1]
-        );
-    }
-}
-
-#[test]
-fn web_css_palette_meets_wcag_aa_contrast() {
-    let blocks = parse_css_theme_blocks(super::ROCHE_CSS);
-    assert!(blocks.len() >= 2, "roche.css must define light and dark :root theme blocks");
-
-    let normal_text_tokens = [
-        "--ink",
-        "--ink-soft",
-        "--ink-faint",
-        "--link",
-        "--link-hover",
-        "--accent",
-        "--tier-S",
-        "--tier-A",
-        "--tier-B",
-        "--tier-C",
-        "--tier-D",
-    ];
-
-    for (selector, vars) in &blocks {
-        let get = |name: &str| -> &str {
-            vars.get(name)
-                .map_or_else(|| panic!("missing CSS token {name} in {selector}"), String::as_str)
-        };
-
-        // All three editorial surfaces for this theme: main paper, recessed paper, and input paper.
-        let surfaces = [
-            ("--paper", get("--paper")),
-            ("--paper-deep", get("--paper-deep")),
-            ("--paper-input", get("--paper-input")),
-        ];
-
-        for (surface_label, surface_hex) in surfaces {
-            for text_token in normal_text_tokens {
-                let text_hex = get(text_token);
-                let ratio = wcag_contrast_ratio(text_hex, surface_hex);
-                assert!(
-                    ratio >= 4.5,
-                    "roche.css ({selector}) {text_token} ({text_hex}) on {surface_label} ({surface_hex}) has contrast {ratio:.2}:1 (WCAG AA requires >= 4.5:1)"
-                );
-            }
-
-            // WCAG 2.1 AA SC 1.4.11 non-text contrast (>= 3.0:1) for interactive borders and focus ring.
-            for ui_token in ["--control-border", "--accent"] {
-                let ui_hex = get(ui_token);
-                let ratio = wcag_contrast_ratio(ui_hex, surface_hex);
-                assert!(
-                    ratio >= 3.0,
-                    "roche.css ({selector}) {ui_token} ({ui_hex}) on {surface_label} ({surface_hex}) has contrast {ratio:.2}:1 (WCAG 1.4.11 requires >= 3.0:1)"
-                );
-            }
-        }
-
-        // Inverted button / skip-link surfaces (--paper on --ink, --accent-on-fill on --accent-fill / hover).
-        for (foreground_token, background_token) in [
-            ("--paper", "--ink"),
-            ("--accent-on-fill", "--accent-fill"),
-            ("--accent-on-fill", "--accent-fill-hover"),
-        ] {
-            let ratio = wcag_contrast_ratio(get(foreground_token), get(background_token));
-            assert!(
-                ratio >= 4.5,
-                "roche.css ({selector}) {foreground_token} on {background_token} has contrast {ratio:.2}:1 (WCAG AA requires >= 4.5:1)"
-            );
-        }
-    }
-
-    // Guard against missing placeholder, disabled, and sticky-player scroll-padding styles.
-    assert!(
-        super::ROCHE_CSS.contains("::placeholder"),
-        "roche.css must explicitly style ::placeholder"
-    );
-    assert!(
-        super::ROCHE_CSS.contains(":disabled"),
-        "roche.css must explicitly style :disabled controls"
-    );
-    assert!(
-        super::ROCHE_CSS.contains("scroll-padding-bottom"),
-        "roche.css must reserve scroll-padding-bottom when fixed player bar is visible"
-    );
-}
-
-async fn seed_a11y_landmark_fixtures(db: &Db) -> (String, String, String) {
-    let feed_url = Url::parse("https://editorial.example/rss.xml").unwrap();
-    let feed =
-        db.feeds().create(FeedType::Rss, &feed_url, Some("Editorial Feed"), None).await.unwrap();
-    let item_url = Url::parse("https://editorial.example/a11y-essay").unwrap();
-    let item = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&feed.id),
-            title: "Accessibility in Editorial Web Design",
-            url: &item_url,
-            author: Some("Ada Lovelace"),
-            published_at: None,
-            summary: Some("A short summary."),
-            content_type: ContentType::Article,
-        })
-        .await
-        .unwrap();
-    db.items()
-        .apply_background_enrichment(
-            &item.id,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            Some(
-                "<h1>Embedded Article Heading</h1><p>Body</p><pre><code>fn main() {}</code></pre><img src=\"https://editorial.example/fig.png\">",
-            ),
-        )
-        .await
-        .unwrap();
-
-    let col = db
-        .catalog()
-        .create_manual_collection(
-            "A11y Classics",
-            None,
-            crate::db::CollectionRole::List,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    let col_slug = col.slug.as_deref().unwrap_or(&col.id).to_owned();
-    let entry_a = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Book),
-            title: "The Design of Everyday Things".to_owned(),
-            ..crate::db::UpsertEntryInput::default()
-        })
-        .await
-        .unwrap();
-    let entry_b = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Book),
-            title: "Inclusive Components".to_owned(),
-            ..crate::db::UpsertEntryInput::default()
-        })
-        .await
-        .unwrap();
-    db.catalog().add_collection_entry(&col_slug, &entry_a.id, None).await.unwrap();
-    db.catalog().add_collection_entry(&col_slug, &entry_b.id, None).await.unwrap();
-
-    (col_slug, entry_a.id, item.id)
-}
-
-#[tokio::test]
-async fn web_pages_include_core_accessibility_landmarks() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, _csrf) = login_browser(&db, &app).await;
-
-    let login_resp = app
-        .clone()
-        .oneshot(Request::builder().uri("/login").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(login_resp.status(), StatusCode::OK);
-    let login_html = read_body_html(login_resp).await;
-    assert!(login_html.contains("<html lang=\"en\""), "/login missing lang attribute");
-    assert!(login_html.contains("<main"), "/login missing <main> landmark");
-    assert_valid_heading_hierarchy("/login", &login_html);
-
-    let login_err_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header(header::HOST, "127.0.0.1")
-                .header(header::ORIGIN, "http://127.0.0.1")
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("pairing_code=invalid-code"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(login_err_resp.status(), StatusCode::UNAUTHORIZED);
-    let login_err_html = read_body_html(login_err_resp).await;
-    assert!(login_err_html.contains("aria-invalid=\"true\""), "/login error missing aria-invalid");
-    assert!(
-        login_err_html.contains("aria-describedby=\"login-error\""),
-        "/login error missing aria-describedby"
-    );
-    assert_valid_heading_hierarchy("/login (401)", &login_err_html);
-
-    let unauthed_err_resp = super::html::render_error_page(
-        StatusCode::FORBIDDEN,
-        "Forbidden",
-        "Access denied",
-        None,
-        None,
-    );
-    assert_eq!(unauthed_err_resp.status(), StatusCode::FORBIDDEN);
-    assert_valid_heading_hierarchy(
-        "unauthenticated error page",
-        &read_body_html(unauthed_err_resp).await,
-    );
-
-    let (col_slug, entry_id, item_id) = seed_a11y_landmark_fixtures(&db).await;
-    let routes = [
-        "/".to_owned(),
-        "/inbox".to_owned(),
-        "/inbox?kind=article&q=Editorial".to_owned(),
-        "/lists/starred".to_owned(),
-        "/feeds".to_owned(),
-        "/lists".to_owned(),
-        format!("/lists/{col_slug}"),
-        format!("/entries/{entry_id}"),
-        format!("/reader/{item_id}"),
-        "/diary".to_owned(),
-        "/queue".to_owned(),
-        format!("/rank/{col_slug}"),
-    ];
-
-    for path in routes {
-        let resp = get_authed(&app, &path, &cookie).await;
-        assert_eq!(resp.status(), StatusCode::OK, "expected HTTP 200 on {path}");
-        let html = read_body_html(resp).await;
-        assert!(html.contains("<html lang=\"en\""), "{path} missing lang attribute");
-        assert!(html.contains("class=\"skip-link\""), "{path} missing skip link");
-        assert!(
-            html.contains("<main id=\"roche-main\""),
-            "{path} missing <main id=\"roche-main\">"
-        );
-        assert!(
-            html.contains("<aside id=\"roche-player-bar\""),
-            "{path} missing <aside> landmark for player bar"
-        );
-        assert_valid_heading_hierarchy(&path, &html);
-
-        if path.starts_with("/reader/") {
-            assert!(
-                html.contains("<h3>Embedded Article Heading</h3>"),
-                "{path} should demote embedded article <h1> to <h3>"
-            );
-            assert!(
-                html.contains("<pre tabindex=\"0\">"),
-                "{path} should add tabindex=\"0\" on <pre> blocks"
-            );
-            assert!(
-                html.contains("alt=\"\""),
-                "{path} should add empty alt=\"\" on untitled sanitized images"
-            );
-        }
-    }
-}
-
-#[test]
-fn test_safe_local_redirect_ascii_fallback_and_fragment_preserving_flash() {
-    use super::html::{redirect_see_other, redirect_with_flash, safe_local_redirect};
-
-    // Non-ASCII redirect targets are rejected
-    assert_eq!(safe_local_redirect(Some("/inbox?q=caf\u{00e9}"), "/fallback"), "/fallback");
-    assert_eq!(safe_local_redirect(Some("/inbox?q=ok"), "/fallback"), "/inbox?q=ok");
-
-    // `redirect_see_other` always emits a Location header (never a Location-less 303)
-    let non_ascii_resp = redirect_see_other("/inbox?q=caf\u{00e9}");
-    assert_eq!(non_ascii_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(non_ascii_resp.headers().get(header::LOCATION).unwrap(), "/");
-
-    // `redirect_with_flash` keeps clean `Location` (preserving query + `#fragment`) and attaches `PendingFlash`
-    let frag_only = redirect_with_flash("/entries/abc#notes", "notice", "Saved ok");
-    assert_eq!(frag_only.headers().get(header::LOCATION).unwrap(), "/entries/abc#notes");
-    assert_eq!(
-        frag_only.extensions().get::<super::html::PendingFlash>(),
-        Some(&super::html::PendingFlash {
-            kind: super::html::FlashKind::Notice,
-            message: "Saved ok".to_owned(),
-        })
-    );
-
-    let query_and_frag = redirect_with_flash("/inbox?status=all#row-5", "err", "Failed");
-    assert_eq!(query_and_frag.headers().get(header::LOCATION).unwrap(), "/inbox?status=all#row-5");
-    assert_eq!(
-        query_and_frag.extensions().get::<super::html::PendingFlash>(),
-        Some(&super::html::PendingFlash {
-            kind: super::html::FlashKind::Err,
-            message: "Failed".to_owned(),
-        })
-    );
-
-    let question_in_frag = redirect_with_flash("/inbox#frag?x=1", "notice", "Hi");
-    assert_eq!(question_in_frag.headers().get(header::LOCATION).unwrap(), "/inbox#frag?x=1");
-    assert_eq!(
-        question_in_frag.extensions().get::<super::html::PendingFlash>(),
-        Some(&super::html::PendingFlash {
-            kind: super::html::FlashKind::Notice,
-            message: "Hi".to_owned(),
-        })
-    );
-}
-
 #[test]
 fn test_try_reserve_enrichment_slot_bounds_concurrency_before_marking_cache() {
-    use std::time::{Duration, Instant};
-
-    use crate::service::enrich::{ArtistEnricher, MAX_CONCURRENT_ENRICH_TASKS};
-
     let enricher = ArtistEnricher::new(false);
     let now = Instant::now();
     let ttl = Duration::from_secs(60);
@@ -2497,11 +1748,8 @@ fn test_try_reserve_enrichment_slot_bounds_concurrency_before_marking_cache() {
         held.push(permit);
     }
     assert_eq!(enricher.available_permits(), 0);
-
-    // Exhausted semaphore rejects new artist WITHOUT marking it in the attempt cache
     assert!(enricher.try_reserve_slot("artist-overflow|sp=false".to_owned(), now, ttl).is_none());
 
-    // Releasing one permit lets the previously-throttled artist run immediately
     drop(held.pop());
     assert_eq!(enricher.available_permits(), 1);
     let overflow_permit =
@@ -2509,2574 +1757,61 @@ fn test_try_reserve_enrichment_slot_bounds_concurrency_before_marking_cache() {
     assert!(overflow_permit.is_some());
     drop(overflow_permit);
 
-    // Duplicate key within TTL returns None and does NOT leak a semaphore permit
     assert_eq!(enricher.available_permits(), 1);
     assert!(enricher.try_reserve_slot("artist-overflow|sp=false".to_owned(), now, ttl).is_none());
-    assert_eq!(enricher.available_permits(), 1);
     drop(held);
     assert_eq!(enricher.available_permits(), MAX_CONCURRENT_ENRICH_TASKS);
 }
 
-#[tokio::test]
-async fn test_web_body_limits_standard_128kib_vs_opml_4mib() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    // 1. Standard form POST > 128 KiB with known body length is rejected with HTML 413 + security headers
-    let big_summary = "a".repeat(140 * 1024);
-    let oversized_regular = post_form(
-        &app,
-        "/web/lists/create",
-        &cookie,
-        &[("_csrf", &csrf), ("title", "Too Big"), ("summary", &big_summary)],
-    )
-    .await;
-    assert_eq!(oversized_regular.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(
-        oversized_regular.headers().get(header::CONTENT_TYPE).unwrap(),
-        "text/html; charset=utf-8"
-    );
-    assert_eq!(oversized_regular.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
-    assert_eq!(oversized_regular.headers().get(header::X_FRAME_OPTIONS).unwrap(), "SAMEORIGIN");
-    let oversized_html = read_body_html(oversized_regular).await;
-    assert!(oversized_html.contains("<!doctype html>"));
-    assert!(oversized_html.contains("Payload Too Large"));
-
-    // 2. Streamed/chunked standard form POST > 128 KiB (unknown size_hint) is capped at 128 KiB with HTML 413
-    let raw_form =
-        encode_form(&[("_csrf", &csrf), ("title", "Streamed"), ("summary", &big_summary)]);
-    let stream_body =
-        Body::from_stream(tokio_util::io::ReaderStream::new(std::io::Cursor::new(raw_form)));
-    let streamed_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/web/lists/create")
-                .header(header::COOKIE, &cookie)
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(stream_body)
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(streamed_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(
-        streamed_resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "text/html; charset=utf-8"
-    );
-    let streamed_html = read_body_html(streamed_resp).await;
-    assert!(streamed_html.contains("Payload Too Large"));
-
-    // 3. Authenticated OPML upload > 128 KiB (within 4 MiB) is accepted
-    let padding = " ".repeat(160 * 1024);
-    let opml_xml = format!(
-        "<?xml version=\"1.0\"?><opml version=\"2.0\"><body><!--{padding}--></body></opml>"
-    );
-    let opml_resp =
-        post_form(&app, "/web/feeds/opml", &cookie, &[("_csrf", &csrf), ("opml_xml", &opml_xml)])
-            .await;
-    assert_eq!(opml_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(opml_resp.headers().get(header::LOCATION).unwrap(), "/feeds");
-    assert!(find_set_cookie(&opml_resp, "roche_flash=n:").is_some());
-}
-
-#[tokio::test]
-async fn test_round2_web_ux_panels_pills_and_roche_js_guards() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, _csrf) = login_browser(&db, &app).await;
-
-    // 1. Subscribe rail on /feeds is directly visible (no unguarded `<details open>`) and default-open panel on /queue carries `data-default-open`
-    let feeds_html = read_body_html(get_authed(&app, "/feeds", &cookie).await).await;
-    assert!(feeds_html.contains("action=\"/web/feeds/create\""));
-    assert!(!feeds_html.contains("<details class=\"rail-details\" open>"));
-    let queue_html = read_body_html(get_authed(&app, "/queue", &cookie).await).await;
-    assert!(queue_html.contains("<details class=\"editorial-panel\" open data-default-open>"));
-    assert!(super::ROCHE_JS.contains("details[open]:not([data-default-open])"));
-    assert!(!super::ROCHE_JS.contains("resp.url?.includes(\"/login\")"));
-    assert!(super::ROCHE_JS.contains("pathname === \"/login\""));
-    assert!(super::ROCHE_JS.contains("syncCsrfFromDoc"));
-    assert!(super::ROCHE_JS.contains("resp.status === 401"));
-    assert!(super::ROCHE_JS.contains("resp.status === 403"));
-
-    // 2. Invalid `kind` on `/inbox` does not render a bogus chip or narrow batch controls
-    let feed_url = Url::parse("https://blog.example/feed.xml").unwrap();
-    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Blog"), None).await.unwrap();
-    let art_url = Url::parse("https://blog.example/post-1").unwrap();
-    db.items()
-        .create(&NewItem {
-            feed_id: Some(&feed.id),
-            title: "Feed Post One",
-            url: &art_url,
-            author: None,
-            published_at: None,
-            summary: None,
-            content_type: ContentType::Article,
-        })
-        .await
-        .unwrap();
-    let bogus_kind_html =
-        read_body_html(get_authed(&app, "/inbox?kind=bogus", &cookie).await).await;
-    assert!(!bogus_kind_html.contains("active-filters"));
-    assert!(!bogus_kind_html.contains("Kind: bogus"));
-    assert!(!bogus_kind_html.contains("name=\"kind\" value=\"bogus\""));
-    assert!(bogus_kind_html.contains("Dismiss All New"));
-
-    // 3. Active filter pills on `/inbox` and `/diary` carry `aria-current="true"`
-    let valid_kind_html =
-        read_body_html(get_authed(&app, "/inbox?kind=article", &cookie).await).await;
-    assert!(valid_kind_html.contains(
-        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/inbox?status=new&amp;kind=article\">New</a>"
-    ));
-    assert!(valid_kind_html.contains(
-        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/inbox?status=new\">Articles</a>"
-    ));
-    assert!(valid_kind_html.contains(
-        "<a class=\"pill\" href=\"/inbox?status=finished&amp;kind=article\">Finished</a>"
-    ));
-    assert!(valid_kind_html.contains(
-        "<a class=\"pill\" href=\"/inbox?status=dismissed&amp;kind=article\">Dismissed</a>"
-    ));
-    assert!(
-        valid_kind_html
-            .contains("<a class=\"pill\" href=\"/inbox?status=all&amp;kind=article\">All</a>")
-    );
-
-    let diary_consumed_html =
-        read_body_html(get_authed(&app, "/diary?status=consumed", &cookie).await).await;
-    assert!(diary_consumed_html.contains(
-        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/diary?status=consumed\">Finished</a>"
-    ));
-    assert!(diary_consumed_html.contains("<a class=\"pill\" href=\"/diary\">All</a>"));
-}
-
-#[tokio::test]
-async fn test_round2_web_security_reader_origin_and_rank_redirect() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    // 1. Login POST enforces HTTPS scheme match on Origin when Sec-Fetch-Site is absent
-    let code = PairingManager::new(db.auth()).create_code(300).await.unwrap();
-    let login_body = encode_form(&[("pairing_code", &code), ("device_name", "Scheme Check")]);
-    let mut http_origin_over_https = Request::builder()
-        .method("POST")
-        .uri("/login")
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header(header::HOST, "roche.example")
-        .header(header::ORIGIN, "http://roche.example")
-        .header("x-forwarded-proto", "https")
-        .body(Body::from(login_body))
-        .unwrap();
-    http_origin_over_https
-        .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41000)));
-    assert_eq!(
-        app.clone().oneshot(http_origin_over_https).await.unwrap().status(),
-        StatusCode::FORBIDDEN
-    );
-
-    // 2. Reader suppresses non-local `Original` links (e.g. http://roche.local or 127.0.0.1)
-    let local_item_url = Url::parse("http://roche.local/private-note").unwrap();
-    let (local_item, _) = db
-        .items()
-        .save_manual_input_with_tags(&crate::db::ManualItemInput {
-            url: &local_item_url,
-            title: "Local Synthetic Note",
-            summary: Some("Local body"),
-            content_html: None,
-            thumbnail_url: None,
-            audio_url: None,
-            duration: None,
-            content_type: ContentType::Article,
-            tags: &[],
-        })
-        .await
-        .unwrap();
-    let local_reader_html =
-        read_body_html(get_authed(&app, &format!("/reader/{}", local_item.id), &cookie).await)
-            .await;
-    assert!(!local_reader_html.contains("Original &#8599;"));
-    assert!(!local_reader_html.contains("class=\"inline-form js-reader-archive-form\""));
-    assert!(local_reader_html.contains("Remove from Queue"));
-
-    let pub_item_url = Url::parse("https://example.org/public-essay").unwrap();
-    let (pub_item, _) = db
-        .items()
-        .save_manual_input_with_tags(&crate::db::ManualItemInput {
-            url: &pub_item_url,
-            title: "Public Essay",
-            summary: Some("Public body"),
-            content_html: None,
-            thumbnail_url: None,
-            audio_url: None,
-            duration: None,
-            content_type: ContentType::Article,
-            tags: &[],
-        })
-        .await
-        .unwrap();
-    let pub_reader_html =
-        read_body_html(get_authed(&app, &format!("/reader/{}", pub_item.id), &cookie).await).await;
-    assert!(
-        pub_reader_html
-            .contains("class=\"reader-title-link\" href=\"https://example.org/public-essay\"")
-    );
-    assert!(!pub_reader_html.contains("Original &#8599;"));
-
-    // 3. Invalid ranking ordering preserves `want=true`, `focus`, and `round`
-    let bad_rank_resp = post_form(
-        &app,
-        "/rank/movies",
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("want", "true"),
-            ("focus", "entry-xyz"),
-            ("round", "2"),
-            ("ordering_json", "not-valid-json"),
+#[test]
+fn test_web_music_links_only_show_wikipedia_and_spotify() {
+    let now = chrono::Utc::now();
+    let entry = CatalogEntry {
+        id: "alb-1".to_owned(),
+        kind: EntryKind::Album,
+        title: "Kind of Blue".to_owned(),
+        creators: vec!["Miles Davis".to_owned()],
+        release_year: Some(1959),
+        url: Some("https://music.apple.com/album/123".to_owned()),
+        published_at: None,
+        summary: None,
+        thumbnail_url: None,
+        metadata: serde_json::json!({}),
+        merged_into_id: None,
+        identifiers: vec![
+            EntryIdentifier {
+                scheme: "spotify".to_owned(),
+                value: "spotify:album:1weenld61qoidwYuZ1GESA".to_owned(),
+            },
+            EntryIdentifier { scheme: "wikipedia".to_owned(), value: "Kind_of_Blue".to_owned() },
+            EntryIdentifier { scheme: "apple_music".to_owned(), value: "123".to_owned() },
         ],
-    )
-    .await;
-    assert_eq!(bad_rank_resp.status(), StatusCode::SEE_OTHER);
-    let bad_rank_loc = bad_rank_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert!(bad_rank_loc.starts_with("/rank/movies?"), "got {bad_rank_loc}");
-    assert!(bad_rank_loc.contains("want=true"), "got {bad_rank_loc}");
-    assert!(bad_rank_loc.contains("focus=entry-xyz"), "got {bad_rank_loc}");
-    assert!(bad_rank_loc.contains("round=2"), "got {bad_rank_loc}");
-    assert!(!bad_rank_loc.contains("err="), "flash must use cookie not URL: {bad_rank_loc}");
-    let rank_err_cookie = find_set_cookie(&bad_rank_resp, "roche_flash=e:").unwrap();
-    assert!(rank_err_cookie.contains("Invalid+comparison+ordering"), "got {rank_err_cookie}");
-}
+        created_at: now,
+        updated_at: now,
+    };
 
-#[tokio::test]
-async fn test_load_existing_reader_item_ids_batched_lookup_and_catalog_links() {
-    let db = Db::connect("sqlite::memory:").await.unwrap();
-    let svc = RocheService::new(db.clone(), DummyWebFetcher, Config::default());
-    let app = ApiRoutes::router_with_service(svc.clone());
-    let (cookie, _csrf) = login_browser(&db, &app).await;
-
-    let reader_url = Url::parse("https://example.org/batched-reader-article").unwrap();
-    let (live_reader_item, _) = db
-        .items()
-        .save_manual_input_with_tags(&crate::db::ManualItemInput {
-            url: &reader_url,
-            title: "Batched Reader Essay",
-            summary: Some("Full reader summary"),
-            content_html: Some("<p>Readable essay</p>"),
-            thumbnail_url: None,
-            audio_url: None,
-            duration: None,
-            content_type: ContentType::Article,
-            tags: &[],
-        })
-        .await
-        .unwrap();
-    db.catalog()
-        .log_consumption(&live_reader_item.id, ConsumptionStatus::Consumed, None, None)
-        .await
-        .unwrap();
-
-    let catalog_only_art = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Article),
-            title: "Catalog Only Essay".to_owned(),
-            url: Some("https://example.org/catalog-only-essay".to_owned()),
-            ..crate::db::UpsertEntryInput::default()
-        })
-        .await
-        .unwrap();
-    db.catalog()
-        .log_consumption(&catalog_only_art.id, ConsumptionStatus::Consumed, None, None)
-        .await
-        .unwrap();
-
-    let (_, want_no_url) = db
-        .catalog()
-        .want_entry(
-            &crate::db::UpsertEntryInput {
-                kind: Some(EntryKind::Article),
-                title: "Queued Article Without URL".to_owned(),
-                ..crate::db::UpsertEntryInput::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    let (_, want_with_url) = db
-        .catalog()
-        .want_entry(
-            &crate::db::UpsertEntryInput {
-                kind: Some(EntryKind::Article),
-                title: "Queued Article With URL".to_owned(),
-                url: Some("https://example.org/queued-article".to_owned()),
-                ..crate::db::UpsertEntryInput::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-    let movie_entry = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Movie),
-            title: "Some Film".to_owned(),
-            url: Some("https://example.org/film".to_owned()),
-            ..crate::db::UpsertEntryInput::default()
-        })
-        .await
-        .unwrap();
-
-    let live_entry =
-        db.catalog().get_entry_detail(&live_reader_item.id).await.unwrap().unwrap().entry;
-    assert!(super::views_catalog::load_existing_reader_item_ids(&svc, []).await.is_empty());
-
-    let found = super::views_catalog::load_existing_reader_item_ids(
-        &svc,
-        [&live_entry, &live_entry, &catalog_only_art, &want_no_url, &want_with_url, &movie_entry],
-    )
-    .await;
-    assert_eq!(found.len(), 2);
-    assert!(found.contains(&live_reader_item.id));
-    assert!(found.contains(&want_with_url.id));
-
-    let articles_html = read_body_html(get_authed(&app, "/lists/articles", &cookie).await).await;
-    assert!(articles_html.contains(&format!("/reader/{}", live_reader_item.id)));
-    assert!(!articles_html.contains(&format!("/reader/{}", catalog_only_art.id)));
-
-    let queue_html = read_body_html(get_authed(&app, "/queue", &cookie).await).await;
-    assert!(queue_html.contains(&format!("/reader/{}", want_with_url.id)));
-    assert!(!queue_html.contains(&format!("/reader/{}", want_no_url.id)));
+    let links = collect_web_external_links(&entry, Some("Source"));
+    assert_eq!(links.len(), 2);
+    assert!(links.iter().any(|l| l.icon == WebLinkIcon::Spotify));
+    assert!(links.iter().any(|l| l.icon == WebLinkIcon::Wikipedia));
 }
 
 #[test]
-fn test_web_query_deserialization_with_optional_numbers_and_booleans() {
-    use axum::{extract::Query, http::Uri};
-
-    let Query(lists) = Query::<super::views_catalog::ListsOverviewQuery>::try_from_uri(
-        &Uri::from_static("/lists?q=bjork&kind=album&notice=Ignored&err=Ignored"),
-    )
-    .unwrap();
-    assert_eq!(lists.q.as_deref(), Some("bjork"));
-    assert_eq!(lists.kind.as_deref(), Some("album"));
-
-    let Query(list_page) = Query::<super::views_catalog::ListPageQuery>::try_from_uri(
-        &Uri::from_static("/lists/movies?page=3"),
-    )
-    .unwrap();
-    assert_eq!(list_page.page, Some(3));
-
-    let Query(list_page_empty) = Query::<super::views_catalog::ListPageQuery>::try_from_uri(
-        &Uri::from_static("/lists/movies?page="),
-    )
-    .unwrap();
-    assert_eq!(list_page_empty.page, None);
-
-    let Query(diary) = Query::<super::views_catalog::DiaryFilterQuery>::try_from_uri(
-        &Uri::from_static("/diary?year=2025&status=consumed"),
-    )
-    .unwrap();
-    assert_eq!(diary.year, Some(2025));
-    assert_eq!(diary.status.as_deref(), Some("consumed"));
-
-    let Query(inbox) = Query::<super::views_reader::InboxQuery>::try_from_uri(&Uri::from_static(
-        "/inbox?status=all&page=2",
-    ))
-    .unwrap();
-    assert_eq!(inbox.status.as_deref(), Some("all"));
-    assert_eq!(inbox.page, Some(2));
-
-    let Query(rank) =
-        Query::<super::views_rank::RankSessionQuery>::try_from_uri(&Uri::from_static(
-            "/rank/movies?want=true&focus=abc&round=2&random=4&covered=x&excluded=aa.bb&k=3",
-        ))
-        .unwrap();
-    assert!(rank.want);
-    assert_eq!(rank.focus.as_deref(), Some("abc"));
-    assert_eq!(rank.round, Some(2));
-    assert_eq!(rank.random, Some(4));
-    assert_eq!(rank.covered.as_deref(), Some("x"));
-    assert_eq!(rank.excluded.as_deref(), Some("aa.bb"));
-    assert_eq!(rank.k, Some(3));
-
-    let Query(rank_defaults) = Query::<super::views_rank::RankSessionQuery>::try_from_uri(
-        &Uri::from_static("/rank/movies"),
-    )
-    .unwrap();
-    assert!(!rank_defaults.want);
-    assert_eq!(rank_defaults.round, None);
-    assert_eq!(rank_defaults.random, None);
-}
-
-#[tokio::test]
-async fn test_feeds_page_suppresses_paused_errors_and_separates_status_and_kind_filters() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, _csrf) = login_browser(&db, &app).await;
-
-    let active_url = Url::parse("https://active.example/rss.xml").unwrap();
-    let active = db
-        .feeds()
-        .create(FeedType::Rss, &active_url, Some("Active Broken Feed"), None)
-        .await
-        .unwrap();
-    db.feeds().mark_error(&active.id, "Upstream feed error: unable to parse feed").await.unwrap();
-
-    let paused_url = Url::parse("https://paused.example/podcast.xml").unwrap();
-    let paused = db
-        .feeds()
-        .create(FeedType::Podcast, &paused_url, Some("Paused Podcast"), None)
-        .await
-        .unwrap();
-    db.feeds().mark_error(&paused.id, "Upstream server returned HTTP 403 Forbidden").await.unwrap();
-    db.feeds().archive(&paused.id).await.unwrap();
-
-    let html = read_body_html(get_authed(&app, "/feeds", &cookie).await).await;
-    assert!(html.contains(">All (2)</button>"));
-    assert!(html.contains(">Active (1)</button>"));
-    assert!(html.contains(">Errors (1)</button>"));
-    assert!(html.contains(">Paused (1)</button>"));
-    assert!(html.contains("id=\"roche-feeds-kind\""));
-    assert!(html.contains("<option value=\"rss\">RSS (1)</option>"));
-    assert!(html.contains("<option value=\"podcast\">Podcasts (1)</option>"));
-    assert!(html.contains("unable to parse feed"));
-    assert!(!html.contains("HTTP 403 Forbidden"));
-    assert!(!html.contains(&format!("/web/feeds/{}/refresh", paused.id)));
-}
-
-#[tokio::test]
-async fn test_album_tracklist_enrichment_and_artist_discography_render() {
-    use crate::service::enrich::{
-        enrich_album_tracklist_with_fetcher, enrich_artist_detail_with_fetcher,
-        parse_itunes_artist_discography, parse_itunes_lookup_tracks, parse_spotify_embed_tracks,
-    };
-
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    let sp_html = r#"<html><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"trackList":[{"title":"Come Together","subtitle":"The Beatles","duration":259000,"uri":"spotify:track:2EqlS6tkEnglzr7tkKAAYD"},{"title":"Something","subtitle":"The Beatles","duration":182000,"uri":"spotify:track:0pNeVovbiZHkulpGeOx1Gj"}]}}}}}}</script></html>"#;
-    let sp_tracks = parse_spotify_embed_tracks(sp_html);
+fn test_album_tracklist_and_artist_discography_parsers() {
+    let spotify_embed_html = r#"<html><body><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"trackList":[{"title":"So What","subtitle":"Miles Davis","duration":562000,"uri":"spotify:track:4vLYewWIvqHfKtJDk8c8tq"},{"title":"Freddie Freeloader","subtitle":"Miles Davis","duration":586000,"uri":"spotify:track:2x91iJc0UKFmcR4z5xS2yX"}]}}}}}}</script></body></html>"#;
+    let sp_tracks = parse_spotify_embed_tracks(spotify_embed_html);
     assert_eq!(sp_tracks.len(), 2);
-    assert_eq!(sp_tracks[0].title, "Come Together");
-    assert_eq!(sp_tracks[0].duration_ms, Some(259_000));
+    assert_eq!(sp_tracks[0].title, "So What");
+    assert_eq!(sp_tracks[0].duration_ms, Some(562_000));
 
-    let itunes_json = r#"{"results":[{"wrapperType":"collection"},{"wrapperType":"track","kind":"song","discNumber":1,"trackNumber":1,"trackName":"Hot Rats Theme","artistName":"Frank Zappa","trackTimeMillis":215000}]}"#;
-    let it_tracks = parse_itunes_lookup_tracks(itunes_json);
+    let itunes_tracks_json = r#"{"resultCount":2,"results":[{"wrapperType":"collection","collectionName":"Kind of Blue"},{"wrapperType":"track","trackNumber":1,"discNumber":1,"trackName":"So What","trackTimeMillis":562000,"artistName":"Miles Davis"}]}"#;
+    let it_tracks = parse_itunes_lookup_tracks(itunes_tracks_json);
     assert_eq!(it_tracks.len(), 1);
-    assert_eq!(it_tracks[0].title, "Hot Rats Theme");
-
-    let album = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Album),
-            title: "Abbey Road".to_owned(),
-            creators: vec!["Beatles".to_owned()],
-            release_year: Some(1969),
-            thumbnail_url: Some("https://i.scdn.co/image/abbey".to_owned()),
-            identifiers: vec![crate::db::EntryIdentifier {
-                scheme: "spotify".to_owned(),
-                value: "spotify:album:0ETFjACtuP2ADo6LFhL6HN".to_owned(),
-            }],
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    let svc = crate::service::RocheService::new(db.clone(), DummyWebFetcher, Config::default());
-    let mut detail = db.catalog().get_entry_detail(&album.id).await.unwrap().unwrap();
-    let mock_fetcher = |url: &Url| -> Option<String> {
-        if url.as_str().contains("open.spotify.com/embed/album/0ETFjACtuP2ADo6LFhL6HN") {
-            Some(sp_html.to_owned())
-        } else {
-            None
-        }
-    };
-    enrich_album_tracklist_with_fetcher(&svc, &mut detail, &mock_fetcher).await;
-
-    let album_html =
-        read_body_html(get_authed(&app, &format!("/entries/{}", album.id), &cookie).await).await;
-    assert!(album_html.contains("table class=\"tracklist\""));
-    assert!(album_html.contains("Come Together"));
-    assert!(album_html.contains("4:19"));
-    assert!(album_html.contains("https://open.spotify.com/track/2EqlS6tkEnglzr7tkKAAYD"));
-    assert!(album_html.contains("2 songs, 7 min 21 sec"));
-
-    let artists = db.catalog().find_artist_ids_by_names(&["Beatles".to_owned()]).await.unwrap();
-    let beatles_id = artists.get("beatles").expect("synthesized Beatles artist");
-    let artist_html =
-        read_body_html(get_authed(&app, &format!("/entries/{beatles_id}"), &cookie).await).await;
-    assert!(artist_html.contains("class=\"discography-grid\""));
-    assert!(artist_html.contains("Abbey Road"));
-    assert!(artist_html.contains("1969 &middot; Album"));
-
-    // Artist external discography enrichment + one-click "+ Add" to library
-    let itunes_discog = r#"{"results":[
-        {"wrapperType":"collection","collectionType":"Album","artistName":"The Beatles","collectionName":"Abbey Road (Remastered)","releaseDate":"1969-09-26T07:00:00Z","artworkUrl100":"https://is1-ssl.mzstatic.com/image/100x100bb.jpg","collectionId":1441164426},
-        {"wrapperType":"collection","collectionType":"Album","artistName":"The Beatles","collectionName":"Let It Be","releaseDate":"1970-05-08T07:00:00Z","artworkUrl100":"https://is1-ssl.mzstatic.com/image/letitbe/100x100bb.jpg","collectionId":1441164495},
-        {"wrapperType":"collection","collectionType":"Album","artistName":"The Beatles","collectionName":"Hey Jude - Single","releaseDate":"1968-08-26T07:00:00Z","collectionId":999}
-    ]}"#;
-    let parsed_discog = parse_itunes_artist_discography(itunes_discog, "Beatles");
-    assert_eq!(parsed_discog.len(), 2);
-    assert_eq!(parsed_discog[0].title, "Let It Be");
-    assert_eq!(parsed_discog[0].release_year, Some(1970));
-
-    let mut artist_detail = db.catalog().get_entry_detail(beatles_id).await.unwrap().unwrap();
-    let discog_fetcher = |url: &Url| -> Option<String> {
-        if url.as_str().contains("itunes.apple.com/search") {
-            Some(itunes_discog.to_owned())
-        } else {
-            None
-        }
-    };
-    enrich_artist_detail_with_fetcher(&svc, &mut artist_detail, &discog_fetcher).await;
-
-    let enriched_artist_html =
-        read_body_html(get_authed(&app, &format!("/entries/{beatles_id}"), &cookie).await).await;
-    assert!(enriched_artist_html.contains("1 of 2 in library"));
-    assert!(enriched_artist_html.contains("discography-card-external"));
-    assert!(enriched_artist_html.contains("Let It Be"));
-
-    let add_resp = post_form(
-        &app,
-        &format!("/web/entries/{beatles_id}/add-album"),
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("title", "Let It Be"),
-            ("release_year", "1970"),
-            ("apple_music_id", "1441164495"),
-        ],
-    )
-    .await;
-    assert_eq!(add_resp.status(), StatusCode::SEE_OTHER);
-    let after_add_html =
-        read_body_html(get_authed(&app, &format!("/entries/{beatles_id}"), &cookie).await).await;
-    assert!(!after_add_html.contains("discography-card-external"));
-    assert!(after_add_html.contains("Let It Be"));
-}
-
-#[tokio::test]
-async fn test_web_auth_theme_and_flash_regressions() {
-    let (_db, app) = setup_web_app(Config::default()).await;
-
-    // redirect_with_flash strips stale notice/err query params and delivers flash via HttpOnly cookie
-    let flashed = super::html::redirect_with_flash(
-        "/inbox?status=unread&notice=Old+Banner&err=Old+Err#top",
-        "notice",
-        "Fresh Notice",
-    );
-    let flash_loc = flashed.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert_eq!(flash_loc, "/inbox?status=unread#top");
-    assert_eq!(
-        flashed.extensions().get::<super::html::PendingFlash>(),
-        Some(&super::html::PendingFlash {
-            kind: super::html::FlashKind::Notice,
-            message: "Fresh Notice".to_owned(),
-        })
-    );
-
-    // qw_8 & a11y_8: unauthenticated deep-link preserves ?return_to, 401 CTA says "Sign in",
-    // login page supports show/hide toggle + preserves device_name on error + SSR data-theme cookie.
-    let deep_unauth = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/lists/movies?page=2")
-                .header(header::COOKIE, "roche_theme=light")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(deep_unauth.status(), StatusCode::SEE_OTHER);
-    let redir_loc = deep_unauth.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert!(redir_loc.starts_with("/login?return_to="), "got {redir_loc}");
-
-    let post_unauth = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/web/items/save")
-                .header(header::COOKIE, "roche_theme=dark")
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("url=https%3A%2F%2Fexample.com"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(post_unauth.status(), StatusCode::UNAUTHORIZED);
-    let post_unauth_html = read_body_html(post_unauth).await;
-    assert!(post_unauth_html.contains(r#"<html lang="en" data-theme="dark">"#));
-    assert!(post_unauth_html.contains(r#"href="/login">Sign in</a>"#));
-
-    let bad_login = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header(header::HOST, "localhost:8080")
-                .header(header::ORIGIN, "http://localhost:8080")
-                .header(header::COOKIE, "roche_theme=light")
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from(
-                    "pairing_code=wrong-code&device_name=Study+Laptop&return_to=%2Flists%2Fmovies",
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(bad_login.status(), StatusCode::UNAUTHORIZED);
-    let bad_login_html = read_body_html(bad_login).await;
-    assert!(bad_login_html.contains(r#"<html lang="en" data-theme="light">"#));
-    assert!(bad_login_html.contains("js-toggle-password"));
-    assert!(bad_login_html.contains(r#"value="Study Laptop""#));
-    assert!(bad_login_html.contains(r#"name="return_to" value="/lists/movies""#));
-    assert!(bad_login_html.contains("autofocus"));
-}
-
-#[tokio::test]
-async fn test_web_inbox_and_reader_regressions() {
-    use crate::domain::ReadAtPatch;
-
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    // qw_1, qw_2, web_2: Reader dynamic headings, archive preserves max progress, unfinish confirms,
-    // Resume pill, PDFs filter, clickable #tags, single-feed Unread default + inline toggle.
-    let feed_url = Url::parse("https://blog.example.com/feed.xml").unwrap();
-    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Tech Blog"), None).await.unwrap();
-    let item_url = Url::parse("https://blog.example.com/deep-dive").unwrap();
-    let item = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&feed.id),
-            title: "Deep Dive Essay",
-            url: &item_url,
-            author: Some("Ada"),
-            published_at: None,
-            summary: Some("Summary text"),
-            content_type: ContentType::Article,
-        })
-        .await
-        .unwrap();
-    sqlx::query("UPDATE entry_content SET content_html = ? WHERE entry_id = ?")
-        .bind("<h2>Intro</h2><p>Body</p><h3>Details</h3>")
-        .bind(&item.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    let pdf_url = Url::parse("https://blog.example.com/spec.pdf").unwrap();
-    let pdf_item = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&feed.id),
-            title: "Spec PDF",
-            url: &pdf_url,
-            author: None,
-            published_at: None,
-            summary: None,
-            content_type: ContentType::Pdf,
-        })
-        .await
-        .unwrap();
-    let tag = db.tags().add_named_to_item(&item.id, "systems").await.unwrap();
-    db.items().update(&item.id, None, None, Some(0.42), ReadAtPatch::Unchanged).await.unwrap();
-
-    let inbox_html = read_body_html(
-        app.clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/inbox")
-                    .header(header::COOKIE, format!("{cookie}; roche_theme=dark"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert!(inbox_html.contains(r#"<html lang="en" data-theme="dark">"#));
-    assert!(inbox_html.contains("kind=pdf"));
-    assert!(inbox_html.contains(&format!("status=new&amp;feed={}", feed.id)));
-    assert!(inbox_html.contains(&format!("/inbox?status=all&amp;tag={}", tag.id)));
-
-    let pdf_inbox_html =
-        read_body_html(get_authed(&app, "/inbox?status=unread&kind=pdf", &cookie).await).await;
-    assert!(pdf_inbox_html.contains("Spec PDF"));
-    assert!(!pdf_inbox_html.contains("Deep Dive Essay"));
-    assert!(pdf_inbox_html.contains("1 item"));
-
-    let scoped_feed_html = read_body_html(
-        get_authed(&app, &format!("/inbox?status=unread&feed={}", feed.id), &cookie).await,
-    )
-    .await;
-    assert!(scoped_feed_html.contains("inbox-feed-status-toggle"));
-
-    let reader_html =
-        read_body_html(get_authed(&app, &format!("/reader/{}", item.id), &cookie).await).await;
-    assert!(reader_html.contains("<h3>Intro</h3>"));
-    assert!(reader_html.contains("<h4>Details</h4>"));
-    assert!(reader_html.contains("Resume at 42%"));
-    assert!(reader_html.contains(&format!("/inbox?status=all&amp;tag={}", tag.id)));
-
-    // Archive with stale 0.0000 progress must retain existing 0.42 progress
-    let arch_resp = post_form(
-        &app,
-        &format!("/web/items/{}/archive", item.id),
-        &cookie,
-        &[("_csrf", &csrf), ("progress", "0.0000"), ("return_to", "/inbox")],
-    )
-    .await;
-    assert_eq!(arch_resp.status(), StatusCode::SEE_OTHER);
-    let reloaded = db.items().get(&item.id).await.unwrap().unwrap();
-    assert!((reloaded.read_progress - 0.42).abs() < 1e-4);
-
-    // Finished Reader page attaches data-confirm to unfinish form
-    let _ = post_form(
-        &app,
-        &format!("/web/items/{}/finish", pdf_item.id),
-        &cookie,
-        &[("_csrf", &csrf)],
-    )
-    .await;
-    let finished_reader =
-        read_body_html(get_authed(&app, &format!("/reader/{}", pdf_item.id), &cookie).await).await;
-    assert!(finished_reader.contains("data-confirm="));
-}
-
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_web_search_diary_entry_feeds_rank_and_reader_flows() {
-    use crate::domain::{CollectionRole, ReadAtPatch};
-
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    // 1. Seed feed + items (in-progress article, unread podcast, cached PDF, uncached video)
-    let feed_url = Url::parse("https://flows.example.com/feed.xml").unwrap();
-    let feed =
-        db.feeds().create(FeedType::Rss, &feed_url, Some("Flow Dispatch"), None).await.unwrap();
-
-    let prog_url = Url::parse("https://flows.example.com/in-progress").unwrap();
-    let in_prog = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&feed.id),
-            title: "Halfway Essay on Typography",
-            url: &prog_url,
-            author: Some("Alice"),
-            published_at: Some(chrono::Utc::now()),
-            summary: Some("Progress summary"),
-            content_type: ContentType::Article,
-        })
-        .await
-        .unwrap();
-    db.items().update(&in_prog.id, None, None, Some(0.45), ReadAtPatch::Unchanged).await.unwrap();
-
-    let pod_url = Url::parse("https://flows.example.com/pod-1").unwrap();
-    let fresh_pod = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&feed.id),
-            title: "Typography Podcast Ep 1",
-            url: &pod_url,
-            author: Some("Host"),
-            published_at: Some(chrono::Utc::now()),
-            summary: Some("Show notes"),
-            content_type: ContentType::Audio,
-        })
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
-         VALUES (?, ?, 'audio', ?, NULL, NULL, ?, ?)",
-    )
-    .bind("enc-pod-1")
-    .bind(&fresh_pod.id)
-    .bind("https://cdn.example.com/ep1.mp3")
-    .bind(3_900i64)
-    .bind(chrono::Utc::now())
-    .execute(db.pool())
-    .await
-    .unwrap();
-
-    let pdf_url = Url::parse("https://flows.example.com/paper.pdf").unwrap();
-    let cached_pdf = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&feed.id),
-            title: "Cached Research PDF",
-            url: &pdf_url,
-            author: None,
-            published_at: Some(chrono::Utc::now()),
-            summary: None,
-            content_type: ContentType::Pdf,
-        })
-        .await
-        .unwrap();
-    let pdf_media = db
-        .media()
-        .create(&cached_pdf.id, crate::db::MediaType::Pdf, "pdfs/flow.pdf", Some(4096), None)
-        .await
-        .unwrap();
-
-    let vid_url = Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
-    let uncached_vid = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&feed.id),
-            title: "Typography Talk Video",
-            url: &vid_url,
-            author: Some("Speaker"),
-            published_at: Some(chrono::Utc::now()),
-            summary: None,
-            content_type: ContentType::Video,
-        })
-        .await
-        .unwrap();
-    sqlx::query("UPDATE entries SET thumbnail_url = ? WHERE id = ?")
-        .bind("https://img.example.com/thumb.jpg")
-        .bind(&uncached_vid.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-
-    // 2. Home Continue Reading filters to in-progress (0.03..0.98) and deduplicates from Feed Inbox
-    let home_html = read_body_html(get_authed(&app, "/", &cookie).await).await;
-    assert!(home_html.contains("Continue Reading"));
-    assert!(home_html.contains("continue-progress"));
-    assert!(home_html.contains("Halfway Essay on Typography"));
-    assert_eq!(
-        home_html.matches(&format!("/reader/{}", in_prog.id)).count(),
-        1,
-        "in-progress item in Continue Reading must be deduplicated out of Feed Inbox"
-    );
-    assert!(home_html.contains("1h 05m"));
-    assert!(home_html.contains("roche-quick-log-dialog"));
-    assert!(home_html.contains("roche-shortcuts-dialog"));
-
-    // 3. Reader upgrades: return_to back link, podcast duration (not "1 min read"), PDF iframe, uncached video hero
-    let pod_reader = read_body_html(
-        get_authed(&app, &format!("/reader/{}?return_to=%2F", fresh_pod.id), &cookie).await,
-    )
-    .await;
-    assert!(pod_reader.contains("href=\"/\""));
-    assert!(pod_reader.contains("1h 05m"));
-    assert!(!pod_reader.contains("1 min read"));
-    assert!(pod_reader.contains("reader-mobile-tools"));
-
-    let pdf_reader =
-        read_body_html(get_authed(&app, &format!("/reader/{}", cached_pdf.id), &cookie).await)
-            .await;
-    assert!(pdf_reader.contains("reader-pdf-frame"));
-    assert!(pdf_reader.contains(&format!("/web/media/{}", pdf_media.id)));
-    assert!(!pdf_reader.contains("No extracted article text"));
-
-    let vid_reader =
-        read_body_html(get_authed(&app, &format!("/reader/{}", uncached_vid.id), &cookie).await)
-            .await;
-    assert!(vid_reader.contains("reader-video-hero"));
-    assert!(vid_reader.contains("Watch Original"));
-
-    // 4. Feeds inline edit preserves filter return_to
-    let edit_feed_resp = post_form(
-        &app,
-        &format!("/web/feeds/{}/edit", feed.id),
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("title", "Flow Renamed"),
-            ("poll_interval", "120"),
-            ("return_to", "/feeds?status=active&q=Flow"),
-        ],
-    )
-    .await;
-    assert_eq!(edit_feed_resp.status(), StatusCode::SEE_OTHER);
-    let edit_loc = edit_feed_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert_eq!(edit_loc, "/feeds?status=active&q=Flow");
-    assert!(find_set_cookie(&edit_feed_resp, "roche_flash=n:").is_some());
-    let updated_feed = db.feeds().get(&feed.id).await.unwrap().unwrap();
-    assert_eq!(updated_feed.title.as_deref(), Some("Flow Renamed"));
-    assert_eq!(updated_feed.poll_interval, 120);
-
-    // 5. Catalog book, manual list auto-open & Auto-match existing across kinds (no Movie duplicate!) + Undo banner
-    let dune = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Book),
-            title: "Dune Typography".to_owned(),
-            creators: vec!["Frank Herbert".to_owned()],
-            release_year: Some(1965),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let other_book = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Book),
-            title: "Dune Typography Duplicate".to_owned(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let third_book = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Book),
-            title: "Grid Systems".to_owned(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let manual = db
-        .catalog()
-        .create_manual_collection("Favorites", Some("favorites"), CollectionRole::List, None, None)
-        .await
-        .unwrap();
-
-    let empty_list_html = read_body_html(get_authed(&app, "/lists/favorites", &cookie).await).await;
-    assert!(empty_list_html.contains("open data-default-open"));
-    assert!(empty_list_html.contains("Auto &mdash; match existing work"));
-
-    let add_existing_resp = post_form(
-        &app,
-        "/web/lists/favorites/add",
-        &cookie,
-        &[("_csrf", &csrf), ("title_or_id", "Dune Typography"), ("kind", "")],
-    )
-    .await;
-    assert_eq!(add_existing_resp.status(), StatusCode::SEE_OTHER);
-    let add_loc = add_existing_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert_eq!(add_loc, "/lists/favorites");
-    let add_flash = find_set_cookie(&add_existing_resp, "roche_flash=n:").unwrap();
-    assert!(add_flash.contains("Linked+existing+Book"), "got: {add_flash}");
-
-    let rem_resp = post_form(
-        &app,
-        &format!("/web/lists/favorites/remove/{}", dune.id),
-        &cookie,
-        &[("_csrf", &csrf), ("return_to", "/lists/favorites")],
-    )
-    .await;
-    assert_eq!(rem_resp.status(), StatusCode::SEE_OTHER);
-    let rem_loc = rem_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert!(rem_loc.contains(&format!("undo_remove={}", dune.id)));
-    let undo_list_html = read_body_html(get_authed(&app, rem_loc, &cookie).await).await;
-    assert!(undo_list_html.contains("undo-banner"));
-    assert!(undo_list_html.contains(">Undo</button>"));
-
-    // 6. Entry Queue toggle, Enrich JSON endpoint, and 2-step Merge Preview + Confirm
-    let q_add = post_form(
-        &app,
-        &format!("/web/entries/{}/queue-toggle", dune.id),
-        &cookie,
-        &[("_csrf", &csrf), ("in_queue", "true"), ("return_to", &format!("/entries/{}", dune.id))],
-    )
-    .await;
-    assert_eq!(q_add.status(), StatusCode::SEE_OTHER);
-    let entry_queued_html =
-        read_body_html(get_authed(&app, &format!("/entries/{}", dune.id), &cookie).await).await;
-    assert!(entry_queued_html.contains("In Queue"));
-
-    let enrich_resp =
-        post_form(&app, &format!("/web/entries/{}/enrich", dune.id), &cookie, &[("_csrf", &csrf)])
-            .await;
-    assert_eq!(enrich_resp.status(), StatusCode::OK);
-    let enrich_body = read_body_html(enrich_resp).await;
-    assert!(enrich_body.contains("\"enriched\""));
-
-    let preview_html = read_body_html(
-        get_authed(&app, &format!("/entries/{}?merge_preview={}", other_book.id, dune.id), &cookie)
-            .await,
-    )
-    .await;
-    assert!(preview_html.contains("merge-preview-card"));
-    assert!(preview_html.contains("Confirm Merge"));
-    let merge_resp = post_form(
-        &app,
-        &format!("/web/entries/{}/merge", other_book.id),
-        &cookie,
-        &[("_csrf", &csrf), ("canonical_id", &dune.id)],
-    )
-    .await;
-    assert_eq!(merge_resp.status(), StatusCode::SEE_OTHER);
-    assert!(
-        merge_resp
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with(&format!("/entries/{}", dune.id))
-    );
-
-    // 7. Diary quick-log return_to, unified labels, inline edit & delete, plus Global Search (/search)
-    let log_resp = post_form(
-        &app,
-        "/web/log",
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("title", "Dune Typography"),
-            ("kind", "book"),
-            ("action", "started"),
-            ("notes", "Initial read"),
-            ("return_to", "/lists"),
-        ],
-    )
-    .await;
-    assert_eq!(log_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(log_resp.headers().get(header::LOCATION).unwrap(), "/lists");
-    assert!(find_set_cookie(&log_resp, "roche_flash=n:").is_some());
-
-    let diary_logs = db.catalog().list_diary(None, None, 10).await.unwrap();
-    assert_eq!(diary_logs.len(), 1);
-    let log_id = diary_logs[0].id.clone();
-
-    let edit_log_resp = post_form(
-        &app,
-        &format!("/web/diary/{log_id}/edit"),
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("status", "abandoned"),
-            ("date", "2024-06-15"),
-            ("notes", "Updated typography note"),
-            ("return_to", "/diary"),
-        ],
-    )
-    .await;
-    assert_eq!(edit_log_resp.status(), StatusCode::SEE_OTHER);
-    let diary_html = read_body_html(get_authed(&app, "/diary", &cookie).await).await;
-    assert!(diary_html.contains(">Finished</a>"));
-    assert!(diary_html.contains(">Skipped</a>"));
-    assert!(diary_html.contains("Updated typography note"));
-
-    // Global Search returns hits across Catalog, Lists, Queue, Inbox, and Diary
-    let search_html = read_body_html(get_authed(&app, "/search?q=Typography", &cookie).await).await;
-    assert!(search_html.contains("id=\"search-catalog\""));
-    assert!(search_html.contains("id=\"search-inbox\""));
-    assert!(search_html.contains("id=\"search-diary\""));
-    assert!(search_html.contains("value=\"Typography\""));
-
-    let del_log_resp = post_form(
-        &app,
-        &format!("/web/diary/{log_id}/delete"),
-        &cookie,
-        &[("_csrf", &csrf), ("return_to", "/diary")],
-    )
-    .await;
-    assert_eq!(del_log_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(db.catalog().list_diary(None, None, 10).await.unwrap().len(), 0);
-
-    // 8. Rank: boundary arrows disabled, non-round-burning Skip, Undo comparison, 5-round Keep Refining
-    let fourth_book = db
-        .catalog()
-        .upsert_entry(&crate::db::UpsertEntryInput {
-            kind: Some(EntryKind::Book),
-            title: "The Elements of Typographic Style".to_owned(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    db.catalog().add_collection_entry(&manual.id, &dune.id, None).await.unwrap();
-    db.catalog().add_collection_entry(&manual.id, &third_book.id, None).await.unwrap();
-    db.catalog().add_collection_entry(&manual.id, &fourth_book.id, None).await.unwrap();
-    let rank_html = read_body_html(
-        get_authed(&app, &format!("/rank/favorites?focus={}&round=0", dune.id), &cookie).await,
-    )
-    .await;
-    assert!(rank_html.contains("Round 1 of 5"));
-    assert!(rank_html.contains("js-card-up\" disabled"));
-    assert!(rank_html.contains("js-card-down\" disabled"));
-    // Skip preserves focus and round=0 while incrementing skip=1
-    assert!(rank_html.contains("name=\"skip\" value=\"1\""));
-    assert!(rank_html.contains("name=\"round\" value=\"0\""));
-    assert!(!rank_html.contains("name=\"random\" value=\"1\""));
-
-    let ord_json = serde_json::json!([[dune.id], [third_book.id]]).to_string();
-    let rank_post = post_form(
-        &app,
-        "/rank/favorites",
-        &cookie,
-        &[("_csrf", &csrf), ("focus", &dune.id), ("round", "0"), ("ordering_json", &ord_json)],
-    )
-    .await;
-    assert_eq!(rank_post.status(), StatusCode::SEE_OTHER);
-    let next_loc = rank_post.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
-    assert!(next_loc.contains("round=1"));
-    assert!(next_loc.contains("undo_comp="));
-
-    let r1_html = read_body_html(get_authed(&app, &next_loc, &cookie).await).await;
-    assert!(r1_html.contains("Provisional:"));
-    assert!(r1_html.contains("Done Placing"));
-    assert!(r1_html.contains("Comparison saved."));
-
-    // Undo deletes the comparison cleanly
-    let undo_comp_id = next_loc.split("undo_comp=").nth(1).unwrap().split('&').next().unwrap();
-    let undo_resp = post_form(
-        &app,
-        &format!("/web/comparisons/{undo_comp_id}/undo"),
-        &cookie,
-        &[("_csrf", &csrf), ("return_to", &format!("/rank/favorites?focus={}&round=0", dune.id))],
-    )
-    .await;
-    assert_eq!(undo_resp.status(), StatusCode::SEE_OTHER);
-    let view_after_undo = crate::service::CatalogService::new(&db)
-        .get_ranked_collection(&manual.id, false)
-        .await
-        .unwrap();
-    assert_eq!(view_after_undo.comparison_count, 0);
-
-    // Settled after 5 rounds exposes Keep Refining
-    let settled_html = read_body_html(
-        get_authed(&app, &format!("/rank/favorites?focus={}&round=5", dune.id), &cookie).await,
-    )
-    .await;
-    assert!(settled_html.contains("Placement Settled"));
-    assert!(settled_html.contains("Keep Refining"));
-    assert!(settled_html.contains("max_rounds=10"));
-}
-
-#[tokio::test]
-async fn test_web_session_isolation_expiry_and_masked_csrf() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (web_cookie, csrf_first) = login_browser(&db, &app).await;
-
-    // 1. Browser login mints a `web_sessions` row, NEVER a `device_tokens` row
-    assert_eq!(db.auth().count_web_sessions().await.unwrap(), 1);
-    assert_eq!(db.auth().count_devices().await.unwrap(), 0);
-
-    // 2. Web session raw token CANNOT authenticate `/api/v1/*` bearer endpoints
-    let web_raw_token = web_cookie.split_once('=').unwrap().1;
-    let api_with_web_token = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/items")
-                .header(header::AUTHORIZATION, format!("Bearer {web_raw_token}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(api_with_web_token.status(), StatusCode::UNAUTHORIZED);
-
-    // 3. API device token CANNOT authenticate browser web routes
-    let pair_code = PairingManager::new(db.auth()).create_code(300).await.unwrap();
-    let pair_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/auth/pair")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "device_name": "Android Phone",
-                        "pairing_code": pair_code,
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(pair_resp.status(), StatusCode::OK);
-    let pair_json: serde_json::Value =
-        serde_json::from_slice(&to_bytes(pair_resp.into_body(), 16 * 1024).await.unwrap()).unwrap();
-    let api_token = pair_json["token"].as_str().unwrap();
-
-    let web_with_api_token = get_authed(&app, "/", &format!("roche_session={api_token}")).await;
-    assert_eq!(web_with_api_token.status(), StatusCode::SEE_OTHER);
-    assert_eq!(web_with_api_token.headers().get(header::LOCATION).unwrap(), "/login");
-
-    // 4. Per-request masked CSRF tokens differ across GETs, are 128 hex chars, and both verify
-    let home2_html = read_body_html(get_authed(&app, "/", &web_cookie).await).await;
-    let csrf_second = extract_csrf_token(&home2_html);
-    assert_eq!(csrf_first.len(), 128);
-    assert_eq!(csrf_second.len(), 128);
-    assert_ne!(csrf_first, csrf_second, "CSRF token must be freshly masked per request");
-
-    let post_first = post_form(
-        &app,
-        "/web/lists/create",
-        &web_cookie,
-        &[("_csrf", &csrf_first), ("title", "One")],
-    )
-    .await;
-    assert_eq!(post_first.status(), StatusCode::SEE_OTHER);
-    let post_second = post_form(
-        &app,
-        "/web/lists/create",
-        &web_cookie,
-        &[("_csrf", &csrf_second), ("title", "Two")],
-    )
-    .await;
-    assert_eq!(post_second.status(), StatusCode::SEE_OTHER);
-
-    // 5. Expired web sessions are rejected immediately and pruned by WorkerManager
-    sqlx::query(
-        "UPDATE web_sessions SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 minute')",
-    )
-    .execute(db.pool())
-    .await
-    .unwrap();
-    let expired_get = get_authed(&app, "/", &web_cookie).await;
-    assert_eq!(expired_get.status(), StatusCode::SEE_OTHER);
-    assert_eq!(expired_get.headers().get(header::LOCATION).unwrap(), "/login");
-
-    let workers =
-        crate::workers::WorkerManager::new(db.clone(), 30, "/tmp/roche-test-session-prune");
-    workers.run_once().await.unwrap();
-    assert_eq!(db.auth().count_web_sessions().await.unwrap(), 0);
-}
-
-#[tokio::test]
-async fn test_security_headers_breach_and_host_cookie_enforcement() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (host_cookie, _csrf) = login_browser(&db, &app).await;
-    let raw_token = host_cookie.split_once('=').unwrap().1;
-
-    // 1. HTML responses are never compressed (BREACH mitigation) and carry Permissions-Policy + HSTS over forwarded HTTPS
-    let mut https_home_req = Request::builder()
-        .uri("/")
-        .header(header::COOKIE, &host_cookie)
-        .header(header::ACCEPT_ENCODING, "gzip, br, deflate")
-        .header("x-forwarded-proto", "https")
-        .body(Body::empty())
-        .unwrap();
-    https_home_req
-        .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42001)));
-    let https_home = app.clone().oneshot(https_home_req).await.unwrap();
-    assert_eq!(https_home.status(), StatusCode::OK);
-    assert!(
-        https_home.headers().get(header::CONTENT_ENCODING).is_none(),
-        "text/html must not be compressed"
-    );
-    assert_eq!(
-        https_home.headers().get("permissions-policy").unwrap(),
-        "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
-    );
-    assert_eq!(
-        https_home.headers().get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
-        "max-age=31536000"
-    );
-
-    // 2. Over forwarded HTTPS, unprefixed `roche_session` cookie is rejected (blocks HTTP cookie-tossing)
-    let mut tossed_req = Request::builder()
-        .uri("/")
-        .header(header::COOKIE, format!("roche_session={raw_token}"))
-        .header("x-forwarded-proto", "https")
-        .body(Body::empty())
-        .unwrap();
-    tossed_req
-        .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42002)));
-    let tossed_resp = app.clone().oneshot(tossed_req).await.unwrap();
-    assert_eq!(tossed_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(tossed_resp.headers().get(header::LOCATION).unwrap(), "/login");
-
-    // 3. Direct non-loopback peer spoofing X-Forwarded-Proto: https does NOT receive HSTS
-    let mut spoofed_https_req = Request::builder()
-        .uri("/health")
-        .header("x-forwarded-proto", "https")
-        .body(Body::empty())
-        .unwrap();
-    spoofed_https_req
-        .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 55)), 42003)));
-    let spoofed_health = app.clone().oneshot(spoofed_https_req).await.unwrap();
-    assert_eq!(spoofed_health.status(), StatusCode::OK);
-    assert_eq!(spoofed_health.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
-    assert_eq!(spoofed_health.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
-    assert!(spoofed_health.headers().get(header::STRICT_TRANSPORT_SECURITY).is_none());
-
-    // 4. API endpoints emit nosniff, no-store, and HSTS over trusted forwarded HTTPS
-    let mut https_api_401 = Request::builder()
-        .uri("/api/v1/items")
-        .header("x-forwarded-proto", "https")
-        .body(Body::empty())
-        .unwrap();
-    https_api_401
-        .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42004)));
-    let api_401_resp = app.clone().oneshot(https_api_401).await.unwrap();
-    assert_eq!(api_401_resp.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(api_401_resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
-    assert_eq!(api_401_resp.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
-    assert_eq!(
-        api_401_resp.headers().get(header::STRICT_TRANSPORT_SECURITY).unwrap(),
-        "max-age=31536000"
-    );
-}
-
-#[tokio::test]
-async fn test_httponly_flash_cookie_lifecycle_and_query_rejection() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (host_cookie, csrf) = login_browser(&db, &app).await;
-
-    // POST sets __Host-roche_flash over HTTPS with clean Location
-    let mut https_create = Request::builder()
-        .method("POST")
-        .uri("/web/lists/create")
-        .header(header::COOKIE, &host_cookie)
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header("x-forwarded-proto", "https")
-        .body(Body::from(encode_form(&[("_csrf", &csrf), ("title", "Flash Test List")])))
-        .unwrap();
-    https_create
-        .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42005)));
-    let create_resp = app.clone().oneshot(https_create).await.unwrap();
-    assert_eq!(create_resp.status(), StatusCode::SEE_OTHER);
-    let create_loc =
-        create_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
-    assert!(!create_loc.contains("notice="), "Location must not leak flash in query: {create_loc}");
-    let flash_set = find_set_cookie(&create_resp, "__Host-roche_flash=n:").unwrap();
-    assert!(flash_set.contains("HttpOnly"));
-    assert!(flash_set.contains("Secure"));
-    assert!(flash_set.contains("Max-Age=60"));
-    let flash_pair = extract_cookie_header(flash_set);
-    let combined_cookie = format!("{host_cookie}; {flash_pair}");
-
-    // Background AJAX poll must NOT clear the flash cookie
-    let mut ajax_req = Request::builder()
-        .uri("/web/refresh-status")
-        .header(header::COOKIE, &combined_cookie)
-        .header("x-forwarded-proto", "https")
-        .body(Body::empty())
-        .unwrap();
-    ajax_req
-        .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42006)));
-    let ajax_resp = app.clone().oneshot(ajax_req).await.unwrap();
-    assert_eq!(ajax_resp.status(), StatusCode::OK);
-    assert!(find_set_cookie(&ajax_resp, "__Host-roche_flash=").is_none());
-
-    // 303 redirect route (/starred -> /lists/starred) must NOT clear the flash cookie
-    let mut redir_req = Request::builder()
-        .uri("/starred")
-        .header(header::COOKIE, &combined_cookie)
-        .header("x-forwarded-proto", "https")
-        .body(Body::empty())
-        .unwrap();
-    redir_req
-        .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42007)));
-    let redir_resp = app.clone().oneshot(redir_req).await.unwrap();
-    assert_eq!(redir_resp.status(), StatusCode::SEE_OTHER);
-    assert!(find_set_cookie(&redir_resp, "__Host-roche_flash=").is_none());
-
-    // Follow-up 200 HTML GET renders the banner and emits Max-Age=0 clear cookie
-    let mut page_req = Request::builder()
-        .uri(&create_loc)
-        .header(header::COOKIE, &combined_cookie)
-        .header("x-forwarded-proto", "https")
-        .body(Body::empty())
-        .unwrap();
-    page_req
-        .extensions_mut()
-        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42008)));
-    let page_resp = app.clone().oneshot(page_req).await.unwrap();
-    assert_eq!(page_resp.status(), StatusCode::OK);
-    let clear_flash = find_set_cookie(&page_resp, "__Host-roche_flash=;").unwrap();
-    assert!(clear_flash.contains("Max-Age=0"));
-    assert!(clear_flash.contains("Secure"));
-    let page_html = read_body_html(page_resp).await;
-    assert!(page_html.contains("Created manual list"));
-
-    // Spoofed URL query parameters `?notice=` / `?err=` are completely ignored
-    let spoofed_flash_html = read_body_html(
-        get_authed(&app, "/inbox?notice=Injected+Notice&err=Spoofed+Error", &host_cookie).await,
-    )
-    .await;
-    assert!(!spoofed_flash_html.contains("Injected Notice"));
-    assert!(!spoofed_flash_html.contains("Spoofed Error"));
-
-    // Multibyte UTF-8 flash messages are byte-capped so percent-encoded Set-Cookie stays < 4096 bytes
-    let big_cjk = "漢".repeat(512);
-    let sanitized_cjk = super::html::sanitize_flash_message(&big_cjk);
-    assert!(sanitized_cjk.len() <= 1024);
-    let encoded_cjk = super::html::urlencode(&sanitized_cjk);
-    assert!(encoded_cjk.len() + "__Host-roche_flash=n:".len() < 4096);
-}
-
-#[tokio::test]
-async fn test_mixed_https_http_localhost_cookie_precedence_and_cleanup() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (dead_host_cookie, csrf1) = login_browser(&db, &app).await;
-
-    // 1. HTTP logout while carrying __Host-roche_session and __Host-roche_flash clears BOTH __Host-* and unprefixed cookies
-    let logout_resp = post_form(
-        &app,
-        "/logout",
-        &format!("{dead_host_cookie}; __Host-roche_flash=n:Leftover"),
-        &[("_csrf", &csrf1)],
-    )
-    .await;
-    assert_eq!(logout_resp.status(), StatusCode::SEE_OTHER);
-    assert!(find_set_cookie(&logout_resp, "__Host-roche_session=;").unwrap().contains("Max-Age=0"));
-    assert!(find_set_cookie(&logout_resp, "roche_session=;").unwrap().contains("Max-Age=0"));
-    assert!(find_set_cookie(&logout_resp, "__Host-roche_flash=;").unwrap().contains("Max-Age=0"));
-    assert!(find_set_cookie(&logout_resp, "roche_flash=;").unwrap().contains("Max-Age=0"));
-
-    // 2. HTTP login while browser still sends stale __Host-roche_session and __Host-roche_logged_out=1
-    //    clears both stale __Host-* cookies and mints a fresh unprefixed roche_session
-    let code = PairingManager::new(db.auth()).create_code(300).await.unwrap();
-    let http_login_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .header("sec-fetch-site", "same-origin")
-                .header(header::COOKIE, format!("{dead_host_cookie}; __Host-roche_logged_out=1"))
-                .body(Body::from(encode_form(&[("pairing_code", &code)])))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(http_login_resp.status(), StatusCode::SEE_OTHER);
-    assert!(
-        find_set_cookie(&http_login_resp, "__Host-roche_session=;").unwrap().contains("Max-Age=0")
-    );
-    assert!(
-        find_set_cookie(&http_login_resp, "__Host-roche_logged_out=;")
-            .unwrap()
-            .contains("Max-Age=0")
-    );
-    let fresh_plain_cookie =
-        extract_cookie_header(find_set_cookie(&http_login_resp, "roche_session=").unwrap());
-
-    // 3. Even if a browser sends revoked __Host-roche_session alongside valid roche_session over HTTP,
-    //    authentication succeeds without looping to /login, and fresh roche_flash beats stale __Host-roche_flash
-    let mixed_resp = get_authed(
-        &app,
-        "/",
-        &format!(
-            "{dead_host_cookie}; {fresh_plain_cookie}; __Host-roche_flash=n:Stale; roche_flash=n:Fresh+HTTP"
-        ),
-    )
-    .await;
-    assert_eq!(mixed_resp.status(), StatusCode::OK);
-    assert!(find_set_cookie(&mixed_resp, "__Host-roche_flash=;").unwrap().contains("Max-Age=0"));
-    assert!(find_set_cookie(&mixed_resp, "roche_flash=;").unwrap().contains("Max-Age=0"));
-    let mixed_html = read_body_html(mixed_resp).await;
-    assert!(mixed_html.contains("Fresh HTTP"));
-    assert!(!mixed_html.contains("Stale"));
-}
-
-async fn seed_consumed_movies(db: &crate::db::Db, count: i32) -> Vec<String> {
-    let mut movie_ids = Vec::new();
-    for idx in 1..=count {
-        let entry = db
-            .catalog()
-            .upsert_entry(&crate::db::UpsertEntryInput {
-                kind: Some(EntryKind::Movie),
-                title: format!("Cinema Work {idx}"),
-                release_year: Some(2000 + idx),
-                ..crate::db::UpsertEntryInput::default()
-            })
-            .await
-            .unwrap();
-        db.catalog()
-            .log_consumption(&entry.id, ConsumptionStatus::Consumed, None, None)
-            .await
-            .unwrap();
-        movie_ids.push(entry.id);
-    }
-    movie_ids
-}
-
-#[tokio::test]
-async fn test_web_rank_cluster_size_cookie_and_partial_subset_exclusion() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-    let movie_ids = seed_consumed_movies(&db, 6).await;
-
-    // 1. Explicit `?k=3` renders 3 cards, sets `roche_rank_k=3` cookie, and renders size pills + exclude controls
-    let resp_k3 = get_authed(&app, "/rank/movies?k=3", &cookie).await;
-    assert_eq!(resp_k3.status(), StatusCode::OK);
-    let rank_k_cookie_hdr = find_set_cookie(&resp_k3, "roche_rank_k=3").unwrap();
-    let rank_k_pair = extract_cookie_header(rank_k_cookie_hdr);
-    let html_k3 = read_body_html(resp_k3).await;
-    assert_eq!(html_k3.matches("class=\"rank-card js-rank-card").count(), 3);
-    assert!(html_k3.contains("data-rank-k=\"2\""));
-    assert!(html_k3.contains("data-rank-k=\"3\""));
-    assert!(html_k3.contains("data-rank-k=\"5\""));
-    assert!(html_k3.contains("js-card-exclude"));
-    assert!(html_k3.contains("data-priority=\"0\""));
-
-    // 2. Subsequent GET without `?k=` honors `roche_rank_k=3` cookie
-    let cookie_with_k3 = format!("{cookie}; {rank_k_pair}");
-    let resp_cookie_k3 = get_authed(&app, "/rank/movies", &cookie_with_k3).await;
-    assert_eq!(resp_cookie_k3.status(), StatusCode::OK);
-    let html_cookie_k3 = read_body_html(resp_cookie_k3).await;
-    assert_eq!(html_cookie_k3.matches("class=\"rank-card js-rank-card").count(), 3);
-
-    // 3. Submitting a 2-item subset while excluding a 3rd item records ONLY the 2 submitted IDs
-    //    in `covered`, propagates the excluded token in `excluded`, and updates `roche_rank_k=2`.
-    let (kept_first, kept_second, dropped_third) = (&movie_ids[0], &movie_ids[1], &movie_ids[2]);
-    let ord_json = serde_json::to_string(&vec![vec![kept_first], vec![kept_second]]).unwrap();
-    let post_resp = post_form(
-        &app,
-        "/rank/movies",
-        &cookie_with_k3,
-        &[
-            ("_csrf", &csrf),
-            ("want", "false"),
-            ("round", "0"),
-            ("k", "2"),
-            ("round_excluded", dropped_third),
-            ("ordering_json", &ord_json),
-        ],
-    )
-    .await;
-    assert_eq!(post_resp.status(), StatusCode::SEE_OTHER);
-    assert!(find_set_cookie(&post_resp, "roche_rank_k=2").is_some());
-    let next_loc = post_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
-    let dropped_tok: String = dropped_third.chars().take(8).collect();
-    let first_tok: String = kept_first.chars().take(8).collect();
-    let second_tok: String = kept_second.chars().take(8).collect();
-    assert!(next_loc.contains("k=2"), "expected k=2 in redirect: {next_loc}");
-    assert!(
-        next_loc.contains(&format!("excluded={dropped_tok}")),
-        "expected excluded token in redirect: {next_loc}"
-    );
-    let covered_param = next_loc
-        .split('?')
-        .nth(1)
-        .unwrap()
-        .split('&')
-        .find_map(|p| p.strip_prefix("covered="))
-        .unwrap();
-    assert!(covered_param.contains(&first_tok));
-    assert!(covered_param.contains(&second_tok));
-    assert!(
-        !covered_param.contains(&dropped_tok),
-        "excluded item must NOT be marked covered: {covered_param}"
-    );
-
-    // 4. Following the redirect renders 2 cards, avoids pulling the excluded item back immediately,
-    //    and builds an Undo return_to URL that reverts the undone round's exclusion.
-    let next_html = read_body_html(get_authed(&app, &next_loc, &cookie).await).await;
-    assert_eq!(next_html.matches("class=\"rank-card js-rank-card").count(), 2);
-    assert!(
-        !next_html.contains(&format!("data-entry-id=\"{dropped_third}\"")),
-        "excluded item should stay on cooldown in the next round"
-    );
-    assert!(next_loc.contains("undo_excluded="), "expected undo_excluded in redirect: {next_loc}");
-    let undo_section = next_html.split("rank-undo-bar").nth(1).unwrap();
-    let undo_return_to = undo_section
-        .split("name=\"return_to\" value=\"")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap();
-    assert!(
-        !undo_return_to.contains(&dropped_tok),
-        "Undo return_to must revert exclusions added in the undone round: {undo_return_to}"
-    );
-}
-
-#[tokio::test]
-async fn test_web_rank_noscript_min_k_and_keep_refining_preserves_excluded() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-    let movie_ids = seed_consumed_movies(&db, 4).await;
-    let (kept_first, kept_second, dropped_third) = (&movie_ids[0], &movie_ids[1], &movie_ids[2]);
-    let dropped_tok: String = dropped_third.chars().take(8).collect();
-    let ord_json = serde_json::to_string(&vec![vec![kept_first], vec![kept_second]]).unwrap();
-
-    // 1. `<noscript>` exclusion that leaves fewer than MIN_K=2 ranked items MUST be rejected
-    //    instead of silently falling back to `ordering_json`.
-    let noscript_too_few = post_form(
-        &app,
-        "/rank/movies",
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("want", "false"),
-            ("round", "0"),
-            ("k", "5"),
-            ("ordering_json", &ord_json),
-            (&format!("pos_{kept_first}"), "1"),
-            (&format!("pos_{kept_second}"), "exclude"),
-            (&format!("pos_{dropped_third}"), "exclude"),
-        ],
-    )
-    .await;
-    assert_eq!(noscript_too_few.status(), StatusCode::SEE_OTHER);
-    assert!(find_set_cookie(&noscript_too_few, "roche_flash=e:").is_some());
-    assert!(find_set_cookie(&noscript_too_few, "roche_rank_k=5").is_some());
-    let after_count = crate::service::CatalogService::new(&db)
-        .get_ranked_collection("movies", false)
-        .await
-        .unwrap()
-        .comparison_count;
-    assert_eq!(
-        0, after_count,
-        "<noscript> exclusion leaving < 2 items must not record a comparison"
-    );
-
-    // 2. Settled focused view's "Keep Refining" link preserves session `excluded` cooldown tokens
-    let settled_html = read_body_html(
-        get_authed(
-            &app,
-            &format!("/rank/movies?focus={kept_first}&round=5&excluded={dropped_tok}"),
-            &cookie,
-        )
-        .await,
-    )
-    .await;
-    assert!(settled_html.contains("Keep Refining"));
-    assert!(settled_html.contains(&format!("excluded={dropped_tok}")));
-}
-
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_web_audio_podcast_decoupling_filters_feed_toggle_and_progress_source() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    let rss_url = Url::parse("https://decouple.example/rss.xml").unwrap();
-    let rss_feed =
-        db.feeds().create(FeedType::Rss, &rss_url, Some("Essay Substack"), None).await.unwrap();
-    let pod_url = Url::parse("https://decouple.example/podcast.xml").unwrap();
-    let pod_feed =
-        db.feeds().create(FeedType::Podcast, &pod_url, Some("True Podcast"), None).await.unwrap();
-
-    // Seed plain RSS article, narrated RSS article (Article + audio_url), and explicit Podcast episode
-    let plain_url = Url::parse("https://decouple.example/plain").unwrap();
-    let _plain = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&rss_feed.id),
-            title: "Plain Written Essay",
-            url: &plain_url,
-            author: None,
-            published_at: Some(chrono::Utc::now()),
-            summary: Some("Just prose"),
-            content_type: ContentType::Article,
-        })
-        .await
-        .unwrap();
-
-    let narrated_url = Url::parse("https://decouple.example/narrated").unwrap();
-    let narrated = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&rss_feed.id),
-            title: "Narrated Essay With Audio",
-            url: &narrated_url,
-            author: None,
-            published_at: Some(chrono::Utc::now()),
-            summary: Some("Written prose with narration"),
-            content_type: ContentType::Article,
-        })
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO entry_media (id, entry_id, media_type, remote_url, duration)
-         VALUES ('decouple-narrated-mp3', ?, 'audio', 'https://cdn.decouple.example/narrated.mp3', 1500)",
-    )
-    .bind(&narrated.id)
-    .execute(db.pool())
-    .await
-    .unwrap();
-
-    let ep_url = Url::parse("https://decouple.example/ep1").unwrap();
-    let ep = db
-        .items()
-        .create(&NewItem {
-            feed_id: Some(&pod_feed.id),
-            title: "Explicit Podcast Ep 1",
-            url: &ep_url,
-            author: None,
-            published_at: Some(chrono::Utc::now()),
-            summary: Some("Episode notes"),
-            content_type: ContentType::Audio,
-        })
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO entry_media (id, entry_id, media_type, remote_url, duration)
-         VALUES ('decouple-ep-mp3', ?, 'audio', 'https://cdn.decouple.example/ep1.mp3', 2700)",
-    )
-    .bind(&ep.id)
-    .execute(db.pool())
-    .await
-    .unwrap();
-
-    // 1. Inbox ?kind=podcast shows ONLY explicit podcast episode (not narrated article!)
-    let pod_html = read_body_html(get_authed(&app, "/inbox?kind=podcast", &cookie).await).await;
-    assert!(pod_html.contains("Explicit Podcast Ep 1"));
-    assert!(!pod_html.contains("Narrated Essay With Audio"));
-    assert!(!pod_html.contains("Plain Written Essay"));
-    assert!(pod_html.contains("Kind: Podcasts"));
-
-    // 2. Inbox ?kind=audio shows BOTH explicit podcast episode AND narrated RSS article
-    let audio_html = read_body_html(get_authed(&app, "/inbox?kind=audio", &cookie).await).await;
-    assert!(audio_html.contains("Explicit Podcast Ep 1"));
-    assert!(audio_html.contains("Narrated Essay With Audio"));
-    assert!(!audio_html.contains("Plain Written Essay"));
-    assert!(audio_html.contains("Kind: Audio"));
-
-    // 3. Inbox ?kind=article includes narrated RSS article with Play button & Audio badge + duration
-    let art_html = read_body_html(get_authed(&app, "/inbox?kind=article", &cookie).await).await;
-    assert!(art_html.contains("Plain Written Essay"));
-    assert!(art_html.contains("Narrated Essay With Audio"));
-    assert!(!art_html.contains("Explicit Podcast Ep 1"));
-    assert!(art_html.contains("js-play-audio"));
-    assert!(art_html.contains("25m"));
-
-    // 4. Reader for narrated article shows BOTH listen duration & reading estimate, and Play button
-    let narrated_reader =
-        read_body_html(get_authed(&app, &format!("/reader/{}", narrated.id), &cookie).await).await;
-    assert!(narrated_reader.contains("25m listen"));
-    assert!(narrated_reader.contains("min read"));
-    assert!(narrated_reader.contains("data-kind=\"article\""));
-    assert!(narrated_reader.contains("data-content-type=\"article\""));
-    assert!(narrated_reader.contains("data-has-audio=\"1\""));
-    assert!(narrated_reader.contains("js-play-audio"));
-
-    // 5. Progress source on narrated article vs podcast episode:
-    //    Reader scroll to 1.0 on narrated article auto-Finishes as Article;
-    //    Dismissing removes Finished; Audio playback at 0.99 also auto-Finishes as Article!
-    let reader_prog = post_form(
-        &app,
-        &format!("/web/items/{}/progress", narrated.id),
-        &cookie,
-        &[("_csrf", &csrf), ("progress", "1.0"), ("source", "reader")],
-    )
-    .await;
-    assert_eq!(reader_prog.status(), StatusCode::NO_CONTENT);
-    let detail_after_scroll = db.catalog().get_entry_detail(&narrated.id).await.unwrap().unwrap();
-    assert!(
-        detail_after_scroll.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed),
-        "reader scroll >= 98% on narrated article must auto-Finish under Article kind"
-    );
-    assert_eq!(
-        post_form(
-            &app,
-            &format!("/web/items/{}/dismiss", narrated.id),
-            &cookie,
-            &[("_csrf", &csrf)]
-        )
-        .await
-        .status(),
-        StatusCode::SEE_OTHER
-    );
-    assert_eq!(
-        db.catalog().get_entry_detail(&narrated.id).await.unwrap().unwrap().log_history.len(),
-        0
-    );
-
-    let audio_prog = post_form(
-        &app,
-        &format!("/web/items/{}/progress", narrated.id),
-        &cookie,
-        &[("_csrf", &csrf), ("progress", "0.99"), ("source", "audio")],
-    )
-    .await;
-    assert_eq!(audio_prog.status(), StatusCode::NO_CONTENT);
-    let detail_after_audio = db.catalog().get_entry_detail(&narrated.id).await.unwrap().unwrap();
-    assert_eq!(detail_after_audio.entry.kind, EntryKind::Article);
-    assert!(
-        detail_after_audio.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed),
-        "audio completion on narrated article must auto-log consumed under Article kind"
-    );
-
-    // 6. Toggling feed RSS -> Podcast via /web/feeds/{id}/edit reclassifies narrated item
-    let toggle_resp = post_form(
-        &app,
-        &format!("/web/feeds/{}/edit", rss_feed.id),
-        &cookie,
-        &[("_csrf", &csrf), ("title", "Essay Substack"), ("feed_type", "podcast")],
-    )
-    .await;
-    assert_eq!(toggle_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(db.feeds().get(&rss_feed.id).await.unwrap().unwrap().feed_type, FeedType::Podcast);
-    assert_eq!(
-        db.items().get(&narrated.id).await.unwrap().unwrap().entry_kind,
-        EntryKind::PodcastEpisode
-    );
-}
-
-#[tokio::test]
-async fn test_web_feeds_editable_url_form_and_post_edit_validation() {
-    let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    let url1 = Url::parse("https://webedit-old.example.com/rss.xml").unwrap();
-    let url2 = Url::parse("https://webedit-other.example.com/rss.xml").unwrap();
-    let feed1 = db.feeds().create(FeedType::Rss, &url1, Some("Editable Blog"), None).await.unwrap();
-    let _feed2 = db.feeds().create(FeedType::Rss, &url2, Some("Other Blog"), None).await.unwrap();
-
-    // 1. /feeds renders an editable Feed URL input (not readonly) inside the edit form with Copy URL
-    let feeds_html = read_body_html(get_authed(&app, "/feeds", &cookie).await).await;
-    assert!(feeds_html.contains("name=\"url\""));
-    assert!(feeds_html.contains("value=\"https://webedit-old.example.com/rss.xml\""));
-    assert!(feeds_html.contains("data-copy-from=\"fe-url-"));
-    assert!(!feeds_html.contains("readonly value=\"https://webedit-old.example.com/rss.xml\""));
-
-    // 2. Submitting an updated URL via /web/feeds/{id}/edit updates the feed URL in place
-    let edit_ok = post_form(
-        &app,
-        &format!("/web/feeds/{}/edit", feed1.id),
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("url", "https://webedit-new.example.com/atom.xml"),
-            ("title", "Editable Blog"),
-            ("poll_interval", "60"),
-            ("return_to", "/feeds?q=Editable"),
-        ],
-    )
-    .await;
-    assert_eq!(edit_ok.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        edit_ok.headers().get(header::LOCATION).unwrap().to_str().unwrap(),
-        "/feeds?q=Editable"
-    );
-    assert!(find_set_cookie(&edit_ok, "roche_flash=n:").is_some());
-    let updated = db.feeds().get(&feed1.id).await.unwrap().unwrap();
-    assert_eq!(updated.id, feed1.id);
-    assert_eq!(updated.url.as_str(), "https://webedit-new.example.com/atom.xml");
-    assert_eq!(updated.poll_interval, 60);
-
-    // 3. Submitting a conflicting or blank URL returns an error flash and leaves the feed unchanged
-    let edit_conflict = post_form(
-        &app,
-        &format!("/web/feeds/{}/edit", feed1.id),
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("url", "https://webedit-other.example.com/rss.xml"),
-            ("title", "Editable Blog"),
-        ],
-    )
-    .await;
-    assert_eq!(edit_conflict.status(), StatusCode::SEE_OTHER);
-    assert!(find_set_cookie(&edit_conflict, "roche_flash=e:").is_some());
-    assert_eq!(
-        db.feeds().get(&feed1.id).await.unwrap().unwrap().url.as_str(),
-        "https://webedit-new.example.com/atom.xml"
-    );
-
-    let edit_blank_url = post_form(
-        &app,
-        &format!("/web/feeds/{}/edit", feed1.id),
-        &cookie,
-        &[("_csrf", &csrf), ("url", "   "), ("title", "Editable Blog")],
-    )
-    .await;
-    assert_eq!(edit_blank_url.status(), StatusCode::SEE_OTHER);
-    assert!(find_set_cookie(&edit_blank_url, "roche_flash=e:").is_some());
-    assert_eq!(
-        db.feeds().get(&feed1.id).await.unwrap().unwrap().url.as_str(),
-        "https://webedit-new.example.com/atom.xml"
-    );
-
-    // 4. Editing URL on an untitled feed keeps title unset instead of freezing the old URL as title
-    let untitled_old = Url::parse("https://untitled-old.example.com/rss.xml").unwrap();
-    let untitled_feed = db.feeds().create(FeedType::Rss, &untitled_old, None, None).await.unwrap();
-    let untitled_edit = post_form(
-        &app,
-        &format!("/web/feeds/{}/edit", untitled_feed.id),
-        &cookie,
-        &[("_csrf", &csrf), ("url", "https://untitled-new.example.com/rss.xml"), ("title", "")],
-    )
-    .await;
-    assert_eq!(untitled_edit.status(), StatusCode::SEE_OTHER);
-    assert!(find_set_cookie(&untitled_edit, "roche_flash=n:").is_some());
-    let untitled_after = db.feeds().get(&untitled_feed.id).await.unwrap().unwrap();
-    assert_eq!(untitled_after.url.as_str(), "https://untitled-new.example.com/rss.xml");
-    assert!(untitled_after.title.is_none());
-}
-
-#[derive(Clone)]
-struct MockBoardWebFetcher;
-
-impl FeedFetcher for MockBoardWebFetcher {
-    #[allow(clippy::too_many_lines)]
-    fn fetch_feed(
-        &self,
-        url: &Url,
-    ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send {
-        let s = url.as_str().to_owned();
-        async move {
-            if s == roche_core::boards::HackerNewsSection::Top.api_stories_url() {
-                let ids: Vec<u64> = (1001..=1035).collect();
-                return Ok(serde_json::to_string(&ids).unwrap());
-            }
-            if let Some(id_part) = s
-                .strip_prefix("https://hacker-news.firebaseio.com/v0/item/")
-                .and_then(|r| r.strip_suffix(".json"))
-                && let Ok(id_num) = id_part.parse::<u64>()
-            {
-                let payload = match id_num {
-                    1001 => serde_json::json!({
-                        "id": 1001,
-                        "type": "story",
-                        "title": "Systems Architecture Deep Dive",
-                        "url": "https://systems.example/essay",
-                        "by": "ada",
-                        "score": 312,
-                        "descendants": 42,
-                        "time": 1_760_000_000_i64
-                    }),
-                    1002 => serde_json::json!({
-                        "id": 1002,
-                        "type": "story",
-                        "title": "Ask HN: Favorite systems books?",
-                        "text": "<p>What books shaped your engineering taste?</p>",
-                        "by": "grace",
-                        "score": 145,
-                        "descendants": 18,
-                        "time": 1_760_000_100_i64
-                    }),
-                    1003 => serde_json::json!({
-                        "id": 1003,
-                        "type": "story",
-                        "title": "Unextractable GitHub Repo",
-                        "url": "https://github.com/example/unextractable-repo",
-                        "by": "linus",
-                        "score": 205,
-                        "descendants": 27,
-                        "time": 1_760_000_200_i64
-                    }),
-                    1005 => serde_json::json!({
-                        "id": 1005,
-                        "type": "story",
-                        "title": "Ask HN: Who is hiring?",
-                        "by": "whoishiring",
-                        "score": 410,
-                        "descendants": 99,
-                        "time": 1_760_000_250_i64
-                    }),
-                    1006 => serde_json::json!({
-                        "id": 1006,
-                        "type": "story",
-                        "title": "Foundations of Raft (PDF)",
-                        "url": "https://papers.example/raft.pdf",
-                        "by": "diego",
-                        "score": 188,
-                        "descendants": 14,
-                        "time": 1_760_000_260_i64
-                    }),
-                    1007 => serde_json::json!({
-                        "id": 1007,
-                        "type": "story",
-                        "title": "Systems Talk Keynote",
-                        "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                        "by": "speaker",
-                        "score": 170,
-                        "descendants": 33,
-                        "time": 1_760_000_270_i64
-                    }),
-                    1008 => serde_json::json!({
-                        "id": 1008,
-                        "type": "story",
-                        "title": "Transient Flaky Host Essay",
-                        "url": "https://timeout.example/flaky",
-                        "by": "ops",
-                        "score": 160,
-                        "descendants": 11,
-                        "time": 1_760_000_280_i64
-                    }),
-                    1034 => serde_json::json!({
-                        "id": 1034,
-                        "type": "story",
-                        "title": "Ranked Story #1034 DeepNeedleBeyondPageOne",
-                        "url": "https://stories.example/post-1034",
-                        "by": "builder",
-                        "score": 66,
-                        "descendants": 34,
-                        "time": 1_760_001_034_i64
-                    }),
-                    n => serde_json::json!({
-                        "id": n,
-                        "type": "story",
-                        "title": format!("Ranked Story #{n}"),
-                        "url": format!("https://stories.example/post-{n}"),
-                        "by": "builder",
-                        "score": 1100 - n,
-                        "descendants": n - 1000,
-                        "time": 1_760_000_000_i64 + i64::try_from(n).unwrap()
-                    }),
-                };
-                return Ok(payload.to_string());
-            }
-            Err(anyhow::anyhow!("unexpected mock board url: {s}"))
-        }
-    }
-
-    fn fetch_html(
-        &self,
-        url: &Url,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<String>>> + Send {
-        let res = if url.as_str() == "https://systems.example/essay" {
-            Ok(Some(
-                "<html><head><title>Systems Architecture Deep Dive</title></head>\
-                 <body><article><h1>Systems Architecture Deep Dive</h1>\
-                 <p>Clean editorial body paragraph from board extraction.</p></article></body></html>"
-                    .to_owned(),
-            ))
-        } else if url.as_str() == "https://timeout.example/flaky" {
-            Err(anyhow::anyhow!("upstream timeout"))
-        } else {
-            Ok(None)
-        };
-        std::future::ready(res)
-    }
-
-    fn fetch_pdf(
-        &self,
-        _url: &Url,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<Vec<u8>>>> + Send {
-        std::future::ready(Ok(None))
-    }
-}
-
-async fn post_form_json(
-    app: &Router,
-    uri: &str,
-    cookie: &str,
-    csrf: &str,
-    fields: &[(&str, &str)],
-) -> (StatusCode, serde_json::Value) {
-    let body = encode_form(fields);
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header(header::COOKIE, cookie)
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .header(header::ACCEPT, "application/json")
-                .header("x-roche-ajax", "1")
-                .header("x-roche-csrf", csrf)
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
-    let val = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    (status, val)
-}
-
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_web_boards_onboarding_lifecycle_backfill_promote_reader_and_isolation() {
-    let db = Db::connect("sqlite::memory:").await.unwrap();
-    let svc = RocheService::new(db.clone(), MockBoardWebFetcher, Config::default());
-    let app = ApiRoutes::router_with_service(svc);
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    // 1. Masthead nav contains Boards after Inbox & empty /boards renders quick-add onboarding
-    let empty_html = read_body_html(get_authed(&app, "/boards", &cookie).await).await;
-    let inbox_pos = empty_html.find("href=\"/inbox\"").unwrap();
-    let boards_pos = empty_html.find("href=\"/boards\"").unwrap();
-    let starred_pos = empty_html.find("href=\"/starred\"").unwrap();
-    assert!(inbox_pos < boards_pos && boards_pos < starred_pos);
-    assert!(empty_html.contains("Hacker News (Front Page)"));
-    assert!(empty_html.contains("HN Best"));
-    assert!(empty_html.contains("Ask HN"));
-    assert!(empty_html.contains("Show HN"));
-
-    // 2. Create Hacker News Front Page board via Web form (auto-polls 35 stories)
-    let create_resp = post_form(
-        &app,
-        "/web/boards/create",
-        &cookie,
-        &[("_csrf", &csrf), ("adapter_type", "hacker_news"), ("section", "top")],
-    )
-    .await;
-    assert_eq!(create_resp.status(), StatusCode::SEE_OTHER);
-    let board_loc =
-        create_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
-    assert!(board_loc.starts_with("/boards/"), "unexpected redirect: {board_loc}");
-    let board_id = board_loc.strip_prefix("/boards/").unwrap().to_owned();
-
-    // 3. Board view renders top 30 ranked stories with comments links, points, Ask HN badge & Load More
-    let board_html = read_body_html(get_authed(&app, &board_loc, &cookie).await).await;
-    assert!(board_html.contains("Systems Architecture Deep Dive"));
-    assert!(board_html.contains("systems.example"));
-    assert!(board_html.contains("312 pts"));
-    assert!(board_html.contains("42 comments"));
-    assert!(board_html.contains("https://news.ycombinator.com/item?id=1001"));
-    assert!(
-        board_html.contains("Open 42 comments on Hacker News for Systems Architecture Deep Dive")
-    );
-    assert!(board_html.contains("Ask HN: Favorite systems books?"));
-    assert!(board_html.contains("What books shaped your engineering taste?"));
-    assert!(board_html.contains("Load more stories"));
-    assert!(board_html.contains("Ranked Story #1030"));
-    assert!(!board_html.contains("Ranked Story #1031"), "page 1 must display only top 30");
-    // De-duplicated toolbar badge: "Hacker News" board shows "Front Page" (not "Hacker News · Front Page")
-    assert!(board_html.contains("<span class=\"badge badge-kind\">Front Page</span>"));
-    assert!(!board_html.contains("Hacker News · Front Page"));
-    // External discussion links carry rel="noopener noreferrer" and #roche-board-list carries data-base-offset
-    assert!(board_html.contains("rel=\"noopener noreferrer\""));
-    assert!(board_html.contains("data-base-offset=\"0\""));
-
-    // 3b. Server-side ?q= searches across the full 90-item buffer (finds rank #34 past page 1!)
-    let query_html = read_body_html(
-        get_authed(&app, &format!("/boards/{board_id}?q=DeepNeedleBeyondPageOne"), &cookie).await,
-    )
-    .await;
-    assert!(query_html.contains("DeepNeedleBeyondPageOne"));
-    assert!(!query_html.contains("Systems Architecture Deep Dive"));
-
-    // 4. Isolation: unpromoted board stories MUST NOT appear in /inbox or /search
-    let inbox_html = read_body_html(get_authed(&app, "/inbox", &cookie).await).await;
-    assert!(!inbox_html.contains("Systems Architecture Deep Dive"));
-    let search_html = read_body_html(get_authed(&app, "/search?q=Systems", &cookie).await).await;
-    assert!(!search_html.contains("Systems Architecture Deep Dive"));
-
-    // 5. Instant dismiss + backfill JSON returns #31 (external_id 1031)
-    let (dismiss_status, dismiss_json) = post_form_json(
-        &app,
-        &format!("/web/boards/{board_id}/items/1004/dismiss"),
-        &cookie,
-        &csrf,
-        &[("_csrf", &csrf), ("backfill_offset", "29")],
-    )
-    .await;
-    assert_eq!(dismiss_status, StatusCode::OK);
-    assert_eq!(dismiss_json["ok"], true);
-    assert_eq!(dismiss_json["replacement_external_id"], "1031");
-    assert!(dismiss_json["replacement_html"].as_str().unwrap().contains("Ranked Story #1031"));
-    assert_eq!(dismiss_json["visible_count"], 34);
-    assert_eq!(dismiss_json["dismissed_count"], 1);
-
-    // 6. Dismissed view shows 1004 with Restore, and undismiss restores it cleanly
-    let dismissed_html = read_body_html(
-        get_authed(&app, &format!("/boards/{board_id}?view=dismissed"), &cookie).await,
-    )
-    .await;
-    assert!(dismissed_html.contains("Ranked Story #1004"));
-    assert!(dismissed_html.contains("Restore"));
-    assert!(!dismissed_html.contains("Systems Architecture Deep Dive"));
-
-    let (undo_status, undo_json) = post_form_json(
-        &app,
-        &format!("/web/boards/{board_id}/items/1004/undismiss"),
-        &cookie,
-        &csrf,
-        &[("_csrf", &csrf)],
-    )
-    .await;
-    assert_eq!(undo_status, StatusCode::OK);
-    assert_eq!(undo_json["visible_count"], 35);
-    assert_eq!(undo_json["dismissed_count"], 0);
-
-    // 7. Progressive Load More fragment returns buffered slice #31..#35
-    let load_more_resp =
-        get_authed(&app, &format!("/web/boards/{board_id}/items?page=2"), &cookie).await;
-    assert_eq!(load_more_resp.status(), StatusCode::OK);
-    let load_more_json: serde_json::Value =
-        serde_json::from_slice(&to_bytes(load_more_resp.into_body(), 256 * 1024).await.unwrap())
-            .unwrap();
-    assert_eq!(load_more_json["count"], 5);
-    assert!(load_more_json["rows_html"].as_str().unwrap().contains("Ranked Story #1031"));
-    assert!(load_more_json["rows_html"].as_str().unwrap().contains("Ranked Story #1035"));
-
-    // 8. On-demand Board Reader: extracted article, Ask HN self-post, and graceful fallback card
-    let art_reader_html =
-        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1001"), &cookie).await)
-            .await;
-    assert!(art_reader_html.contains("data-board-reader=\"1\""));
-    assert!(art_reader_html.contains("data-has-readable-body=\"1\""));
-    assert!(art_reader_html.contains("Clean editorial body paragraph from board extraction."));
-    assert!(art_reader_html.contains("Original &#8599;"));
-    assert!(art_reader_html.contains("Hacker News (42 comments) &#8599;"));
-    // Opening Reader marks seen but still does NOT insert into entries / Inbox!
-    assert!(db.items().list(None, None, None).await.unwrap().is_empty());
-
-    let ask_reader_html =
-        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1002"), &cookie).await)
-            .await;
-    assert!(ask_reader_html.contains("data-has-readable-body=\"1\""));
-    assert!(ask_reader_html.contains("What books shaped your engineering taste?"));
-    assert!(!ask_reader_html.contains("Original &#8599;"));
-    assert!(ask_reader_html.contains("Hacker News (18 comments) &#8599;"));
-
-    let fallback_reader_html =
-        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1003"), &cookie).await)
-            .await;
-    assert!(fallback_reader_html.contains("board-reader-fallback"));
-    assert!(fallback_reader_html.contains("data-has-readable-body=\"0\""));
-    assert!(fallback_reader_html.contains("Open Original &#8599;"));
-    assert!(fallback_reader_html.contains("Open Hacker News Discussion (27 comments) &#8599;"));
-    assert!(fallback_reader_html.contains("Mark Finished"));
-    // Typography buttons are omitted when no readable prose body is present
-    assert!(!fallback_reader_html.contains("js-font-dec"));
-    assert!(!fallback_reader_html.contains("js-font-inc"));
-
-    // 8b. Tailored fallback cards: SelfPostEmpty, Pdf, Video, and FetchFailed
-    let empty_ask_html =
-        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1005"), &cookie).await)
-            .await;
-    assert!(empty_ask_html.contains("board-reader-fallback"));
-    assert!(empty_ask_html.contains("This Hacker News post has no body text"));
-    assert!(empty_ask_html.contains("Open Hacker News Discussion (99 comments) &#8599;"));
-    assert!(!empty_ask_html.contains("Open Original"));
-    assert!(!empty_ask_html.contains("Original &#8599;"));
-    assert!(!empty_ask_html.contains("js-font-dec"));
-
-    let pdf_fallback_html =
-        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1006"), &cookie).await)
-            .await;
-    assert!(pdf_fallback_html.contains("PDF document"));
-    assert!(pdf_fallback_html.contains("Open PDF &#8599;"));
-    assert!(!pdf_fallback_html.contains("js-font-dec"));
-
-    let video_fallback_html =
-        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1007"), &cookie).await)
-            .await;
-    assert!(video_fallback_html.contains("Video link"));
-    assert!(video_fallback_html.contains("Watch Video &#8599;"));
-
-    let fetch_fail_html =
-        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1008"), &cookie).await)
-            .await;
-    assert!(fetch_fail_html.contains("load article right now"));
-    assert!(fetch_fail_html.contains(">Retry</a>"));
-    assert!(fetch_fail_html.contains("Open Original &#8599;"));
-
-    // 9. Promote via Queue, Star, Finish -> dedups onto same canonical entry & persists HN link
-    let (q_status, q_json) = post_form_json(
-        &app,
-        &format!("/web/boards/{board_id}/items/1001/promote"),
-        &cookie,
-        &csrf,
-        &[("_csrf", &csrf), ("action", "queue")],
-    )
-    .await;
-    assert_eq!(q_status, StatusCode::OK);
-    let entry_id = q_json["entry_id"].as_str().unwrap().to_owned();
-    assert_eq!(q_json["in_want_to_read"], true);
-    assert_eq!(q_json["unqueue_action"], format!("/web/want/read/remove/{entry_id}"));
-
-    let (s_status, s_json) = post_form_json(
-        &app,
-        &format!("/web/boards/{board_id}/items/1001/promote"),
-        &cookie,
-        &csrf,
-        &[("_csrf", &csrf), ("action", "star")],
-    )
-    .await;
-    assert_eq!(s_status, StatusCode::OK);
-    assert_eq!(s_json["entry_id"], entry_id);
-    assert_eq!(s_json["is_favorite"], true);
-
-    let (f_status, f_json) = post_form_json(
-        &app,
-        &format!("/web/boards/{board_id}/items/1001/promote"),
-        &cookie,
-        &csrf,
-        &[("_csrf", &csrf), ("action", "finish")],
-    )
-    .await;
-    assert_eq!(f_status, StatusCode::OK);
-    assert_eq!(f_json["entry_id"], entry_id);
-    assert_eq!(f_json["is_finished"], true);
-
-    // Board row now shows seen styling + Finished indicator (and NO redundant byline star badge)
-    let board_after_promote = read_body_html(get_authed(&app, &board_loc, &cookie).await).await;
-    assert!(board_after_promote.contains("board-seen"));
-    assert!(board_after_promote.contains("&#10003; Finished"));
-    assert!(!board_after_promote.contains("js-board-star-badge"));
-
-    // Board Reader unfinish form carries hidden requeue=0 and unfinishing MUST NOT add to Queue!
-    let finished_board_reader =
-        read_body_html(get_authed(&app, &format!("/boards/{board_id}/read/1001"), &cookie).await)
-            .await;
-    assert!(finished_board_reader.contains("name=\"requeue\" value=\"0\""));
-    let unfinish_resp = post_form(
-        &app,
-        &format!("/web/items/{entry_id}/unfinish"),
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("requeue", "0"),
-            ("return_to", &format!("/boards/{board_id}/read/1001")),
-        ],
-    )
-    .await;
-    assert_eq!(unfinish_resp.status(), StatusCode::SEE_OTHER);
-    let after_unfinish = db.items().get(&entry_id).await.unwrap().unwrap();
-    assert!(!after_unfinish.is_finished, "unfinish must clear finished state");
-    assert!(
-        !after_unfinish.in_want_to_read,
-        "unfinishing a board story with requeue=0 must NOT add it to Queue"
-    );
-    // Re-finish 1001 so subsequent catalog/Diary assertions stay intact
-    let (refin_status, _) = post_form_json(
-        &app,
-        &format!("/web/boards/{board_id}/items/1001/promote"),
-        &cookie,
-        &csrf,
-        &[("_csrf", &csrf), ("action", "finish")],
-    )
-    .await;
-    assert_eq!(refin_status, StatusCode::OK);
-
-    // Tagging promoted board story: clicking its tag pill (/inbox?status=all&tag={id}) shows it,
-    // while regular /inbox still excludes promoted board stories!
-    let tag_resp = post_form(
-        &app,
-        &format!("/web/items/{entry_id}/tags"),
-        &cookie,
-        &[("_csrf", &csrf), ("name", "systems-board-tag")],
-    )
-    .await;
-    assert_eq!(tag_resp.status(), StatusCode::SEE_OTHER);
-    let entry_tags = db.tags().list_id_name_pairs().await.unwrap();
-    let tag_id = &entry_tags.iter().find(|(_, name)| name == "systems-board-tag").unwrap().0;
-    let tagged_view_html =
-        read_body_html(get_authed(&app, &format!("/inbox?status=all&tag={tag_id}"), &cookie).await)
-            .await;
-    assert!(tagged_view_html.contains("Systems Architecture Deep Dive"));
-
-    // Regular /reader/{entry_id} and /entries/{entry_id} link the title to the original URL and
-    // display the persisted Hacker News discussion link without redundant Original / Open Source links.
-    let regular_reader_html =
-        read_body_html(get_authed(&app, &format!("/reader/{entry_id}"), &cookie).await).await;
-    assert!(regular_reader_html.contains("class=\"reader-title-link\""));
-    assert!(!regular_reader_html.contains("Original &#8599;"));
-    assert!(regular_reader_html.contains("Hacker News &#8599;"));
-    assert!(regular_reader_html.contains("https://news.ycombinator.com/item?id=1001"));
-
-    let entry_detail_html =
-        read_body_html(get_authed(&app, &format!("/entries/{entry_id}"), &cookie).await).await;
-    assert!(entry_detail_html.contains("class=\"entry-title-link\""));
-    assert!(!entry_detail_html.contains("Open Source"));
-    assert!(entry_detail_html.contains("Hacker News"));
-    assert!(entry_detail_html.contains("https://news.ycombinator.com/item?id=1001"));
-
-    // Promoted board item STILL stays out of Feed Inbox (inbox_state = 'none')!
-    let inbox_after = read_body_html(get_authed(&app, "/inbox", &cookie).await).await;
-    assert!(!inbox_after.contains("Systems Architecture Deep Dive"));
-
-    // 10. Settings edit, global masthead refresh (feeds + boards), pause, delete
-    let edit_resp = post_form(
-        &app,
-        &format!("/web/boards/{board_id}/edit"),
-        &cookie,
-        &[("_csrf", &csrf), ("title", "HN Frontpage"), ("poll_interval", "45")],
-    )
-    .await;
-    assert_eq!(edit_resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(db.boards().get(&board_id).await.unwrap().unwrap().title, "HN Frontpage");
-
-    let refresh_all_resp = post_form(
-        &app,
-        "/web/feeds/refresh-all",
-        &cookie,
-        &[("_csrf", &csrf), ("return_to", &board_loc)],
-    )
-    .await;
-    assert_eq!(refresh_all_resp.status(), StatusCode::SEE_OTHER);
-    let flash_cookie = find_set_cookie(&refresh_all_resp, "roche_flash=n:").unwrap();
-    assert!(flash_cookie.contains("board"), "expected board refresh flash, got: {flash_cookie}");
-
-    let pause_resp = post_form(
-        &app,
-        &format!("/web/boards/{board_id}/toggle-active"),
-        &cookie,
-        &[("_csrf", &csrf), ("active", "false")],
-    )
-    .await;
-    assert_eq!(pause_resp.status(), StatusCode::SEE_OTHER);
-    assert!(!db.boards().get(&board_id).await.unwrap().unwrap().is_active);
-
-    let del_resp =
-        post_form(&app, &format!("/web/boards/{board_id}/delete"), &cookie, &[("_csrf", &csrf)])
-            .await;
-    assert_eq!(del_resp.status(), StatusCode::SEE_OTHER);
-    assert!(db.boards().get(&board_id).await.unwrap().is_none());
-    // Promoted entry preserved in Diary/Catalog!
-    assert!(db.catalog().get_entry_detail(&entry_id).await.unwrap().is_some());
-}
-
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_web_entry_edit_refresh_and_reader_harmonized_date() {
-    struct TempDirGuard(std::path::PathBuf);
-    impl Drop for TempDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    let tmp_dir = std::env::temp_dir().join(format!("roche_web_doc_test_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp_dir).unwrap();
-    let _guard = TempDirGuard(tmp_dir.clone());
-
-    let mut cfg = Config::default();
-    cfg.storage.media_dir = tmp_dir.clone();
-
-    let db = Db::connect("sqlite::memory:").await.unwrap();
-    let svc = RocheService::new(db.clone(), DummyWebFetcher, cfg);
-    let app = ApiRoutes::router_with_service(svc.clone());
-    let (cookie, csrf) = login_browser(&db, &app).await;
-
-    // 1. Seed a Paper item with a placeholder filename title and a cached PDF on disk
-    let pdf_url =
-        Url::parse("https://web.maths.unsw.edu.au/~davidharvey/research/subnlogn.pdf").unwrap();
-    let (paper, _) = db
-        .items()
-        .save_manual_input_with_tags(&crate::db::ManualItemInput {
-            url: &pdf_url,
-            title: "subnlogn.pdf",
-            summary: None,
-            content_html: None,
-            thumbnail_url: None,
-            audio_url: None,
-            duration: None,
-            content_type: ContentType::Pdf,
-            tags: &[],
-        })
-        .await
-        .unwrap();
-
-    let stream = "\
-BT\n\
-/F1 17.28 Tf\n\
-100 720 Td (Integer multiplication in time O\\(n log n\\)) Tj\n\
-/F1 12 Tf\n\
-0 -28 Td (David Harvey and Joris van der Hoeven) Tj\n\
-/F1 10 Tf\n\
-0 -20 Td (October 20, 2026) Tj\n\
-0 -28 Td (Abstract) Tj\n\
-0 -14 Td (We prove an O\\(n log n\\) multiplication bound for large integers.) Tj\n\
-ET\n";
-    let pdf_bytes = format!(
-        "%PDF-1.5\n\
-         1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
-         2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
-         3 0 obj << /Type /Page /Parent 2 0 R /Contents 4 0 R >> endobj\n\
-         4 0 obj << /Length {} >>\nstream\n{}\nendstream\nendobj\n\
-         5 0 obj << /Title () /Author () /Producer (pdfTeX) >> endobj\n\
-         %%EOF\n",
-        stream.len(),
-        stream
-    );
-    let rel_path = format!("pdfs/{}.pdf", paper.id);
-    let file_size = svc.media_store().write_bytes(&rel_path, pdf_bytes.as_bytes()).await.unwrap();
-    db.media()
-        .create(&paper.id, crate::db::MediaType::Pdf, &rel_path, Some(file_size), None)
-        .await
-        .unwrap();
-
-    // 2. Entry page shows inline pencil edit trigger (no ugly rail edit card), title-as-link,
-    // Refresh Metadata button, and triggers auto-enrich predicate
-    let before_detail = db.catalog().get_entry_detail(&paper.id).await.unwrap().unwrap();
-    assert!(crate::service::enrich::should_auto_enrich_document(&before_detail));
-    let entry_html =
-        read_body_html(get_authed(&app, &format!("/entries/{}", paper.id), &cookie).await).await;
-    assert!(entry_html.contains("id=\"entry-inline-edit\""));
-    assert!(entry_html.contains("js-entry-edit-toggle"));
-    assert!(entry_html.contains("class=\"entry-title-link\""));
-    assert!(!entry_html.contains("id=\"edit-details\""));
-    assert!(!entry_html.contains("Open Source"));
-    assert!(entry_html.contains("Refresh Metadata"));
-
-    // ?edit=1 unlocks the inline hero editor directly without JS
-    let entry_edit_html =
-        read_body_html(get_authed(&app, &format!("/entries/{}?edit=1", paper.id), &cookie).await)
-            .await;
-    assert!(entry_edit_html.contains("entry-hero-text is-editing"));
-
-    // 3. POST /web/entries/{id}/refresh-metadata discovers metadata from the cached PDF
-    let refresh_resp = post_form(
-        &app,
-        &format!("/web/entries/{}/refresh-metadata", paper.id),
-        &cookie,
-        &[("_csrf", &csrf)],
-    )
-    .await;
-    assert_eq!(refresh_resp.status(), StatusCode::SEE_OTHER);
-    let after_refresh = db.catalog().get_entry_detail(&paper.id).await.unwrap().unwrap();
-    assert_eq!(after_refresh.entry.title, "Integer multiplication in time O(n log n)");
-    assert_eq!(after_refresh.entry.creators, vec!["David Harvey", "Joris van der Hoeven"]);
-    assert_eq!(after_refresh.entry.release_year, Some(2026));
-    assert!(after_refresh.entry.summary.as_deref().unwrap_or("").contains("O(n log n)"));
-
-    // 4. POST /web/entries/{id}/edit updates details with inline LaTeX math and stamps edited_hlc
-    let edit_resp = post_form(
-        &app,
-        &format!("/web/entries/{}/edit", paper.id),
-        &cookie,
-        &[
-            ("_csrf", &csrf),
-            ("title", "On the recently proposed $o(n \\log n)$ integer multiplication algorithm"),
-            ("kind", "paper"),
-            ("creators", "David Harvey, Joris van der Hoeven"),
-            ("published_date", "2021-03-15"),
-            ("release_year", ""),
-            ("url", "https://web.maths.unsw.edu.au/~davidharvey/research/subnlogn.pdf"),
-            ("summary", "Analysis of the $o(n \\log n)$ bound."),
-            ("doi", "10.4007/annals.2021.193.2.4"),
-            ("arxiv_id", ""),
-            ("isbn", ""),
-        ],
-    )
-    .await;
-    assert_eq!(edit_resp.status(), StatusCode::SEE_OTHER);
-    let after_edit = db.catalog().get_entry_detail(&paper.id).await.unwrap().unwrap();
-    assert_eq!(
-        after_edit.entry.title,
-        "On the recently proposed $o(n \\log n)$ integer multiplication algorithm"
-    );
-    assert_eq!(after_edit.entry.release_year, Some(2021));
-    assert_eq!(after_edit.entry.identifier("doi"), Some("10.4007/annals.2021.193.2.4"));
-    assert!(
-        roche_core::crdt::extract_entry_edited_hlc_from_value(Some(&after_edit.entry.metadata))
-            .is_some()
-    );
-
-    // Entry page renders inline MathML in hero h2 + summary, strips $ from <title>, and shows DOI in hero facts
-    let after_entry_html =
-        read_body_html(get_authed(&app, &format!("/entries/{}", paper.id), &cookie).await).await;
-    assert!(after_entry_html.contains("<math><mi>o</mi><mo stretchy=\"false\">(</mo><mi>n</mi>"));
-    assert!(
-        after_entry_html.contains(
-            "<title>On the recently proposed o(n log n) integer multiplication algorithm"
-        )
-    );
-    assert!(after_entry_html.contains("<dt>DOI</dt>"));
-    assert!(after_entry_html.contains("10.4007/annals.2021.193.2.4"));
-
-    // 5. Reader displays harmonized date, MathML title-as-link, pencil edit button, and 3-mode PDF switcher
-    let reader_html =
-        read_body_html(get_authed(&app, &format!("/reader/{}", paper.id), &cookie).await).await;
-    assert!(reader_html.contains(&format!("/entries/{}?edit=1", paper.id)));
-    assert!(reader_html.contains("2021"));
-    assert!(reader_html.contains("class=\"reader-title-link\""));
-    assert!(reader_html.contains("<math><mi>o</mi><mo stretchy=\"false\">(</mo><mi>n</mi>"));
-    assert!(!reader_html.contains("Original &#8599;"));
-    assert!(reader_html.contains("reader-pdf-mode-switch"));
-    assert!(reader_html.contains("data-pdf-mode-target=\"extracted\""));
-    assert!(reader_html.contains("data-pdf-mode-target=\"pdf\""));
-    assert!(reader_html.contains("data-pdf-mode-target=\"split\""));
-    assert!(reader_html.contains("data-pdf-mode=\"extracted\""));
-
-    let reader_split_html = read_body_html(
-        get_authed(&app, &format!("/reader/{}?view=split", paper.id), &cookie).await,
-    )
-    .await;
-    assert!(reader_split_html.contains("data-pdf-mode=\"split\""));
+    assert_eq!(it_tracks[0].title, "So What");
+
+    let itunes_discog_json = r#"{"resultCount":2,"results":[{"wrapperType":"artist","artistName":"Miles Davis"},{"wrapperType":"collection","collectionType":"Album","collectionName":"Kind of Blue","artistName":"Miles Davis","releaseDate":"1959-08-17T07:00:00Z","artworkUrl100":"https://is1-ssl.mzstatic.com/image/thumb/100x100bb.jpg","trackCount":5}]}"#;
+    let discog = parse_itunes_artist_discography(itunes_discog_json, "Miles Davis");
+    assert_eq!(discog.len(), 1);
+    assert_eq!(discog[0].title, "Kind of Blue");
+    assert_eq!(discog[0].release_year, Some(1959));
 }
