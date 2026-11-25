@@ -119,8 +119,33 @@ async function stopServerGracefully(child: ChildProcess | undefined): Promise<vo
   });
 }
 
+function rocheTestEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ROCHE_TAILSCALE_ENABLED: 'false',
+    ROCHE_BACKUP_ENABLED: 'false',
+    ...extra,
+  };
+}
+
+function formatServerDiagnostics(
+  child: ChildProcess | undefined,
+  exitInfo: string | null,
+  logs: string
+): string {
+  const state = child
+    ? `pid=${child.pid ?? 'none'}, exitCode=${child.exitCode}, signalCode=${child.signalCode}, event=${exitInfo ?? 'running'}`
+    : 'not started';
+  return `--- roche-server state (${state}) ---\n${logs.trim() || '(no output captured)'}`;
+}
+
+function isAddrInUseError(err: unknown, logs: string): boolean {
+  const haystack = `${err instanceof Error ? err.message : String(err)}\n${logs}`;
+  return /address already in use|addrinuse|eaddrinuse/i.test(haystack);
+}
+
 function seedFixtures(serverBin: string, dataDir: string): void {
-  const env = { ...process.env, ROCHE_TAILSCALE_ENABLED: 'false' };
+  const env = rocheTestEnv();
 
   const batchPayload = {
     entries: [
@@ -333,6 +358,7 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
   let baseUrl = '';
   let serverBin = '';
   let serverLogs = '';
+  let serverExitInfo: string | null = null;
   let sessionCookies: Awaited<ReturnType<Page['context']['cookies']>> = [];
 
   test.beforeAll(async ({ browser }) => {
@@ -340,48 +366,87 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'roche-web-a11y-'));
     seedFixtures(serverBin, dataDir);
 
-    const port = await getFreePort();
-    baseUrl = `http://127.0.0.1:${port}`;
-    serverLogs = '';
-
-    serverProcess = spawn(
-      serverBin,
-      ['--data-dir', dataDir, '--host', '127.0.0.1', '--port', String(port), 'serve'],
-      {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          ROCHE_TAILSCALE_ENABLED: 'false',
-          RUST_LOG: 'warn',
-        },
-      }
-    );
-    serverProcess.stdout?.on('data', (chunk: Buffer) => {
-      serverLogs = appendBounded(serverLogs, chunk);
-    });
-    serverProcess.stderr?.on('data', (chunk: Buffer) => {
-      serverLogs = appendBounded(serverLogs, chunk);
-    });
-
-    await waitForServer(baseUrl, serverProcess, () => serverLogs);
-
-    // Pair once and cache session cookies for authenticated route tests.
+    // Mint the initial pairing code before spawning `serve` to avoid concurrent startup SQLite writes.
     const pairingCode = execFileSync(serverBin, ['--data-dir', dataDir, 'pair'], {
       encoding: 'utf8',
-      env: { ...process.env, ROCHE_TAILSCALE_ENABLED: 'false' },
+      env: rocheTestEnv(),
     }).trim();
     expect(pairingCode.length).toBeGreaterThan(0);
 
+    // Retry ephemeral port allocation on rare Linux TOCTOU `EADDRINUSE` races.
+    const maxStartAttempts = 3;
+    for (let attempt = 1; attempt <= maxStartAttempts; attempt++) {
+      const port = await getFreePort();
+      baseUrl = `http://127.0.0.1:${port}`;
+      serverLogs = '';
+      serverExitInfo = null;
+
+      const child = spawn(
+        serverBin,
+        ['--data-dir', dataDir, '--host', '127.0.0.1', '--port', String(port), 'serve'],
+        {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: rocheTestEnv({ RUST_LOG: 'warn' }),
+        }
+      );
+      serverProcess = child;
+      child.stdout?.on('data', (chunk: Buffer) => {
+        serverLogs = appendBounded(serverLogs, chunk);
+      });
+      child.stderr?.on('data', (chunk: Buffer) => {
+        serverLogs = appendBounded(serverLogs, chunk);
+      });
+      child.once('exit', (code, signal) => {
+        serverExitInfo = `exit(code=${code}, signal=${signal})`;
+      });
+      child.once('error', (err) => {
+        serverExitInfo = `error(${err.message})`;
+      });
+
+      try {
+        await waitForServer(baseUrl, child, () => serverLogs);
+        break;
+      } catch (err) {
+        await stopServerGracefully(child);
+        if (attempt < maxStartAttempts && isAddrInUseError(err, serverLogs)) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
     const authContext = await browser.newContext();
-    const authPage = await authContext.newPage();
-    await authPage.goto(`${baseUrl}/login`, { waitUntil: 'load' });
-    await authPage.fill('#pairing_code', pairingCode);
-    await Promise.all([
-      authPage.waitForURL((url) => url.pathname === '/'),
-      authPage.click('button[type="submit"]'),
-    ]);
-    sessionCookies = await authContext.cookies();
-    await authContext.close();
+    try {
+      const authPage = await authContext.newPage();
+      await authPage.goto(`${baseUrl}/login`, { waitUntil: 'load' });
+      await authPage.fill('#pairing_code', pairingCode);
+      await Promise.all([
+        authPage.waitForURL((url) => url.pathname === '/'),
+        authPage.click('button[type="submit"]'),
+      ]);
+      sessionCookies = await authContext.cookies();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `beforeAll login failed against ${baseUrl}: ${msg}\n${formatServerDiagnostics(serverProcess, serverExitInfo, serverLogs)}`,
+        { cause: err }
+      );
+    } finally {
+      await authContext.close();
+    }
+  });
+
+  test.afterEach(async ({}, testInfo) => {
+    if (testInfo.status !== testInfo.expectedStatus) {
+      const diag = formatServerDiagnostics(serverProcess, serverExitInfo, serverLogs);
+      await testInfo.attach('roche-server-diagnostics', {
+        body: diag,
+        contentType: 'text/plain',
+      });
+      if (serverExitInfo) {
+        console.error(diag);
+      }
+    }
   });
 
   test.afterAll(async () => {
@@ -579,7 +644,7 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
     //    (zero external network calls; includes Ask HN self-post, PDF fallback item, and 32 stories for backfill)
     const apiPairCode = execFileSync(serverBin, ['--data-dir', dataDir!, 'pair'], {
       encoding: 'utf8',
-      env: { ...process.env, ROCHE_TAILSCALE_ENABLED: 'false' },
+      env: rocheTestEnv(),
     }).trim();
     const pairRes = await fetch(`${baseUrl}/api/v1/auth/pair`, {
       method: 'POST',
