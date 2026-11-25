@@ -1,17 +1,25 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use sqlx::SqliteConnection;
+use roche_core::domain::parse_dynamic_collection_rule;
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 
 use super::{
     CatalogRepo,
-    models::{CatalogError, CatalogResult, CollectionRankingInputs, ComparisonRecord},
+    collections::{
+        append_dynamic_rule_sql_filters, append_dynamic_rule_sql_filters_opts,
+        creators_json_matches_needle,
+    },
+    models::{
+        CatalogEntry, CatalogError, CatalogResult, CollectionPageMeta, CollectionRankingInputs,
+        ComparisonRecord, DynamicCollectionRule, RawCollectionRow, RawEntryRow, raw_entry_columns,
+    },
 };
 use crate::{
     db::{
         WriteTx,
         sync::{SyncRepo, canonical_ordering_json, deterministic_comparison_id},
-        types::{ActivityAction, ActivityEntityType, CollectionRole},
+        types::{ActivityAction, ActivityEntityType, CollectionRole, EntryKind},
     },
     ranking::validate_ordering,
     util::clock::now_utc,
@@ -181,7 +189,7 @@ impl CatalogRepo<'_> {
             Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, true).await?
         };
         let count = if raw_col.is_dynamic() {
-            Self::resolve_rankable_member_ids_in_tx(tx.conn(), &raw_col).await?.len()
+            Self::count_dynamic_members_in_tx(tx.conn(), &raw_col).await?
         } else {
             let raw_count: i64 = if raw_col.has_generator {
                 sqlx::query_scalar(
@@ -379,5 +387,537 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<Vec<Vec<Vec<String>>>> {
         let mut conn = self.pool.acquire().await?;
         Self::load_orderings_for_scope_in_tx(&mut conn, scope_collection_id).await
+    }
+
+    /// Loads collection metadata, exact total & per-kind counts, hydrated entries ONLY for
+    /// `compared_ids` belonging to the collection, and membership status for `check_member_ids`
+    /// (avoiding full-collection hydration).
+    pub async fn load_collection_page_meta(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+        compared_ids: &[String],
+        check_member_ids: &[String],
+    ) -> CatalogResult<CollectionPageMeta> {
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let raw_col =
+            Self::resolve_target_collection_row_in_tx(tx.conn(), slug_or_id, want).await?;
+        let is_priority_scope = raw_col.collection_role == CollectionRole::Want;
+        let kind_counts = Self::load_collection_kind_counts_in_tx(tx.conn(), &raw_col).await?;
+        let total_count: usize = kind_counts.iter().map(|(_, c)| *c).sum();
+
+        let compared_members =
+            Self::load_collection_members_in_id_set_in_tx(tx.conn(), &raw_col, compared_ids)
+                .await?;
+        let mut present_member_ids: HashSet<String> = HashSet::new();
+        if !check_member_ids.is_empty() {
+            let compared_id_set: HashSet<&str> =
+                compared_members.iter().map(|e| e.id.as_str()).collect();
+            let mut unresolved_checks: Vec<String> = Vec::new();
+            let mut seen_checks: HashSet<&str> = HashSet::new();
+            for id in check_member_ids {
+                if !seen_checks.insert(id.as_str()) {
+                    continue;
+                }
+                if compared_id_set.contains(id.as_str()) {
+                    present_member_ids.insert(id.clone());
+                } else {
+                    unresolved_checks.push(id.clone());
+                }
+            }
+            if !unresolved_checks.is_empty() {
+                let checked = Self::check_collection_member_ids_in_tx(
+                    tx.conn(),
+                    &raw_col,
+                    &unresolved_checks,
+                )
+                .await?;
+                present_member_ids.extend(checked);
+            }
+        }
+
+        tx.commit().await?;
+        let summary = raw_col.into_summary(total_count, 0);
+        Ok(CollectionPageMeta {
+            collection: summary,
+            is_priority_scope,
+            total_count,
+            kind_counts,
+            compared_members,
+            present_member_ids,
+        })
+    }
+
+    /// Counts zero-band entries in `slug_or_id` matching `(kind_filter, query)` while directly
+    /// excluding `exclude_ids` in SQL (no Rust subtraction drift and no redundant `COUNT(*)`).
+    pub async fn count_collection_zero_band_filtered(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+        kind_filter: Option<EntryKind>,
+        query: Option<&str>,
+        exclude_ids: &HashSet<String>,
+    ) -> CatalogResult<usize> {
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let raw_col =
+            Self::resolve_target_collection_row_in_tx(tx.conn(), slug_or_id, want).await?;
+        let dyn_rule = if raw_col.is_dynamic() {
+            let Some(rule) = parse_dynamic_collection_rule(raw_col.rule_json.as_deref()) else {
+                tx.commit().await?;
+                return Ok(0);
+            };
+            Some(rule)
+        } else {
+            None
+        };
+        if let Some(c_needle) = dyn_rule
+            .as_ref()
+            .and_then(|r| r.creator.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase)
+        {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT e.id, e.creators_json FROM entries e WHERE e.merged_into_id IS NULL",
+            );
+            if let Some(ref rule) = dyn_rule {
+                append_dynamic_rule_sql_filters(&mut qb, rule);
+            }
+            append_optional_kind_and_query_filters(&mut qb, kind_filter, query);
+            let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(tx.conn()).await?;
+            tx.commit().await?;
+            return Ok(rows
+                .into_iter()
+                .filter(|(id, cj)| {
+                    !exclude_ids.contains(id) && creators_json_matches_needle(cj, &c_needle)
+                })
+                .count());
+        }
+
+        let mut qb =
+            build_collection_select_qb(&raw_col, dyn_rule.as_ref(), SelectMode::Count, false);
+        append_optional_kind_and_query_filters(&mut qb, kind_filter, query);
+        append_exclude_ids_filter(&mut qb, exclude_ids);
+        let cnt: i64 = qb.build_query_scalar().fetch_one(tx.conn()).await?;
+        tx.commit().await?;
+        Ok(usize::try_from(cnt).unwrap_or(0))
+    }
+
+    /// Loads a paginated SQL slice of zero-band entries for `slug_or_id` (excluding
+    /// `exclude_ids`, ordered alphabetically by `(LOWER(title), id)`), without running any
+    /// redundant `COUNT(*)`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_collection_zero_band_slice(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+        kind_filter: Option<EntryKind>,
+        query: Option<&str>,
+        exclude_ids: &HashSet<String>,
+        limit: usize,
+        offset: usize,
+    ) -> CatalogResult<Vec<CatalogEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let raw_col =
+            Self::resolve_target_collection_row_in_tx(tx.conn(), slug_or_id, want).await?;
+        let dyn_rule = if raw_col.is_dynamic() {
+            let Some(rule) = parse_dynamic_collection_rule(raw_col.rule_json.as_deref()) else {
+                tx.commit().await?;
+                return Ok(Vec::new());
+            };
+            Some(rule)
+        } else {
+            None
+        };
+        if let Some(c_needle) = dyn_rule
+            .as_ref()
+            .and_then(|r| r.creator.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase)
+        {
+            let mut qb = QueryBuilder::<Sqlite>::new(concat!(
+                "SELECT ",
+                raw_entry_columns!(e),
+                " FROM entries e WHERE e.merged_into_id IS NULL"
+            ));
+            if let Some(ref rule) = dyn_rule {
+                append_dynamic_rule_sql_filters(&mut qb, rule);
+            }
+            append_optional_kind_and_query_filters(&mut qb, kind_filter, query);
+            qb.push(" ORDER BY LOWER(e.title) ASC, e.id ASC");
+            let all_rows: Vec<RawEntryRow> = qb.build_query_as().fetch_all(tx.conn()).await?;
+            let page_raw: Vec<RawEntryRow> = all_rows
+                .into_iter()
+                .filter(|r| {
+                    !exclude_ids.contains(&r.id)
+                        && creators_json_matches_needle(&r.creators_json, &c_needle)
+                })
+                .skip(offset)
+                .take(limit)
+                .collect();
+            let hydrated = Self::hydrate_entries_in_tx(tx.conn(), page_raw).await?;
+            tx.commit().await?;
+            return Ok(hydrated);
+        }
+
+        let mut qb =
+            build_collection_select_qb(&raw_col, dyn_rule.as_ref(), SelectMode::Entries, false);
+        append_optional_kind_and_query_filters(&mut qb, kind_filter, query);
+        append_exclude_ids_filter(&mut qb, exclude_ids);
+        qb.push(" ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT ")
+            .push_bind(i64::try_from(limit).unwrap_or(200))
+            .push(" OFFSET ")
+            .push_bind(i64::try_from(offset).unwrap_or(0));
+        let page_raw: Vec<RawEntryRow> = qb.build_query_as().fetch_all(tx.conn()).await?;
+        let hydrated = Self::hydrate_entries_in_tx(tx.conn(), page_raw).await?;
+        tx.commit().await?;
+        Ok(hydrated)
+    }
+
+    /// Counts members in `slug_or_id` sorting strictly before `(target_ascii_lower_title, target_id)`
+    /// by `(LOWER(e.title), e.id)` so entry rank appearances stay O(log N) without loading all rows.
+    pub async fn count_collection_entries_alpha_before(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+        target_ascii_lower_title: &str,
+        target_id: &str,
+    ) -> CatalogResult<usize> {
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let raw_col =
+            Self::resolve_target_collection_row_in_tx(tx.conn(), slug_or_id, want).await?;
+        let dyn_rule = if raw_col.is_dynamic() {
+            let Some(rule) = parse_dynamic_collection_rule(raw_col.rule_json.as_deref()) else {
+                tx.commit().await?;
+                return Ok(0);
+            };
+            Some(rule)
+        } else {
+            None
+        };
+        if let Some(c_needle) = dyn_rule
+            .as_ref()
+            .and_then(|r| r.creator.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase)
+        {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT e.creators_json FROM entries e WHERE e.merged_into_id IS NULL",
+            );
+            if let Some(ref rule) = dyn_rule {
+                append_dynamic_rule_sql_filters(&mut qb, rule);
+            }
+            qb.push(" AND (LOWER(e.title) < ")
+                .push_bind(target_ascii_lower_title)
+                .push(" OR (LOWER(e.title) = ")
+                .push_bind(target_ascii_lower_title)
+                .push(" AND e.id < ")
+                .push_bind(target_id)
+                .push("))");
+            let rows: Vec<String> = qb.build_query_scalar().fetch_all(tx.conn()).await?;
+            tx.commit().await?;
+            return Ok(rows
+                .into_iter()
+                .filter(|c| creators_json_matches_needle(c, &c_needle))
+                .count());
+        }
+
+        let mut qb =
+            build_collection_select_qb(&raw_col, dyn_rule.as_ref(), SelectMode::Count, false);
+        qb.push(" AND (LOWER(e.title) < ")
+            .push_bind(target_ascii_lower_title)
+            .push(" OR (LOWER(e.title) = ")
+            .push_bind(target_ascii_lower_title)
+            .push(" AND e.id < ")
+            .push_bind(target_id)
+            .push("))");
+        let count: i64 = qb.build_query_scalar().fetch_one(tx.conn()).await?;
+        tx.commit().await?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    async fn resolve_target_collection_row_in_tx(
+        conn: &mut SqliteConnection,
+        slug_or_id: &str,
+        want: bool,
+    ) -> CatalogResult<RawCollectionRow> {
+        if want {
+            Self::lookup_want_collection_row_in_tx(&mut *conn, slug_or_id).await?.ok_or_else(|| {
+                CatalogError::NotFound(format!("Want collection '{slug_or_id}' not found"))
+            })
+        } else {
+            Self::lookup_collection_row_in_tx(&mut *conn, slug_or_id, true).await
+        }
+    }
+
+    async fn load_collection_kind_counts_in_tx(
+        conn: &mut SqliteConnection,
+        raw_col: &RawCollectionRow,
+    ) -> CatalogResult<Vec<(EntryKind, usize)>> {
+        let dyn_rule = if raw_col.is_dynamic() {
+            let Some(rule) = parse_dynamic_collection_rule(raw_col.rule_json.as_deref()) else {
+                return Ok(Vec::new());
+            };
+            Some(rule)
+        } else {
+            None
+        };
+        if let Some(c_needle) = dyn_rule
+            .as_ref()
+            .and_then(|r| r.creator.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase)
+        {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT e.kind, e.creators_json FROM entries e WHERE e.merged_into_id IS NULL",
+            );
+            if let Some(ref rule) = dyn_rule {
+                append_dynamic_rule_sql_filters(&mut qb, rule);
+            }
+            let rows: Vec<(EntryKind, String)> = qb.build_query_as().fetch_all(&mut *conn).await?;
+            let mut map: HashMap<EntryKind, usize> = HashMap::new();
+            for (kind, creators_json) in rows {
+                if creators_json_matches_needle(&creators_json, &c_needle) {
+                    *map.entry(kind).or_insert(0) += 1;
+                }
+            }
+            let mut out: Vec<(EntryKind, usize)> = map.into_iter().collect();
+            out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+            return Ok(out);
+        }
+
+        let mut qb = if raw_col.is_dynamic() {
+            let mut b = QueryBuilder::<Sqlite>::new(
+                "SELECT e.kind, COUNT(*) AS cnt FROM entries e WHERE e.merged_into_id IS NULL",
+            );
+            if let Some(ref rule) = dyn_rule {
+                append_dynamic_rule_sql_filters(&mut b, rule);
+            }
+            b
+        } else {
+            let mut b = QueryBuilder::<Sqlite>::new(
+                "SELECT e.kind, COUNT(*) AS cnt
+                 FROM collection_entries ce
+                 CROSS JOIN entries e ON e.id = ce.entry_id
+                 WHERE ce.collection_id = ",
+            );
+            b.push_bind(&raw_col.id).push(" AND e.merged_into_id IS NULL");
+            if raw_col.has_generator {
+                b.push(
+                    " AND EXISTS (
+                        SELECT 1 FROM consumption_log cl
+                        WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                      )",
+                );
+            }
+            b
+        };
+        qb.push(" GROUP BY e.kind ORDER BY cnt DESC, e.kind ASC");
+        let rows: Vec<(EntryKind, i64)> = qb.build_query_as().fetch_all(&mut *conn).await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(k, c)| usize::try_from(c).ok().filter(|&n| n > 0).map(|n| (k, n)))
+            .collect())
+    }
+
+    async fn load_collection_members_in_id_set_in_tx(
+        conn: &mut SqliteConnection,
+        raw_col: &RawCollectionRow,
+        candidate_ids: &[String],
+    ) -> CatalogResult<Vec<CatalogEntry>> {
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dyn_rule = if raw_col.is_dynamic() {
+            let Some(rule) = parse_dynamic_collection_rule(raw_col.rule_json.as_deref()) else {
+                return Ok(Vec::new());
+            };
+            Some(rule)
+        } else {
+            None
+        };
+        let creator_needle = dyn_rule
+            .as_ref()
+            .and_then(|r| r.creator.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
+
+        let mut matched: Vec<RawEntryRow> = Vec::new();
+        let id_col = if raw_col.is_dynamic() { "e.id" } else { "ce.entry_id" };
+        for chunk in candidate_ids.chunks(450) {
+            let mut qb =
+                build_collection_select_qb(raw_col, dyn_rule.as_ref(), SelectMode::Entries, true);
+            qb.push(" AND ").push(id_col).push(" IN (");
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+            sep.push_unseparated(")");
+            let mut rows: Vec<RawEntryRow> = qb.build_query_as().fetch_all(&mut *conn).await?;
+            if let Some(ref needle) = creator_needle {
+                rows.retain(|r| creators_json_matches_needle(&r.creators_json, needle));
+            }
+            matched.extend(rows);
+        }
+        Self::hydrate_entries_in_tx(&mut *conn, matched).await
+    }
+
+    async fn check_collection_member_ids_in_tx(
+        conn: &mut SqliteConnection,
+        raw_col: &RawCollectionRow,
+        candidate_ids: &[String],
+    ) -> CatalogResult<HashSet<String>> {
+        if candidate_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let dyn_rule = if raw_col.is_dynamic() {
+            let Some(rule) = parse_dynamic_collection_rule(raw_col.rule_json.as_deref()) else {
+                return Ok(HashSet::new());
+            };
+            Some(rule)
+        } else {
+            None
+        };
+        let creator_needle = dyn_rule
+            .as_ref()
+            .and_then(|r| r.creator.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
+
+        let mut present: HashSet<String> = HashSet::new();
+        let id_col = if raw_col.is_dynamic() { "e.id" } else { "ce.entry_id" };
+        let mode =
+            if creator_needle.is_some() { SelectMode::IdAndCreators } else { SelectMode::IdOnly };
+        for chunk in candidate_ids.chunks(450) {
+            let mut qb = build_collection_select_qb(raw_col, dyn_rule.as_ref(), mode, true);
+            qb.push(" AND ").push(id_col).push(" IN (");
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+            sep.push_unseparated(")");
+            if let Some(ref needle) = creator_needle {
+                let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(&mut *conn).await?;
+                for (id, creators_json) in rows {
+                    if creators_json_matches_needle(&creators_json, needle) {
+                        present.insert(id);
+                    }
+                }
+            } else {
+                let ids: Vec<String> = qb.build_query_scalar().fetch_all(&mut *conn).await?;
+                present.extend(ids);
+            }
+        }
+        Ok(present)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SelectMode {
+    Count,
+    IdOnly,
+    IdAndCreators,
+    Entries,
+}
+
+fn build_collection_select_qb(
+    raw_col: &RawCollectionRow,
+    dyn_rule: Option<&DynamicCollectionRule>,
+    mode: SelectMode,
+    suppress_kind_index: bool,
+) -> QueryBuilder<Sqlite> {
+    let prefix = match mode {
+        SelectMode::Count => "SELECT COUNT(*)",
+        SelectMode::IdOnly => "SELECT e.id",
+        SelectMode::IdAndCreators => "SELECT e.id, e.creators_json",
+        SelectMode::Entries => concat!("SELECT ", raw_entry_columns!(e)),
+    };
+    let mut qb = QueryBuilder::<Sqlite>::new(prefix);
+    if raw_col.is_dynamic() {
+        qb.push(" FROM entries e WHERE e.merged_into_id IS NULL");
+        if let Some(rule) = dyn_rule {
+            append_dynamic_rule_sql_filters_opts(&mut qb, rule, suppress_kind_index);
+        }
+    } else {
+        // Drive manual collections from `collection_entries` so filtering a small list by
+        // `kind = 'song'` never flips SQLite into scanning 30k songs.
+        qb.push(
+            " FROM collection_entries ce
+              CROSS JOIN entries e ON e.id = ce.entry_id
+              WHERE ce.collection_id = ",
+        )
+        .push_bind(raw_col.id.clone())
+        .push(" AND e.merged_into_id IS NULL");
+        if raw_col.has_generator {
+            qb.push(
+                " AND EXISTS (
+                    SELECT 1 FROM consumption_log cl
+                    WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                  )",
+            );
+        }
+    }
+    qb
+}
+
+fn append_exclude_ids_filter(qb: &mut QueryBuilder<Sqlite>, exclude_ids: &HashSet<String>) {
+    if exclude_ids.is_empty() {
+        return;
+    }
+    if exclude_ids.len() <= 450 {
+        qb.push(" AND e.id NOT IN (");
+        let mut sep = qb.separated(", ");
+        for ex in exclude_ids {
+            sep.push_bind(ex.clone());
+        }
+        sep.push_unseparated(")");
+    } else {
+        let ids: Vec<&str> = exclude_ids.iter().map(String::as_str).collect();
+        let json_array = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_owned());
+        qb.push(" AND e.id NOT IN (SELECT value FROM json_each(").push_bind(json_array).push("))");
+    }
+}
+
+fn append_optional_kind_and_query_filters(
+    qb: &mut QueryBuilder<Sqlite>,
+    kind_filter: Option<EntryKind>,
+    query: Option<&str>,
+) {
+    if let Some(k) = kind_filter {
+        qb.push(" AND e.kind = ").push_bind(k);
+    }
+    if let Some(raw_q) = query.map(str::trim).filter(|s| !s.is_empty()) {
+        let bounded: String = raw_q.chars().take(256).collect();
+        let lower_pat = format!("%{}%", crate::db::escape_like_literal(&bounded.to_lowercase()));
+        let orig_pat = format!("%{}%", crate::db::escape_like_literal(&bounded));
+        if lower_pat == orig_pat {
+            qb.push(" AND (LOWER(e.title) LIKE ")
+                .push_bind(lower_pat.clone())
+                .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM json_each(e.creators_json) jc WHERE LOWER(jc.value) LIKE ")
+                .push_bind(lower_pat.clone())
+                .push(" ESCAPE '\\') OR CAST(COALESCE(e.release_year, '') AS TEXT) LIKE ")
+                .push_bind(lower_pat)
+                .push(" ESCAPE '\\')");
+        } else {
+            qb.push(" AND (LOWER(e.title) LIKE ")
+                .push_bind(lower_pat.clone())
+                .push(" ESCAPE '\\' OR e.title LIKE ")
+                .push_bind(orig_pat.clone())
+                .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM json_each(e.creators_json) jc WHERE LOWER(jc.value) LIKE ")
+                .push_bind(lower_pat.clone())
+                .push(" ESCAPE '\\' OR jc.value LIKE ")
+                .push_bind(orig_pat)
+                .push(" ESCAPE '\\') OR CAST(COALESCE(e.release_year, '') AS TEXT) LIKE ")
+                .push_bind(lower_pat)
+                .push(" ESCAPE '\\')");
+        }
     }
 }

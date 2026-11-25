@@ -60,33 +60,31 @@ impl CatalogRepo<'_> {
             }
         }
 
-        // Batch-load members for all non-dynamic collections in a single query instead of N queries.
-        let manual_or_feed_ids: Vec<&str> =
-            rows.iter().filter(|r| !r.is_dynamic()).map(|r| r.id.as_str()).collect();
-        let mut manual_members_by_col: HashMap<String, Vec<(String, bool)>> = HashMap::new();
-        for chunk in manual_or_feed_ids.chunks(450) {
-            let mut mqb = QueryBuilder::<Sqlite>::new(
-                "SELECT ce.collection_id,
-                        e.id,
-                        EXISTS (
-                            SELECT 1 FROM consumption_log cl
-                            WHERE cl.entry_id = e.id AND cl.status = 'consumed'
-                        ) AS is_consumed
-                 FROM collection_entries ce
-                 JOIN entries e ON e.id = ce.entry_id
-                 WHERE e.merged_into_id IS NULL AND ce.collection_id IN (",
-            );
-            let mut sep = mqb.separated(", ");
-            for id in chunk {
-                sep.push_bind(*id);
-            }
-            sep.push_unseparated(")");
-            let member_rows: Vec<(String, String, bool)> =
-                mqb.build_query_as().fetch_all(tx.conn()).await?;
-            for (cid, eid, is_consumed) in member_rows {
-                manual_members_by_col.entry(cid).or_default().push((eid, is_consumed));
-            }
-        }
+        // Load member counts via SQL `GROUP BY` aggregates instead of materializing tens of
+        // thousands of entry IDs (e.g. 30k songs + 5k starred items) into Rust RAM.
+        let consumed_counts_by_kind = Self::count_consumed_entries_by_kind_in_tx(tx.conn()).await?;
+        let manual_non_gen_ids: Vec<&str> = rows
+            .iter()
+            .filter(|r| !r.is_dynamic() && !r.has_generator)
+            .map(|r| r.id.as_str())
+            .collect();
+        let manual_gen_ids: Vec<&str> = rows
+            .iter()
+            .filter(|r| !r.is_dynamic() && r.has_generator)
+            .map(|r| r.id.as_str())
+            .collect();
+        let mut manual_counts =
+            Self::count_manual_members_by_col_in_tx(tx.conn(), &manual_non_gen_ids, false).await?;
+        manual_counts.extend(
+            Self::count_manual_members_by_col_in_tx(tx.conn(), &manual_gen_ids, true).await?,
+        );
+
+        // Load metadata + memberships ONLY for entries that actually appear in global comparisons
+        // (typically dozens/hundreds, never 30k uncompared songs) so `comparison_count` is exact.
+        let global_compared_ids: Vec<String> =
+            global_comp_indices_by_entry.keys().cloned().collect();
+        let (compared_entry_meta, compared_statuses, compared_manual_cols) =
+            Self::load_compared_entry_memberships_in_tx(tx.conn(), &global_compared_ids).await?;
 
         // Batch-load scoped comparisons for all Want collections in a single query.
         let want_ids: Vec<&str> = rows
@@ -95,6 +93,7 @@ impl CatalogRepo<'_> {
             .map(|r| r.id.as_str())
             .collect();
         let mut want_orderings_by_col: HashMap<String, Vec<Vec<Vec<String>>>> = HashMap::new();
+        let mut want_compared_ids: HashSet<String> = HashSet::new();
         for chunk in want_ids.chunks(450) {
             let mut cqb = QueryBuilder::<Sqlite>::new(
                 "SELECT scope_collection_id, ordering_json
@@ -110,52 +109,80 @@ impl CatalogRepo<'_> {
                 cqb.build_query_as().fetch_all(tx.conn()).await?;
             for (cid, json_str) in comp_rows {
                 if let Ok(ord) = serde_json::from_str::<Vec<Vec<String>>>(&json_str) {
+                    for id in ord.iter().flat_map(|g| g.iter()) {
+                        want_compared_ids.insert(id.clone());
+                    }
                     want_orderings_by_col.entry(cid).or_default().push(ord);
                 }
             }
         }
+        let want_compared_vec: Vec<String> = want_compared_ids.into_iter().collect();
+        let want_member_pairs =
+            Self::load_active_membership_pairs_for_entries_in_tx(tx.conn(), &want_compared_vec)
+                .await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for raw in rows {
-            let member_ids: Vec<String> = if raw.is_dynamic() {
-                Self::resolve_rankable_member_ids_in_tx(tx.conn(), &raw).await?
-            } else {
-                manual_members_by_col
-                    .remove(&raw.id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|(eid, is_consumed)| {
-                        (!raw.has_generator || is_consumed).then_some(eid)
-                    })
-                    .collect()
-            };
-            let comp_count = if raw.collection_role == CollectionRole::Want {
-                if member_ids.is_empty() {
-                    0
+            let member_count = if raw.is_dynamic() {
+                if let Some(simple_kind) =
+                    extract_simple_consumed_kind_rule(raw.rule_json.as_deref())
+                {
+                    consumed_counts_by_kind.get(&simple_kind).copied().unwrap_or(0)
                 } else {
-                    let member_set: HashSet<&str> = member_ids.iter().map(String::as_str).collect();
-                    want_orderings_by_col.get(&raw.id).map_or(0, |scoped| {
-                        scoped
-                            .iter()
-                            .filter(|ord| {
-                                ord.iter()
-                                    .flat_map(|g| g.iter())
-                                    .any(|id| member_set.contains(id.as_str()))
-                            })
-                            .count()
-                    })
+                    Self::count_dynamic_members_in_tx(tx.conn(), &raw).await?
                 }
             } else {
+                manual_counts.get(&raw.id).copied().unwrap_or(0)
+            };
+
+            let comp_count = if member_count == 0 {
+                0
+            } else if raw.collection_role == CollectionRole::Want {
+                want_orderings_by_col.get(&raw.id).map_or(0, |scoped| {
+                    scoped
+                        .iter()
+                        .filter(|ord| {
+                            ord.iter()
+                                .flat_map(|g| g.iter())
+                                .any(|id| want_member_pairs.contains(&(raw.id.clone(), id.clone())))
+                        })
+                        .count()
+                })
+            } else if raw.is_dynamic() {
                 let mut matched_comps: HashSet<usize> = HashSet::new();
-                for mid in &member_ids {
-                    if let Some(indices) = global_comp_indices_by_entry.get(mid) {
-                        matched_comps.extend(indices.iter().copied());
+                if let Some(rule) = parse_dynamic_collection_rule(raw.rule_json.as_deref()) {
+                    for (eid, (kind, creators, release_year)) in &compared_entry_meta {
+                        let statuses = compared_statuses.get(eid).map_or(&[][..], Vec::as_slice);
+                        if roche_core::domain::matches_dynamic_collection_rule(
+                            &rule,
+                            *kind,
+                            creators,
+                            *release_year,
+                            statuses,
+                        ) && let Some(indices) = global_comp_indices_by_entry.get(eid)
+                        {
+                            matched_comps.extend(indices.iter().copied());
+                        }
+                    }
+                }
+                matched_comps.len()
+            } else {
+                let mut matched_comps: HashSet<usize> = HashSet::new();
+                if let Some(eids) = compared_manual_cols.get(&raw.id) {
+                    for eid in eids {
+                        let eligible = !raw.has_generator
+                            || compared_statuses.get(eid).is_some_and(|st| {
+                                st.contains(&crate::db::types::ConsumptionStatus::Consumed)
+                            });
+                        if eligible && let Some(indices) = global_comp_indices_by_entry.get(eid) {
+                            matched_comps.extend(indices.iter().copied());
+                        }
                     }
                 }
                 matched_comps.len()
             };
 
-            out.push(raw.into_summary(member_ids.len(), comp_count));
+            out.push(raw.into_summary(member_count, comp_count));
         }
         tx.commit().await?;
         Ok(out)
@@ -938,6 +965,27 @@ impl CatalogRepo<'_> {
                 .collect());
         }
 
+        // Fast indexed path for standard dynamic kind collections using
+        // `idx_entries_kind_thumb_updated` so 30k songs stop after 5 rows instead of scanning
+        // all `consumption_log` timestamps.
+        if rule.kind.is_some()
+            && rule.kinds.is_empty()
+            && rule.release_year.is_none()
+            && rule.status.is_none()
+        {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT e.title, e.thumbnail_url
+                 FROM entries e
+                 WHERE e.merged_into_id IS NULL
+                   AND e.kind != 'collection'
+                   AND e.thumbnail_url IS NOT NULL
+                   AND TRIM(e.thumbnail_url) != ''",
+            );
+            append_dynamic_rule_sql_filters(&mut qb, rule);
+            qb.push(" ORDER BY e.updated_at DESC, e.id ASC LIMIT ").push_bind(limit_i64);
+            return Ok(qb.build_query_as().fetch_all(&mut *conn).await?);
+        }
+
         let mut qb = QueryBuilder::<Sqlite>::new(
             "SELECT e.title, e.thumbnail_url
              FROM entries e
@@ -956,9 +1004,224 @@ impl CatalogRepo<'_> {
         .push_bind(limit_i64);
         Ok(qb.build_query_as().fetch_all(&mut *conn).await?)
     }
+
+    /// Returns the most common non-collection [`EntryKind`] in `slug_or_id` via SQL `GROUP BY`
+    /// without hydrating the collection.
+    pub async fn infer_dominant_kind_in_collection(
+        &self,
+        slug_or_id: &str,
+    ) -> CatalogResult<Option<EntryKind>> {
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let Ok(raw_col) = Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, true).await
+        else {
+            return Ok(None);
+        };
+        if raw_col.is_dynamic()
+            && let Some(rule) = parse_dynamic_collection_rule(raw_col.rule_json.as_deref())
+            && let Some(k) = rule.kind.or_else(|| rule.kinds.first().copied())
+        {
+            tx.commit().await?;
+            return Ok(Some(k));
+        }
+        let kind: Option<EntryKind> = sqlx::query_scalar(
+            "SELECT e.kind
+             FROM collection_entries ce
+             JOIN entries e ON e.id = ce.entry_id
+             WHERE ce.collection_id = ?
+               AND e.merged_into_id IS NULL
+               AND e.kind != 'collection'
+             GROUP BY e.kind
+             ORDER BY COUNT(*) DESC, e.kind ASC
+             LIMIT 1",
+        )
+        .bind(&raw_col.id)
+        .fetch_optional(tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(kind)
+    }
+
+    pub(super) async fn count_consumed_entries_by_kind_in_tx(
+        conn: &mut SqliteConnection,
+    ) -> CatalogResult<HashMap<EntryKind, usize>> {
+        let rows: Vec<(EntryKind, i64)> = sqlx::query_as(
+            "SELECT e.kind, COUNT(*)
+             FROM entries e
+             WHERE e.merged_into_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM consumption_log cl
+                   WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+               )
+             GROUP BY e.kind",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(rows.into_iter().map(|(k, c)| (k, usize::try_from(c).unwrap_or(0))).collect())
+    }
+
+    async fn count_manual_members_by_col_in_tx(
+        conn: &mut SqliteConnection,
+        col_ids: &[&str],
+        require_consumed: bool,
+    ) -> CatalogResult<HashMap<String, usize>> {
+        let mut out = HashMap::new();
+        for chunk in col_ids.chunks(450) {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT ce.collection_id, COUNT(*)
+                 FROM collection_entries ce
+                 JOIN entries e ON e.id = ce.entry_id
+                 WHERE e.merged_into_id IS NULL AND ce.collection_id IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(*id);
+            }
+            sep.push_unseparated(")");
+            if require_consumed {
+                qb.push(
+                    " AND EXISTS (
+                        SELECT 1 FROM consumption_log cl
+                        WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                      )",
+                );
+            }
+            qb.push(" GROUP BY ce.collection_id");
+            let rows: Vec<(String, i64)> = qb.build_query_as().fetch_all(&mut *conn).await?;
+            for (cid, cnt) in rows {
+                out.insert(cid, usize::try_from(cnt).unwrap_or(0));
+            }
+        }
+        Ok(out)
+    }
+
+    pub(super) async fn count_dynamic_members_in_tx(
+        conn: &mut SqliteConnection,
+        raw: &RawCollectionRow,
+    ) -> CatalogResult<usize> {
+        let Some(rule) = parse_dynamic_collection_rule(raw.rule_json.as_deref()) else {
+            return Ok(0);
+        };
+        if rule.creator.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) {
+            return Ok(Self::resolve_rankable_member_ids_in_tx(conn, raw).await?.len());
+        }
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT COUNT(*) FROM entries e WHERE e.merged_into_id IS NULL",
+        );
+        append_dynamic_rule_sql_filters(&mut qb, &rule);
+        let cnt: i64 = qb.build_query_scalar().fetch_one(&mut *conn).await?;
+        Ok(usize::try_from(cnt).unwrap_or(0))
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn load_compared_entry_memberships_in_tx(
+        conn: &mut SqliteConnection,
+        entry_ids: &[String],
+    ) -> CatalogResult<(
+        HashMap<String, (EntryKind, Vec<String>, Option<i32>)>,
+        HashMap<String, Vec<crate::db::types::ConsumptionStatus>>,
+        HashMap<String, Vec<String>>,
+    )> {
+        let mut meta = HashMap::new();
+        let mut statuses: HashMap<String, Vec<crate::db::types::ConsumptionStatus>> =
+            HashMap::new();
+        let mut by_col: HashMap<String, Vec<String>> = HashMap::new();
+        if entry_ids.is_empty() {
+            return Ok((meta, statuses, by_col));
+        }
+        for chunk in entry_ids.chunks(450) {
+            let mut eqb = QueryBuilder::<Sqlite>::new(
+                "SELECT id, kind, creators_json, release_year
+                 FROM entries
+                 WHERE merged_into_id IS NULL AND id IN (",
+            );
+            let mut entry_sep = eqb.separated(", ");
+            for id in chunk {
+                entry_sep.push_bind(id);
+            }
+            entry_sep.push_unseparated(")");
+            let rows: Vec<(String, EntryKind, String, Option<i32>)> =
+                eqb.build_query_as().fetch_all(&mut *conn).await?;
+            let mut active_chunk_ids = Vec::with_capacity(rows.len());
+            for (id, kind, creators_json, release_year) in rows {
+                let creators: Vec<String> =
+                    serde_json::from_str(&creators_json).unwrap_or_default();
+                active_chunk_ids.push(id.clone());
+                meta.insert(id, (kind, creators, release_year));
+            }
+            if active_chunk_ids.is_empty() {
+                continue;
+            }
+
+            let mut sqb = QueryBuilder::<Sqlite>::new(
+                "SELECT DISTINCT entry_id, status FROM consumption_log WHERE entry_id IN (",
+            );
+            let mut status_sep = sqb.separated(", ");
+            for id in &active_chunk_ids {
+                status_sep.push_bind(id);
+            }
+            status_sep.push_unseparated(")");
+            let st_rows: Vec<(String, crate::db::types::ConsumptionStatus)> =
+                sqb.build_query_as().fetch_all(&mut *conn).await?;
+            for (eid, st) in st_rows {
+                statuses.entry(eid).or_default().push(st);
+            }
+
+            let mut mqb = QueryBuilder::<Sqlite>::new(
+                "SELECT collection_id, entry_id FROM collection_entries WHERE entry_id IN (",
+            );
+            let mut mem_sep = mqb.separated(", ");
+            for id in &active_chunk_ids {
+                mem_sep.push_bind(id);
+            }
+            mem_sep.push_unseparated(")");
+            let mem_rows: Vec<(String, String)> =
+                mqb.build_query_as().fetch_all(&mut *conn).await?;
+            for (cid, eid) in mem_rows {
+                by_col.entry(cid).or_default().push(eid);
+            }
+        }
+        Ok((meta, statuses, by_col))
+    }
+
+    async fn load_active_membership_pairs_for_entries_in_tx(
+        conn: &mut SqliteConnection,
+        entry_ids: &[String],
+    ) -> CatalogResult<HashSet<(String, String)>> {
+        let mut pairs = HashSet::new();
+        for chunk in entry_ids.chunks(450) {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT ce.collection_id, ce.entry_id
+                 FROM collection_entries ce
+                 JOIN entries e ON e.id = ce.entry_id
+                 WHERE e.merged_into_id IS NULL AND ce.entry_id IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+            sep.push_unseparated(")");
+            let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(&mut *conn).await?;
+            pairs.extend(rows);
+        }
+        Ok(pairs)
+    }
 }
 
-fn creators_json_matches_needle(creators_json: &str, lower_needle: &str) -> bool {
+fn extract_simple_consumed_kind_rule(rule_json: Option<&str>) -> Option<EntryKind> {
+    let rule = parse_dynamic_collection_rule(rule_json)?;
+    if rule.consumed == Some(true)
+        && rule.kinds.is_empty()
+        && rule.status.is_none()
+        && rule.release_year.is_none()
+        && rule.creator.as_deref().map(str::trim).is_none_or(str::is_empty)
+    {
+        rule.kind
+    } else {
+        None
+    }
+}
+
+pub(super) fn creators_json_matches_needle(creators_json: &str, lower_needle: &str) -> bool {
     let creators: Vec<String> = serde_json::from_str(creators_json).unwrap_or_default();
     creators.iter().any(|c| c.to_lowercase().contains(lower_needle))
 }
@@ -1004,7 +1267,18 @@ fn derive_want_collection_slug_and_label(trimmed: &str) -> CatalogResult<(String
     }
 }
 
-fn append_dynamic_rule_sql_filters(qb: &mut QueryBuilder<Sqlite>, rule: &DynamicCollectionRule) {
+pub(super) fn append_dynamic_rule_sql_filters(
+    qb: &mut QueryBuilder<Sqlite>,
+    rule: &DynamicCollectionRule,
+) {
+    append_dynamic_rule_sql_filters_opts(qb, rule, false);
+}
+
+pub(super) fn append_dynamic_rule_sql_filters_opts(
+    qb: &mut QueryBuilder<Sqlite>,
+    rule: &DynamicCollectionRule,
+    suppress_kind_index: bool,
+) {
     let mut target_kinds: Vec<EntryKind> = Vec::new();
     if let Some(k) = rule.kind {
         target_kinds.push(k);
@@ -1014,10 +1288,11 @@ fn append_dynamic_rule_sql_filters(qb: &mut QueryBuilder<Sqlite>, rule: &Dynamic
             target_kinds.push(k);
         }
     }
+    let kind_col = if suppress_kind_index { "+e.kind" } else { "e.kind" };
     if target_kinds.len() == 1 {
-        qb.push(" AND e.kind = ").push_bind(target_kinds[0]);
+        qb.push(" AND ").push(kind_col).push(" = ").push_bind(target_kinds[0]);
     } else if !target_kinds.is_empty() {
-        qb.push(" AND e.kind IN (");
+        qb.push(" AND ").push(kind_col).push(" IN (");
         let mut sep = qb.separated(", ");
         for k in target_kinds {
             sep.push_bind(k);

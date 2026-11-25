@@ -15,13 +15,14 @@ use super::AppError;
 use crate::{
     db::{
         CatalogBatchInput, CatalogBatchResult, CatalogEntry, CatalogRepo, CollectionGeneratorState,
-        CollectionRankingInputs, CollectionSummary, ComparisonRecord, ConsumptionLogView, Db,
+        CollectionSummary, ComparisonRecord, ConsumptionLogView, Db, DiaryKindFilter,
         EntryDetailView, EntryIdentifier, UpdateEntryInput, UpsertEntryInput, WantSearchMatch,
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::{
-        MAX_K_DEFAULT, MIN_K, N_QUANTILES, RANDOM_SEED_EVERY, Score, infer_scores,
-        rescale_to_quantiles, select_cluster_prioritized, sort_by_score_with_ties, tier_label,
+        MAX_K_DEFAULT, MEAN_TIE_EPSILON, MIN_K, N_QUANTILES, RANDOM_SEED_EVERY, Score,
+        infer_scores, rescale_to_quantiles, rescale_to_quantiles_with_uncompared,
+        select_cluster_prioritized, sort_by_score_with_ties, tier_label,
     },
 };
 
@@ -153,20 +154,25 @@ impl EpScoreCache {
     }
 }
 
-/// Filter parameters for server-side tier & search filtering over a ranked collection.
+/// Filter parameters for server-side tier, kind & search filtering over a ranked collection.
 #[derive(Debug, Clone, Default)]
 pub struct RankedCollectionFilter<'a> {
     pub tier: Option<char>,
+    pub kind: Option<EntryKind>,
     pub query: Option<&'a str>,
 }
 
-/// Ranked collection view together with full-collection totals & S/A/B/C/D tier counts
-/// computed before applying `RankedCollectionFilter` or pagination slices.
+/// SQL-paginated ranked collection slice containing ONLY the current page's rows while preserving
+/// exact full-collection totals, S/A/B/C/D tier distribution, per-kind counts, and ranks.
 #[derive(Debug, Clone)]
-pub struct FilteredRankedCollection {
+pub struct RankedCollectionPage {
     pub view: RankedCollectionView,
+    pub total_matching: usize,
     pub full_total: usize,
     pub full_tier_counts: [usize; 5],
+    pub kind_counts: Vec<(EntryKind, usize)>,
+    pub page_num: usize,
+    pub total_pages: usize,
 }
 
 /// Summary of an entry's rank, list size, and optional quality tier on a global list.
@@ -313,6 +319,13 @@ impl<'a> CatalogService<'a> {
         Ok(self.repo.merge_entries(duplicate_id, canonical_id).await?)
     }
 
+    pub async fn infer_dominant_kind_in_collection(
+        &self,
+        slug_or_id: &str,
+    ) -> Result<Option<EntryKind>, AppError> {
+        Ok(self.repo.infer_dominant_kind_in_collection(slug_or_id).await?)
+    }
+
     pub async fn list_diary(
         &self,
         year: Option<i32>,
@@ -322,21 +335,41 @@ impl<'a> CatalogService<'a> {
         Ok(self.repo.list_diary(year, status, limit).await?)
     }
 
-    pub async fn list_diary_page(
+    pub async fn list_diary_with_kind(
         &self,
         year: Option<i32>,
         status: Option<ConsumptionStatus>,
+        kind_filter: DiaryKindFilter,
+        limit: usize,
+    ) -> Result<Vec<ConsumptionLogView>, AppError> {
+        Ok(self.repo.list_diary_with_kind(year, status, kind_filter, limit).await?)
+    }
+
+    pub async fn list_diary_page_with_kind(
+        &self,
+        year: Option<i32>,
+        status: Option<ConsumptionStatus>,
+        kind_filter: DiaryKindFilter,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ConsumptionLogView>, AppError> {
-        Ok(self.repo.list_diary_page(year, status, limit, offset).await?)
+        Ok(self.repo.list_diary_page_with_kind(year, status, kind_filter, limit, offset).await?)
     }
 
-    pub async fn list_diary_year_counts(
+    pub async fn list_diary_year_counts_with_kind(
         &self,
         status: Option<ConsumptionStatus>,
+        kind_filter: DiaryKindFilter,
     ) -> Result<Vec<(i32, i64)>, AppError> {
-        Ok(self.repo.list_diary_year_counts(status).await?)
+        Ok(self.repo.list_diary_year_counts_with_kind(status, kind_filter).await?)
+    }
+
+    pub async fn list_diary_kind_summary(
+        &self,
+        year: Option<i32>,
+        status: Option<ConsumptionStatus>,
+    ) -> Result<(Vec<(EntryKind, usize)>, bool), AppError> {
+        Ok(self.repo.list_diary_kind_summary(year, status).await?)
     }
 
     pub async fn search_diary_logs(
@@ -582,9 +615,7 @@ impl<'a> CatalogService<'a> {
             &mut sorted_members,
             &scores,
             |entry| entry.id.as_str(),
-            |a, b| {
-                a.title.to_lowercase().cmp(&b.title.to_lowercase()).then_with(|| a.id.cmp(&b.id))
-            },
+            cmp_entry_title_id_ascii,
         );
 
         let max_abs =
@@ -610,46 +641,271 @@ impl<'a> CatalogService<'a> {
         })
     }
 
-    /// Loads a ranked collection, computes full-list S/A/B/C/D tier counts across ALL rows, and
-    /// applies optional server-side tier (`S`/`A`/`B`/`C`/`D`) and text filters before pagination.
-    pub async fn get_filtered_ranked_collection(
+    /// Loads ONLY the requested page of a ranked collection via banded SQL pagination, never
+    /// hydrating thousands of uncompared rows outside the current page.
+    ///
+    /// When `clamp_page` is `true` (Web SSR), out-of-range page numbers clamp to `1..=total_pages`.
+    /// When `clamp_page` is `false` (REST API), requesting `page > total_pages` returns empty rows
+    /// so clients paging until `rows.is_empty()` terminate cleanly.
+    #[allow(clippy::too_many_lines)]
+    pub async fn get_ranked_collection_page(
         &self,
         slug_or_id: &str,
         want: bool,
         filter: &RankedCollectionFilter<'_>,
-    ) -> Result<FilteredRankedCollection, AppError> {
-        let mut view = self.get_ranked_collection(slug_or_id, want).await?;
-        let full_total = view.rows.len();
-        let full_tier_counts = count_row_tiers(&view.rows);
+        requested_page: usize,
+        page_size: usize,
+        clamp_page: bool,
+    ) -> Result<RankedCollectionPage, AppError> {
+        let safe_page_size = page_size.clamp(1, 2_000);
+        let (is_priority, scope_id) = self.repo.resolve_ranking_scope(slug_or_id, want).await?;
+        let (orderings, scope_scores) =
+            self.load_scope_orderings_and_scores(scope_id.as_deref()).await?;
+
+        let scope_compared_ids: Vec<String> = scope_scores.keys().cloned().collect();
+        let mut meta =
+            self.repo.load_collection_page_meta(slug_or_id, want, &scope_compared_ids, &[]).await?;
+
+        let full_total = meta.total_count;
+        let compared_ids_in_col: Vec<String> =
+            meta.compared_members.iter().map(|m| m.id.clone()).collect();
+        let relevant_comparison_count =
+            count_relevant_comparisons(&compared_ids_in_col, &orderings);
+        meta.collection.comparison_count = relevant_comparison_count;
+
+        let compared_scores: HashMap<String, Score> = meta
+            .compared_members
+            .iter()
+            .map(|m| (m.id.clone(), scope_scores.get(&m.id).copied().unwrap_or_default()))
+            .collect();
+        let uncompared_count = full_total.saturating_sub(meta.compared_members.len());
+
+        let (compared_tiers, uncompared_tier) = if !is_priority && relevant_comparison_count > 0 {
+            let q = rescale_to_quantiles_with_uncompared(
+                &compared_scores,
+                uncompared_count,
+                N_QUANTILES,
+            );
+            let mapped =
+                q.compared.into_iter().map(|(id, bucket)| (id, tier_label(bucket))).collect();
+            (mapped, q.uncompared.map(tier_label))
+        } else {
+            (HashMap::new(), None)
+        };
+
+        let mut full_tier_counts = [0usize; 5];
+        for &t in compared_tiers.values() {
+            if let Some(idx) = tier_index(t) {
+                full_tier_counts[idx] += 1;
+            }
+        }
+        if let Some(t) = uncompared_tier
+            && let Some(idx) = tier_index(t)
+        {
+            full_tier_counts[idx] += uncompared_count;
+        }
+
+        let max_abs = compared_scores
+            .values()
+            .map(|s| s.mean.abs())
+            .filter(|v| v.is_finite())
+            .fold(0.0_f64, f64::max);
+        let scale = if max_abs > 0.0 { max_abs } else { 1.0 };
+
+        // Partition compared members into exact `sort_by_score_with_ties` bands around 0.0.
+        let bands = split_compared_bands_around_zero(
+            meta.compared_members,
+            &compared_scores,
+            uncompared_count > 0,
+        );
+        let full_zero_band_total = full_total.saturating_sub(bands.above.len() + bands.below.len());
 
         let target_tier = filter
             .tier
             .map(|t| t.to_ascii_uppercase())
             .filter(|t| matches!(t, 'S' | 'A' | 'B' | 'C' | 'D'));
-        let needle = filter.query.map(str::trim).filter(|q| !q.is_empty()).map(str::to_lowercase);
+        let needle = filter
+            .query
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(|q| q.chars().take(256).collect::<String>().to_lowercase());
+        let is_unfiltered = target_tier.is_none() && filter.kind.is_none() && needle.is_none();
 
-        if target_tier.is_some() || needle.is_some() {
-            view.rows.retain(|row| {
-                if let Some(t) = target_tier
-                    && row.tier != Some(t)
-                {
-                    return false;
+        let make_row = |rank: usize, entry: CatalogEntry| -> RankedEntryRow {
+            let score = compared_scores.get(&entry.id).copied().unwrap_or_default();
+            let tier = compared_tiers.get(&entry.id).copied().or(uncompared_tier);
+            let bar_pct = ((score.mean / scale + 1.0) * 50.0).clamp(2.0, 100.0);
+            RankedEntryRow { rank, entry, score, tier, bar_pct }
+        };
+
+        let mut above_filtered: Vec<RankedEntryRow> = Vec::new();
+        for (idx, entry) in bands.above.iter().enumerate() {
+            if entry_matches_kind_and_query(entry, filter.kind, needle.as_deref()) {
+                let row_tier = compared_tiers.get(&entry.id).copied();
+                if target_tier.is_none() || target_tier == row_tier {
+                    let rank = if is_unfiltered { idx + 1 } else { above_filtered.len() + 1 };
+                    above_filtered.push(make_row(rank, entry.clone()));
                 }
-                if let Some(ref q) = needle {
-                    let title_hit = row.entry.title.to_lowercase().contains(q);
-                    let creator_hit =
-                        row.entry.creators.iter().any(|c| c.to_lowercase().contains(q));
-                    let year_hit =
-                        row.entry.release_year.is_some_and(|y| y.to_string().contains(q));
-                    if !title_hit && !creator_hit && !year_hit {
-                        return false;
-                    }
+            }
+        }
+        let mut below_candidates: Vec<(usize, CatalogEntry)> = Vec::new();
+        for (idx, entry) in bands.below.iter().enumerate() {
+            if entry_matches_kind_and_query(entry, filter.kind, needle.as_deref()) {
+                let row_tier = compared_tiers.get(&entry.id).copied();
+                if target_tier.is_none() || target_tier == row_tier {
+                    below_candidates.push((idx, entry.clone()));
                 }
-                true
-            });
+            }
         }
 
-        Ok(FilteredRankedCollection { view, full_total, full_tier_counts })
+        let uncompared_matches_tier =
+            target_tier.is_none() || (target_tier == uncompared_tier && target_tier.is_some());
+
+        // Determine zero-band matching count & SQL exclusion set directly in SQL (no Rust subtraction).
+        let mut exclude_ids: HashSet<String> =
+            HashSet::with_capacity(bands.above.len() + bands.below.len());
+        for e in &bands.above {
+            exclude_ids.insert(e.id.clone());
+        }
+        for e in &bands.below {
+            exclude_ids.insert(e.id.clone());
+        }
+
+        let (zero_total_matching, near_zero_only_rows) = if uncompared_count == 0 {
+            (0, Some(Vec::new()))
+        } else if uncompared_matches_tier {
+            if let Some(t) = target_tier {
+                for e in &bands.zero_compared {
+                    let row_tier = compared_tiers.get(&e.id).copied().or(uncompared_tier);
+                    if row_tier != Some(t) {
+                        exclude_ids.insert(e.id.clone());
+                    }
+                }
+            }
+            let z_total = if filter.kind.is_none() && needle.is_none() {
+                full_total.saturating_sub(exclude_ids.len())
+            } else {
+                self.repo
+                    .count_collection_zero_band_filtered(
+                        slug_or_id,
+                        want,
+                        filter.kind,
+                        filter.query,
+                        &exclude_ids,
+                    )
+                    .await?
+            };
+            (z_total, None)
+        } else {
+            // Uncompared zero-band entries are excluded by tier filter; sort matching near-zero
+            // compared entries BEFORE assigning filtered ordinal ranks.
+            let mut matched_entries: Vec<CatalogEntry> = bands
+                .zero_compared
+                .into_iter()
+                .filter(|e| {
+                    let row_tier = compared_tiers.get(&e.id).copied().or(uncompared_tier);
+                    row_tier == target_tier
+                        && entry_matches_kind_and_query(e, filter.kind, needle.as_deref())
+                })
+                .collect();
+            matched_entries.sort_by(cmp_entry_title_id_ascii);
+            let above_len_now = above_filtered.len();
+            let matched_near_zero: Vec<RankedEntryRow> = matched_entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| make_row(above_len_now + i + 1, e))
+                .collect();
+            let z_total = matched_near_zero.len();
+            (z_total, Some(matched_near_zero))
+        };
+
+        let total_matching = above_filtered.len() + zero_total_matching + below_candidates.len();
+        let total_pages = total_matching.max(1).div_ceil(safe_page_size);
+        let page_num =
+            if clamp_page { requested_page.clamp(1, total_pages) } else { requested_page.max(1) };
+        let start_idx = page_num.saturating_sub(1).saturating_mul(safe_page_size);
+        let end_idx = start_idx.saturating_add(safe_page_size).min(total_matching);
+
+        let mut page_rows: Vec<RankedEntryRow> =
+            Vec::with_capacity(end_idx.saturating_sub(start_idx));
+
+        if start_idx < end_idx {
+            // 1. Slice from `above_filtered`.
+            let above_len = above_filtered.len();
+            if start_idx < above_len {
+                let take_end = end_idx.min(above_len);
+                page_rows.extend(above_filtered.drain(start_idx..take_end));
+            }
+
+            // 2. Slice from zero band (either in-memory `near_zero_only_rows` or SQL slice).
+            let zero_start_global = above_len;
+            let zero_end_global = above_len + zero_total_matching;
+            if end_idx > zero_start_global && start_idx < zero_end_global {
+                let z_offset = start_idx.saturating_sub(zero_start_global);
+                let z_limit = end_idx.min(zero_end_global) - start_idx.max(zero_start_global);
+                if let Some(mut near_only) = near_zero_only_rows {
+                    let take_end = (z_offset + z_limit).min(near_only.len());
+                    if z_offset < take_end {
+                        page_rows.extend(near_only.drain(z_offset..take_end));
+                    }
+                } else if z_limit > 0 {
+                    let zero_entries = self
+                        .repo
+                        .load_collection_zero_band_slice(
+                            slug_or_id,
+                            want,
+                            filter.kind,
+                            filter.query,
+                            &exclude_ids,
+                            z_limit,
+                            z_offset,
+                        )
+                        .await?;
+                    for (i, entry) in zero_entries.into_iter().enumerate() {
+                        let rank = if is_unfiltered {
+                            bands.above.len() + z_offset + i + 1
+                        } else {
+                            zero_start_global + z_offset + i + 1
+                        };
+                        page_rows.push(make_row(rank, entry));
+                    }
+                }
+            }
+
+            // 3. Slice from `below_candidates`.
+            if end_idx > zero_end_global {
+                let b_offset = start_idx.saturating_sub(zero_end_global);
+                let b_limit = end_idx - start_idx.max(zero_end_global);
+                let take_end = (b_offset + b_limit).min(below_candidates.len());
+                if b_offset < take_end {
+                    for (i, (global_idx, entry)) in
+                        below_candidates.drain(b_offset..take_end).enumerate()
+                    {
+                        let rank = if is_unfiltered {
+                            bands.above.len() + full_zero_band_total + global_idx + 1
+                        } else {
+                            zero_end_global + b_offset + i + 1
+                        };
+                        page_rows.push(make_row(rank, entry));
+                    }
+                }
+            }
+        }
+
+        Ok(RankedCollectionPage {
+            view: RankedCollectionView {
+                collection: meta.collection,
+                is_priority_scope: is_priority,
+                comparison_count: relevant_comparison_count,
+                rows: page_rows,
+            },
+            total_matching,
+            full_total,
+            full_tier_counts,
+            kind_counts: meta.kind_counts,
+            page_num,
+            total_pages,
+        })
     }
 
     /// Selects the next uncovered cluster together with its selection-priority order
@@ -681,7 +937,8 @@ impl<'a> CatalogService<'a> {
     }
 
     /// Computes quality tier letters (`S`..`D`) for a heterogeneous set of entries across their
-    /// default kind lists using a single cached global EP pass.
+    /// default kind lists using a single cached global EP pass and uncompared quantile folding
+    /// (without hydrating uncompared catalog entries).
     pub async fn load_tiers_for_entries(&self, entries: &[CatalogEntry]) -> HashMap<String, char> {
         let mut slugs: Vec<&'static str> = entries
             .iter()
@@ -696,27 +953,63 @@ impl<'a> CatalogService<'a> {
         let Ok((orderings, scope_scores)) = self.load_scope_orderings_and_scores(None).await else {
             return HashMap::new();
         };
+        let scope_compared_ids: Vec<String> = scope_scores.keys().cloned().collect();
+        let entry_ids_by_slug: HashMap<&'static str, Vec<String>> = {
+            let mut map: HashMap<&'static str, Vec<String>> = HashMap::new();
+            for e in entries {
+                if e.kind != EntryKind::Song
+                    && let Some(sl) = e.kind.default_list_slug()
+                {
+                    map.entry(sl).or_default().push(e.id.clone());
+                }
+            }
+            map
+        };
         let mut tiers = HashMap::new();
         for slug in slugs {
-            let Ok(inputs) = self.repo.load_collection_ranking_inputs(slug, false).await else {
+            let Some(target_ids) = entry_ids_by_slug.get(slug) else {
                 continue;
             };
-            if inputs.is_priority_scope {
+            let Ok(meta) = self
+                .repo
+                .load_collection_page_meta(slug, false, &scope_compared_ids, target_ids)
+                .await
+            else {
+                continue;
+            };
+            if meta.is_priority_scope || meta.total_count == 0 {
                 continue;
             }
-            let member_ids: Vec<String> = inputs.members.iter().map(|m| m.id.clone()).collect();
-            if count_relevant_comparisons(&member_ids, &orderings) == 0 {
+            let compared_ids: Vec<String> =
+                meta.compared_members.iter().map(|m| m.id.clone()).collect();
+            if count_relevant_comparisons(&compared_ids, &orderings) == 0 {
                 continue;
             }
-            let list_scores: HashMap<String, Score> = member_ids
+            let compared_scores: HashMap<String, Score> = compared_ids
                 .into_iter()
                 .map(|id| {
                     let s = scope_scores.get(&id).copied().unwrap_or_default();
                     (id, s)
                 })
                 .collect();
-            for (id, q) in rescale_to_quantiles(&list_scores, N_QUANTILES) {
-                tiers.entry(id).or_insert_with(|| tier_label(q));
+            let uncompared_count = meta.total_count.saturating_sub(compared_scores.len());
+            let q = rescale_to_quantiles_with_uncompared(
+                &compared_scores,
+                uncompared_count,
+                N_QUANTILES,
+            );
+            let uncompared_tier = q.uncompared.map(tier_label);
+            for eid in target_ids {
+                // Only assign a tier to entries that actually belong to the list (e.g. consumed
+                // entries for default kind lists), never unconsumed discography items.
+                if !meta.present_member_ids.contains(eid) {
+                    continue;
+                }
+                let letter =
+                    q.compared.get(eid.as_str()).copied().map(tier_label).or(uncompared_tier);
+                if let Some(t) = letter {
+                    tiers.entry(eid.clone()).or_insert(t);
+                }
             }
         }
         tiers
@@ -843,7 +1136,9 @@ impl<'a> CatalogService<'a> {
     }
 
     /// Computes an entry's rank, list total, and optional S-D tier across its default kind list
-    /// and all parent global lists using a **single** global EP inference pass.
+    /// and all parent global lists using a **single** global EP inference pass without hydrating
+    /// uncompared list members.
+    #[allow(clippy::too_many_lines)]
     pub async fn load_entry_ranked_appearances(
         &self,
         detail: &EntryDetailView,
@@ -857,20 +1152,7 @@ impl<'a> CatalogService<'a> {
                 candidate_keys.push(parent.id.clone());
             }
         }
-
-        let mut eligible_lists: Vec<CollectionRankingInputs> = Vec::new();
-        let mut seen_col_ids: HashSet<String> = HashSet::new();
-        for key in candidate_keys {
-            // Only show genuine global Lists (`List` / `System`), never `Want`, `Tag`, or `Feed`.
-            if let Ok(inputs) = self.repo.load_collection_ranking_inputs(&key, false).await
-                && matches!(inputs.collection.role, CollectionRole::List | CollectionRole::System)
-                && seen_col_ids.insert(inputs.collection.id.clone())
-                && inputs.members.iter().any(|m| m.id == detail.entry.id)
-            {
-                eligible_lists.push(inputs);
-            }
-        }
-        if eligible_lists.is_empty() {
+        if candidate_keys.is_empty() {
             return Vec::new();
         }
 
@@ -878,56 +1160,97 @@ impl<'a> CatalogService<'a> {
         else {
             return Vec::new();
         };
+        let scope_compared_ids: Vec<String> = global_scores.keys().cloned().collect();
 
-        let list_has_relevant_comp: Vec<bool> = eligible_lists
-            .iter()
-            .map(|inputs| {
-                let member_set: HashSet<&str> =
-                    inputs.members.iter().map(|m| m.id.as_str()).collect();
-                orderings.iter().any(|ord| {
-                    ord.iter().flat_map(|g| g.iter()).any(|id| member_set.contains(id.as_str()))
-                })
-            })
-            .collect();
+        let mut seen_col_ids: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+        let target_ascii_lower = detail.entry.title.to_ascii_lowercase();
 
-        let mut out = Vec::with_capacity(eligible_lists.len());
-        for (inputs, has_relevant_comp) in eligible_lists.into_iter().zip(list_has_relevant_comp) {
-            let list_scores: HashMap<String, Score> = inputs
-                .members
+        for key in candidate_keys {
+            // Only show genuine global Lists (`List` / `System`), never `Want`, `Tag`, or `Feed`.
+            let Ok(meta) = self
+                .repo
+                .load_collection_page_meta(
+                    &key,
+                    false,
+                    &scope_compared_ids,
+                    std::slice::from_ref(&detail.entry.id),
+                )
+                .await
+            else {
+                continue;
+            };
+            if !matches!(meta.collection.role, CollectionRole::List | CollectionRole::System)
+                || !meta.present_member_ids.contains(&detail.entry.id)
+                || !seen_col_ids.insert(meta.collection.id.clone())
+            {
+                continue;
+            }
+
+            let total = meta.total_count;
+            let compared_ids: Vec<String> =
+                meta.compared_members.iter().map(|m| m.id.clone()).collect();
+            let has_relevant_comp = count_relevant_comparisons(&compared_ids, &orderings) > 0;
+
+            let compared_scores: HashMap<String, Score> = meta
+                .compared_members
                 .iter()
                 .map(|m| (m.id.clone(), global_scores.get(&m.id).copied().unwrap_or_default()))
                 .collect();
+            let uncompared_count = total.saturating_sub(meta.compared_members.len());
             let tier = if has_relevant_comp {
-                rescale_to_quantiles(&list_scores, N_QUANTILES)
-                    .get(&detail.entry.id)
-                    .copied()
-                    .map(tier_label)
+                let q = rescale_to_quantiles_with_uncompared(
+                    &compared_scores,
+                    uncompared_count,
+                    N_QUANTILES,
+                );
+                q.compared.get(&detail.entry.id).copied().or(q.uncompared).map(tier_label)
             } else {
                 None
             };
 
-            let mut sorted_members = inputs.members;
-            sort_by_score_with_ties(
-                &mut sorted_members,
-                &list_scores,
-                |entry| entry.id.as_str(),
-                |a, b| {
-                    a.title
-                        .to_lowercase()
-                        .cmp(&b.title.to_lowercase())
-                        .then_with(|| a.id.cmp(&b.id))
-                },
+            let bands = split_compared_bands_around_zero(
+                meta.compared_members,
+                &compared_scores,
+                uncompared_count > 0,
             );
-            let total = sorted_members.len();
-            if let Some(idx) = sorted_members.iter().position(|e| e.id == detail.entry.id) {
-                out.push(EntryListAppearance {
-                    slug: inputs.collection.slug.unwrap_or(inputs.collection.id),
-                    title: inputs.collection.title,
-                    rank: idx + 1,
-                    total,
-                    tier,
-                });
-            }
+            let zero_band_total = total.saturating_sub(bands.above.len() + bands.below.len());
+
+            let rank = if let Some(idx) = bands.above.iter().position(|e| e.id == detail.entry.id) {
+                idx + 1
+            } else if let Some(idx) = bands.below.iter().position(|e| e.id == detail.entry.id) {
+                bands.above.len() + zero_band_total + idx + 1
+            } else {
+                let all_before = self
+                    .repo
+                    .count_collection_entries_alpha_before(
+                        &key,
+                        false,
+                        &target_ascii_lower,
+                        &detail.entry.id,
+                    )
+                    .await
+                    .unwrap_or(0);
+                let non_zero_before = bands
+                    .above
+                    .iter()
+                    .chain(bands.below.iter())
+                    .filter(|e| {
+                        let lo = e.title.to_ascii_lowercase();
+                        lo < target_ascii_lower
+                            || (lo == target_ascii_lower && e.id < detail.entry.id)
+                    })
+                    .count();
+                bands.above.len() + all_before.saturating_sub(non_zero_before) + 1
+            };
+
+            out.push(EntryListAppearance {
+                slug: meta.collection.slug.unwrap_or(meta.collection.id),
+                title: meta.collection.title,
+                rank: rank.clamp(1, total.max(1)),
+                total,
+                tier,
+            });
         }
         out
     }
@@ -1090,21 +1413,6 @@ fn is_spotify_web_url(raw: &str) -> bool {
                 norm == "open.spotify.com" || norm == "play.spotify.com"
             })
     })
-}
-
-fn count_row_tiers(rows: &[RankedEntryRow]) -> [usize; 5] {
-    let mut counts = [0usize; 5];
-    for row in rows {
-        match row.tier {
-            Some('S') => counts[0] += 1,
-            Some('A') => counts[1] += 1,
-            Some('B') => counts[2] += 1,
-            Some('C') => counts[3] += 1,
-            Some('D') => counts[4] += 1,
-            _ => {}
-        }
-    }
-    counts
 }
 
 fn pick_uncovered_cluster_prioritized<F>(
@@ -1314,6 +1622,142 @@ fn looks_like_isbn(raw: &str) -> bool {
     }
 }
 
+const fn tier_index(tier: char) -> Option<usize> {
+    match tier {
+        'S' => Some(0),
+        'A' => Some(1),
+        'B' => Some(2),
+        'C' => Some(3),
+        'D' => Some(4),
+        _ => None,
+    }
+}
+
+struct ZeroSplitBands {
+    above: Vec<CatalogEntry>,
+    zero_compared: Vec<CatalogEntry>,
+    below: Vec<CatalogEntry>,
+}
+
+enum BandItem {
+    Compared(Box<CatalogEntry>),
+    UncomparedMarker,
+}
+
+/// Partitions compared members into strictly-above, tied-with-0.0, and strictly-below bands
+/// matching the exact descending tie-chaining behavior of [`sort_by_score_with_ties`].
+fn split_compared_bands_around_zero(
+    mut compared_members: Vec<CatalogEntry>,
+    scores: &HashMap<String, Score>,
+    has_uncompared: bool,
+) -> ZeroSplitBands {
+    if !has_uncompared {
+        sort_by_score_with_ties(
+            &mut compared_members,
+            scores,
+            |e| e.id.as_str(),
+            cmp_entry_title_id_ascii,
+        );
+        return ZeroSplitBands {
+            above: compared_members,
+            zero_compared: Vec::new(),
+            below: Vec::new(),
+        };
+    }
+
+    let mean_of = |item: &BandItem| match item {
+        BandItem::Compared(e) => scores.get(&e.id).copied().unwrap_or_default().mean,
+        BandItem::UncomparedMarker => 0.0,
+    };
+
+    compared_members.sort_by(|a, b| {
+        let ma = scores.get(&a.id).copied().unwrap_or_default().mean;
+        let mb = scores.get(&b.id).copied().unwrap_or_default().mean;
+        mb.total_cmp(&ma).then_with(|| cmp_entry_title_id_ascii(a, b))
+    });
+
+    let mut seq: Vec<BandItem> = Vec::with_capacity(compared_members.len() + 1);
+    let mut inserted_marker = false;
+    for entry in compared_members {
+        let m = scores.get(&entry.id).copied().unwrap_or_default().mean;
+        if !inserted_marker && m.total_cmp(&0.0) != std::cmp::Ordering::Greater {
+            seq.push(BandItem::UncomparedMarker);
+            inserted_marker = true;
+        }
+        seq.push(BandItem::Compared(Box::new(entry)));
+    }
+    if !inserted_marker {
+        seq.push(BandItem::UncomparedMarker);
+    }
+
+    let mut group_sizes: Vec<(usize, bool)> = Vec::new();
+    let mut tie_start = 0usize;
+    while tie_start < seq.len() {
+        let base_mean = mean_of(&seq[tie_start]);
+        let mut tie_end = tie_start + 1;
+        let mut has_marker = matches!(seq[tie_start], BandItem::UncomparedMarker);
+        while tie_end < seq.len() && (mean_of(&seq[tie_end]) - base_mean).abs() <= MEAN_TIE_EPSILON
+        {
+            if matches!(seq[tie_end], BandItem::UncomparedMarker) {
+                has_marker = true;
+            }
+            tie_end += 1;
+        }
+        group_sizes.push((tie_end - tie_start, has_marker));
+        tie_start = tie_end;
+    }
+
+    let mut above = Vec::new();
+    let mut zero_compared = Vec::new();
+    let mut below = Vec::new();
+    let mut seen_marker_group = false;
+    let mut seq_iter = seq.into_iter();
+    for (count, has_marker) in group_sizes {
+        let mut group_entries: Vec<CatalogEntry> = Vec::with_capacity(count);
+        for item in seq_iter.by_ref().take(count) {
+            if let BandItem::Compared(entry) = item {
+                group_entries.push(*entry);
+            }
+        }
+        group_entries.sort_by(cmp_entry_title_id_ascii);
+        if has_marker {
+            zero_compared.extend(group_entries);
+            seen_marker_group = true;
+        } else if seen_marker_group {
+            below.extend(group_entries);
+        } else {
+            above.extend(group_entries);
+        }
+    }
+
+    ZeroSplitBands { above, zero_compared, below }
+}
+
+fn cmp_entry_title_id_ascii(a: &CatalogEntry, b: &CatalogEntry) -> std::cmp::Ordering {
+    a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()).then_with(|| a.id.cmp(&b.id))
+}
+
+fn entry_matches_kind_and_query(
+    entry: &CatalogEntry,
+    kind: Option<EntryKind>,
+    lower_needle: Option<&str>,
+) -> bool {
+    if let Some(k) = kind
+        && entry.kind != k
+    {
+        return false;
+    }
+    if let Some(q) = lower_needle {
+        let title_hit = entry.title.to_lowercase().contains(q);
+        let creator_hit = entry.creators.iter().any(|c| c.to_lowercase().contains(q));
+        let year_hit = entry.release_year.is_some_and(|y| y.to_string().contains(q));
+        if !title_hit && !creator_hit && !year_hit {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1505,10 +1949,13 @@ mod tests {
         svc.append_comparison(None, &[vec![a.id.clone()], vec![b.id.clone()]], None).await.unwrap();
 
         let first = svc
-            .get_filtered_ranked_collection(
+            .get_ranked_collection_page(
                 "movies",
                 false,
-                &RankedCollectionFilter { tier: Some('S'), query: None },
+                &RankedCollectionFilter { tier: Some('S'), kind: None, query: None },
+                1,
+                50,
+                true,
             )
             .await
             .unwrap();
@@ -1594,5 +2041,507 @@ mod tests {
         assert_eq!(fallback.entries.len(), 2);
         assert!(fallback.entries.iter().any(|e| e.id == focus));
         assert!(fallback.entries.iter().all(|e| e.id != opp1));
+    }
+
+    #[tokio::test]
+    async fn test_ranked_collection_page_matches_full_ranking_with_kind_and_tier_filters() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let svc = CatalogService::new(&db);
+
+        let mut song_ids = Vec::new();
+        for i in 1..=12 {
+            let s = svc
+                .upsert_entry(&UpsertEntryInput {
+                    kind: Some(EntryKind::Song),
+                    title: format!("Track {i:02}"),
+                    creators: vec!["The Band".to_owned()],
+                    ..UpsertEntryInput::default()
+                })
+                .await
+                .unwrap();
+            svc.log_consumption(&s.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+            svc.add_collection_entry(crate::db::STARRED_COLLECTION_ID, &s.id, None).await.unwrap();
+            song_ids.push(s.id);
+        }
+        let book = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Book),
+                title: "Dune".to_owned(),
+                creators: vec!["Frank Herbert".to_owned()],
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        svc.log_consumption(&book.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+        svc.add_collection_entry(crate::db::STARRED_COLLECTION_ID, &book.id, None).await.unwrap();
+
+        // Compare two songs so one sits in above-zero, one in below-zero, and 10 in zero-band.
+        svc.append_comparison(None, &[vec![song_ids[10].clone()], vec![song_ids[1].clone()]], None)
+            .await
+            .unwrap();
+
+        let full = svc.get_ranked_collection("songs", false).await.unwrap();
+        let mut collected_ids = Vec::new();
+        for p in 1..=3 {
+            let page = svc
+                .get_ranked_collection_page(
+                    "songs",
+                    false,
+                    &RankedCollectionFilter::default(),
+                    p,
+                    5,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.full_total, 12);
+            assert_eq!(page.total_matching, 12);
+            assert_eq!(page.total_pages, 3);
+            for row in &page.view.rows {
+                let full_row = full.rows.iter().find(|r| r.entry.id == row.entry.id).unwrap();
+                assert_eq!(row.rank, full_row.rank);
+                assert_eq!(row.tier, full_row.tier);
+                collected_ids.push(row.entry.id.clone());
+            }
+        }
+        let full_ids: Vec<String> = full.rows.iter().map(|r| r.entry.id.clone()).collect();
+        assert_eq!(collected_ids, full_ids);
+
+        // Starred has mixed kinds (12 songs + 1 book); kind filter isolates Book cleanly.
+        let starred_books = svc
+            .get_ranked_collection_page(
+                "starred",
+                false,
+                &RankedCollectionFilter { tier: None, kind: Some(EntryKind::Book), query: None },
+                1,
+                50,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(starred_books.full_total, 13);
+        assert_eq!(starred_books.total_matching, 1);
+        assert_eq!(starred_books.view.rows[0].entry.id, book.id);
+        assert_eq!(starred_books.kind_counts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_diary_kind_filter_hides_songs_by_default_and_supports_all_and_specific_kinds() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let svc = CatalogService::new(&db);
+
+        let song = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Song),
+                title: "Paranoid Android".to_owned(),
+                creators: vec!["Radiohead".to_owned()],
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        let book = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Book),
+                title: "Solaris".to_owned(),
+                creators: vec!["Stanislaw Lem".to_owned()],
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        svc.log_consumption(&song.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+        svc.log_consumption(&book.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+
+        // Default diary excludes individual song plays.
+        let default_rows = svc.list_diary(None, None, 50).await.unwrap();
+        assert_eq!(default_rows.len(), 1);
+        assert_eq!(default_rows[0].entry.id, book.id);
+
+        // Songs filter returns only song plays.
+        let song_rows = svc
+            .list_diary_with_kind(None, None, DiaryKindFilter::Only(EntryKind::Song), 50)
+            .await
+            .unwrap();
+        assert_eq!(song_rows.len(), 1);
+        assert_eq!(song_rows[0].entry.id, song.id);
+
+        // All filter returns both.
+        let all_rows =
+            svc.list_diary_with_kind(None, None, DiaryKindFilter::All, 50).await.unwrap();
+        assert_eq!(all_rows.len(), 2);
+
+        // Kind summary reports non-song counts + has_songs=true.
+        let (non_song_counts, has_songs) = svc.list_diary_kind_summary(None, None).await.unwrap();
+        assert_eq!(non_song_counts, vec![(EntryKind::Book, 1)]);
+        assert!(has_songs);
+    }
+
+    #[tokio::test]
+    async fn test_find_artist_ids_by_names_resolves_ascii_and_unicode_artists() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let svc = CatalogService::new(&db);
+
+        let ascii = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Artist),
+                title: "Radiohead".to_owned(),
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        let unicode = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Artist),
+                title: "Édith Piaf".to_owned(),
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        let custom_unicode = svc
+            .upsert_entry(&UpsertEntryInput {
+                id: Some("custom-non-det-artist-id".to_owned()),
+                kind: Some(EntryKind::Artist),
+                title: "Ólafur Arnalds".to_owned(),
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+
+        let found = svc
+            .find_artist_ids_by_names(&[
+                "radiohead".to_owned(),
+                "édith piaf".to_owned(),
+                "ólafur arnalds".to_owned(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(found.get("radiohead"), Some(&ascii.id));
+        assert_eq!(found.get("édith piaf"), Some(&unicode.id));
+        assert_eq!(found.get("ólafur arnalds"), Some(&custom_unicode.id));
+    }
+
+    #[tokio::test]
+    async fn test_entry_detail_caps_log_history_while_preserving_exact_total_log_count() {
+        use chrono::TimeZone as _;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let svc = CatalogService::new(&db);
+
+        let song = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Song),
+                title: "Repeat Track".to_owned(),
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        for i in 0..120 {
+            let ts = base + chrono::Duration::minutes(i);
+            svc.log_consumption(&song.id, ConsumptionStatus::Consumed, None, Some(ts))
+                .await
+                .unwrap();
+        }
+        let detail = svc.get_entry_detail(&song.id).await.unwrap().unwrap();
+        assert_eq!(detail.total_log_count, 120);
+        assert_eq!(detail.log_history.len(), 100);
+        assert!(detail.has_consumed_log);
+    }
+
+    #[tokio::test]
+    async fn test_load_tiers_for_entries_excludes_unconsumed_entries() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let svc = CatalogService::new(&db);
+
+        let a1 = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Album),
+                title: "Kid A".to_owned(),
+                creators: vec!["Radiohead".to_owned()],
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        let a2 = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Album),
+                title: "OK Computer".to_owned(),
+                creators: vec!["Radiohead".to_owned()],
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        let unconsumed = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Album),
+                title: "Pablo Honey".to_owned(),
+                creators: vec!["Radiohead".to_owned()],
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        svc.log_consumption(&a1.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+        svc.log_consumption(&a2.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+        svc.append_comparison(None, &[vec![a2.id.clone()], vec![a1.id.clone()]], None)
+            .await
+            .unwrap();
+
+        let tiers = svc.load_tiers_for_entries(&[a1.clone(), a2.clone(), unconsumed.clone()]).await;
+        assert!(tiers.contains_key(&a1.id));
+        assert!(tiers.contains_key(&a2.id));
+        assert!(!tiers.contains_key(&unconsumed.id));
+    }
+
+    #[tokio::test]
+    async fn test_ranked_collection_page_filtering_json_creators_monotonic_ranks_and_unclamped_page()
+     {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let svc = CatalogService::new(&db);
+
+        let mut ids = Vec::new();
+        for (idx, (title, creator)) in [
+            ("Alpha", "Frank Herbert"),
+            ("Beta", "Ursula K. Le Guin"),
+            ("Gamma", "Frank Herbert"),
+            ("Delta", "Frank Herbert"),
+            ("Epsilon", "Stanislaw Lem"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let e = svc
+                .upsert_entry(&UpsertEntryInput {
+                    kind: Some(EntryKind::Book),
+                    title: title.to_owned(),
+                    creators: vec![creator.to_owned()],
+                    release_year: Some(1960 + i32::try_from(idx).unwrap()),
+                    ..UpsertEntryInput::default()
+                })
+                .await
+                .unwrap();
+            svc.log_consumption(&e.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+            ids.push(e.id);
+        }
+        // Alpha > Epsilon puts Alpha in above-band, Beta/Gamma/Delta in zero-band, Epsilon in below-band.
+        svc.append_comparison(None, &[vec![ids[0].clone()], vec![ids[4].clone()]], None)
+            .await
+            .unwrap();
+
+        // Searching raw JSON punctuation must NOT match creators_json syntax.
+        let bracket_search = svc
+            .get_ranked_collection_page(
+                "books",
+                false,
+                &RankedCollectionFilter { tier: None, kind: None, query: Some("[") },
+                1,
+                50,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bracket_search.total_matching, 0);
+        assert!(bracket_search.view.rows.is_empty());
+
+        let quote_search = svc
+            .get_ranked_collection_page(
+                "books",
+                false,
+                &RankedCollectionFilter { tier: None, kind: None, query: Some("\"") },
+                1,
+                50,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(quote_search.total_matching, 0);
+
+        // Filtered query spanning above + zero bands produces strictly monotonic ordinal ranks 1..=3.
+        let herbert = svc
+            .get_ranked_collection_page(
+                "books",
+                false,
+                &RankedCollectionFilter { tier: None, kind: None, query: Some("herbert") },
+                1,
+                50,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(herbert.total_matching, 3);
+        let ranks: Vec<usize> = herbert.view.rows.iter().map(|r| r.rank).collect();
+        assert_eq!(ranks, vec![1, 2, 3]);
+
+        // Unclamped pagination (REST API mode) returns empty rows for out-of-range page numbers.
+        let past_end = svc
+            .get_ranked_collection_page(
+                "books",
+                false,
+                &RankedCollectionFilter::default(),
+                99,
+                2,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(past_end.page_num, 99);
+        assert_eq!(past_end.total_pages, 3);
+        assert!(past_end.view.rows.is_empty());
+
+        // Large exclusion set (>450 IDs) exercises the `json_each` SQL exclusion path cleanly.
+        let mut large_exclude: HashSet<String> =
+            (0..500).map(|i| format!("dummy-{i:04}")).collect();
+        large_exclude.insert(ids[0].clone());
+        large_exclude.insert(ids[4].clone());
+        let repo = db.catalog();
+        let cnt = repo
+            .count_collection_zero_band_filtered("books", false, None, None, &large_exclude)
+            .await
+            .unwrap();
+        assert_eq!(cnt, 3);
+        let slice = repo
+            .load_collection_zero_band_slice("books", false, None, None, &large_exclude, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(slice.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_diary_validation_search_union_and_has_consumed_log_beyond_cap() {
+        use chrono::TimeZone as _;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let svc = CatalogService::new(&db);
+
+        // L5: container kinds rejected in DiaryKindFilter.
+        assert!(DiaryKindFilter::parse_optional(Some("artist")).is_err());
+        assert!(DiaryKindFilter::parse_optional(Some("podcast")).is_err());
+
+        // H5: i32::MAX year returns InvalidInput rather than overflowing.
+        assert!(svc.list_diary_kind_summary(Some(i32::MAX), None).await.is_err());
+        assert!(
+            svc.list_diary_page_with_kind(
+                Some(i32::MAX),
+                None,
+                DiaryKindFilter::DefaultNonSong,
+                10,
+                0,
+            )
+            .await
+            .is_err()
+        );
+
+        let book = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Book),
+                title: "Solaris".to_owned(),
+                creators: vec!["Stanislaw Lem".to_owned()],
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        let ts_2025 = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 0, 0).unwrap();
+        svc.log_consumption(&book.id, ConsumptionStatus::Consumed, Some("oceanic"), Some(ts_2025))
+            .await
+            .unwrap();
+
+        // C1: year + status filter works cleanly.
+        let filtered = svc
+            .list_diary_page_with_kind(
+                Some(2025),
+                Some(ConsumptionStatus::Consumed),
+                DiaryKindFilter::DefaultNonSong,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        let (counts, has_songs) = svc
+            .list_diary_kind_summary(Some(2025), Some(ConsumptionStatus::Consumed))
+            .await
+            .unwrap();
+        assert_eq!(counts, vec![(EntryKind::Book, 1)]);
+        assert!(!has_songs);
+
+        // H4: search_diary_logs matches both title (FTS) and notes (partial index UNION).
+        let by_title = svc.search_diary_logs("Solaris", 10).await.unwrap();
+        assert_eq!(by_title.len(), 1);
+        let by_note = svc.search_diary_logs("oceanic", 10).await.unwrap();
+        assert_eq!(by_note.len(), 1);
+
+        // L6: has_consumed_log stays true even when >100 newer non-consumed logs exist.
+        for i in 1..=105 {
+            let ts = ts_2025 + chrono::Duration::hours(i);
+            svc.log_consumption(&book.id, ConsumptionStatus::Started, None, Some(ts))
+                .await
+                .unwrap();
+        }
+        let detail = svc.get_entry_detail(&book.id).await.unwrap().unwrap();
+        assert_eq!(detail.total_log_count, 106);
+        assert_eq!(detail.log_history.len(), 100);
+        assert!(detail.has_consumed_log);
+        assert!(detail.log_history.iter().all(|l| l.status == ConsumptionStatus::Started));
+    }
+
+    #[test]
+    fn test_split_compared_bands_matches_sort_by_score_with_ties_on_tie_chain_edges() {
+        let make_entry = |id: &str, title: &str| CatalogEntry {
+            id: id.to_owned(),
+            kind: EntryKind::Book,
+            title: title.to_owned(),
+            creators: Vec::new(),
+            url: None,
+            published_at: None,
+            release_year: None,
+            summary: None,
+            thumbnail_url: None,
+            metadata: serde_json::json!({}),
+            identifiers: Vec::new(),
+            merged_into_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        // Case 1: (+1.4e-5, +0.8e-5) tie together strictly ABOVE uncompared (0.0).
+        let entry_a = make_entry("a", "Zeta");
+        let entry_b = make_entry("b", "Alpha");
+        let uncomp_1 = make_entry("u", "Middle");
+        let mut scores = HashMap::new();
+        scores.insert("a".to_owned(), Score { mean: 1.4e-5, variance: 1.0 });
+        scores.insert("b".to_owned(), Score { mean: 0.8e-5, variance: 1.0 });
+
+        let mut full = vec![entry_a.clone(), entry_b.clone(), uncomp_1.clone()];
+        sort_by_score_with_ties(&mut full, &scores, |e| e.id.as_str(), cmp_entry_title_id_ascii);
+
+        let bands = split_compared_bands_around_zero(vec![entry_a, entry_b], &scores, true);
+        let mut zero_band = bands.zero_compared;
+        zero_band.push(uncomp_1);
+        zero_band.sort_by(cmp_entry_title_id_ascii);
+        let reconstructed: Vec<String> =
+            bands.above.into_iter().chain(zero_band).chain(bands.below).map(|e| e.id).collect();
+        let full_ids: Vec<String> = full.into_iter().map(|e| e.id).collect();
+        assert_eq!(reconstructed, full_ids);
+
+        // Case 2: (+0.6e-5, 0.0, -0.6e-5) puts +0.6e-5 in zero-band and -0.6e-5 strictly BELOW.
+        let pos_entry = make_entry("p", "Zebra");
+        let neg_entry = make_entry("n", "Aardvark");
+        let uncomp_2 = make_entry("u2", "Mango");
+        let mut scores2 = HashMap::new();
+        scores2.insert("p".to_owned(), Score { mean: 0.6e-5, variance: 1.0 });
+        scores2.insert("n".to_owned(), Score { mean: -0.6e-5, variance: 1.0 });
+
+        let mut full2 = vec![pos_entry.clone(), neg_entry.clone(), uncomp_2.clone()];
+        sort_by_score_with_ties(&mut full2, &scores2, |e| e.id.as_str(), cmp_entry_title_id_ascii);
+
+        let bands2 = split_compared_bands_around_zero(vec![pos_entry, neg_entry], &scores2, true);
+        assert_eq!(bands2.above.len(), 0);
+        assert_eq!(bands2.below.len(), 1);
+        assert_eq!(bands2.below[0].id, "n");
+        let mut zero_band2 = bands2.zero_compared;
+        zero_band2.push(uncomp_2);
+        zero_band2.sort_by(cmp_entry_title_id_ascii);
+        let reconstructed2: Vec<String> =
+            bands2.above.into_iter().chain(zero_band2).chain(bands2.below).map(|e| e.id).collect();
+        let full_ids2: Vec<String> = full2.into_iter().map(|e| e.id).collect();
+        assert_eq!(reconstructed2, full_ids2);
     }
 }

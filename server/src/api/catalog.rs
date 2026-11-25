@@ -8,12 +8,15 @@ use super::error::{ApiError, ProblemJson, ProblemPath, ProblemQuery};
 use crate::{
     db::{
         CatalogBatchInput, CatalogBatchResult, CatalogEntry, CollectionGeneratorState,
-        CollectionSummary, ComparisonRecord, ConsumptionLogView, EntryDetailView, UpdateEntryInput,
-        UpsertEntryInput,
+        CollectionSummary, ComparisonRecord, ConsumptionLogView, DiaryKindFilter, EntryDetailView,
+        UpdateEntryInput, UpsertEntryInput,
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::Score,
-    service::{ClusterSelectFilter, RankedCollectionView, RocheService, WorkspaceSearchResults},
+    service::{
+        ClusterSelectFilter, RankedCollectionFilter, RankedCollectionView, RocheService,
+        WorkspaceSearchResults,
+    },
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -49,6 +52,11 @@ pub(super) struct CreateCollectionRequest {
 pub(super) struct RankedListQuery {
     #[serde(default)]
     want: bool,
+    kind: Option<String>,
+    tier: Option<String>,
+    q: Option<String>,
+    page: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +81,7 @@ pub(super) struct MergeEntryRequest {
 pub(super) struct DiaryQuery {
     year: Option<i32>,
     status: Option<ConsumptionStatus>,
+    kind: Option<String>,
     limit: Option<usize>,
 }
 
@@ -188,6 +197,49 @@ pub(super) async fn catalog_list_get(
     ProblemPath(slug_or_id): ProblemPath<String>,
     ProblemQuery(q): ProblemQuery<RankedListQuery>,
 ) -> Result<Json<RankedCollectionView>, ApiError> {
+    let has_filter_or_page = q.kind.is_some()
+        || q.tier.is_some()
+        || q.q.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
+        || q.page.is_some()
+        || q.limit.is_some();
+    if has_filter_or_page {
+        let kind = match q.kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => Some(
+                EntryKind::parse_flexible(raw).map_err(|e| ApiError::bad_request(e.to_string()))?,
+            ),
+            None => None,
+        };
+        let tier = match q.tier.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let mut chars = raw.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None)
+                        if matches!(c.to_ascii_uppercase(), 'S' | 'A' | 'B' | 'C' | 'D') =>
+                    {
+                        Some(c.to_ascii_uppercase())
+                    }
+                    _ => {
+                        return Err(ApiError::bad_request(format!(
+                            "Invalid tier '{raw}'; expected one of S, A, B, C, D"
+                        )));
+                    }
+                }
+            }
+            None => None,
+        };
+        let page = service
+            .catalog()
+            .get_ranked_collection_page(
+                &slug_or_id,
+                q.want,
+                &RankedCollectionFilter { tier, kind, query: q.q.as_deref() },
+                q.page.unwrap_or(1),
+                q.limit.unwrap_or(200),
+                false,
+            )
+            .await?;
+        return Ok(Json(page.view));
+    }
     let view = service.catalog().get_ranked_collection(&slug_or_id, q.want).await?;
     Ok(Json(view))
 }
@@ -412,7 +464,12 @@ pub(super) async fn catalog_diary_list(
     State(service): State<Arc<RocheService>>,
     ProblemQuery(q): ProblemQuery<DiaryQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let entries = service.catalog().list_diary(q.year, q.status, q.limit.unwrap_or(100)).await?;
+    let kind_filter = DiaryKindFilter::parse_optional(q.kind.as_deref())
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let entries = service
+        .catalog()
+        .list_diary_with_kind(q.year, q.status, kind_filter, q.limit.unwrap_or(100))
+        .await?;
     Ok(Json(serde_json::json!({ "entries": entries })))
 }
 

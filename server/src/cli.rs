@@ -175,9 +175,9 @@ impl Cli {
                 let db = crate::RocheServer::connect_db(&cfg).await?;
                 run_show_cmd(&db, &target, want).await
             }
-            Some(Command::Diary { year, status, limit }) => {
+            Some(Command::Diary { year, status, kind, limit }) => {
                 let db = crate::RocheServer::connect_db(&cfg).await?;
-                run_diary_cmd(&db, year, status.as_deref(), limit).await
+                run_diary_cmd(&db, year, status.as_deref(), kind.as_deref(), limit).await
             }
             Some(Command::Consumed { args, rank }) => {
                 let db = crate::RocheServer::connect_db(&cfg).await?;
@@ -539,6 +539,9 @@ pub enum Command {
         /// Filter by status (`consumed`, `started`, `abandoned`)
         #[arg(long)]
         status: Option<String>,
+        /// Filter by media kind (`song`, `album`, `book`, `movie`, `all`, ...; hides songs by default)
+        #[arg(long)]
+        kind: Option<String>,
         /// Maximum entries to display
         #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
@@ -836,6 +839,7 @@ async fn run_diary_cmd(
     db: &Db,
     year: Option<i32>,
     status_raw: Option<&str>,
+    kind_raw: Option<&str>,
     limit: usize,
 ) -> anyhow::Result<()> {
     let status = match status_raw.map(str::trim).filter(|s| !s.is_empty()) {
@@ -847,7 +851,9 @@ async fn run_diary_cmd(
         }
         None => None,
     };
-    let entries = CatalogService::new(db).list_diary(year, status, limit).await?;
+    let kind_filter = crate::db::DiaryKindFilter::parse_optional(kind_raw)?;
+    let entries =
+        CatalogService::new(db).list_diary_with_kind(year, status, kind_filter, limit).await?;
     if entries.is_empty() {
         println!("No diary entries found.");
         return Ok(());

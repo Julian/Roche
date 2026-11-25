@@ -69,8 +69,8 @@ pub(in crate::web) async fn reader_get(
     let (is_consumed, rank_slug, can_rank, entry_release_year, entry_arxiv_id) =
         match service.catalog().get_entry_detail(&id).await {
             Ok(Some(ed)) => {
-                let consumed =
-                    ed.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed);
+                let consumed = ed.has_consumed_log
+                    || ed.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed);
                 let slug = if consumed {
                     service.catalog().rank_target_after_consumption(&ed.entry).await.ok().flatten()
                 } else {

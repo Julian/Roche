@@ -20,10 +20,7 @@ use crate::db::{
     WriteTx,
     entries_core::{self, EntryInsertParams},
     sync::{SyncRepo, deterministic_title_entry_id},
-    types::{
-        ActivityAction, ActivityEntityType, CollectionRole, ConsumptionStatus, ContentType,
-        EntryKind,
-    },
+    types::{ActivityAction, ActivityEntityType, CollectionRole, ContentType, EntryKind},
 };
 
 impl CatalogRepo<'_> {
@@ -64,21 +61,13 @@ impl CatalogRepo<'_> {
     }
 
     pub async fn get_entry_detail(&self, id: &str) -> CatalogResult<Option<EntryDetailView>> {
+        const ENTRY_DETAIL_LOG_LIMIT: i64 = 100;
+
         let mut tx = crate::db::begin_read(self.pool).await?;
         let Some(entry) = Self::get_entry_in_tx(tx.conn(), id).await? else {
             return Ok(None);
         };
-        let child_rows: Vec<RawEntryRow> = sqlx::query_as(concat!(
-            "SELECT ",
-            raw_entry_columns!(e),
-            " FROM collection_entries ce
-             JOIN entries e ON e.id = ce.entry_id
-             WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
-             ORDER BY ce.position ASC NULLS LAST, COALESCE(e.release_year, 0) DESC, LOWER(e.title) ASC"
-        ))
-        .bind(&entry.id)
-        .fetch_all(tx.conn())
-        .await?;
+        let child_rows = Self::load_entry_detail_child_rows_in_tx(tx.conn(), &entry).await?;
         let children = Self::hydrate_entries_in_tx(tx.conn(), child_rows).await?;
 
         let parent_rows: Vec<RawEntryRow> = sqlx::query_as(concat!(
@@ -97,21 +86,96 @@ impl CatalogRepo<'_> {
         .await?;
         let parents = Self::hydrate_entries_in_tx(tx.conn(), parent_rows).await?;
 
-        let log_history = sqlx::query_as!(
-            ConsumptionLogRow,
-            r#"SELECT id as "id!", entry_id as "entry_id!", ts as "ts!: DateTime<Utc>",
-                      status as "status!: ConsumptionStatus", notes as "notes?",
-                      created_at as "created_at!: DateTime<Utc>"
-               FROM consumption_log
-               WHERE entry_id = ?
-               ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) DESC, id DESC"#,
-            &entry.id,
+        let total_log_count_raw: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM consumption_log WHERE entry_id = ?")
+                .bind(&entry.id)
+                .fetch_one(tx.conn())
+                .await?;
+        let total_log_count = usize::try_from(total_log_count_raw).unwrap_or(0);
+
+        let has_consumed_raw: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM consumption_log WHERE entry_id = ? AND status = 'consumed')",
         )
+        .bind(&entry.id)
+        .fetch_one(tx.conn())
+        .await?;
+        let has_consumed_log = has_consumed_raw != 0;
+
+        let log_history: Vec<ConsumptionLogRow> = sqlx::query_as(
+            "SELECT id, entry_id, ts, status, notes, created_at
+             FROM consumption_log
+             WHERE entry_id = ?
+             ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) DESC, id DESC
+             LIMIT ?",
+        )
+        .bind(&entry.id)
+        .bind(ENTRY_DETAIL_LOG_LIMIT)
         .fetch_all(tx.conn())
         .await?;
 
         tx.commit().await?;
-        Ok(Some(EntryDetailView { entry, children, parents, log_history }))
+        Ok(Some(EntryDetailView {
+            entry,
+            children,
+            parents,
+            log_history,
+            total_log_count,
+            has_consumed_log,
+        }))
+    }
+
+    async fn load_entry_detail_child_rows_in_tx(
+        conn: &mut SqliteConnection,
+        entry: &CatalogEntry,
+    ) -> CatalogResult<Vec<RawEntryRow>> {
+        const ARTIST_DETAIL_SONG_SAMPLE_LIMIT: i64 = 16;
+
+        if entry.kind == EntryKind::Artist {
+            // Load all non-song works (albums, books, films, etc.) plus a small bounded sample of
+            // song children so prolific artists never truncate albums or hydrate thousands of tracks.
+            let mut non_song_rows: Vec<RawEntryRow> = sqlx::query_as(concat!(
+                "SELECT ",
+                raw_entry_columns!(e),
+                " FROM collection_entries ce
+                 JOIN entries e ON e.id = ce.entry_id
+                 WHERE ce.collection_id = ? AND e.merged_into_id IS NULL AND e.kind != 'song'
+                 ORDER BY ce.position ASC NULLS LAST,
+                          COALESCE(e.release_year, 0) DESC,
+                          LOWER(e.title) ASC"
+            ))
+            .bind(&entry.id)
+            .fetch_all(&mut *conn)
+            .await?;
+            let song_sample: Vec<RawEntryRow> = sqlx::query_as(concat!(
+                "SELECT ",
+                raw_entry_columns!(e),
+                " FROM collection_entries ce
+                 JOIN entries e ON e.id = ce.entry_id
+                 WHERE ce.collection_id = ? AND e.merged_into_id IS NULL AND e.kind = 'song'
+                 ORDER BY ce.position ASC NULLS LAST,
+                          COALESCE(e.release_year, 0) DESC,
+                          LOWER(e.title) ASC
+                 LIMIT ?"
+            ))
+            .bind(&entry.id)
+            .bind(ARTIST_DETAIL_SONG_SAMPLE_LIMIT)
+            .fetch_all(&mut *conn)
+            .await?;
+            non_song_rows.extend(song_sample);
+            Ok(non_song_rows)
+        } else {
+            Ok(sqlx::query_as(concat!(
+                "SELECT ",
+                raw_entry_columns!(e),
+                " FROM collection_entries ce
+                 JOIN entries e ON e.id = ce.entry_id
+                 WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
+                 ORDER BY ce.position ASC NULLS LAST, COALESCE(e.release_year, 0) DESC, LOWER(e.title) ASC"
+            ))
+            .bind(&entry.id)
+            .fetch_all(&mut *conn)
+            .await?)
+        }
     }
 
     pub async fn search_entries(
@@ -165,32 +229,101 @@ impl CatalogRepo<'_> {
         &self,
         names: &[String],
     ) -> CatalogResult<HashMap<String, String>> {
-        let mut seen = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut ascii_lower_keys: Vec<String> = Vec::new();
+        let mut ascii_seen: HashSet<String> = HashSet::new();
+        let mut det_pairs: Vec<(String, String)> = Vec::new();
         for name in names {
             let trimmed = name.trim();
-            if !trimmed.is_empty() {
-                seen.insert(trimmed.to_lowercase());
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_lowercase();
+            if seen.insert(lower.clone()) {
+                let det_id =
+                    crate::db::deterministic_title_entry_id(EntryKind::Artist.as_str(), &lower);
+                det_pairs.push((lower.clone(), det_id));
+            }
+            let ascii_lower = trimmed.to_ascii_lowercase();
+            if ascii_seen.insert(ascii_lower.clone()) {
+                ascii_lower_keys.push(ascii_lower);
+            }
+            if lower != trimmed.to_ascii_lowercase() && ascii_seen.insert(lower.clone()) {
+                ascii_lower_keys.push(lower);
             }
         }
         if seen.is_empty() {
             return Ok(HashMap::new());
         }
 
-        // Fold titles with Rust's full Unicode `.to_lowercase()` rather than SQLite's ASCII-only
-        // `LOWER()` so non-ASCII artists (e.g. `"Édith Piaf"`, `"Ólafur Arnalds"`) match reliably.
-        let rows = sqlx::query!(
-            r#"SELECT title as "title!", id as "id!" FROM entries
-               WHERE kind = 'artist' AND merged_into_id IS NULL
-               ORDER BY updated_at DESC"#,
-        )
-        .fetch_all(self.pool)
-        .await?;
-
         let mut out = HashMap::with_capacity(seen.len());
-        for row in rows {
-            let lower_title = row.title.trim().to_lowercase();
-            if seen.contains(&lower_title) {
-                out.entry(lower_title).or_insert(row.id);
+
+        // Fast indexed lookup via `idx_entries_kind_lower_title_id` for ASCII/exact-case titles.
+        for chunk in ascii_lower_keys.chunks(450) {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT title, id FROM entries
+                 WHERE kind = 'artist' AND merged_into_id IS NULL AND LOWER(title) IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for key in chunk {
+                sep.push_bind(key);
+            }
+            sep.push_unseparated(") ORDER BY updated_at DESC");
+            let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(self.pool).await?;
+            for (title, id) in rows {
+                let lower_title = title.trim().to_lowercase();
+                if seen.contains(&lower_title) {
+                    out.entry(lower_title).or_insert(id);
+                }
+            }
+        }
+
+        // Direct PK lookup by deterministic artist ID covers canonical non-ASCII artists even when
+        // case differs (e.g. `"édith piaf"` vs `"Édith Piaf"`), querying only unresolved names.
+        let remaining_det_ids: Vec<&str> = det_pairs
+            .iter()
+            .filter(|(lower, id)| !out.contains_key(lower.as_str()) && !id.is_empty())
+            .map(|(_, id)| id.as_str())
+            .collect();
+        for chunk in remaining_det_ids.chunks(450) {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT title, id FROM entries
+                 WHERE kind = 'artist' AND merged_into_id IS NULL AND id IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(*id);
+            }
+            sep.push_unseparated(")");
+            let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(self.pool).await?;
+            for (title, id) in rows {
+                let lower_title = title.trim().to_lowercase();
+                if seen.contains(&lower_title) {
+                    out.entry(lower_title).or_insert(id);
+                }
+            }
+        }
+
+        // Rare Unicode case-folding fallback only for unresolved non-ASCII artist names with
+        // non-deterministic UUIDs (e.g., manually renamed non-ASCII artists).
+        let unresolved_non_ascii: HashSet<&str> = seen
+            .iter()
+            .filter(|k| !k.is_ascii() && !out.contains_key(k.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !unresolved_non_ascii.is_empty() {
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT title, id FROM entries
+                 WHERE kind = 'artist' AND merged_into_id IS NULL AND title GLOB '*[^ -~]*'
+                 ORDER BY updated_at DESC",
+            )
+            .fetch_all(self.pool)
+            .await?;
+            for (title, id) in rows {
+                let lower_title = title.trim().to_lowercase();
+                if unresolved_non_ascii.contains(lower_title.as_str()) {
+                    out.entry(lower_title).or_insert(id);
+                }
             }
         }
         Ok(out)

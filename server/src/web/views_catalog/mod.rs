@@ -37,6 +37,7 @@ pub(super) struct ListPageQuery {
     #[serde(default, deserialize_with = "de_opt_from_str")]
     pub page: Option<usize>,
     pub tier: Option<String>,
+    pub kind: Option<String>,
     pub q: Option<String>,
     pub undo_remove: Option<String>,
 }
@@ -46,6 +47,7 @@ pub(super) struct DiaryFilterQuery {
     #[serde(default, deserialize_with = "de_opt_from_str")]
     pub year: Option<i32>,
     pub status: Option<String>,
+    pub kind: Option<String>,
     #[serde(default, deserialize_with = "de_opt_from_str")]
     pub page: Option<usize>,
 }

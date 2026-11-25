@@ -551,10 +551,19 @@ pub(in crate::web) async fn post_list_create(
     Ok(redirect_with_flash(&format!("/lists/{}", urlencode(slug)), "notice", "Created manual list"))
 }
 
-fn build_list_href(slug: &str, page: Option<usize>, tier: Option<char>, q: Option<&str>) -> String {
+fn build_list_href(
+    slug: &str,
+    page: Option<usize>,
+    tier: Option<char>,
+    kind: Option<EntryKind>,
+    q: Option<&str>,
+) -> String {
     let mut params = Vec::new();
     if let Some(t) = tier {
         params.push(format!("tier={t}"));
+    }
+    if let Some(k) = kind {
+        params.push(format!("kind={}", k.as_str()));
     }
     if let Some(query) = q.map(str::trim).filter(|s| !s.is_empty()) {
         params.push(format!("q={}", urlencode(query)));
@@ -582,9 +591,12 @@ fn append_query_param(base: &str, key: &str, val: &str) -> String {
 
 struct ListDetailRenderCtx<'a> {
     view: &'a RankedCollectionView,
+    total_matching: usize,
     full_total: usize,
     full_tier_counts: [usize; 5],
+    kind_counts: &'a [(EntryKind, usize)],
     active_tier: Option<char>,
+    active_kind: Option<EntryKind>,
     active_q: Option<&'a str>,
     undo_entry: Option<(String, String)>,
     gen_state: Option<&'a CollectionGeneratorState>,
@@ -609,25 +621,33 @@ pub(in crate::web) async fn list_detail_get(
         .and_then(|s| s.chars().next())
         .map(|c| c.to_ascii_uppercase())
         .filter(|c| matches!(c, 'S' | 'A' | 'B' | 'C' | 'D'));
+    let active_kind = q
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| EntryKind::parse_flexible(s).ok());
     let active_q = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    let filtered = service
+    let page = service
         .catalog()
-        .get_filtered_ranked_collection(
+        .get_ranked_collection_page(
             &slug,
             false,
-            &RankedCollectionFilter { tier: active_tier, query: active_q },
+            &RankedCollectionFilter { tier: active_tier, kind: active_kind, query: active_q },
+            q.page.unwrap_or(1),
+            LIST_PAGE_SIZE,
+            true,
         )
         .await
         .web_err(&session)?;
-    let view = filtered.view;
-    let full_total = filtered.full_total;
-    let full_tier_counts = filtered.full_tier_counts;
-    let total_rows = view.rows.len();
-    let total_pages = total_rows.max(1).div_ceil(LIST_PAGE_SIZE);
-    let page_num = q.page.unwrap_or(1).clamp(1, total_pages);
-    let start_idx = (page_num - 1) * LIST_PAGE_SIZE;
-    let end_idx = (page_num * LIST_PAGE_SIZE).min(total_rows);
+    let view = page.view;
+    let total_matching = page.total_matching;
+    let full_total = page.full_total;
+    let full_tier_counts = page.full_tier_counts;
+    let kind_counts = page.kind_counts;
+    let page_num = page.page_num;
+    let total_pages = page.total_pages;
 
     let is_editable_manual = view.collection.is_manual()
         && view.collection.role == CollectionRole::List
@@ -648,29 +668,28 @@ pub(in crate::web) async fn list_detail_get(
         None
     };
 
-    let mut page_creators: Vec<String> = view.rows[start_idx..end_idx]
-        .iter()
-        .flat_map(|r| r.entry.creators.iter().cloned())
-        .collect();
+    let mut page_creators: Vec<String> =
+        view.rows.iter().flat_map(|r| r.entry.creators.iter().cloned()).collect();
     if let Some(drawn) = gen_state.as_ref().and_then(|gs| gs.current_entry.as_ref()) {
         page_creators.extend(drawn.creators.iter().cloned());
     }
     let (artist_links, reader_item_ids) = tokio::join!(
         load_artist_id_by_lower_name(&service, &page_creators),
-        load_existing_reader_item_ids(
-            &service,
-            view.rows[start_idx..end_idx].iter().map(|r| &r.entry),
-        ),
+        load_existing_reader_item_ids(&service, view.rows.iter().map(|r| &r.entry)),
     );
 
     let canonical_slug = view.collection.slug.as_deref().unwrap_or(&view.collection.id);
-    let current_href = build_list_href(canonical_slug, Some(page_num), active_tier, active_q);
+    let current_href =
+        build_list_href(canonical_slug, Some(page_num), active_tier, active_kind, active_q);
 
     let ctx = ListDetailRenderCtx {
         view: &view,
+        total_matching,
         full_total,
         full_tier_counts,
+        kind_counts: &kind_counts,
         active_tier,
+        active_kind,
         active_q,
         undo_entry,
         gen_state: gen_state.as_ref(),
@@ -710,17 +729,16 @@ fn render_ranked_list_body(out: &mut String, ctx: &ListDetailRenderCtx<'_>) {
         view.collection.is_manual() && view.collection.role == CollectionRole::List;
     let is_editable_manual = is_manual_list && !view.collection.has_generator;
     let ranked_mode = view.comparison_count > 0;
-    let is_filtered = ctx.active_tier.is_some() || ctx.active_q.is_some();
+    let is_filtered =
+        ctx.active_tier.is_some() || ctx.active_kind.is_some() || ctx.active_q.is_some();
 
-    let start = (ctx.page_num - 1) * LIST_PAGE_SIZE;
-    let end = (start + LIST_PAGE_SIZE).min(view.rows.len());
-    let slice = &view.rows[start..end];
+    let slice = &view.rows;
 
     out.push_str(
         "<div class=\"lists-grid\">\n<section class=\"lists-main\" aria-label=\"List entries\">\n",
     );
     let badge_text = if is_filtered {
-        format!("{} of {}", view.rows.len(), ctx.full_total)
+        format!("{} of {}", ctx.total_matching, ctx.full_total)
     } else {
         ctx.full_total.to_string()
     };
@@ -756,6 +774,7 @@ fn render_ranked_list_body(out: &mut String, ctx: &ListDetailRenderCtx<'_>) {
             ctx.page_num,
             ctx.total_pages,
             ctx.active_tier,
+            ctx.active_kind,
             ctx.active_q,
             "Pagination (top)",
         );
@@ -770,6 +789,7 @@ fn render_ranked_list_body(out: &mut String, ctx: &ListDetailRenderCtx<'_>) {
             ctx.page_num,
             ctx.total_pages,
             ctx.active_tier,
+            ctx.active_kind,
             ctx.active_q,
             "Pagination (bottom)",
         );
@@ -821,10 +841,12 @@ fn render_list_entries_section(
         ctx.full_total,
         ranked_mode,
         ctx.full_tier_counts,
+        ctx.kind_counts,
         ctx.active_tier,
+        ctx.active_kind,
         ctx.active_q,
     );
-    let clear_href = build_list_href(slug, None, None, None);
+    let clear_href = build_list_href(slug, None, None, None, None);
     if slice.is_empty() {
         let _ = writeln!(
             out,
@@ -876,18 +898,21 @@ fn render_list_detail_lede(out: &mut String, view: &RankedCollectionView) {
     out.push_str("</p>\n");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_list_toolbar(
     out: &mut String,
     slug: &str,
     full_total: usize,
     ranked_mode: bool,
     tiers: [usize; 5],
+    kind_counts: &[(EntryKind, usize)],
     active_tier: Option<char>,
+    active_kind: Option<EntryKind>,
     active_q: Option<&str>,
 ) {
     out.push_str("<div class=\"list-toolbar\">\n");
     if ranked_mode {
-        let all_href = build_list_href(slug, None, None, active_q);
+        let all_href = build_list_href(slug, None, None, active_kind, active_q);
         let all_attrs = if active_tier.is_none() {
             "class=\"pill is-active\" aria-current=\"true\""
         } else {
@@ -902,7 +927,7 @@ fn render_list_toolbar(
         for (idx, letter) in ['S', 'A', 'B', 'C', 'D'].into_iter().enumerate() {
             if tiers[idx] > 0 || active_tier == Some(letter) {
                 let is_cur = active_tier == Some(letter);
-                let href = build_list_href(slug, None, Some(letter), active_q);
+                let href = build_list_href(slug, None, Some(letter), active_kind, active_q);
                 let active_cls = if is_cur { " is-active" } else { "" };
                 let aria_cur = if is_cur { " aria-current=\"true\"" } else { "" };
                 let _ = writeln!(
@@ -924,14 +949,17 @@ fn render_list_toolbar(
     if let Some(t) = active_tier {
         let _ = write!(out, "<input type=\"hidden\" name=\"tier\" value=\"{t}\">");
     }
+    if let Some(k) = active_kind {
+        let _ = write!(out, "<input type=\"hidden\" name=\"kind\" value=\"{}\">", k.as_str());
+    }
     let _ = write!(
         out,
         "<input type=\"search\" id=\"roche-list-search\" name=\"q\" value=\"{}\" class=\"list-filter-input\" placeholder=\"Filter list…\" aria-label=\"Filter entries in this list\">\
          <button type=\"submit\" class=\"btn btn-small btn-ghost\">Filter</button>",
         esc(active_q.unwrap_or("")),
     );
-    if active_tier.is_some() || active_q.is_some() {
-        let clear_href = build_list_href(slug, None, None, None);
+    if active_tier.is_some() || active_kind.is_some() || active_q.is_some() {
+        let clear_href = build_list_href(slug, None, None, None, None);
         let _ = write!(
             out,
             "<a class=\"btn btn-small btn-ghost\" href=\"{}\">Clear</a>",
@@ -939,6 +967,38 @@ fn render_list_toolbar(
         );
     }
     out.push_str("</form>\n</div>\n");
+
+    if kind_counts.len() > 1 || active_kind.is_some() {
+        let all_kinds_href = build_list_href(slug, None, active_tier, None, active_q);
+        let all_kinds_attrs = if active_kind.is_none() {
+            "class=\"pill is-active\" aria-current=\"true\""
+        } else {
+            "class=\"pill\""
+        };
+        let _ = writeln!(
+            out,
+            "<div class=\"list-toolbar\">\n\
+               <div class=\"list-tier-pills\" role=\"group\" aria-label=\"Filter by media type\">\n\
+                 <a {all_kinds_attrs} href=\"{}\">All Types ({full_total})</a>",
+            esc(&all_kinds_href),
+        );
+        for &(kind, cnt) in kind_counts {
+            let is_cur = active_kind == Some(kind);
+            let attrs = if is_cur {
+                "class=\"pill is-active\" aria-current=\"true\""
+            } else {
+                "class=\"pill\""
+            };
+            let href = build_list_href(slug, None, active_tier, Some(kind), active_q);
+            let _ = writeln!(
+                out,
+                "<a {attrs} href=\"{}\">{} ({cnt})</a>",
+                esc(&href),
+                esc(kind.display_label()),
+            );
+        }
+        out.push_str("</div>\n</div>\n");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1116,7 +1176,7 @@ fn render_list_detail_rail(
             let cnt = ctx.full_tier_counts[idx];
             let is_cur = ctx.active_tier == Some(letter);
             let target_tier = if is_cur { None } else { Some(letter) };
-            let href = build_list_href(slug, None, target_tier, ctx.active_q);
+            let href = build_list_href(slug, None, target_tier, ctx.active_kind, ctx.active_q);
             let active_cls = if is_cur { " is-active" } else { "" };
             let aria_cur = if is_cur { " aria-current=\"true\"" } else { "" };
             let _ = writeln!(
@@ -1211,18 +1271,20 @@ fn render_manual_list_add_panel(out: &mut String, slug: &str, default_open: bool
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_list_pager(
     out: &mut String,
     slug: &str,
     page_num: usize,
     total_pages: usize,
     active_tier: Option<char>,
+    active_kind: Option<EntryKind>,
     active_q: Option<&str>,
     aria_label: &str,
 ) {
     let _ = write!(out, "<nav class=\"pager\" aria-label=\"{}\">", esc(aria_label));
     if page_num > 1 {
-        let href = build_list_href(slug, Some(page_num - 1), active_tier, active_q);
+        let href = build_list_href(slug, Some(page_num - 1), active_tier, active_kind, active_q);
         let _ = write!(
             out,
             "<a href=\"{}\"><span aria-hidden=\"true\">&larr;</span> Prev</a>",
@@ -1233,14 +1295,14 @@ fn render_list_pager(
         if p == page_num {
             let _ = write!(out, "<span class=\"current\" aria-current=\"page\">{p}</span>");
         } else if p == 1 || p == total_pages || p.abs_diff(page_num) <= 2 {
-            let href = build_list_href(slug, Some(p), active_tier, active_q);
+            let href = build_list_href(slug, Some(p), active_tier, active_kind, active_q);
             let _ = write!(out, "<a href=\"{}\">{p}</a>", esc(&href));
         } else if p.abs_diff(page_num) == 3 {
             out.push_str("<span aria-hidden=\"true\">&hellip;</span>");
         }
     }
     if page_num < total_pages {
-        let href = build_list_href(slug, Some(page_num + 1), active_tier, active_q);
+        let href = build_list_href(slug, Some(page_num + 1), active_tier, active_kind, active_q);
         let _ = write!(
             out,
             "<a href=\"{}\">Next <span aria-hidden=\"true\">&rarr;</span></a>",
@@ -1251,16 +1313,13 @@ fn render_list_pager(
 }
 
 async fn infer_dominant_list_kind(service: &RocheService, slug: &str) -> EntryKind {
-    let Ok(view) = service.catalog().get_ranked_collection(slug, false).await else {
-        return EntryKind::Movie;
-    };
-    let mut counts: HashMap<EntryKind, usize> = HashMap::new();
-    for row in &view.rows {
-        if row.entry.kind != EntryKind::Collection {
-            *counts.entry(row.entry.kind).or_insert(0) += 1;
-        }
-    }
-    counts.into_iter().max_by_key(|(_, c)| *c).map_or(EntryKind::Movie, |(k, _)| k)
+    service
+        .catalog()
+        .infer_dominant_kind_in_collection(slug)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(EntryKind::Movie)
 }
 
 pub(in crate::web) async fn post_list_add_entry(

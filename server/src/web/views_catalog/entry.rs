@@ -959,7 +959,7 @@ fn render_rail_rankings_card(
 
 fn render_rail_diary_card(out: &mut String, detail: &EntryDetailView, csrf: &str) {
     let is_music = matches!(detail.entry.kind, EntryKind::Album | EntryKind::Song);
-    let count = detail.log_history.len();
+    let count = detail.total_log_count.max(detail.log_history.len());
     let count_badge = if count == 0 {
         String::new()
     } else if is_music {
@@ -986,6 +986,13 @@ fn render_rail_diary_card(out: &mut String, detail: &EntryDetailView, csrf: &str
             render_entry_diary_row(out, log, &return_to, csrf);
         }
         out.push_str("</ul>\n");
+        if count > detail.log_history.len() {
+            let _ = writeln!(
+                out,
+                "<p class=\"rail-note\">Showing latest {} of {count}.</p>",
+                detail.log_history.len(),
+            );
+        }
     }
 
     let subhead = if is_music { "Log a play" } else { "Log activity" };
@@ -1189,7 +1196,7 @@ fn render_rail_merge_card(
                 };
                 let year =
                     target.entry.release_year.map_or_else(String::new, |y| format!(" ({y})"));
-                let log_count = target.log_history.len();
+                let log_count = target.total_log_count.max(target.log_history.len());
                 let log_word = if log_count == 1 { "diary log" } else { "diary logs" };
                 let _ = write!(
                     out,

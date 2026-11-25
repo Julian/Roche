@@ -70,8 +70,8 @@ pub(in crate::web) async fn board_reader_get(
         let detail_tags = service.items().get(&linked.id).await.ok().map_or_default(|d| d.tags);
         let (slug, rankable) = match service.catalog().get_entry_detail(&linked.id).await {
             Ok(Some(ed)) => {
-                let consumed =
-                    ed.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed);
+                let consumed = ed.has_consumed_log
+                    || ed.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed);
                 let slug = if consumed {
                     service.catalog().rank_target_after_consumption(&ed.entry).await.ok().flatten()
                 } else {

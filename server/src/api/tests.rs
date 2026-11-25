@@ -2942,3 +2942,71 @@ ET\n";
         .unwrap();
     assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn test_catalog_list_api_unclamped_pagination_and_strict_tier_validation() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let token = TokenManager::new(db.auth()).create("test-suite", 32).await.unwrap();
+    let auth = format!("Bearer {token}");
+    let app = ApiRoutes::router_with_fetcher(&db, FakeFeedFetcher);
+
+    let svc = crate::service::CatalogService::new(&db);
+    let b1 = svc
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(crate::db::EntryKind::Book),
+            title: "Dune".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    svc.log_consumption(&b1.id, crate::db::ConsumptionStatus::Consumed, None, None).await.unwrap();
+
+    // Out-of-range page returns empty rows rather than clamping to page 1.
+    let page99 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/catalog/lists/books?page=99&limit=10")
+                .header(header::AUTHORIZATION, &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page99.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(page99.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["rows"].as_array().unwrap().len(), 0);
+
+    // Invalid multi-char or non-tier values return 400 Bad Request.
+    for bad_tier in ["songs", "Z", "SA"] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/v1/catalog/lists/books?tier={bad_tier}"))
+                    .header(header::AUTHORIZATION, &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "expected 400 for tier={bad_tier}");
+    }
+
+    // Container kind in diary API returns 400 Bad Request.
+    let bad_diary = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/catalog/diary?kind=artist")
+                .header(header::AUTHORIZATION, &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_diary.status(), StatusCode::BAD_REQUEST);
+}

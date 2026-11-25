@@ -17,7 +17,7 @@ use super::{
     parse_diary_date_input, parse_optional_year, render_kind_options,
 };
 use crate::{
-    db::{CatalogEntry, CollectionSummary, ConsumptionLogView, UpsertEntryInput},
+    db::{CatalogEntry, CollectionSummary, ConsumptionLogView, DiaryKindFilter, UpsertEntryInput},
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     service::{CatalogService, RankedCollectionView, RocheService},
     web::{
@@ -69,6 +69,7 @@ impl DiaryStats {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(in crate::web) async fn diary_get(
     State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
@@ -80,8 +81,15 @@ pub(in crate::web) async fn diary_get(
         Some("abandoned") => Some(ConsumptionStatus::Abandoned),
         _ => None,
     };
+    let kind_filter = DiaryKindFilter::parse_optional(q.kind.as_deref())
+        .unwrap_or(DiaryKindFilter::DefaultNonSong);
     let catalog = service.catalog();
-    let sql_year_counts = catalog.list_diary_year_counts(status_filter).await.web_err(&session)?;
+    let (sql_year_counts_res, kind_summary_res) = tokio::join!(
+        catalog.list_diary_year_counts_with_kind(status_filter, kind_filter),
+        catalog.list_diary_kind_summary(q.year, status_filter),
+    );
+    let sql_year_counts = sql_year_counts_res.web_err(&session)?;
+    let (non_song_kind_counts, has_songs) = kind_summary_res.web_err(&session)?;
     let total_all_years: usize = sql_year_counts
         .iter()
         .map(|(_, c)| usize::try_from(*c).unwrap_or(0))
@@ -98,7 +106,7 @@ pub(in crate::web) async fn diary_get(
     let offset = (page_num - 1) * DIARY_PAGE_SIZE;
 
     let entries = catalog
-        .list_diary_page(q.year, status_filter, DIARY_PAGE_SIZE, offset)
+        .list_diary_page_with_kind(q.year, status_filter, kind_filter, DIARY_PAGE_SIZE, offset)
         .await
         .web_err(&session)?;
     let stats = DiaryStats::from_sql_years_and_entries(&sql_year_counts, &entries, q.year);
@@ -111,8 +119,12 @@ pub(in crate::web) async fn diary_get(
     );
     let months = group_diary_by_month(&entries);
     let active_status = status_filter.map_or("", ConsumptionStatus::as_str);
-    let current_href =
-        build_diary_href_page(q.year, active_status, (page_num > 1).then_some(page_num));
+    let current_href = build_diary_href_page(
+        q.year,
+        active_status,
+        kind_filter,
+        (page_num > 1).then_some(page_num),
+    );
 
     let mut body = String::with_capacity(12_288);
     body.push_str(
@@ -128,12 +140,20 @@ pub(in crate::web) async fn diary_get(
          </div>",
     );
 
-    render_diary_toolbar(&mut body, q.year, status_filter);
+    render_diary_toolbar(
+        &mut body,
+        q.year,
+        status_filter,
+        kind_filter,
+        &non_song_kind_counts,
+        has_songs,
+    );
     if total_pages > 1 {
         render_diary_pager(
             &mut body,
             q.year,
             active_status,
+            kind_filter,
             page_num,
             total_pages,
             "Diary pagination (top)",
@@ -152,6 +172,7 @@ pub(in crate::web) async fn diary_get(
             &mut body,
             q.year,
             active_status,
+            kind_filter,
             page_num,
             total_pages,
             "Diary pagination (bottom)",
@@ -159,7 +180,7 @@ pub(in crate::web) async fn diary_get(
     }
     body.push_str("</section>\n");
 
-    render_diary_rail(&mut body, &stats, q.year, status_filter, &session.csrf_token);
+    render_diary_rail(&mut body, &stats, q.year, status_filter, kind_filter, &session.csrf_token);
     body.push_str("</div>\n");
 
     Ok(render_page(&PageShell {
@@ -202,17 +223,25 @@ async fn load_diary_entry_tiers(
     service.catalog().load_tiers_for_entries(&consumed).await
 }
 
-fn build_diary_href(year: Option<i32>, status: &str) -> String {
-    build_diary_href_page(year, status, None)
+fn build_diary_href(year: Option<i32>, status: &str, kind_filter: DiaryKindFilter) -> String {
+    build_diary_href_page(year, status, kind_filter, None)
 }
 
-fn build_diary_href_page(year: Option<i32>, status: &str, page: Option<usize>) -> String {
+fn build_diary_href_page(
+    year: Option<i32>,
+    status: &str,
+    kind_filter: DiaryKindFilter,
+    page: Option<usize>,
+) -> String {
     let mut params = Vec::new();
     if let Some(yr) = year {
         params.push(format!("year={yr}"));
     }
     if !status.is_empty() {
         params.push(format!("status={status}"));
+    }
+    if let Some(kind_param) = kind_filter.query_param_value() {
+        params.push(format!("kind={kind_param}"));
     }
     if let Some(p) = page.filter(|&p| p > 1) {
         params.push(format!("page={p}"));
@@ -224,13 +253,14 @@ fn render_diary_pager(
     out: &mut String,
     year: Option<i32>,
     status: &str,
+    kind_filter: DiaryKindFilter,
     page_num: usize,
     total_pages: usize,
     aria_label: &str,
 ) {
     let _ = write!(out, "<nav class=\"pager\" aria-label=\"{}\">", esc(aria_label));
     if page_num > 1 {
-        let href = build_diary_href_page(year, status, Some(page_num - 1));
+        let href = build_diary_href_page(year, status, kind_filter, Some(page_num - 1));
         let _ = write!(
             out,
             "<a href=\"{}\"><span aria-hidden=\"true\">&larr;</span> Prev</a>",
@@ -241,14 +271,14 @@ fn render_diary_pager(
         if p == page_num {
             let _ = write!(out, "<span class=\"current\" aria-current=\"page\">{p}</span>");
         } else if p == 1 || p == total_pages || p.abs_diff(page_num) <= 2 {
-            let href = build_diary_href_page(year, status, Some(p));
+            let href = build_diary_href_page(year, status, kind_filter, Some(p));
             let _ = write!(out, "<a href=\"{}\">{p}</a>", esc(&href));
         } else if p.abs_diff(page_num) == 3 {
             out.push_str("<span aria-hidden=\"true\">&hellip;</span>");
         }
     }
     if page_num < total_pages {
-        let href = build_diary_href_page(year, status, Some(page_num + 1));
+        let href = build_diary_href_page(year, status, kind_filter, Some(page_num + 1));
         let _ = write!(
             out,
             "<a href=\"{}\">Next <span aria-hidden=\"true\">&rarr;</span></a>",
@@ -262,6 +292,9 @@ fn render_diary_toolbar(
     out: &mut String,
     selected_year: Option<i32>,
     status_filter: Option<ConsumptionStatus>,
+    kind_filter: DiaryKindFilter,
+    non_song_kind_counts: &[(EntryKind, usize)],
+    has_songs: bool,
 ) {
     let active_status = status_filter.map_or("", ConsumptionStatus::as_str);
     out.push_str(
@@ -277,7 +310,7 @@ fn render_diary_toolbar(
         } else {
             "class=\"pill\""
         };
-        let href = build_diary_href(selected_year, slug);
+        let href = build_diary_href(selected_year, slug, kind_filter);
         let _ = writeln!(out, "<a {attrs} href=\"{}\">{label}</a>", esc(&href));
     }
     out.push_str(
@@ -285,6 +318,68 @@ fn render_diary_toolbar(
          <input type=\"search\" id=\"roche-diary-search\" class=\"diary-filter-input\" placeholder=\"Filter diary…\" aria-label=\"Filter diary entries\">\n\
        </div>\n",
     );
+
+    let show_kind_bar = has_songs
+        || non_song_kind_counts.len() > 1
+        || kind_filter != DiaryKindFilter::DefaultNonSong;
+    if show_kind_bar {
+        out.push_str(
+            "<div class=\"diary-toolbar\">\n\
+               <div class=\"diary-toolbar-pills\" role=\"group\" aria-label=\"Filter by media type\">\n",
+        );
+        let default_label = if has_songs { "Diary (excl. songs)" } else { "All Types" };
+        let default_attrs = if kind_filter == DiaryKindFilter::DefaultNonSong {
+            "class=\"pill is-active\" aria-current=\"true\""
+        } else {
+            "class=\"pill\""
+        };
+        let default_href =
+            build_diary_href(selected_year, active_status, DiaryKindFilter::DefaultNonSong);
+        let _ =
+            writeln!(out, "<a {default_attrs} href=\"{}\">{default_label}</a>", esc(&default_href));
+
+        for &(kind, cnt) in non_song_kind_counts {
+            let target = DiaryKindFilter::Only(kind);
+            let is_cur = kind_filter == target;
+            let attrs = if is_cur {
+                "class=\"pill is-active\" aria-current=\"true\""
+            } else {
+                "class=\"pill\""
+            };
+            let href = build_diary_href(selected_year, active_status, target);
+            let _ = writeln!(
+                out,
+                "<a {attrs} href=\"{}\">{} ({cnt})</a>",
+                esc(&href),
+                esc(kind.display_label()),
+            );
+        }
+
+        if has_songs || kind_filter == DiaryKindFilter::Only(EntryKind::Song) {
+            let target = DiaryKindFilter::Only(EntryKind::Song);
+            let is_cur = kind_filter == target;
+            let attrs = if is_cur {
+                "class=\"pill is-active\" aria-current=\"true\""
+            } else {
+                "class=\"pill\""
+            };
+            let href = build_diary_href(selected_year, active_status, target);
+            let _ = writeln!(out, "<a {attrs} href=\"{}\">Songs</a>", esc(&href));
+        }
+
+        if has_songs || kind_filter == DiaryKindFilter::All {
+            let target = DiaryKindFilter::All;
+            let is_cur = kind_filter == target;
+            let attrs = if is_cur {
+                "class=\"pill is-active\" aria-current=\"true\""
+            } else {
+                "class=\"pill\""
+            };
+            let href = build_diary_href(selected_year, active_status, target);
+            let _ = writeln!(out, "<a {attrs} href=\"{}\">All (incl. songs)</a>", esc(&href));
+        }
+        out.push_str("</div>\n</div>\n");
+    }
 }
 
 fn render_diary_months(
@@ -435,6 +530,7 @@ fn render_diary_rail(
     stats: &DiaryStats,
     selected_year: Option<i32>,
     status_filter: Option<ConsumptionStatus>,
+    kind_filter: DiaryKindFilter,
     csrf: &str,
 ) {
     let active_status = status_filter.map_or("", ConsumptionStatus::as_str);
@@ -472,7 +568,7 @@ fn render_diary_rail(
                <ul class=\"year-links\">\n",
         );
         let all_cls = if selected_year.is_none() { " class=\"is-active\"" } else { "" };
-        let all_href = build_diary_href(None, active_status);
+        let all_href = build_diary_href(None, active_status, kind_filter);
         let _ = writeln!(
             out,
             "<li><a{all_cls} href=\"{}\"><span>All Years</span><span class=\"list-count-badge\">{}</span></a></li>",
@@ -481,7 +577,7 @@ fn render_diary_rail(
         );
         for (&yr, &cnt) in stats.year_counts.iter().rev() {
             let cls = if selected_year == Some(yr) { " class=\"is-active\"" } else { "" };
-            let href = build_diary_href(Some(yr), active_status);
+            let href = build_diary_href(Some(yr), active_status, kind_filter);
             let _ = writeln!(
                 out,
                 "<li><a{cls} href=\"{}\"><span>{yr}</span><span class=\"list-count-badge\">{cnt}</span></a></li>",

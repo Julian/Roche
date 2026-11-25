@@ -20,10 +20,10 @@ pub use models::{
     BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
     BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult, CatalogEntry,
     CatalogError, CatalogExportSnapshot, CatalogResult, CollectionGeneratorState,
-    CollectionRankingInputs, CollectionSummary, ComparisonRecord, ConsumptionLogRow,
-    ConsumptionLogView, DynamicCollectionRule, EntryDetailView, EntryIdentifier,
-    ExportCatalogEntry, ExportCollectionEntry, ExportCollectionGenerator, ExportComparison,
-    ExportConsumptionLog, UpdateEntryInput, UpsertEntryInput, WantSearchMatch,
+    CollectionPageMeta, CollectionRankingInputs, CollectionSummary, ComparisonRecord,
+    ConsumptionLogRow, ConsumptionLogView, DiaryKindFilter, DynamicCollectionRule, EntryDetailView,
+    EntryIdentifier, ExportCatalogEntry, ExportCollectionEntry, ExportCollectionGenerator,
+    ExportComparison, ExportConsumptionLog, UpdateEntryInput, UpsertEntryInput, WantSearchMatch,
 };
 pub use roche_core::{
     domain::{matches_dynamic_collection_rule, parse_dynamic_collection_rule},

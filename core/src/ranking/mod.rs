@@ -360,6 +360,110 @@ pub fn select_cluster_prioritized<R: Rng + ?Sized, S: BuildHasher>(
     SelectedCluster { ordered_ids, priority_ids }
 }
 
+/// Quantile bucket result separating compared items from uncompared items (which all share `mean = 0.0`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuantilesWithUncompared {
+    pub compared: HashMap<String, usize>,
+    pub uncompared: Option<usize>,
+}
+
+enum WeightedQuantileRun<'a> {
+    Compared(&'a str, f64),
+    Uncompared(usize),
+}
+
+impl WeightedQuantileRun<'_> {
+    const fn mean(&self) -> f64 {
+        match *self {
+            Self::Compared(_, m) => m,
+            Self::Uncompared(_) => 0.0,
+        }
+    }
+
+    const fn weight(&self) -> usize {
+        match *self {
+            Self::Compared(_, _) => 1,
+            Self::Uncompared(w) => w,
+        }
+    }
+}
+
+/// Maps posterior means into `n_quantiles` monotonic buckets (`0..n_quantiles - 1`) without
+/// materializing `uncompared_count` zero-mean entries, producing bit-for-bit identical buckets to
+/// [`rescale_to_quantiles`].
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn rescale_to_quantiles_with_uncompared<S: BuildHasher>(
+    compared_scores: &HashMap<String, Score, S>,
+    uncompared_count: usize,
+    n_quantiles: usize,
+) -> QuantilesWithUncompared {
+    let total = compared_scores.len().saturating_add(uncompared_count);
+    if total == 0 || n_quantiles == 0 {
+        return QuantilesWithUncompared::default();
+    }
+    if total == 1 {
+        let top = n_quantiles - 1;
+        return compared_scores.keys().next().map_or_else(
+            || QuantilesWithUncompared { compared: HashMap::new(), uncompared: Some(top) },
+            |only_id| {
+                let mut compared = HashMap::with_capacity(1);
+                compared.insert(only_id.clone(), top);
+                QuantilesWithUncompared { compared, uncompared: None }
+            },
+        );
+    }
+
+    let mut sorted: Vec<(&str, f64)> =
+        compared_scores.iter().map(|(id, sc)| (id.as_str(), sc.mean)).collect();
+    sorted.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+
+    let mut runs: Vec<WeightedQuantileRun<'_>> =
+        Vec::with_capacity(sorted.len() + usize::from(uncompared_count > 0));
+    let mut inserted_uncompared = uncompared_count == 0;
+    for (id, mean) in sorted {
+        if !inserted_uncompared && mean.total_cmp(&0.0) != Ordering::Less {
+            runs.push(WeightedQuantileRun::Uncompared(uncompared_count));
+            inserted_uncompared = true;
+        }
+        runs.push(WeightedQuantileRun::Compared(id, mean));
+    }
+    if !inserted_uncompared {
+        runs.push(WeightedQuantileRun::Uncompared(uncompared_count));
+    }
+
+    let mut compared_buckets = HashMap::with_capacity(compared_scores.len());
+    let mut uncompared_bucket = None;
+    let mut idx = 0usize;
+    let mut offset = 0usize;
+    while idx < runs.len() {
+        let base_mean = runs[idx].mean();
+        let mut end = idx + 1;
+        let mut group_weight = runs[idx].weight();
+        while end < runs.len() && (runs[end].mean() - base_mean).abs() <= MEAN_TIE_EPSILON {
+            group_weight += runs[end].weight();
+            end += 1;
+        }
+        let midpoint = (offset + offset + group_weight - 1) as f64 / 2.0;
+        let raw_bucket = (midpoint / (total - 1) as f64 * n_quantiles as f64).floor() as usize;
+        let bucket = raw_bucket.min(n_quantiles - 1);
+        for run in &runs[idx..end] {
+            match *run {
+                WeightedQuantileRun::Compared(id, _) => {
+                    compared_buckets.insert(id.to_owned(), bucket);
+                }
+                WeightedQuantileRun::Uncompared(_) => {
+                    uncompared_bucket = Some(bucket);
+                }
+            }
+        }
+        offset += group_weight;
+        idx = end;
+    }
+
+    QuantilesWithUncompared { compared: compared_buckets, uncompared: uncompared_bucket }
+}
+
 /// Maps posterior means into `n_quantiles` monotonic buckets (`0..n_quantiles - 1`).
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1063,5 +1167,55 @@ mod tests {
             seen_seeds.len() >= 3,
             "expected random seed pool >= MAX_K_DEFAULT even at max_k=2, saw {seen_seeds:?}"
         );
+    }
+
+    #[test]
+    fn test_rescale_to_quantiles_with_uncompared_matches_full_rescale_bit_for_bit() {
+        let cases: Vec<(Vec<(&str, f64)>, usize)> = vec![
+            (vec![], 0),
+            (vec![], 1),
+            (vec![], 50),
+            (vec![("a", 0.5)], 0),
+            (vec![("a", 0.5)], 10),
+            (vec![("a", -0.5)], 10),
+            (vec![("a", 1.2), ("b", 0.4), ("c", 0.0), ("d", -0.3), ("e", -1.1)], 100),
+            // Tie-chaining right around `0.0` within and outside `MEAN_TIE_EPSILON`.
+            (vec![("neg_near", -MEAN_TIE_EPSILON * 0.5), ("pos_near", MEAN_TIE_EPSILON * 0.6)], 25),
+            (vec![("neg_far", -MEAN_TIE_EPSILON * 2.0), ("pos_near", MEAN_TIE_EPSILON * 0.5)], 25),
+        ];
+        for (compared_list, uncompared_count) in cases {
+            let compared_scores: HashMap<String, Score> = compared_list
+                .iter()
+                .map(|&(id, mean)| (id.to_owned(), Score { mean, variance: 0.5 }))
+                .collect();
+            let mut full_scores = compared_scores.clone();
+            for i in 0..uncompared_count {
+                full_scores.insert(format!("uncompared-{i:04}"), Score::default());
+            }
+            let expected = rescale_to_quantiles(&full_scores, N_QUANTILES);
+            let actual = rescale_to_quantiles_with_uncompared(
+                &compared_scores,
+                uncompared_count,
+                N_QUANTILES,
+            );
+            for id in compared_scores.keys() {
+                assert_eq!(
+                    actual.compared.get(id),
+                    expected.get(id),
+                    "mismatch for compared id {id} with uncompared={uncompared_count}"
+                );
+            }
+            for i in 0..uncompared_count {
+                let uid = format!("uncompared-{i:04}");
+                assert_eq!(
+                    actual.uncompared,
+                    expected.get(&uid).copied(),
+                    "mismatch for uncompared {uid} with uncompared={uncompared_count}"
+                );
+            }
+            if uncompared_count == 0 {
+                assert_eq!(actual.uncompared, None);
+            }
+        }
     }
 }

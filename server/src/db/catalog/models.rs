@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 pub use roche_core::domain::{DynamicCollectionRule, EntryIdentifier};
 use roche_core::external_links::EXTERNAL_ID_DISPLAY_ORDER;
@@ -313,12 +315,62 @@ pub struct CollectionGeneratorState {
     pub remaining_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiaryKindFilter {
+    /// Default diary view: excludes container kinds and individual `song` plays so large music
+    /// streaming histories do not drown out books, albums, films, and articles.
+    #[default]
+    DefaultNonSong,
+    /// Include all diary-visible kinds, including individual `song` plays.
+    All,
+    /// Restrict strictly to a single [`EntryKind`].
+    Only(EntryKind),
+}
+
+impl DiaryKindFilter {
+    /// Parses a `?kind=` / `--kind` filter value (`""`/`None` -> `DefaultNonSong`,
+    /// `"all"` -> `All`, otherwise [`EntryKind::parse_flexible`]).
+    pub fn parse_optional(raw: Option<&str>) -> CatalogResult<Self> {
+        let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(Self::DefaultNonSong);
+        };
+        if trimmed.eq_ignore_ascii_case("all") {
+            return Ok(Self::All);
+        }
+        let kind = EntryKind::parse_flexible(trimmed)
+            .map_err(|e| CatalogError::InvalidInput(e.to_string()))?;
+        if matches!(
+            kind,
+            EntryKind::Artist | EntryKind::Podcast | EntryKind::Publication | EntryKind::Channel
+        ) {
+            return Err(CatalogError::InvalidInput(format!(
+                "Kind '{}' is a container and does not appear in Diary",
+                kind.as_str()
+            )));
+        }
+        Ok(Self::Only(kind))
+    }
+
+    #[must_use]
+    pub const fn query_param_value(self) -> Option<&'static str> {
+        match self {
+            Self::DefaultNonSong => None,
+            Self::All => Some("all"),
+            Self::Only(kind) => Some(kind.as_str()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryDetailView {
     pub entry: CatalogEntry,
     pub children: Vec<CatalogEntry>,
     pub parents: Vec<CatalogEntry>,
     pub log_history: Vec<ConsumptionLogRow>,
+    #[serde(default)]
+    pub total_log_count: usize,
+    #[serde(default)]
+    pub has_consumed_log: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -476,6 +528,18 @@ pub struct CollectionRankingInputs {
     pub collection: CollectionSummary,
     pub is_priority_scope: bool,
     pub members: Vec<CatalogEntry>,
+}
+
+/// Lightweight paginated metadata snapshot for a collection: full counts, per-kind counts, and
+/// hydrated records ONLY for compared members (never hydrating thousands of uncompared rows).
+#[derive(Debug, Clone)]
+pub struct CollectionPageMeta {
+    pub collection: CollectionSummary,
+    pub is_priority_scope: bool,
+    pub total_count: usize,
+    pub kind_counts: Vec<(EntryKind, usize)>,
+    pub compared_members: Vec<CatalogEntry>,
+    pub present_member_ids: HashSet<String>,
 }
 
 /// Exported catalog entry record (alias for [`CatalogEntry`]).

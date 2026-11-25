@@ -529,7 +529,24 @@ impl CatalogRepo<'_> {
         status: Option<ConsumptionStatus>,
         limit: usize,
     ) -> CatalogResult<Vec<ConsumptionLogView>> {
-        self.list_diary_page(year, status, limit, 0).await
+        self.list_diary_page_with_kind(
+            year,
+            status,
+            super::models::DiaryKindFilter::DefaultNonSong,
+            limit,
+            0,
+        )
+        .await
+    }
+
+    pub async fn list_diary_with_kind(
+        &self,
+        year: Option<i32>,
+        status: Option<ConsumptionStatus>,
+        kind_filter: super::models::DiaryKindFilter,
+        limit: usize,
+    ) -> CatalogResult<Vec<ConsumptionLogView>> {
+        self.list_diary_page_with_kind(year, status, kind_filter, limit, 0).await
     }
 
     pub async fn list_diary_page(
@@ -539,28 +556,70 @@ impl CatalogRepo<'_> {
         limit: usize,
         offset: usize,
     ) -> CatalogResult<Vec<ConsumptionLogView>> {
+        self.list_diary_page_with_kind(
+            year,
+            status,
+            super::models::DiaryKindFilter::DefaultNonSong,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn list_diary_page_with_kind(
+        &self,
+        year: Option<i32>,
+        status: Option<ConsumptionStatus>,
+        kind_filter: super::models::DiaryKindFilter,
+        limit: usize,
+        offset: usize,
+    ) -> CatalogResult<Vec<ConsumptionLogView>> {
+        use super::models::DiaryKindFilter;
+
         let cap = i64::try_from(limit.clamp(1, 2_000)).unwrap_or(200);
         let skip = i64::try_from(offset).unwrap_or(0).max(0);
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT cl.id, cl.entry_id, cl.ts, cl.status, cl.notes, cl.created_at
-             FROM consumption_log cl
-             JOIN entries e ON e.id = cl.entry_id
-             WHERE e.merged_into_id IS NULL
-               AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')",
-        );
+        validate_diary_year(year)?;
+
+        // Drive from `entries CROSS JOIN consumption_log` for sparse non-song views (so 200k
+        // song plays are never scanned to find books/albums/films), and from
+        // `consumption_log CROSS JOIN entries` for `All` / `Only(Song)` (walking `ts_iso`
+        // backwards in O(limit) with zero temp B-tree).
+        let drive_from_entries = match kind_filter {
+            DiaryKindFilter::DefaultNonSong => true,
+            DiaryKindFilter::Only(k) => k != EntryKind::Song,
+            DiaryKindFilter::All => false,
+        };
+
+        let mut qb = if drive_from_entries {
+            QueryBuilder::<Sqlite>::new(
+                "SELECT cl.id, cl.entry_id, cl.ts, cl.status, cl.notes, cl.created_at
+                 FROM entries e
+                 CROSS JOIN consumption_log cl ON cl.entry_id = e.id
+                 WHERE e.merged_into_id IS NULL",
+            )
+        } else {
+            QueryBuilder::<Sqlite>::new(
+                "SELECT cl.id, cl.entry_id, cl.ts, cl.status, cl.notes, cl.created_at
+                 FROM consumption_log cl
+                 CROSS JOIN entries e ON e.id = cl.entry_id
+                 WHERE e.merged_into_id IS NULL",
+            )
+        };
+        append_diary_kind_filter_sql(&mut qb, kind_filter);
         if let Some(y) = year {
-            if !(1..=9998).contains(&y) {
-                return Err(CatalogError::InvalidInput(
-                    "Year filter must be between 1 and 9998".to_owned(),
-                ));
-            }
             qb.push(" AND strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) >= ")
                 .push_bind(format!("{y:04}-01-01T00:00:00.000Z"))
                 .push(" AND strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) < ")
                 .push_bind(format!("{:04}-01-01T00:00:00.000Z", y + 1));
         }
         if let Some(st) = status {
-            qb.push(" AND cl.status = ").push_bind(st);
+            // When driving from `entries` with a year range, prevent SQLite (without ANALYZE)
+            // from choosing `idx_consumption_log_status_ts_iso` in the inner loop.
+            if drive_from_entries && year.is_some() {
+                qb.push(" AND +cl.status = ").push_bind(st);
+            } else {
+                qb.push(" AND cl.status = ").push_bind(st);
+            }
         }
         qb.push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) DESC, cl.id DESC LIMIT ")
             .push_bind(cap)
@@ -616,17 +675,28 @@ impl CatalogRepo<'_> {
         let notes_pattern = format!("%{}%", crate::db::escape_like_literal(&bounded_q));
 
         let mut tx = crate::db::begin_read(self.pool).await?;
+        // Split FTS and notes branches with UNION so FTS drives its branch and the partial index
+        // `idx_consumption_log_notes_id` drives the notes branch without scanning 200k NULL notes.
         let log_rows: Vec<ConsumptionLogRow> = sqlx::query_as(
-            "SELECT cl.id, cl.entry_id, cl.ts, cl.status, cl.notes, cl.created_at
-             FROM consumption_log cl
-             JOIN entries e ON e.id = cl.entry_id
-             WHERE e.merged_into_id IS NULL
-               AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')
-               AND (
-                   e.rowid IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?)
-                   OR COALESCE(cl.notes, '') LIKE ? ESCAPE '\\'
-               )
-             ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) DESC, cl.id DESC
+            "SELECT id, entry_id, ts, status, notes, created_at
+             FROM (
+                 SELECT cl.id, cl.entry_id, cl.ts, cl.status, cl.notes, cl.created_at
+                 FROM entries_fts f
+                 JOIN entries e ON e.rowid = f.rowid
+                 CROSS JOIN consumption_log cl ON cl.entry_id = e.id
+                 WHERE entries_fts MATCH ?
+                   AND e.merged_into_id IS NULL
+                   AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')
+                 UNION
+                 SELECT cl.id, cl.entry_id, cl.ts, cl.status, cl.notes, cl.created_at
+                 FROM consumption_log cl
+                 JOIN entries e ON e.id = cl.entry_id
+                 WHERE cl.notes IS NOT NULL
+                   AND cl.notes LIKE ? ESCAPE '\\'
+                   AND e.merged_into_id IS NULL
+                   AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')
+             )
+             ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) DESC, id DESC
              LIMIT ?",
         )
         .bind(&fts_query)
@@ -660,26 +730,130 @@ impl CatalogRepo<'_> {
         Ok(out)
     }
 
-    /// Returns exact `(year, count)` totals across the full diary history (excluding parent
-    /// container kinds `artist`/`podcast`/`publication`/`channel`), optionally filtered by status.
+    /// Returns exact `(year, count)` totals across the default non-song diary history.
     pub async fn list_diary_year_counts(
         &self,
         status: Option<ConsumptionStatus>,
     ) -> CatalogResult<Vec<(i32, i64)>> {
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT CAST(strftime('%Y', cl.ts) AS INTEGER) AS yr, COUNT(*) AS cnt
-             FROM consumption_log cl
-             JOIN entries e ON e.id = cl.entry_id
-             WHERE e.merged_into_id IS NULL
-               AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')
-               AND strftime('%Y', cl.ts) IS NOT NULL",
-        );
+        self.list_diary_year_counts_with_kind(
+            status,
+            super::models::DiaryKindFilter::DefaultNonSong,
+        )
+        .await
+    }
+
+    /// Returns exact `(year, count)` totals for the specified status and kind filter.
+    pub async fn list_diary_year_counts_with_kind(
+        &self,
+        status: Option<ConsumptionStatus>,
+        kind_filter: super::models::DiaryKindFilter,
+    ) -> CatalogResult<Vec<(i32, i64)>> {
+        use super::models::DiaryKindFilter;
+
+        let drive_from_entries = match kind_filter {
+            DiaryKindFilter::DefaultNonSong => true,
+            DiaryKindFilter::Only(k) => k != EntryKind::Song,
+            DiaryKindFilter::All => false,
+        };
+        let mut qb = if drive_from_entries {
+            QueryBuilder::<Sqlite>::new(
+                "SELECT CAST(strftime('%Y', cl.ts) AS INTEGER) AS yr, COUNT(*) AS cnt
+                 FROM entries e
+                 CROSS JOIN consumption_log cl ON cl.entry_id = e.id
+                 WHERE e.merged_into_id IS NULL
+                   AND strftime('%Y', cl.ts) IS NOT NULL",
+            )
+        } else {
+            QueryBuilder::<Sqlite>::new(
+                "SELECT CAST(strftime('%Y', cl.ts) AS INTEGER) AS yr, COUNT(*) AS cnt
+                 FROM consumption_log cl
+                 CROSS JOIN entries e ON e.id = cl.entry_id
+                 WHERE e.merged_into_id IS NULL
+                   AND strftime('%Y', cl.ts) IS NOT NULL",
+            )
+        };
+        append_diary_kind_filter_sql(&mut qb, kind_filter);
         if let Some(st) = status {
-            qb.push(" AND cl.status = ").push_bind(st);
+            // Almost all rows are `consumed`; sequential table scan avoids 200k random index-to-
+            // table bounces through `idx_consumption_log_status_ts_iso`, while sparse `started`/
+            // `abandoned` filters still use the index.
+            if !drive_from_entries && st == ConsumptionStatus::Consumed {
+                qb.push(" AND +cl.status = ").push_bind(st);
+            } else {
+                qb.push(" AND cl.status = ").push_bind(st);
+            }
         }
         qb.push(" GROUP BY yr ORDER BY yr DESC");
         let rows: Vec<(i32, i64)> = qb.build_query_as().fetch_all(self.pool).await?;
         Ok(rows)
+    }
+
+    /// Fast count of diary rows per non-song kind plus whether any `song` logs exist, without
+    /// scanning hundreds of thousands of `song` rows on default `/diary` loads.
+    pub async fn list_diary_kind_summary(
+        &self,
+        year: Option<i32>,
+        status: Option<ConsumptionStatus>,
+    ) -> CatalogResult<(Vec<(EntryKind, usize)>, bool)> {
+        validate_diary_year(year)?;
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT e.kind, COUNT(*) AS cnt
+             FROM entries e
+             CROSS JOIN consumption_log cl ON cl.entry_id = e.id
+             WHERE e.merged_into_id IS NULL",
+        );
+        append_diary_kind_filter_sql(&mut qb, super::models::DiaryKindFilter::DefaultNonSong);
+        if let Some(y) = year {
+            qb.push(" AND strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) >= ")
+                .push_bind(format!("{y:04}-01-01T00:00:00.000Z"))
+                .push(" AND strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) < ")
+                .push_bind(format!("{:04}-01-01T00:00:00.000Z", y + 1));
+        }
+        if let Some(st) = status {
+            if year.is_some() {
+                qb.push(" AND +cl.status = ").push_bind(st);
+            } else {
+                qb.push(" AND cl.status = ").push_bind(st);
+            }
+        }
+        qb.push(" GROUP BY e.kind ORDER BY cnt DESC, e.kind ASC");
+        let rows: Vec<(EntryKind, i64)> = qb.build_query_as().fetch_all(self.pool).await?;
+        let non_song_counts: Vec<(EntryKind, usize)> = rows
+            .into_iter()
+            .filter_map(|(k, c)| usize::try_from(c).ok().filter(|&n| n > 0).map(|n| (k, n)))
+            .collect();
+
+        // Check in O(1) via `EXISTS` whether at least one matching `song` log exists.
+        // Without year/status filters, drive from `entries` so 0-song catalogs never scan logs.
+        let mut sqb = if year.is_none() && status.is_none() {
+            QueryBuilder::<Sqlite>::new(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM entries e
+                    CROSS JOIN consumption_log cl ON cl.entry_id = e.id
+                    WHERE e.merged_into_id IS NULL AND e.kind = 'song'",
+            )
+        } else {
+            QueryBuilder::<Sqlite>::new(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM consumption_log cl
+                    CROSS JOIN entries e ON e.id = cl.entry_id
+                    WHERE e.merged_into_id IS NULL AND e.kind = 'song'",
+            )
+        };
+        if let Some(y) = year {
+            sqb.push(" AND strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) >= ")
+                .push_bind(format!("{y:04}-01-01T00:00:00.000Z"))
+                .push(" AND strftime('%Y-%m-%dT%H:%M:%fZ', cl.ts) < ")
+                .push_bind(format!("{:04}-01-01T00:00:00.000Z", y + 1));
+        }
+        if let Some(st) = status {
+            sqb.push(" AND cl.status = ").push_bind(st);
+        }
+        sqb.push(")");
+        let has_songs: i64 = sqb.build_query_scalar().fetch_one(self.pool).await?;
+        Ok((non_song_counts, has_songs != 0))
     }
 
     /// Updates an existing diary log's status, notes, and/or timestamp in a single transaction,
@@ -798,5 +972,40 @@ impl CatalogRepo<'_> {
             .await?;
         }
         Ok(log_ids.len())
+    }
+}
+
+fn validate_diary_year(year: Option<i32>) -> CatalogResult<()> {
+    if let Some(y) = year
+        && !(1..=9998).contains(&y)
+    {
+        return Err(CatalogError::InvalidInput(
+            "Year filter must be between 1 and 9998".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn append_diary_kind_filter_sql(
+    qb: &mut QueryBuilder<Sqlite>,
+    kind_filter: super::models::DiaryKindFilter,
+) {
+    use super::models::DiaryKindFilter;
+
+    match kind_filter {
+        DiaryKindFilter::DefaultNonSong => {
+            // Positive `IN (...)` list enables SQLite to seek `idx_entries_kind_lower_title_id`
+            // directly when driving from `entries CROSS JOIN consumption_log`.
+            qb.push(
+                " AND e.kind IN ('article', 'paper', 'video', 'podcast_episode', \
+                 'movie', 'book', 'game', 'album', 'tv', 'collection')",
+            );
+        }
+        DiaryKindFilter::All => {
+            qb.push(" AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')");
+        }
+        DiaryKindFilter::Only(kind) => {
+            qb.push(" AND e.kind = ").push_bind(kind);
+        }
     }
 }
