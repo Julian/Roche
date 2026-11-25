@@ -67,6 +67,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.core.isLocalPdfUrl
@@ -442,22 +443,15 @@ private fun ReaderViewScaffold(
             onOpenLightbox = onOpenLightbox,
         )
     Column(modifier = Modifier.fillMaxSize().background(colors.background)) {
-        ReaderTopToolbar(
+        ReaderHeaderChrome(
             entry = entry,
             backLabel = backLabel,
-            showTypographyDrawer = showTypographyDrawer,
-            onToggleTypography = onToggleTypography,
-            onAction = onAction,
-        )
-        ReaderScrollProgressBar(listState = listState, fallbackProgress = entry.readProgress)
-        ReaderTypographySection(
-            visible = showTypographyDrawer,
-            isPdf = content.metrics.hasPdfPages,
-            onDismiss = onDismissTypography,
-            parsedState = content.parsedState,
-            sectionBlockOffset = content.metrics.sectionBlockOffset,
             settings = settings,
+            content = content,
+            showTypographyDrawer = showTypographyDrawer,
             listState = listState,
+            onToggleTypography = onToggleTypography,
+            onDismissTypography = onDismissTypography,
             onAction = onAction,
         )
         ReaderArticleBody(
@@ -484,6 +478,41 @@ private fun ReaderViewScaffold(
                 },
             )
         }
+    }
+}
+
+@Composable
+@Suppress("LongParameterList")
+private fun ReaderHeaderChrome(
+    entry: InboxEntry,
+    backLabel: String,
+    settings: Settings,
+    content: ReaderContentBundle,
+    showTypographyDrawer: Boolean,
+    listState: LazyListState,
+    onToggleTypography: () -> Unit,
+    onDismissTypography: () -> Unit,
+    onAction: (MainAction) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth().zIndex(1f)) {
+        ReaderTopToolbar(
+            entry = entry,
+            backLabel = backLabel,
+            showTypographyDrawer = showTypographyDrawer,
+            onToggleTypography = onToggleTypography,
+            onAction = onAction,
+        )
+        ReaderScrollProgressBar(listState = listState, fallbackProgress = entry.readProgress)
+        ReaderTypographySection(
+            visible = showTypographyDrawer,
+            isPdf = content.metrics.hasPdfPages,
+            onDismiss = onDismissTypography,
+            parsedState = content.parsedState,
+            sectionBlockOffset = content.metrics.sectionBlockOffset,
+            settings = settings,
+            listState = listState,
+            onAction = onAction,
+        )
     }
 }
 

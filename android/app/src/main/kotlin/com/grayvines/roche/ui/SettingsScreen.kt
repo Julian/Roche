@@ -46,6 +46,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
@@ -149,24 +150,27 @@ internal fun SettingsHubPage(
     val colors = LocalRocheColors.current
     val showBackToHome = state.isUnpinnedDestination(AppTab.SETTINGS)
     Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(
-            title = "Settings",
-            navigationAction =
-                if (showBackToHome) {
-                    {
-                        UnpinnedTabBackButton(
-                            onBack = { onAction(MainAction.SelectTab(AppTab.HOME)) }
-                        )
-                    }
-                } else {
-                    null
-                },
-        )
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
+        Column(modifier = Modifier.fillMaxWidth().zIndex(1f)) {
+            RocheTopHeader(
+                title = "Settings",
+                navigationAction =
+                    if (showBackToHome) {
+                        {
+                            UnpinnedTabBackButton(
+                                onBack = { onAction(MainAction.SelectTab(AppTab.HOME)) }
+                            )
+                        }
+                    } else {
+                        null
+                    },
+            )
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+        }
 
         Column(
             modifier =
-                Modifier.fillMaxSize()
+                Modifier.fillMaxWidth()
+                    .weight(1f)
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 16.dp, vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp),
@@ -467,41 +471,43 @@ internal fun SettingsSubPageHeader(
     content: (@Composable () -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
-    Row(
-        modifier =
-            Modifier.fillMaxWidth()
-                .statusBarsPadding()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
-            contentAlignment = Alignment.Center,
+    Column(modifier = Modifier.fillMaxWidth().zIndex(1f)) {
+        Row(
             modifier =
-                Modifier.minimumInteractiveComponentSize()
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable(onClick = onBack)
-                    .semantics { role = Role.Button }
-                    .padding(horizontal = 4.dp, vertical = 4.dp)
-                    .testTag("settings_subpage_back_btn"),
+                Modifier.fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(text = "← Settings", color = colors.accentBlue, fontSize = 13.sp)
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier =
+                    Modifier.minimumInteractiveComponentSize()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable(onClick = onBack)
+                        .semantics { role = Role.Button }
+                        .padding(horizontal = 4.dp, vertical = 4.dp)
+                        .testTag("settings_subpage_back_btn"),
+            ) {
+                Text(text = "← Settings", color = colors.accentBlue, fontSize = 13.sp)
+            }
+            Text(
+                text = title,
+                color = colors.textPrimary,
+                fontFamily = currentHeadlineFontFamily(),
+                fontSize = 17.5.sp,
+                fontWeight = FontWeight.Normal,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (content != null) {
+                content()
+            }
         }
-        Text(
-            text = title,
-            color = colors.textPrimary,
-            fontFamily = currentHeadlineFontFamily(),
-            fontSize = 17.5.sp,
-            fontWeight = FontWeight.Normal,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
-        if (content != null) {
-            content()
-        }
+        HorizontalDivider(color = colors.border, thickness = 1.dp)
     }
-    HorizontalDivider(color = colors.border, thickness = 1.dp)
 }
 
 @Composable

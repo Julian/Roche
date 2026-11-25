@@ -59,6 +59,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.data.SearchScopeFilter
 import com.grayvines.roche.data.catalog.CatalogListSummary
@@ -223,20 +224,22 @@ fun SearchOverlay(
                 .statusBarsPadding()
                 .testTag("search_overlay")
     ) {
-        SearchIntegratedTopBar(
-            query = state.searchQuery,
-            totalEntryCount = state.allEntries.size,
-            canEditQuery = isSearchActive,
-            focusRequester = focusRequester,
-            onAction = onAction,
-        )
-        SearchScopeFilterStrip(
-            selectedScope = scopeFilter,
-            catalogMatchCount = computed.catalogTotalCount,
-            scopeCounts = computed.scopeCounts,
-            onSelectScope = { scopeFilter = it },
-        )
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
+        Column(modifier = Modifier.fillMaxWidth().zIndex(1f)) {
+            SearchIntegratedTopBar(
+                query = state.searchQuery,
+                totalEntryCount = state.allEntries.size,
+                canEditQuery = isSearchActive,
+                focusRequester = focusRequester,
+                onAction = onAction,
+            )
+            SearchScopeFilterStrip(
+                selectedScope = scopeFilter,
+                catalogMatchCount = computed.catalogTotalCount,
+                scopeCounts = computed.scopeCounts,
+                onSelectScope = { scopeFilter = it },
+            )
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+        }
         SearchResultsBody(
             results = computed.visibleResults,
             catalogMatches = computed.shownCatalogMatches,

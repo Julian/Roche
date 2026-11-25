@@ -3,6 +3,7 @@ package com.grayvines.roche.ui.components
 import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -13,10 +14,12 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import kotlinx.coroutines.CancellationException
 
@@ -55,14 +58,20 @@ internal fun RocheRefreshableTabScaffold(
 ) {
     val colors = LocalRocheColors.current
     Column(modifier = modifier.fillMaxSize()) {
-        header()
-        subHeader?.invoke()
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-        drawer?.invoke()
+        // Keep header chrome above scrolled body content in z-order so partially scrolled-off
+        // interactive rows cannot expand their 48dp touch bounds over top-bar buttons in
+        // TalkBack/ATF.
+        Column(modifier = Modifier.fillMaxWidth().zIndex(HEADER_Z_INDEX)) {
+            header()
+            subHeader?.invoke()
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+            drawer?.invoke()
+        }
         PullToRefreshBox(
             isRefreshing = isRefreshing,
             onRefresh = onRefresh,
-            modifier = Modifier.fillMaxSize().testTag(pullToRefreshTestTag),
+            modifier =
+                Modifier.fillMaxWidth().weight(1f).clipToBounds().testTag(pullToRefreshTestTag),
         ) {
             content()
         }
@@ -107,6 +116,7 @@ internal fun Modifier.predictiveBackDrawerGraphics(progress: Float): Modifier {
     }
 }
 
+private const val HEADER_Z_INDEX = 1f
 private const val MIN_PROGRESS = 0f
 private const val FULL_SCALE = 1f
 private const val DRAWER_ORIGIN_CENTER_X = 0.5f

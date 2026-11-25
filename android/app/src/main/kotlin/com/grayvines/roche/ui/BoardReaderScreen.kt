@@ -61,6 +61,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.data.boards.BoardItemView
 import com.grayvines.roche.data.boards.BoardReaderContent
@@ -380,30 +381,32 @@ private fun BoardReaderScaffold(
         modifier =
             Modifier.fillMaxSize().background(colors.background).testTag("board_reader_screen")
     ) {
-        BoardReaderTopToolbar(
-            backLabel = "← ${board?.title ?: "Boards"}",
-            item = item,
-            showTypographyDrawer = showTypographyDrawer,
-            onBack = { onAction(MainAction.CloseBoardReader) },
-            onToggleTypography = onToggleTypography,
-            onToggleQueue = callbacks.onToggleQueue,
-            onToggleStar = callbacks.onToggleStar,
-            onDismiss = callbacks.onDismiss,
-        )
-        ReaderScrollProgressBar(
-            listState = listState,
-            fallbackProgress = if (item?.isFinished == true) 1.0 else 0.0,
-        )
-        ReaderTypographySection(
-            visible = showTypographyDrawer,
-            isPdf = false,
-            onDismiss = onDismissTypography,
-            parsedState = bundle.parsedState,
-            sectionBlockOffset = BOARD_READER_HEADER_ITEMS,
-            settings = settings,
-            listState = listState,
-            onAction = onAction,
-        )
+        Column(modifier = Modifier.fillMaxWidth().zIndex(1f)) {
+            BoardReaderTopToolbar(
+                backLabel = "← ${board?.title ?: "Boards"}",
+                item = item,
+                showTypographyDrawer = showTypographyDrawer,
+                onBack = { onAction(MainAction.CloseBoardReader) },
+                onToggleTypography = onToggleTypography,
+                onToggleQueue = callbacks.onToggleQueue,
+                onToggleStar = callbacks.onToggleStar,
+                onDismiss = callbacks.onDismiss,
+            )
+            ReaderScrollProgressBar(
+                listState = listState,
+                fallbackProgress = if (item?.isFinished == true) 1.0 else 0.0,
+            )
+            ReaderTypographySection(
+                visible = showTypographyDrawer,
+                isPdf = false,
+                onDismiss = onDismissTypography,
+                parsedState = bundle.parsedState,
+                sectionBlockOffset = BOARD_READER_HEADER_ITEMS,
+                settings = settings,
+                listState = listState,
+                onAction = onAction,
+            )
+        }
         BoardReaderBodyList(
             item = item,
             bundle = bundle,
