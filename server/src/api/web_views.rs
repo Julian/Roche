@@ -35,9 +35,8 @@ use crate::{
     ranking::{MAX_FOCUSED_ROUNDS, MAX_K_DEFAULT, MIN_K},
     service::{
         AppError, BoardDismissOutcome, BoardPromoteResult, BoardReaderView, CatalogService,
-        ClusterSelectFilter, EntryListAppearance, InProgressRow, ItemDetail, PrioritizedCluster,
-        RankedCollectionFilter, RankedCollectionView, RankedEntryRow, RocheService,
-        WorkspaceSearchResults,
+        EntryListAppearance, InProgressRow, ItemDetail, RankedCollectionFilter,
+        RankedCollectionView, RankedEntryRow, RocheService, WorkspaceSearchResults,
         enrich::{
             AlbumTrack, DiscographyAlbum, EnrichService, extract_album_tracks,
             extract_artist_discography, normalize_album_match_key,
@@ -1768,8 +1767,15 @@ pub(super) struct RankSessionPayload {
     focus_missing: bool,
 }
 
+fn short_cluster_token_slice(id: &str) -> &str {
+    match id.char_indices().nth(8) {
+        Some((idx, _)) => &id[..idx],
+        None => id,
+    }
+}
+
 fn short_cluster_token(id: &str) -> String {
-    id.chars().take(8).collect()
+    short_cluster_token_slice(id).to_owned()
 }
 
 fn cluster_signature_from_ids(ids: &[&str]) -> String {
@@ -1844,12 +1850,13 @@ fn merge_excluded_tokens(
     list.join(".")
 }
 
-fn is_cluster_covered(cluster: &[CatalogEntry], covered: &[HashSet<String>]) -> bool {
-    if cluster.is_empty() || covered.is_empty() {
+fn is_cluster_ids_covered(cluster_ids: &[String], covered: &[HashSet<String>]) -> bool {
+    if cluster_ids.is_empty() || covered.is_empty() {
         return false;
     }
-    let prefixes: Vec<String> = cluster.iter().map(|c| short_cluster_token(&c.id)).collect();
-    covered.iter().any(|prev| prefixes.iter().all(|p| prev.contains(p)))
+    covered
+        .iter()
+        .any(|prev| cluster_ids.iter().all(|id| prev.contains(short_cluster_token_slice(id))))
 }
 
 pub(super) async fn rank_session_get(
@@ -1870,86 +1877,61 @@ pub(super) async fn rank_session_get(
     let covered_sets = parse_covered_signatures(q.covered.as_deref());
     let excluded_tokens = parse_excluded_tokens(q.excluded.as_deref());
 
-    let ranked_view = service.catalog().get_ranked_collection(&slug, q.want).await?;
-    let focus_row =
-        focus_clean.and_then(|fid| ranked_view.rows.iter().find(|r| r.entry.id == fid)).cloned();
-    let focus_missing = focus_clean.is_some() && focus_row.is_none();
+    let session = service
+        .catalog()
+        .prepare_rank_session(
+            &slug,
+            q.want,
+            focus_clean,
+            q.done,
+            q.random == Some(1),
+            effective_max_rounds,
+            round,
+            skip_count,
+            effective_k,
+            &excluded_tokens,
+            short_cluster_token_slice,
+            |cand_ids| is_cluster_ids_covered(cand_ids, &covered_sets),
+        )
+        .await?;
 
-    let selected: PrioritizedCluster = if q.done
-        || focus_missing
-        || (focus_row.is_some() && round >= effective_max_rounds)
-    {
-        PrioritizedCluster::default()
-    } else {
-        let focus_ids: Vec<String> = if q.random == Some(1) || focus_row.is_none() {
-            Vec::new()
-        } else {
-            focus_clean.into_iter().map(ToOwned::to_owned).collect()
-        };
-        let excluded_ids: Vec<String> = if excluded_tokens.is_empty() {
-            Vec::new()
-        } else {
-            ranked_view
-                .rows
-                .iter()
-                .filter(|r| excluded_tokens.contains(&short_cluster_token(&r.entry.id)))
-                .map(|r| r.entry.id.clone())
-                .collect()
-        };
-        let iter_idx =
-            if q.random == Some(1) { 5 + skip_count } else { round.saturating_add(skip_count) };
-        let filter = ClusterSelectFilter {
-            max_k: effective_k,
-            iteration: iter_idx,
-            focus_ids,
-            excluded_ids,
-            ..ClusterSelectFilter::default()
-        };
-        service
-            .catalog()
-            .select_uncovered_cluster_prioritized_from_ranked_view(&ranked_view, &filter, |cand| {
-                is_cluster_covered(cand, &covered_sets)
-            })
-            .await?
-    };
-
-    let effective_want = q.want || ranked_view.is_priority_scope;
-    let settled = selected.entries.len() < 2;
+    let effective_want = q.want || session.is_priority_scope;
+    let settled = session.cluster.entries.len() < 2;
     let cluster_creators: Vec<String> =
-        selected.entries.iter().flat_map(|e| e.creators.iter().cloned()).collect();
+        session.cluster.entries.iter().flat_map(|e| e.creators.iter().cloned()).collect();
     let artist_links = load_artist_id_by_lower_name(&service, &cluster_creators).await;
     let mut open_urls = HashMap::new();
-    for entry in &selected.entries {
+    for entry in &session.cluster.entries {
         if let Some(u) = web_primary_open_url(entry) {
             open_urls.insert(entry.id.clone(), u);
         }
     }
     let mut pairs: Vec<(&str, &str)> =
-        selected.entries.iter().map(|e| (e.id.as_str(), e.title.as_str())).collect();
-    if let Some(ref fr) = focus_row {
+        session.cluster.entries.iter().map(|e| (e.id.as_str(), e.title.as_str())).collect();
+    if let Some(ref fr) = session.focus_row {
         pairs.push((fr.entry.id.as_str(), fr.entry.title.as_str()));
     }
     let title_html = render_title_html_map(pairs);
 
     Ok(Json(RankSessionPayload {
-        collection: ranked_view.collection,
+        collection: session.collection,
         want: effective_want,
-        is_priority_scope: ranked_view.is_priority_scope,
-        comparison_count: ranked_view.comparison_count,
-        total_rows: ranked_view.rows.len(),
+        is_priority_scope: session.is_priority_scope,
+        comparison_count: session.comparison_count,
+        total_rows: session.total_rows,
         round,
         skip: skip_count,
         max_rounds: effective_max_rounds,
         effective_k,
         focus_id: if q.random == Some(1) { None } else { focus_clean.map(ToOwned::to_owned) },
-        focus_row,
-        cluster: selected.entries,
-        priority_ids: selected.priority_ids,
+        focus_row: session.focus_row,
+        cluster: session.cluster.entries,
+        priority_ids: session.cluster.priority_ids,
         artist_links,
         open_urls,
         title_html,
         settled,
-        focus_missing,
+        focus_missing: session.focus_missing,
     }))
 }
 

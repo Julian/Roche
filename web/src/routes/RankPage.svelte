@@ -50,8 +50,11 @@
   let board = $state<RankBucketState>(createRankState([], [], null));
   let loading = $state(true);
   let submitting = $state(false);
+  let undoing = $state(false);
+  let busy = $derived(submitting || undoing || loading);
   let errorMsg = $state<string | null>(null);
   let loadController: AbortController | null = null;
+  let unmounted = false;
 
   // Drag state
   let draggedId = $state<string | null>(null);
@@ -149,9 +152,12 @@
         payload.priority_ids,
         payload.focus_id,
       );
+      draggedId = null;
+      dropTargetId = null;
+      dropZone = null;
       router.setTitle(`Rank: ${payload.collection.title}`);
     } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') return;
+      if (signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) return;
       errorMsg = err instanceof ApiError ? err.message : 'Unable to load ranking session.';
     } finally {
       if (!signal.aborted) {
@@ -161,6 +167,7 @@
   }
 
   $effect(() => {
+    void router.navVersion;
     void slug;
     void wantParam;
     void focusParam;
@@ -178,6 +185,20 @@
     void loadSession(controller.signal);
     return () => controller.abort();
   });
+
+  function navigateAndLoad(url: string): void {
+    const beforeNav = router.navVersion;
+    loading = true;
+    try {
+      router.navigate(url);
+    } catch (err) {
+      loading = false;
+      throw err;
+    }
+    if (router.navVersion === beforeNav) {
+      loading = false;
+    }
+  }
 
   async function preserveMoveFocus(cardId: string, preferred: 'up' | 'down'): Promise<void> {
     await tick();
@@ -199,16 +220,19 @@
   }
 
   async function handleMoveUp(cardId: string): Promise<void> {
+    if (busy) return;
     board = { ...board, buckets: moveCardUp(board.buckets, cardId), selectedId: cardId };
     await preserveMoveFocus(cardId, 'up');
   }
 
   async function handleMoveDown(cardId: string): Promise<void> {
+    if (busy) return;
     board = { ...board, buckets: moveCardDown(board.buckets, cardId), selectedId: cardId };
     await preserveMoveFocus(cardId, 'down');
   }
 
   async function handleToggleTie(cardId: string): Promise<void> {
+    if (busy) return;
     board = { ...board, buckets: toggleTieWithAbove(board.buckets, cardId), selectedId: cardId };
     await tick();
     const tieBtn = document.querySelector<HTMLButtonElement>(
@@ -220,20 +244,24 @@
   }
 
   function handleExclude(cardId: string): void {
+    if (busy) return;
     board = excludeCard(board, cardId, 'manual');
   }
 
   function handleRestore(cardId: string): void {
+    if (busy) return;
     board = restoreCard(board, cardId);
     writeRankKCookie(activeCardCount(board));
   }
 
   function handleRestoreAll(): void {
+    if (busy) return;
     board = restoreAllCards(board);
     writeRankKCookie(activeCardCount(board));
   }
 
   function handleSelectSize(targetK: number): void {
+    if (busy || errorMsg) return;
     const clamped = Math.max(MIN_K, Math.min(maxSelectableK, targetK));
     writeRankKCookie(clamped);
     if (clamped <= loadedMaxK) {
@@ -244,7 +272,7 @@
         manualExcludedIds(board),
         flattenBuckets(board.buckets),
       );
-      router.navigate(
+      navigateAndLoad(
         buildRankUrl({
           k: clamped,
           excluded: mergedExcluded || undefined,
@@ -255,7 +283,8 @@
 
   async function handleSubmitComparison(e?: Event): Promise<void> {
     e?.preventDefault();
-    if (!data || submitting || activeCount < MIN_K) return;
+    if (!data || errorMsg || busy || activeCount < MIN_K) return;
+    const startNavVersion = router.navVersion;
     submitting = true;
     try {
       const kToPersist = activeCount;
@@ -281,9 +310,10 @@
       } catch {
         // Ignore storage errors
       }
+      if (unmounted || router.navVersion !== startNavVersion) return;
       const undoExcludedToken =
         res.undo_excluded !== null ? res.undo_excluded || UNDO_EMPTY_SENTINEL : undefined;
-      router.navigate(
+      navigateAndLoad(
         buildRankUrl({
           round: data.round + 1,
           skip: undefined,
@@ -306,13 +336,13 @@
 
   function handleSkip(e?: Event): void {
     e?.preventDefault();
-    if (!data) return;
+    if (!data || errorMsg || busy) return;
     const mergedExcluded = mergeExcludedTokens(
       excludedParam,
       manualExcludedIds(board),
       flattenBuckets(board.buckets),
     );
-    router.navigate(
+    navigateAndLoad(
       buildRankUrl({
         skip: data.skip + 1,
         covered: skipCoveredValue || undefined,
@@ -322,8 +352,9 @@
   }
 
   async function handleUndoComparison(): Promise<void> {
-    if (!undoCompParam || !data || submitting) return;
-    submitting = true;
+    if (!undoCompParam || !data || errorMsg || busy) return;
+    const startNavVersion = router.navVersion;
+    undoing = true;
     try {
       await api.post(`/api/v1/catalog/comparisons/${encodeURIComponent(undoCompParam)}/undo`);
       toast.show('Undid last comparison');
@@ -339,6 +370,7 @@
         // Ignore
       }
 
+      if (unmounted || router.navVersion !== startNavVersion) return;
       const restoredExcluded = savedPrev
         ? savedPrev.prevExcluded || undefined
         : undoExcludedParam === UNDO_EMPTY_SENTINEL
@@ -350,7 +382,7 @@
         ? savedPrev.prevCovered || undefined
         : coveredParam || undefined;
 
-      router.navigate(
+      navigateAndLoad(
         buildRankUrl({
           round: Math.max(0, data.round - 1),
           covered: restoredCovered,
@@ -365,11 +397,15 @@
         isError: true,
       });
     } finally {
-      submitting = false;
+      undoing = false;
     }
   }
 
   function handleDragStart(e: DragEvent, cardId: string): void {
+    if (busy) {
+      e.preventDefault();
+      return;
+    }
     draggedId = cardId;
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = 'move';
@@ -378,7 +414,7 @@
   }
 
   function handleDragOver(e: DragEvent, targetId: string): void {
-    if (!draggedId || draggedId === targetId) return;
+    if (busy || !draggedId || draggedId === targetId) return;
     e.preventDefault();
     const el = e.currentTarget as HTMLElement;
     const rect = el.getBoundingClientRect();
@@ -389,7 +425,7 @@
 
   function handleDrop(e: DragEvent, targetId: string): void {
     e.preventDefault();
-    if (draggedId && draggedId !== targetId && dropZone) {
+    if (!busy && draggedId && draggedId !== targetId && dropZone) {
       board = {
         ...board,
         buckets: dropCardOnTarget(board.buckets, draggedId, targetId, dropZone),
@@ -409,7 +445,7 @@
 
   onMount(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (modals.anyOpen || !data || data.settled) return;
+      if (modals.anyOpen || errorMsg || !data || data.settled || busy) return;
       const target = e.target as HTMLElement | null;
       if (
         e.metaKey ||
@@ -480,6 +516,7 @@
     };
     window.addEventListener('keydown', onKeyDown);
     return () => {
+      unmounted = true;
       loadController?.abort();
       window.removeEventListener('keydown', onKeyDown);
     };
@@ -522,10 +559,10 @@
       <button
         type="button"
         class="btn btn-small"
-        disabled={submitting}
+        disabled={busy}
         onclick={() => void handleUndoComparison()}
       >
-        Undo
+        {undoing ? 'Undoing…' : 'Undo'}
       </button>
     </div>
   {/if}
@@ -608,6 +645,7 @@
                 class:is-active={activeCount === kOpt}
                 data-rank-k={kOpt}
                 aria-current={activeCount === kOpt ? 'true' : undefined}
+                disabled={busy}
                 onclick={() => handleSelectSize(kOpt)}
               >
                 {kOpt}
@@ -616,7 +654,12 @@
           </div>
         {/if}
 
-        <div id="roche-rank-board" class="rank-board">
+        <div
+          id="roche-rank-board"
+          class="rank-board"
+          class:is-loading={busy}
+          aria-busy={busy ? 'true' : undefined}
+        >
           {#each board.buckets as bucket, bIdx (bucket.join('|'))}
             <div class="rank-bucket" class:is-tied={bucket.length > 1} data-bucket-idx={bIdx}>
               {#each bucket as cardId (cardId)}
@@ -639,16 +682,16 @@
                     role="group"
                     aria-label={entry.title}
                     data-entry-id={cardId}
-                    draggable="true"
+                    draggable={!busy}
                     ondragstart={(e) => handleDragStart(e, cardId)}
                     ondragover={(e) => handleDragOver(e, cardId)}
                     ondrop={(e) => handleDrop(e, cardId)}
                     ondragend={handleDragEnd}
                     onpointerdown={() => {
-                      board = { ...board, selectedId: cardId };
+                      if (!busy) board = { ...board, selectedId: cardId };
                     }}
                     onfocusin={() => {
-                      board = { ...board, selectedId: cardId };
+                      if (!busy) board = { ...board, selectedId: cardId };
                     }}
                   >
                     <span class="rank-grip" aria-hidden="true">
@@ -699,7 +742,7 @@
                         class="btn btn-small btn-ghost js-card-up"
                         aria-label={`Move ${entry.title} up`}
                         title="Move up (K)"
-                        disabled={!upEnabled}
+                        disabled={busy || !upEnabled}
                         onclick={(e) => {
                           e.stopPropagation();
                           void handleMoveUp(cardId);
@@ -712,7 +755,7 @@
                         class="btn btn-small btn-ghost js-card-down"
                         aria-label={`Move ${entry.title} down`}
                         title="Move down (J)"
-                        disabled={!downEnabled}
+                        disabled={busy || !downEnabled}
                         onclick={(e) => {
                           e.stopPropagation();
                           void handleMoveDown(cardId);
@@ -725,7 +768,7 @@
                         class="btn btn-small btn-ghost js-card-tie"
                         aria-label={tied ? `Untie ${entry.title}` : `Tie ${entry.title} with above`}
                         aria-pressed={tied}
-                        disabled={!tied && bIdx === 0}
+                        disabled={busy || (!tied && bIdx === 0)}
                         title={tied ? 'Untie (=)' : 'Tie with above (=)'}
                         onclick={(e) => {
                           e.stopPropagation();
@@ -739,7 +782,7 @@
                         class="btn btn-small btn-ghost btn-danger-quiet js-card-exclude"
                         aria-label={`Leave ${entry.title} out of this comparison`}
                         title="Leave out (x)"
-                        disabled={excludeDisabled}
+                        disabled={busy || excludeDisabled}
                         onclick={(e) => {
                           e.stopPropagation();
                           handleExclude(cardId);
@@ -765,6 +808,7 @@
             <button
               type="button"
               class="link-btn js-rank-restore-all"
+              disabled={busy}
               onclick={handleRestoreAll}
             >
               Restore all
@@ -777,6 +821,7 @@
                 <button
                   type="button"
                   class="pill js-rank-restore-chip"
+                  disabled={busy}
                   onclick={() => handleRestore(exId)}
                 >
                   + {exEntry.title}
@@ -790,16 +835,18 @@
           <button
             type="button"
             class="btn btn-primary"
-            disabled={submitting || activeCount < MIN_K}
+            disabled={busy || activeCount < MIN_K}
             onclick={() => void handleSubmitComparison()}
           >
-            {submitting ? 'Saving…' : 'Submit Comparison'}
+            {submitting ? 'Saving…' : loading ? 'Loading next…' : 'Submit Comparison'}
           </button>
 
           <button
             type="button"
             class="btn btn-ghost"
+            disabled={busy}
             onclick={() => {
+              if (busy) return;
               board = { ...board, buckets: toggleTieAll(board.buckets) };
             }}
           >
@@ -808,7 +855,7 @@
 
           <form id="rank-skip-form" class="inline-form" onsubmit={handleSkip}>
             <input type="hidden" name="covered" value={skipCoveredValue} />
-            <button type="submit" class="btn btn-ghost">Skip (s)</button>
+            <button type="submit" class="btn btn-ghost" disabled={busy}>Skip (s)</button>
           </form>
         </div>
       </section>
@@ -880,6 +927,12 @@
     display: flex;
     flex-direction: column;
     gap: 0.55rem;
+    transition: opacity 120ms ease;
+  }
+
+  .rank-board.is-loading {
+    opacity: 0.55;
+    pointer-events: none;
   }
 
   .rank-bucket {

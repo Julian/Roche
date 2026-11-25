@@ -11,8 +11,9 @@ use super::{
         creators_json_matches_needle,
     },
     models::{
-        CatalogEntry, CatalogError, CatalogResult, CollectionPageMeta, CollectionRankingInputs,
-        ComparisonRecord, DynamicCollectionRule, RawCollectionRow, RawEntryRow, raw_entry_columns,
+        CatalogEntry, CatalogError, CatalogResult, CollectionPageMeta, CollectionRankableIds,
+        CollectionRankingInputs, ComparisonRecord, DynamicCollectionRule, RawCollectionRow,
+        RawEntryRow, raw_entry_columns,
     },
 };
 use crate::{
@@ -169,6 +170,74 @@ impl CatalogRepo<'_> {
         tx.commit().await?;
         let summary = raw_col.into_summary(members.len(), 0);
         Ok(CollectionRankingInputs { collection: summary, is_priority_scope, members })
+    }
+
+    /// Loads a collection and ONLY its rankable member IDs without hydrating full entries,
+    /// avoiding thousands of `entry_identifiers` queries and JSON parses during ranking sessions.
+    ///
+    /// Strictly read-only: when `want == true` and the queue does not yet exist, returns
+    /// [`CatalogError::NotFound`] rather than creating rows on `GET`.
+    pub async fn load_collection_rankable_ids(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+    ) -> CatalogResult<CollectionRankableIds> {
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let raw_col =
+            Self::resolve_target_collection_row_in_tx(tx.conn(), slug_or_id, want).await?;
+        let is_priority_scope = raw_col.collection_role == CollectionRole::Want;
+        let member_ids = Self::resolve_rankable_member_ids_in_tx(tx.conn(), &raw_col).await?;
+        tx.commit().await?;
+        let summary = raw_col.into_summary(member_ids.len(), 0);
+        Ok(CollectionRankableIds { collection: summary, is_priority_scope, member_ids })
+    }
+
+    /// Hydrates ONLY the requested entry IDs in a single read snapshot, deduplicating input IDs
+    /// so cross-chunk duplicates cannot drop hydrated identifiers.
+    pub async fn load_entries_by_ids(
+        &self,
+        ids: &[String],
+    ) -> CatalogResult<HashMap<String, CatalogEntry>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut seen: HashSet<&str> = HashSet::with_capacity(ids.len());
+        let unique_ids: Vec<String> =
+            ids.iter().filter(|id| seen.insert(id.as_str())).cloned().collect();
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let loaded = Self::load_entries_by_ids_in_tx(tx.conn(), &unique_ids).await?;
+        tx.commit().await?;
+        Ok(loaded)
+    }
+
+    /// Loads ONLY `(id, title)` pairs for the requested entry IDs without querying
+    /// `entry_identifiers` or parsing JSON columns.
+    pub async fn load_entry_titles_by_ids(
+        &self,
+        ids: &[String],
+    ) -> CatalogResult<HashMap<String, String>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut seen: HashSet<&str> = HashSet::with_capacity(ids.len());
+        let unique_ids: Vec<&str> =
+            ids.iter().map(String::as_str).filter(|id| seen.insert(*id)).collect();
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let mut out = HashMap::with_capacity(unique_ids.len());
+        for chunk in unique_ids.chunks(400) {
+            let mut qb = QueryBuilder::<Sqlite>::new("SELECT id, title FROM entries WHERE id IN (");
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(*id);
+            }
+            sep.push_unseparated(")");
+            let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(tx.conn()).await?;
+            for (id, title) in rows {
+                out.insert(id, title);
+            }
+        }
+        tx.commit().await?;
+        Ok(out)
     }
 
     /// Lightweight count of rankable members in `slug_or_id` without hydrating entries,

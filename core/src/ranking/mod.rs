@@ -153,50 +153,79 @@ pub fn to_pairs(ordering: &[Vec<String>]) -> Vec<(String, String)> {
     pairs
 }
 
-/// Runs Expectation Propagation over the connected components intersecting `item_ids`.
+/// Canonical connected component extracted from comparison orderings for EP inference.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EpComponent {
+    /// Lexicographically sorted item IDs belonging to this connected component.
+    pub items: Vec<String>,
+    /// Directed `(winner_idx, loser_idx)` pairs in canonical ordering-traversal order.
+    pub pairs: Vec<(usize, usize)>,
+}
+
+/// Extracts the independent connected components intersecting `item_ids` from global `orderings`.
 ///
-/// Passing all global quality `orderings` allows transitive calibration across items outside
-/// `item_ids`, while disconnected components solve independently in `O(sum n_c^3)`.
+/// Each returned [`EpComponent`] is self-contained and canonically ordered, so callers can cache
+/// solved component scores across comparison revisions without re-solving unrelated components.
 #[must_use]
-pub fn infer_scores(item_ids: &[String], orderings: &[Vec<Vec<String>>]) -> HashMap<String, Score> {
-    let mut scores: HashMap<String, Score> =
-        item_ids.iter().map(|id| (id.clone(), Score::default())).collect();
+pub fn extract_ep_components(
+    item_ids: &[String],
+    orderings: &[Vec<Vec<String>>],
+) -> Vec<EpComponent> {
     if item_ids.is_empty() || orderings.is_empty() {
-        return scores;
+        return Vec::new();
     }
 
-    let raw_pairs: Vec<(String, String)> = orderings
-        .iter()
-        .filter(|ord| {
-            let width: usize = ord.iter().map(Vec::len).sum();
-            if width > MAX_COMPARISON_WIDTH {
-                tracing::warn!(
-                    width,
-                    max_width = MAX_COMPARISON_WIDTH,
-                    "Ignoring oversized comparison ordering during EP inference"
-                );
-                false
-            } else {
-                true
+    let mut raw_pairs: Vec<(&str, &str)> = Vec::new();
+    for ord in orderings {
+        let width: usize = ord.iter().map(Vec::len).sum();
+        if width > MAX_COMPARISON_WIDTH {
+            tracing::warn!(
+                width,
+                max_width = MAX_COMPARISON_WIDTH,
+                "Ignoring oversized comparison ordering during EP inference"
+            );
+            continue;
+        }
+        for (gi, winners) in ord.iter().enumerate() {
+            for losers in &ord[gi + 1..] {
+                for w in winners {
+                    for l in losers {
+                        if w != l {
+                            raw_pairs.push((w.as_str(), l.as_str()));
+                        }
+                    }
+                }
             }
-        })
-        .flat_map(|ord| to_pairs(ord))
-        .collect();
+        }
+        for group in ord {
+            for (i, a) in group.iter().enumerate() {
+                for b in &group[i + 1..] {
+                    if a != b {
+                        raw_pairs.push((a.as_str(), b.as_str()));
+                        raw_pairs.push((b.as_str(), a.as_str()));
+                    }
+                }
+            }
+        }
+    }
     if raw_pairs.is_empty() {
-        return scores;
+        return Vec::new();
     }
 
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (w, l) in &raw_pairs {
-        adj.entry(w.as_str()).or_default().push(l.as_str());
-        adj.entry(l.as_str()).or_default().push(w.as_str());
+    for &(w, l) in &raw_pairs {
+        adj.entry(w).or_default().push(l);
+        adj.entry(l).or_default().push(w);
     }
 
     let target_set: HashSet<&str> = item_ids.iter().map(String::as_str).collect();
-    let mut sorted_targets: Vec<&str> = target_set.iter().copied().collect();
+    let mut sorted_targets: Vec<&str> = target_set.into_iter().collect();
     sorted_targets.sort_unstable();
 
     let mut visited: HashSet<&str> = HashSet::new();
+    let mut comp_items: Vec<Vec<&str>> = Vec::new();
+    let mut node_loc: HashMap<&str, (usize, usize)> = HashMap::new();
+
     for seed in sorted_targets {
         if visited.contains(seed) || !adj.contains_key(seed) {
             continue;
@@ -215,27 +244,80 @@ pub fn infer_scores(item_ids: &[String], orderings: &[Vec<Vec<String>>]) -> Hash
             }
         }
         comp.sort_unstable();
-        let idx_map: HashMap<&str, usize> =
-            comp.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-        let comp_pairs: Vec<(usize, usize)> = raw_pairs
-            .iter()
-            .filter_map(|(w, l)| {
-                let &wi = idx_map.get(w.as_str())?;
-                let &li = idx_map.get(l.as_str())?;
-                (wi != li).then_some((wi, li))
-            })
-            .collect();
-        if comp_pairs.is_empty() {
-            continue;
+        let comp_idx = comp_items.len();
+        for (local_idx, &id) in comp.iter().enumerate() {
+            node_loc.insert(id, (comp_idx, local_idx));
         }
-        if let Some((means, variances)) =
-            ep_pairwise_component(comp.len(), &comp_pairs, PRIOR_ALPHA, 100)
+        comp_items.push(comp);
+    }
+
+    if comp_items.is_empty() {
+        return Vec::new();
+    }
+
+    let mut comp_pairs_list: Vec<Vec<(usize, usize)>> = vec![Vec::new(); comp_items.len()];
+    for &(w, l) in &raw_pairs {
+        if let (Some(&(c_w, wi)), Some(&(c_l, li))) = (node_loc.get(w), node_loc.get(l))
+            && c_w == c_l
+            && wi != li
         {
-            for (i, &id) in comp.iter().enumerate() {
-                if target_set.contains(id) {
-                    let clean_mean = if means[i].abs() < 1e-12 { 0.0 } else { means[i] };
-                    scores
-                        .insert(id.to_owned(), Score { mean: clean_mean, variance: variances[i] });
+            comp_pairs_list[c_w].push((wi, li));
+        }
+    }
+
+    comp_items
+        .into_iter()
+        .zip(comp_pairs_list)
+        .filter(|(_, pairs)| !pairs.is_empty())
+        .map(|(items, pairs)| EpComponent {
+            items: items.into_iter().map(ToOwned::to_owned).collect(),
+            pairs,
+        })
+        .collect()
+}
+
+/// Runs Expectation Propagation on a single extracted [`EpComponent`], returning posterior
+/// [`Score`]s aligned 1-to-1 with `component.items` (or `None` if EP aborts/fails to converge).
+#[must_use]
+pub fn solve_ep_component(component: &EpComponent) -> Option<Vec<Score>> {
+    let n = component.items.len();
+    if n == 0
+        || component.pairs.is_empty()
+        || component.pairs.iter().any(|&(a, b)| a == b || a >= n || b >= n)
+    {
+        return None;
+    }
+    let (means, variances) = ep_pairwise_component(n, &component.pairs, PRIOR_ALPHA, 100)?;
+    Some(
+        means
+            .into_iter()
+            .zip(variances)
+            .map(|(m, variance)| {
+                let mean = if m.abs() < 1e-12 { 0.0 } else { m };
+                Score { mean, variance }
+            })
+            .collect(),
+    )
+}
+
+/// Runs Expectation Propagation over the connected components intersecting `item_ids`.
+///
+/// Passing all global quality `orderings` allows transitive calibration across items outside
+/// `item_ids`, while disconnected components solve independently in `O(sum n_c^3)`.
+#[must_use]
+pub fn infer_scores(item_ids: &[String], orderings: &[Vec<Vec<String>>]) -> HashMap<String, Score> {
+    let mut scores: HashMap<String, Score> =
+        item_ids.iter().map(|id| (id.clone(), Score::default())).collect();
+    if item_ids.is_empty() || orderings.is_empty() {
+        return scores;
+    }
+
+    let target_set: HashSet<&str> = item_ids.iter().map(String::as_str).collect();
+    for component in extract_ep_components(item_ids, orderings) {
+        if let Some(comp_scores) = solve_ep_component(&component) {
+            for (id, score) in component.items.into_iter().zip(comp_scores) {
+                if target_set.contains(id.as_str()) {
+                    scores.insert(id, score);
                 }
             }
         }
@@ -289,40 +371,87 @@ pub fn select_cluster_prioritized<R: Rng + ?Sized, S: BuildHasher>(
     seed_pool: Option<&[String]>,
     rng: &mut R,
 ) -> SelectedCluster {
+    select_cluster_prioritized_generic(scores, item_ids, max_k, force_random_seed, seed_pool, rng)
+}
+
+/// Zero-copy slice variant of [`select_cluster_prioritized`] accepting `&[&str]` candidate pools
+/// so filtered/retry pools avoid cloning thousands of item ID strings.
+pub fn select_cluster_prioritized_refs<R: Rng + ?Sized, S: BuildHasher>(
+    scores: &HashMap<String, Score, S>,
+    item_ids: &[&str],
+    max_k: usize,
+    force_random_seed: bool,
+    seed_pool: Option<&[String]>,
+    rng: &mut R,
+) -> SelectedCluster {
+    select_cluster_prioritized_generic(scores, item_ids, max_k, force_random_seed, seed_pool, rng)
+}
+
+fn insert_top_k_desc<'a>(
+    buf: &mut Vec<(f64, f64, &'a str)>,
+    limit: usize,
+    entry: (f64, f64, &'a str),
+) {
+    if limit == 0 {
+        return;
+    }
+    let is_greater = |a: &(f64, f64, &str), b: &(f64, f64, &str)| {
+        a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)).is_gt()
+    };
+    if buf.len() == limit && !is_greater(&entry, &buf[limit - 1]) {
+        return;
+    }
+    let pos = buf.partition_point(|x| !is_greater(&entry, x));
+    if pos < limit {
+        if buf.len() == limit {
+            buf.pop();
+        }
+        buf.insert(pos, entry);
+    }
+}
+
+fn select_cluster_prioritized_generic<T: AsRef<str>, R: Rng + ?Sized, S: BuildHasher>(
+    scores: &HashMap<String, Score, S>,
+    item_ids: &[T],
+    max_k: usize,
+    force_random_seed: bool,
+    seed_pool: Option<&[String]>,
+    rng: &mut R,
+) -> SelectedCluster {
     let cap = max_k.max(MIN_K);
     if item_ids.is_empty() {
         return SelectedCluster { ordered_ids: Vec::new(), priority_ids: Vec::new() };
     }
 
-    let candidates: Vec<&String> = seed_pool.map_or_else(
-        || item_ids.iter().collect(),
-        |pool| {
-            let pool_set: HashSet<&str> = pool.iter().map(String::as_str).collect();
-            item_ids.iter().filter(|id| pool_set.contains(id.as_str())).collect()
-        },
-    );
-    if candidates.is_empty() {
-        return SelectedCluster { ordered_ids: Vec::new(), priority_ids: Vec::new() };
-    }
+    let pool_set: Option<HashSet<&str>> =
+        seed_pool.map(|pool| pool.iter().map(String::as_str).collect());
 
-    let seed_id: &String = if force_random_seed {
-        let mut ranked: Vec<(f64, f64, &String)> = candidates
-            .iter()
-            .map(|&id| {
-                let var = scores.get(id).copied().unwrap_or_default().variance;
-                (var, rng.random::<f64>(), id)
-            })
-            .collect();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
-        ranked.truncate(cap.max(MAX_K_DEFAULT));
-        let pick = rng.random_range(0..ranked.len());
-        ranked[pick].2
+    let seed_id: &str = if force_random_seed {
+        let top_k = cap.max(MAX_K_DEFAULT);
+        let mut top: Vec<(f64, f64, &str)> = Vec::with_capacity(top_k);
+        for raw_id in item_ids {
+            let id = raw_id.as_ref();
+            if pool_set.as_ref().is_some_and(|set| !set.contains(id)) {
+                continue;
+            }
+            let var = scores.get(id).copied().unwrap_or_default().variance;
+            insert_top_k_desc(&mut top, top_k, (var, rng.random::<f64>(), id));
+        }
+        if top.is_empty() {
+            return SelectedCluster { ordered_ids: Vec::new(), priority_ids: Vec::new() };
+        }
+        let pick = rng.random_range(0..top.len());
+        top[pick].2
     } else {
-        let mut best: Option<(f64, f64, &String)> = None;
-        for &id in &candidates {
+        let mut best: Option<(f64, f64, &str)> = None;
+        for raw_id in item_ids {
+            let id = raw_id.as_ref();
+            if pool_set.as_ref().is_some_and(|set| !set.contains(id)) {
+                continue;
+            }
             let var = scores.get(id).copied().unwrap_or_default().variance;
             let tie = rng.random::<f64>();
-            if best.is_none_or(|b| (var, tie) > (b.0, b.1)) {
+            if best.is_none_or(|b| var.total_cmp(&b.0).then_with(|| tie.total_cmp(&b.1)).is_gt()) {
                 best = Some((var, tie, id));
             }
         }
@@ -333,22 +462,30 @@ pub fn select_cluster_prioritized<R: Rng + ?Sized, S: BuildHasher>(
     };
 
     let seed_score = scores.get(seed_id).copied().unwrap_or_default();
-    let mut neighbors: Vec<(f64, f64, &String)> = item_ids
-        .iter()
-        .filter(|&id| id != seed_id)
-        .map(|id| {
-            let cand_score = scores.get(id).copied().unwrap_or_default();
-            (confusability(seed_score, cand_score), rng.random::<f64>(), id)
-        })
-        .collect();
-    neighbors.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
-
-    let mut priority_ids = vec![seed_id.clone()];
-    for (conf, _, cand_id) in neighbors {
-        if priority_ids.len() >= cap || conf < MIN_CONFUSABILITY {
-            break;
+    let default_conf = confusability(seed_score, Score::default());
+    let needed = cap.saturating_sub(1);
+    let mut top_neighbors: Vec<(f64, f64, &str)> = Vec::with_capacity(needed);
+    if needed > 0 {
+        for raw_id in item_ids {
+            let id = raw_id.as_ref();
+            if id == seed_id {
+                continue;
+            }
+            let conf = match scores.get(id) {
+                Some(&cand_score) => confusability(seed_score, cand_score),
+                None => default_conf,
+            };
+            if conf < MIN_CONFUSABILITY {
+                continue;
+            }
+            insert_top_k_desc(&mut top_neighbors, needed, (conf, rng.random::<f64>(), id));
         }
-        priority_ids.push(cand_id.clone());
+    }
+
+    let mut priority_ids = Vec::with_capacity(1 + top_neighbors.len());
+    priority_ids.push(seed_id.to_owned());
+    for (_, _, cand_id) in top_neighbors {
+        priority_ids.push(cand_id.to_owned());
     }
 
     let mut ordered_ids = priority_ids.clone();
@@ -537,7 +674,7 @@ pub fn sort_by_score_with_ties<T, S, IdFn, TieCmp>(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::needless_range_loop)]
 fn ep_pairwise_component(
     n_items: usize,
     pairs: &[(usize, usize)],
@@ -546,6 +683,8 @@ fn ep_pairwise_component(
 ) -> Option<(Vec<f64>, Vec<f64>)> {
     let m = pairs.len();
     let mut mean = vec![0.0; n_items];
+    // During each inner sweep we maintain only the upper triangle (`r <= c`) of the symmetric
+    // covariance matrix `cov`; `cholesky_invert` refreshes the full symmetric matrix after each sweep.
     let mut cov = vec![0.0; n_items * n_items];
     for i in 0..n_items {
         cov[i * n_items + i] = 1.0 / alpha;
@@ -561,7 +700,8 @@ fn ep_pairwise_component(
         let nu_old = nu.clone();
 
         for (i, &(a, b)) in pairs.iter().enumerate() {
-            let f_var = cov[a * n_items + a] + cov[b * n_items + b] - 2.0 * cov[a * n_items + b];
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let f_var = cov[a * n_items + a] + cov[b * n_items + b] - 2.0 * cov[lo * n_items + hi];
             let f_mean = mean[a] - mean[b];
             if f_var <= 0.0 || !f_var.is_finite() {
                 tracing::warn!(
@@ -633,30 +773,62 @@ fn ep_pairwise_component(
             xs[a] += delta_nu;
             xs[b] -= delta_nu;
 
-            if delta_tau.abs() > 0.0 {
-                let scale_denom = (1.0 / delta_tau) + f_var;
-                if !scale_denom.is_finite() || scale_denom.abs() <= f64::EPSILON {
-                    tracing::warn!(
-                        n_items,
-                        n_pairs = pairs.len(),
-                        scale_denom,
-                        "EP pairwise inference aborted due to degenerate rank-1 covariance update"
-                    );
-                    return None;
+            if delta_tau.abs() > 0.0 || delta_nu.abs() > 0.0 {
+                // Reconstruct `diff_col = cov[:, a] - cov[:, b]` from the symmetric upper triangle.
+                for k in 0..a {
+                    diff_col[k] = cov[k * n_items + a];
                 }
-                let scale = -1.0 / scale_denom;
-                for k in 0..n_items {
-                    diff_col[k] = cov[a * n_items + k] - cov[b * n_items + k];
+                diff_col[a..].copy_from_slice(&cov[a * n_items + a..(a + 1) * n_items]);
+                for k in 0..b {
+                    diff_col[k] -= cov[k * n_items + b];
                 }
-                for r in 0..n_items {
-                    let sr = scale * diff_col[r];
-                    let row_offset = r * n_items;
-                    for c in 0..n_items {
-                        cov[row_offset + c] += sr * diff_col[c];
+                let b_row = &cov[b * n_items + b..(b + 1) * n_items];
+                let diff_tail = &mut diff_col[b..];
+                for k in 0..diff_tail.len() {
+                    diff_tail[k] -= b_row[k];
+                }
+
+                let scale = if delta_tau.abs() > 0.0 {
+                    let scale_denom = (1.0 / delta_tau) + f_var;
+                    if !scale_denom.is_finite() || scale_denom.abs() <= f64::EPSILON {
+                        tracing::warn!(
+                            n_items,
+                            n_pairs = pairs.len(),
+                            scale_denom,
+                            "EP pairwise inference aborted due to degenerate rank-1 covariance update"
+                        );
+                        return None;
                     }
+                    let s = -1.0 / scale_denom;
+                    for r in 0..n_items {
+                        let dr = diff_col[r];
+                        if dr == 0.0 {
+                            continue;
+                        }
+                        let sr = s * dr;
+                        let row = &mut cov[r * n_items + r..(r + 1) * n_items];
+                        let dc = &diff_col[r..];
+                        for c in 0..row.len() {
+                            row[c] += sr * dc[c];
+                        }
+                    }
+                    s
+                } else {
+                    0.0
+                };
+
+                // Exact rank-1 mean update: `(cov + s * d * d^T)(xs + delta_nu * (e_a - e_b))`
+                // equals `mean + (delta_nu + s * (f_mean + delta_nu * f_var)) * d`, avoiding an
+                // `O(n^2)` matrix-vector product on every site update.
+                let mean_step = if scale == 0.0 {
+                    delta_nu
+                } else {
+                    delta_nu + scale * (f_mean + delta_nu * f_var)
+                };
+                for k in 0..n_items {
+                    mean[k] += mean_step * diff_col[k];
                 }
             }
-            mat_vec_mul(&cov, &xs, &mut mean, n_items);
         }
 
         let mut sys_mat = prec.clone();
@@ -723,50 +895,66 @@ fn max_finite_site_delta(tau: &[f64], tau_old: &[f64], nu: &[f64], nu_old: &[f64
     Some(max_delta)
 }
 
+#[allow(clippy::needless_range_loop)]
 fn mat_vec_mul(mat: &[f64], vec_x: &[f64], out: &mut [f64], n: usize) {
     for r in 0..n {
         let row = &mat[r * n..(r + 1) * n];
-        out[r] = row.iter().zip(vec_x).map(|(a, b)| a * b).sum();
+        let mut sum = 0.0;
+        for c in 0..n {
+            sum += row[c] * vec_x[c];
+        }
+        out[r] = sum;
     }
 }
 
+#[allow(clippy::needless_range_loop)]
 fn cholesky_invert(mat: &[f64], n: usize) -> Option<Vec<f64>> {
     let mut low = vec![0.0; n * n];
     for i in 0..n {
+        let row_i_off = i * n;
         for j in 0..=i {
-            let mut sum = mat[i * n + j];
+            let row_j_off = j * n;
+            let mut sum = mat[row_i_off + j];
             for k in 0..j {
-                sum -= low[i * n + k] * low[j * n + k];
+                sum -= low[row_i_off + k] * low[row_j_off + k];
             }
             if i == j {
                 if sum <= 0.0 || !sum.is_finite() {
                     return None;
                 }
-                low[i * n + i] = sum.sqrt();
+                low[row_i_off + i] = sum.sqrt();
             } else {
-                low[i * n + j] = sum / low[j * n + j];
+                low[row_i_off + j] = sum / low[row_j_off + j];
             }
         }
     }
 
-    let mut inv_low = vec![0.0; n * n];
+    // Store `L^{-1}` transposed (`inv_low_t[col * n + row] = (L^{-1})_{row, col}`) so both
+    // triangular inversion and `L^{-T} L^{-1}` read contiguous row-major slices with identical
+    // IEEE-754 summation order.
+    let mut inv_low_t = vec![0.0; n * n];
     for col in 0..n {
-        inv_low[col * n + col] = 1.0 / low[col * n + col];
+        let col_off = col * n;
+        inv_low_t[col_off + col] = 1.0 / low[col_off + col];
         for row in (col + 1)..n {
+            let low_row = &low[row * n + col..row * n + row];
+            let inv_col = &inv_low_t[col_off + col..col_off + row];
             let mut sum = 0.0;
-            for k in col..row {
-                sum += low[row * n + k] * inv_low[k * n + col];
+            for k in 0..low_row.len() {
+                sum += low_row[k] * inv_col[k];
             }
-            inv_low[row * n + col] = -sum / low[row * n + row];
+            inv_low_t[col_off + row] = -sum / low[row * n + row];
         }
     }
 
     let mut out = vec![0.0; n * n];
     for i in 0..n {
+        let row_i = &inv_low_t[i * n..(i + 1) * n];
         for j in i..n {
+            let row_j = &inv_low_t[j * n..(j + 1) * n];
             let mut sum = 0.0;
             for k in j..n {
-                sum += inv_low[k * n + i] * inv_low[k * n + j];
+                sum += row_i[k] * row_j[k];
             }
             out[i * n + j] = sum;
             out[j * n + i] = sum;
@@ -1217,5 +1405,60 @@ mod tests {
                 assert_eq!(actual.uncompared, None);
             }
         }
+    }
+
+    #[test]
+    fn test_extract_ep_components_isolates_unrelated_components_and_preserves_bridges() {
+        let orderings = vec![
+            vec![
+                vec!["album_a".to_owned()],
+                vec!["album_b".to_owned()],
+                vec!["album_c".to_owned()],
+            ],
+            vec![vec!["artist_1".to_owned()], vec!["artist_2".to_owned()]],
+            vec![vec!["artist_3".to_owned()], vec!["bridge_work".to_owned()]],
+            vec![vec!["bridge_work".to_owned()], vec!["artist_4".to_owned()]],
+        ];
+
+        // Querying only artist IDs must skip the unrelated album component while retaining
+        // transitive bridges through `bridge_work`.
+        let artist_targets = vec![
+            "artist_1".to_owned(),
+            "artist_2".to_owned(),
+            "artist_3".to_owned(),
+            "artist_4".to_owned(),
+        ];
+        let comps = extract_ep_components(&artist_targets, &orderings);
+        assert_eq!(comps.len(), 2);
+        assert_eq!(comps[0].items, vec!["artist_1", "artist_2"]);
+        assert_eq!(comps[1].items, vec!["artist_3", "artist_4", "bridge_work"]);
+
+        // Component-by-component solve matches `infer_scores` bit-for-bit.
+        let direct = infer_scores(&artist_targets, &orderings);
+        let mut from_comps = HashMap::new();
+        for comp in &comps {
+            let solved = solve_ep_component(comp).unwrap();
+            for (id, score) in comp.items.iter().zip(solved) {
+                from_comps.insert(id.clone(), score);
+            }
+        }
+        for id in &artist_targets {
+            assert_eq!(from_comps.get(id), direct.get(id));
+        }
+
+        // Unrelated album component key stays identical when a new artist comparison is appended.
+        let album_before = extract_ep_components(&["album_a".to_owned()], &orderings);
+        let mut with_extra_artist = orderings;
+        with_extra_artist.push(vec![vec!["artist_5".to_owned()], vec!["artist_6".to_owned()]]);
+        let album_after = extract_ep_components(&["album_a".to_owned()], &with_extra_artist);
+        assert_eq!(album_before, album_after);
+
+        // Out-of-bounds or self-loop pair indices in manually constructed components fail gracefully with None.
+        let invalid =
+            EpComponent { items: vec!["a".to_owned(), "b".to_owned()], pairs: vec![(0, 2)] };
+        assert!(solve_ep_component(&invalid).is_none());
+        let self_loop =
+            EpComponent { items: vec!["a".to_owned(), "b".to_owned()], pairs: vec![(0, 0)] };
+        assert!(solve_ep_component(&self_loop).is_none());
     }
 }

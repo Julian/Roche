@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -9,7 +10,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use sha2::{Digest, Sha256};
+use tokio::sync::{Semaphore, watch};
 
 use super::AppError;
 use crate::{
@@ -21,9 +23,10 @@ use crate::{
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::{
-        MAX_K_DEFAULT, MEAN_TIE_EPSILON, MIN_K, N_QUANTILES, RANDOM_SEED_EVERY, Score,
-        infer_scores, rescale_to_quantiles, rescale_to_quantiles_with_uncompared,
-        select_cluster_prioritized, sort_by_score_with_ties, tier_label,
+        EpComponent, MAX_K_DEFAULT, MEAN_TIE_EPSILON, MIN_K, N_QUANTILES, RANDOM_SEED_EVERY, Score,
+        SelectedCluster, extract_ep_components, rescale_to_quantiles,
+        rescale_to_quantiles_with_uncompared, select_cluster_prioritized_refs, solve_ep_component,
+        sort_by_score_with_ties, tier_label,
     },
 };
 
@@ -63,32 +66,113 @@ pub struct PrioritizedCluster {
     pub priority_ids: Vec<String>,
 }
 
+/// Prepared state for one interactive ranking round without hydrating unselected collection entries.
+#[derive(Debug, Clone)]
+pub struct RankSessionSelection {
+    pub collection: CollectionSummary,
+    pub is_priority_scope: bool,
+    pub comparison_count: usize,
+    pub total_rows: usize,
+    pub focus_row: Option<RankedEntryRow>,
+    pub focus_missing: bool,
+    pub cluster: PrioritizedCluster,
+}
+
 const MAX_COVERED_CLUSTER_RETRIES: usize = 4;
 const MAX_FOCUSED_COVERED_RETRIES: usize = 12;
 const SPAWN_BLOCKING_EP_THRESHOLD: usize = 150;
 const MAX_CACHED_EP_SCOPES: usize = 64;
+const MAX_CACHED_EP_COMPONENTS: usize = 512;
 const MAX_CONCURRENT_EP_RUNS: usize = 4;
 
 type ScopeRevision = (i64, i64, i64);
 type OrderingsArc = Arc<Vec<Vec<Vec<String>>>>;
-type ScoresArc = Arc<HashMap<String, Score>>;
+type ComparedIdsArc = Arc<Vec<String>>;
+type ComponentDigest = [u8; 32];
+type ComponentScoresArc = Arc<Option<Vec<Score>>>;
 
 #[derive(Debug, Clone)]
-struct CachedScopeEp {
+struct IndexedEpComponent {
+    digest: ComponentDigest,
+    component: Arc<EpComponent>,
+}
+
+#[derive(Debug, Clone)]
+struct ScopeOrderingsSnapshot {
+    orderings: OrderingsArc,
+    compared_ids: ComparedIdsArc,
+    components: Arc<Vec<IndexedEpComponent>>,
+    item_to_component: Arc<HashMap<String, usize>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedScopeOrderings {
     revision: ScopeRevision,
     generation: u64,
-    orderings: OrderingsArc,
-    scores: ScoresArc,
+    snapshot: ScopeOrderingsSnapshot,
     last_used: Instant,
 }
 
-/// Bounded in-memory cache of scope-level Expectation Propagation scores keyed by
-/// `(scope_collection_id, (count, max_sync_seq, sum_sync_seq))` behind a concurrency semaphore.
+#[derive(Debug, Clone)]
+struct CachedComponentEp {
+    scores: ComponentScoresArc,
+    last_used: Instant,
+}
+
+type InFlightMap =
+    Arc<Mutex<HashMap<ComponentDigest, watch::Receiver<Option<ComponentScoresArc>>>>>;
+
+struct InFlightGuard {
+    in_flight: InFlightMap,
+    digest: ComponentDigest,
+    tx: Option<watch::Sender<Option<ComponentScoresArc>>>,
+}
+
+impl InFlightGuard {
+    fn finish(mut self, scores: ComponentScoresArc) {
+        let mut guard = self.in_flight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(&self.digest);
+        drop(guard);
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Some(scores));
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let mut guard =
+                self.in_flight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(&self.digest);
+            drop(guard);
+            drop(tx);
+        }
+    }
+}
+
+enum ComponentClaim {
+    Hit(ComponentScoresArc),
+    Leader(InFlightGuard),
+    Wait(watch::Receiver<Option<ComponentScoresArc>>),
+}
+
+/// Bounded in-memory cache of scope-level comparison orderings + precomputed connected-component
+/// indices keyed by `(scope_collection_id, (count, max_sync_seq, sum_sync_seq))` and per-component
+/// Expectation Propagation scores keyed by 32-byte SHA-256 component digest, with in-flight solve
+/// coalescing and a concurrency semaphore.
+///
+/// Caching EP per connected component ensures submitting or undoing a comparison in one list
+/// (e.g. `artists`) never re-solves unrelated components (e.g. hundreds of `albums`).
 #[derive(Debug, Clone)]
 pub struct EpScoreCache {
-    entries: Arc<Mutex<HashMap<Option<String>, CachedScopeEp>>>,
+    scopes: Arc<Mutex<HashMap<Option<String>, CachedScopeOrderings>>>,
+    components: Arc<Mutex<HashMap<ComponentDigest, CachedComponentEp>>>,
+    in_flight: InFlightMap,
     semaphore: Arc<Semaphore>,
     next_gen: Arc<AtomicU64>,
+    #[cfg(test)]
+    component_solves: Arc<AtomicU64>,
 }
 
 impl Default for EpScoreCache {
@@ -101,40 +185,49 @@ impl EpScoreCache {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
+            scopes: Arc::new(Mutex::new(HashMap::new())),
+            components: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EP_RUNS)),
             next_gen: Arc::new(AtomicU64::new(1)),
+            #[cfg(test)]
+            component_solves: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn component_solve_count(&self) -> u64 {
+        self.component_solves.load(Ordering::Relaxed)
     }
 
     fn allocate_generation(&self) -> u64 {
         self.next_gen.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn get(
+    fn get_scope(
         &self,
         scope: Option<&str>,
         revision: ScopeRevision,
-    ) -> Option<(OrderingsArc, ScoresArc)> {
+    ) -> Option<ScopeOrderingsSnapshot> {
         let key = scope.map(ToOwned::to_owned);
-        let mut guard = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self.scopes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let hit = guard.get_mut(&key).filter(|e| e.revision == revision).map(|entry| {
             entry.last_used = Instant::now();
-            (Arc::clone(&entry.orderings), Arc::clone(&entry.scores))
+            entry.snapshot.clone()
         });
         drop(guard);
         hit
     }
 
-    fn insert(
+    fn insert_scope(
         &self,
         scope: Option<&str>,
         revision: ScopeRevision,
         generation: u64,
-        orderings: OrderingsArc,
-        scores: ScoresArc,
+        snapshot: ScopeOrderingsSnapshot,
     ) {
-        let mut guard = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self.scopes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = scope.map(ToOwned::to_owned);
         if let Some(existing) = guard.get(&key)
             && existing.generation > generation
@@ -150,8 +243,89 @@ impl EpScoreCache {
         }
         guard.insert(
             key,
-            CachedScopeEp { revision, generation, orderings, scores, last_used: Instant::now() },
+            CachedScopeOrderings { revision, generation, snapshot, last_used: Instant::now() },
         );
+    }
+
+    fn get_component(&self, digest: ComponentDigest) -> Option<ComponentScoresArc> {
+        let mut guard = self.components.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hit = guard.get_mut(&digest).map(|entry| {
+            entry.last_used = Instant::now();
+            Arc::clone(&entry.scores)
+        });
+        drop(guard);
+        hit
+    }
+
+    fn insert_component(&self, digest: ComponentDigest, scores: ComponentScoresArc) {
+        let mut guard = self.components.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !guard.contains_key(&digest)
+            && guard.len() >= MAX_CACHED_EP_COMPONENTS
+            && let Some(&oldest_key) = guard.iter().min_by_key(|(_, v)| v.last_used).map(|(k, _)| k)
+        {
+            guard.remove(&oldest_key);
+        }
+        guard.insert(digest, CachedComponentEp { scores, last_used: Instant::now() });
+    }
+
+    fn claim_or_wait_component(&self, digest: ComponentDigest) -> ComponentClaim {
+        if let Some(hit) = self.get_component(digest) {
+            return ComponentClaim::Hit(hit);
+        }
+        let inflight_guard = {
+            let mut guard =
+                self.in_flight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(rx) = guard.get(&digest) {
+                return ComponentClaim::Wait(rx.clone());
+            }
+            let (tx, rx) = watch::channel(None);
+            guard.insert(digest, rx);
+            drop(guard);
+            InFlightGuard { in_flight: Arc::clone(&self.in_flight), digest, tx: Some(tx) }
+        };
+        // Re-check after claiming leadership in case a previous leader inserted and dropped its
+        // in-flight entry right before we acquired `in_flight`.
+        if let Some(hit) = self.get_component(digest) {
+            inflight_guard.finish(Arc::clone(&hit));
+            return ComponentClaim::Hit(hit);
+        }
+        ComponentClaim::Leader(inflight_guard)
+    }
+}
+
+fn component_digest(component: &EpComponent) -> ComponentDigest {
+    let mut hasher = Sha256::new();
+    hasher.update((component.items.len() as u64).to_le_bytes());
+    for item in &component.items {
+        hasher.update((item.len() as u64).to_le_bytes());
+        hasher.update(item.as_bytes());
+    }
+    hasher.update((component.pairs.len() as u64).to_le_bytes());
+    for &(a, b) in &component.pairs {
+        hasher.update((a as u64).to_le_bytes());
+        hasher.update((b as u64).to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn build_scope_snapshot(orderings: Vec<Vec<Vec<String>>>) -> ScopeOrderingsSnapshot {
+    let compared_ids = collect_compared_ids(&orderings);
+    let raw_components = extract_ep_components(&compared_ids, &orderings);
+    let mut components = Vec::with_capacity(raw_components.len());
+    let mut item_to_component = HashMap::with_capacity(compared_ids.len());
+    for comp in raw_components {
+        let comp_idx = components.len();
+        let digest = component_digest(&comp);
+        for item in &comp.items {
+            item_to_component.insert(item.clone(), comp_idx);
+        }
+        components.push(IndexedEpComponent { digest, component: Arc::new(comp) });
+    }
+    ScopeOrderingsSnapshot {
+        orderings: Arc::new(orderings),
+        compared_ids: Arc::new(compared_ids),
+        components: Arc::new(components),
+        item_to_component: Arc::new(item_to_component),
     }
 }
 
@@ -540,64 +714,153 @@ impl<'a> CatalogService<'a> {
         Ok(self.repo.resolve_ranking_scope(slug_or_id, want).await?)
     }
 
-    async fn load_scope_orderings_and_scores(
+    async fn load_scope_orderings(
         &self,
         scope_collection_id: Option<&str>,
-    ) -> Result<(OrderingsArc, ScoresArc), AppError> {
+    ) -> Result<ScopeOrderingsSnapshot, AppError> {
         if let Some(cache) = self.ep_cache {
             let rev = self.repo.comparison_scope_revision(scope_collection_id).await?;
-            if let Some(hit) = cache.get(scope_collection_id, rev) {
+            if let Some(hit) = cache.get_scope(scope_collection_id, rev) {
                 return Ok(hit);
             }
         }
 
-        let _permit =
-            match self.ep_cache {
-                Some(cache) => Some(cache.semaphore.acquire().await.map_err(|e| {
-                    AppError::Internal(anyhow::anyhow!("EP semaphore closed: {e}"))
-                })?),
-                None => None,
-            };
-
-        // Read `(revision, orderings)` atomically inside one read snapshot and re-check the cache
-        // in case another caller populated it while we waited for the semaphore.
+        // Read `(revision, orderings)` atomically inside one read snapshot so cached orderings
+        // can never pair a newer revision with older orderings (or vice versa).
         let generation = self.ep_cache.map_or(0, EpScoreCache::allocate_generation);
         let (fresh_rev, orderings) =
             self.repo.load_revision_and_orderings_for_scope(scope_collection_id).await?;
         if let Some(cache) = self.ep_cache
-            && let Some(hit) = cache.get(scope_collection_id, fresh_rev)
+            && let Some(hit) = cache.get_scope(scope_collection_id, fresh_rev)
         {
             return Ok(hit);
         }
 
-        let mut compared_ids: Vec<String> = Vec::new();
-        let mut seen: HashSet<&str> = HashSet::new();
-        for ord in &orderings {
-            for group in ord {
-                for id in group {
-                    if seen.insert(id.as_str()) {
-                        compared_ids.push(id.clone());
+        let snapshot = if orderings.len() >= SPAWN_BLOCKING_EP_THRESHOLD {
+            tokio::task::spawn_blocking(move || build_scope_snapshot(orderings))
+                .await
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("EP graph build failed: {e}")))?
+        } else {
+            build_scope_snapshot(orderings)
+        };
+        if let Some(cache) = self.ep_cache {
+            cache.insert_scope(scope_collection_id, fresh_rev, generation, snapshot.clone());
+        }
+        Ok(snapshot)
+    }
+
+    /// Infers EP scores ONLY for connected components intersecting `target_ids`, using the
+    /// precomputed revision-level component index on `snapshot` (O(`target_ids.len()`) on cache
+    /// hits with zero graph rebuilding), reusing cached per-component solutions across revisions,
+    /// and coalescing concurrent misses on the same component.
+    async fn infer_scores_for_targets(
+        &self,
+        snapshot: &ScopeOrderingsSnapshot,
+        target_ids: &[String],
+    ) -> Result<HashMap<String, Score>, AppError> {
+        if target_ids.is_empty() || snapshot.components.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut matched_indices: Vec<usize> = Vec::new();
+        for id in target_ids {
+            if let Some(&comp_idx) = snapshot.item_to_component.get(id) {
+                matched_indices.push(comp_idx);
+            }
+        }
+        if matched_indices.is_empty() {
+            return Ok(HashMap::new());
+        }
+        matched_indices.sort_unstable();
+        matched_indices.dedup();
+
+        let mut pending: Vec<IndexedEpComponent> =
+            matched_indices.into_iter().map(|idx| snapshot.components[idx].clone()).collect();
+        let mut resolved: Vec<(IndexedEpComponent, ComponentScoresArc)> =
+            Vec::with_capacity(pending.len());
+
+        if let Some(cache) = self.ep_cache {
+            while !pending.is_empty() {
+                let mut claimed: Vec<(IndexedEpComponent, InFlightGuard)> = Vec::new();
+                let mut waited: Vec<(
+                    IndexedEpComponent,
+                    watch::Receiver<Option<ComponentScoresArc>>,
+                )> = Vec::new();
+                for indexed in std::mem::take(&mut pending) {
+                    match cache.claim_or_wait_component(indexed.digest) {
+                        ComponentClaim::Hit(hit) => resolved.push((indexed, hit)),
+                        ComponentClaim::Leader(guard) => claimed.push((indexed, guard)),
+                        ComponentClaim::Wait(rx) => waited.push((indexed, rx)),
+                    }
+                }
+
+                if !claimed.is_empty() {
+                    let permit = cache.semaphore.acquire().await.map_err(|e| {
+                        AppError::Internal(anyhow::anyhow!("EP semaphore closed: {e}"))
+                    })?;
+
+                    #[cfg(test)]
+                    cache
+                        .component_solves
+                        .fetch_add(u64::try_from(claimed.len()).unwrap_or(0), Ordering::Relaxed);
+
+                    let mut to_solve = Vec::with_capacity(claimed.len());
+                    let mut guards = Vec::with_capacity(claimed.len());
+                    for (indexed, guard) in claimed {
+                        to_solve.push(indexed);
+                        guards.push(guard);
+                    }
+                    let solved_batch = run_solve_ep_components(to_solve).await?;
+                    for ((indexed, scores_opt), guard) in solved_batch.into_iter().zip(guards) {
+                        let scores_arc = Arc::new(scores_opt);
+                        cache.insert_component(indexed.digest, Arc::clone(&scores_arc));
+                        // Deliver directly to waiters so LRU eviction under >512 components or
+                        // concurrent cache churn can never drop a freshly solved result.
+                        guard.finish(Arc::clone(&scores_arc));
+                        resolved.push((indexed, scores_arc));
+                    }
+                    drop(permit);
+                }
+
+                for (indexed, mut rx) in waited {
+                    if let Ok(val) = rx.wait_for(Option::is_some).await
+                        && let Some(hit) = val.clone()
+                    {
+                        resolved.push((indexed, hit));
+                    } else if let Some(hit) = cache.get_component(indexed.digest) {
+                        resolved.push((indexed, hit));
+                    } else {
+                        // Leader exited without populating (cancelled/errored); retry and claim.
+                        pending.push(indexed);
+                    }
+                }
+            }
+        } else {
+            let solved_batch = run_solve_ep_components(pending).await?;
+            for (indexed, scores_opt) in solved_batch {
+                resolved.push((indexed, Arc::new(scores_opt)));
+            }
+        }
+
+        let target_set: HashSet<&str> = target_ids.iter().map(String::as_str).collect();
+        let mut out: HashMap<String, Score> = HashMap::with_capacity(target_set.len());
+        for (indexed, scores_arc) in resolved {
+            if let Some(ref comp_scores) = *scores_arc
+                && comp_scores.len() == indexed.component.items.len()
+            {
+                for (id, &score) in indexed.component.items.iter().zip(comp_scores.iter()) {
+                    if target_set.contains(id.as_str()) {
+                        out.insert(id.clone(), score);
                     }
                 }
             }
         }
-        let scores = run_infer_scores(compared_ids, orderings.clone()).await?;
-        let orderings_arc = Arc::new(orderings);
-        let scores_arc = Arc::new(scores);
-        if let Some(cache) = self.ep_cache {
-            cache.insert(
-                scope_collection_id,
-                fresh_rev,
-                generation,
-                Arc::clone(&orderings_arc),
-                Arc::clone(&scores_arc),
-            );
-        }
-        Ok((orderings_arc, scores_arc))
+        Ok(out)
     }
 
-    /// Loads a collection's rankable members, runs (or reuses cached) EP inference, assigns S-D
-    /// quantile tiers for global lists, and computes bar widths.
+    /// Loads a collection's rankable members, runs (or reuses cached) EP inference for ONLY the
+    /// connected components touching this collection, assigns S-D quantile tiers for global lists,
+    /// and computes bar widths.
     pub async fn get_ranked_collection(
         &self,
         slug_or_id: &str,
@@ -606,11 +869,21 @@ impl<'a> CatalogService<'a> {
         let mut inputs = self.repo.load_collection_ranking_inputs(slug_or_id, want).await?;
         let is_priority = inputs.is_priority_scope;
         let member_ids: Vec<String> = inputs.members.iter().map(|m| m.id.clone()).collect();
+        let member_set: HashSet<&str> = member_ids.iter().map(String::as_str).collect();
 
         let scope_id = is_priority.then_some(inputs.collection.id.as_str());
-        let (orderings, scope_scores) = self.load_scope_orderings_and_scores(scope_id).await?;
-        let relevant_comparison_count = count_relevant_comparisons(&member_ids, &orderings);
+        let scope_snap = self.load_scope_orderings(scope_id).await?;
+        let relevant_comparison_count =
+            count_relevant_comparisons_with_set(&member_set, &scope_snap.orderings);
         inputs.collection.comparison_count = relevant_comparison_count;
+
+        let compared_in_col: Vec<String> = scope_snap
+            .compared_ids
+            .iter()
+            .filter(|id| member_set.contains(id.as_str()))
+            .cloned()
+            .collect();
+        let scope_scores = self.infer_scores_for_targets(&scope_snap, &compared_in_col).await?;
 
         let scores: HashMap<String, Score> = member_ids
             .iter()
@@ -657,7 +930,8 @@ impl<'a> CatalogService<'a> {
     }
 
     /// Loads ONLY the requested page of a ranked collection via banded SQL pagination, never
-    /// hydrating thousands of uncompared rows outside the current page.
+    /// hydrating thousands of uncompared rows outside the current page and solving EP ONLY for
+    /// connected components touching this collection.
     ///
     /// When `clamp_page` is `true` (Web SSR), out-of-range page numbers clamp to `1..=total_pages`.
     /// When `clamp_page` is `false` (REST API), requesting `page > total_pages` returns empty rows
@@ -674,19 +948,21 @@ impl<'a> CatalogService<'a> {
     ) -> Result<RankedCollectionPage, AppError> {
         let safe_page_size = page_size.clamp(1, 2_000);
         let (is_priority, scope_id) = self.repo.resolve_ranking_scope(slug_or_id, want).await?;
-        let (orderings, scope_scores) =
-            self.load_scope_orderings_and_scores(scope_id.as_deref()).await?;
+        let scope_snap = self.load_scope_orderings(scope_id.as_deref()).await?;
 
-        let scope_compared_ids: Vec<String> = scope_scores.keys().cloned().collect();
-        let mut meta =
-            self.repo.load_collection_page_meta(slug_or_id, want, &scope_compared_ids, &[]).await?;
+        let mut meta = self
+            .repo
+            .load_collection_page_meta(slug_or_id, want, &scope_snap.compared_ids, &[])
+            .await?;
 
         let full_total = meta.total_count;
         let compared_ids_in_col: Vec<String> =
             meta.compared_members.iter().map(|m| m.id.clone()).collect();
         let relevant_comparison_count =
-            count_relevant_comparisons(&compared_ids_in_col, &orderings);
+            count_relevant_comparisons(&compared_ids_in_col, &scope_snap.orderings);
         meta.collection.comparison_count = relevant_comparison_count;
+
+        let scope_scores = self.infer_scores_for_targets(&scope_snap, &compared_ids_in_col).await?;
 
         let compared_scores: HashMap<String, Score> = meta
             .compared_members
@@ -923,8 +1199,253 @@ impl<'a> CatalogService<'a> {
         })
     }
 
+    /// Prepares one interactive ranking session round without hydrating thousands of unselected
+    /// collection members and without solving unrelated global EP components.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn prepare_rank_session<F, T>(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+        focus_id: Option<&str>,
+        done: bool,
+        random: bool,
+        max_rounds: usize,
+        round: usize,
+        skip_count: usize,
+        effective_k: usize,
+        excluded_tokens: &HashSet<String>,
+        token_of: T,
+        is_covered: F,
+    ) -> Result<RankSessionSelection, AppError>
+    where
+        F: Fn(&[String]) -> bool + Send + Sync,
+        T: for<'s> Fn(&'s str) -> &'s str + Sync,
+    {
+        let mut inputs = self.repo.load_collection_rankable_ids(slug_or_id, want).await?;
+        let is_priority = inputs.is_priority_scope;
+        let total_rows = inputs.member_ids.len();
+        let member_set: HashSet<&str> = inputs.member_ids.iter().map(String::as_str).collect();
+
+        let scope_id = is_priority.then_some(inputs.collection.id.as_str());
+        let scope = self.load_scope_orderings(scope_id).await?;
+        let relevant_comparison_count =
+            count_relevant_comparisons_with_set(&member_set, &scope.orderings);
+        inputs.collection.comparison_count = relevant_comparison_count;
+
+        let focus_clean = focus_id.map(str::trim).filter(|s| !s.is_empty());
+        let focus_in_col = focus_clean.is_some_and(|fid| member_set.contains(fid));
+        let initial_focus_missing = focus_clean.is_some() && !focus_in_col;
+        let need_cluster_if_focus_ok = !(done
+            || initial_focus_missing
+            || (focus_in_col && round >= max_rounds)
+            || total_rows < MIN_K);
+
+        let compared_member_ids: Vec<String> = if focus_in_col || need_cluster_if_focus_ok {
+            scope
+                .compared_ids
+                .iter()
+                .filter(|id| member_set.contains(id.as_str()))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let compared_scores = if focus_in_col || need_cluster_if_focus_ok {
+            self.infer_scores_for_targets(&scope, &compared_member_ids).await?
+        } else {
+            HashMap::new()
+        };
+
+        let (focus_row, focus_missing) = if let Some(fid) = focus_clean {
+            if focus_in_col {
+                let row = self
+                    .compute_focus_ranked_row(
+                        slug_or_id,
+                        want,
+                        fid,
+                        is_priority,
+                        total_rows,
+                        relevant_comparison_count,
+                        &compared_member_ids,
+                        &compared_scores,
+                    )
+                    .await?;
+                let missing = row.is_none();
+                (row, missing)
+            } else {
+                (None, true)
+            }
+        } else {
+            (None, false)
+        };
+
+        let cluster = if done
+            || focus_missing
+            || (focus_row.is_some() && round >= max_rounds)
+            || total_rows < MIN_K
+        {
+            PrioritizedCluster::default()
+        } else {
+            let focus_ids: Vec<String> = if random || focus_row.is_none() {
+                Vec::new()
+            } else {
+                focus_clean.into_iter().map(ToOwned::to_owned).collect()
+            };
+            let excluded_ids: HashSet<String> = if excluded_tokens.is_empty() {
+                HashSet::new()
+            } else {
+                inputs
+                    .member_ids
+                    .iter()
+                    .filter(|id| excluded_tokens.contains(token_of(id)))
+                    .cloned()
+                    .collect()
+            };
+            let iter_idx = if random {
+                RANDOM_SEED_EVERY.saturating_add(skip_count)
+            } else {
+                round.saturating_add(skip_count)
+            };
+            let mut acceptor = IdClusterAcceptor { is_covered: &is_covered };
+            let selected = pick_uncovered_cluster_async(
+                &inputs.member_ids,
+                &compared_scores,
+                effective_k,
+                iter_idx,
+                !focus_ids.is_empty(),
+                (!focus_ids.is_empty()).then_some(focus_ids.as_slice()),
+                &excluded_ids,
+                MAX_COVERED_CLUSTER_RETRIES,
+                &mut acceptor,
+            )
+            .await?
+            .unwrap_or(SelectedCluster { ordered_ids: Vec::new(), priority_ids: Vec::new() });
+            self.materialize_prioritized_cluster(selected).await?
+        };
+
+        Ok(RankSessionSelection {
+            collection: inputs.collection,
+            is_priority_scope: is_priority,
+            comparison_count: relevant_comparison_count,
+            total_rows,
+            focus_row,
+            focus_missing,
+            cluster,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compute_focus_ranked_row(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+        focus_id: &str,
+        is_priority: bool,
+        total_rows: usize,
+        relevant_comparison_count: usize,
+        compared_member_ids: &[String],
+        compared_scores: &HashMap<String, Score>,
+    ) -> Result<Option<RankedEntryRow>, AppError> {
+        let focus_loaded = self.repo.load_entries_by_ids(&[focus_id.to_owned()]).await?;
+        let Some(focus_entry) = focus_loaded.into_values().next() else {
+            return Ok(None);
+        };
+
+        let mut titles_by_id = self.repo.load_entry_titles_by_ids(compared_member_ids).await?;
+        let mut compared_id_titles: Vec<(String, String)> =
+            Vec::with_capacity(compared_member_ids.len());
+        let mut full_compared_scores: HashMap<String, Score> =
+            HashMap::with_capacity(compared_member_ids.len());
+        for id in compared_member_ids {
+            if let Some(title) = titles_by_id.remove(id) {
+                let sc = compared_scores.get(id).copied().unwrap_or_default();
+                full_compared_scores.insert(id.clone(), sc);
+                compared_id_titles.push((id.clone(), title));
+            }
+        }
+
+        let uncompared_count = total_rows.saturating_sub(compared_id_titles.len());
+        let tier = if !is_priority && relevant_comparison_count > 0 {
+            let q = rescale_to_quantiles_with_uncompared(
+                &full_compared_scores,
+                uncompared_count,
+                N_QUANTILES,
+            );
+            q.compared.get(focus_id).copied().or(q.uncompared).map(tier_label)
+        } else {
+            None
+        };
+
+        let score = full_compared_scores.get(focus_id).copied().unwrap_or_default();
+        let max_abs = full_compared_scores
+            .values()
+            .map(|s| s.mean.abs())
+            .filter(|v| v.is_finite())
+            .fold(0.0_f64, f64::max);
+        let scale = if max_abs > 0.0 { max_abs } else { 1.0 };
+        let bar_pct = ((score.mean / scale + 1.0) * 50.0).clamp(2.0, 100.0);
+
+        let bands = split_compared_bands_around_zero_by(
+            compared_id_titles,
+            &full_compared_scores,
+            uncompared_count > 0,
+            |(id, _)| id.as_str(),
+            |(_, title)| title.as_str(),
+        );
+        let zero_band_total = total_rows.saturating_sub(bands.above.len() + bands.below.len());
+        let rank = if let Some(idx) = bands.above.iter().position(|(id, _)| id == focus_id) {
+            idx + 1
+        } else if let Some(idx) = bands.below.iter().position(|(id, _)| id == focus_id) {
+            bands.above.len() + zero_band_total + idx + 1
+        } else {
+            let target_ascii_lower = focus_entry.title.to_ascii_lowercase();
+            let all_before = self
+                .repo
+                .count_collection_entries_alpha_before(
+                    slug_or_id,
+                    want,
+                    &target_ascii_lower,
+                    focus_id,
+                )
+                .await?;
+            let non_zero_before = bands
+                .above
+                .iter()
+                .chain(bands.below.iter())
+                .filter(|(id, title)| {
+                    let lo = title.to_ascii_lowercase();
+                    lo < target_ascii_lower || (lo == target_ascii_lower && id.as_str() < focus_id)
+                })
+                .count();
+            (bands.above.len() + all_before.saturating_sub(non_zero_before) + 1)
+                .clamp(1, total_rows.max(1))
+        };
+
+        Ok(Some(RankedEntryRow { rank, entry: focus_entry, score, tier, bar_pct }))
+    }
+
+    async fn materialize_prioritized_cluster(
+        &self,
+        selected: SelectedCluster,
+    ) -> Result<PrioritizedCluster, AppError> {
+        if selected.ordered_ids.is_empty() {
+            return Ok(PrioritizedCluster::default());
+        }
+        let mut by_id = self.repo.load_entries_by_ids(&selected.ordered_ids).await?;
+        let entries: Vec<CatalogEntry> =
+            selected.ordered_ids.iter().filter_map(|id| by_id.remove(id)).collect();
+        let entry_set: HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        let priority_ids: Vec<String> = selected
+            .priority_ids
+            .into_iter()
+            .filter(|id| entry_set.contains(id.as_str()))
+            .collect();
+        Ok(PrioritizedCluster { entries, priority_ids })
+    }
+
     /// Selects the next uncovered cluster together with its selection-priority order
     /// (`[seed, most_confusable, ...]`) from an already-computed [`RankedCollectionView`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn select_uncovered_cluster_prioritized_from_ranked_view<F>(
         &self,
         ranked: &RankedCollectionView,
@@ -932,7 +1453,7 @@ impl<'a> CatalogService<'a> {
         is_covered: F,
     ) -> Result<PrioritizedCluster, AppError>
     where
-        F: Fn(&[CatalogEntry]) -> bool,
+        F: Fn(&[CatalogEntry]) -> bool + Send + Sync,
     {
         let raw_members: Vec<CatalogEntry> = ranked.rows.iter().map(|r| r.entry.clone()).collect();
         let members = self.filter_cluster_members(raw_members, filter).await?;
@@ -940,20 +1461,28 @@ impl<'a> CatalogService<'a> {
             ranked.rows.iter().map(|r| (r.entry.id.clone(), r.score)).collect();
         let seed_pool = self.resolve_cluster_seed_pool(filter).await?;
         let excluded_ids = self.resolve_cluster_excluded_ids(filter).await?;
-        Ok(pick_uncovered_cluster_prioritized(
-            members,
+        let all_member_ids: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
+        let by_id: HashMap<String, CatalogEntry> =
+            members.into_iter().map(|e| (e.id.clone(), e)).collect();
+        let mut acceptor = MapClusterAcceptor { by_id: &by_id, is_covered: &is_covered };
+        Ok(pick_uncovered_cluster_async(
+            &all_member_ids,
             &scores,
-            filter,
+            filter.max_k,
+            filter.iteration,
+            !filter.focus_ids.is_empty(),
             seed_pool.as_deref(),
             &excluded_ids,
             MAX_COVERED_CLUSTER_RETRIES,
-            is_covered,
-        ))
+            &mut acceptor,
+        )
+        .await?
+        .unwrap_or_default())
     }
 
     /// Computes quality tier letters (`S`..`D`) for a heterogeneous set of entries across their
-    /// default kind lists using a single cached global EP pass and uncompared quantile folding
-    /// (without hydrating uncompared catalog entries).
+    /// default kind lists using cached component-level EP inference and uncompared quantile folding
+    /// (without hydrating uncompared catalog entries or solving unrelated components).
     pub async fn load_tiers_for_entries(&self, entries: &[CatalogEntry]) -> HashMap<String, char> {
         let mut slugs: Vec<&'static str> = entries
             .iter()
@@ -965,10 +1494,9 @@ impl<'a> CatalogService<'a> {
         if slugs.is_empty() {
             return HashMap::new();
         }
-        let Ok((orderings, scope_scores)) = self.load_scope_orderings_and_scores(None).await else {
+        let Ok(scope) = self.load_scope_orderings(None).await else {
             return HashMap::new();
         };
-        let scope_compared_ids: Vec<String> = scope_scores.keys().cloned().collect();
         let entry_ids_by_slug: HashMap<&'static str, Vec<String>> = {
             let mut map: HashMap<&'static str, Vec<String>> = HashMap::new();
             for e in entries {
@@ -987,7 +1515,7 @@ impl<'a> CatalogService<'a> {
             };
             let Ok(meta) = self
                 .repo
-                .load_collection_page_meta(slug, false, &scope_compared_ids, target_ids)
+                .load_collection_page_meta(slug, false, &scope.compared_ids, target_ids)
                 .await
             else {
                 continue;
@@ -997,9 +1525,13 @@ impl<'a> CatalogService<'a> {
             }
             let compared_ids: Vec<String> =
                 meta.compared_members.iter().map(|m| m.id.clone()).collect();
-            if count_relevant_comparisons(&compared_ids, &orderings) == 0 {
+            if count_relevant_comparisons(&compared_ids, &scope.orderings) == 0 {
                 continue;
             }
+            let Ok(scope_scores) = self.infer_scores_for_targets(&scope, &compared_ids).await
+            else {
+                continue;
+            };
             let compared_scores: HashMap<String, Score> = compared_ids
                 .into_iter()
                 .map(|id| {
@@ -1050,7 +1582,7 @@ impl<'a> CatalogService<'a> {
         is_covered: F,
     ) -> Result<(CollectionSummary, Vec<CatalogEntry>, HashMap<String, Score>), AppError>
     where
-        F: Fn(&[CatalogEntry]) -> bool,
+        F: Fn(&[CatalogEntry]) -> bool + Send + Sync,
     {
         self.select_next_cluster_with_retries(
             slug_or_id,
@@ -1071,35 +1603,108 @@ impl<'a> CatalogService<'a> {
         is_covered: F,
     ) -> Result<(CollectionSummary, Vec<CatalogEntry>, HashMap<String, Score>), AppError>
     where
-        F: Fn(&[CatalogEntry]) -> bool,
+        F: Fn(&[CatalogEntry]) -> bool + Send + Sync,
     {
-        let mut inputs = self.repo.load_collection_ranking_inputs(slug_or_id, want).await?;
+        let has_creator_filter =
+            filter.by_creator.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
+        if has_creator_filter {
+            let mut inputs = self.repo.load_collection_ranking_inputs(slug_or_id, want).await?;
+            let is_priority = inputs.is_priority_scope;
+            let all_member_ids: Vec<String> = inputs.members.iter().map(|m| m.id.clone()).collect();
+            let all_member_set: HashSet<&str> = all_member_ids.iter().map(String::as_str).collect();
+
+            let scope_id = is_priority.then_some(inputs.collection.id.as_str());
+            let scope = self.load_scope_orderings(scope_id).await?;
+            inputs.collection.comparison_count =
+                count_relevant_comparisons_with_set(&all_member_set, &scope.orderings);
+
+            let members = self.filter_cluster_members(inputs.members, filter).await?;
+            let filtered_ids: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
+            let filtered_set: HashSet<&str> = filtered_ids.iter().map(String::as_str).collect();
+            let compared_in_filtered: Vec<String> = scope
+                .compared_ids
+                .iter()
+                .filter(|id| filtered_set.contains(id.as_str()))
+                .cloned()
+                .collect();
+            let scope_scores = self.infer_scores_for_targets(&scope, &compared_in_filtered).await?;
+            let seed_pool = self.resolve_cluster_seed_pool(filter).await?;
+            let excluded_ids = self.resolve_cluster_excluded_ids(filter).await?;
+            let by_id: HashMap<String, CatalogEntry> =
+                members.into_iter().map(|e| (e.id.clone(), e)).collect();
+            let mut acceptor = MapClusterAcceptor { by_id: &by_id, is_covered: &is_covered };
+            let cluster_entries = pick_uncovered_cluster_async(
+                &filtered_ids,
+                &scope_scores,
+                filter.max_k,
+                filter.iteration,
+                !filter.focus_ids.is_empty(),
+                seed_pool.as_deref(),
+                &excluded_ids,
+                max_covered_retries,
+                &mut acceptor,
+            )
+            .await?
+            .unwrap_or_default()
+            .entries;
+            let scores: HashMap<String, Score> = filtered_ids
+                .iter()
+                .map(|id| (id.clone(), scope_scores.get(id).copied().unwrap_or_default()))
+                .collect();
+            return Ok((inputs.collection, cluster_entries, scores));
+        }
+
+        // Fast path: load ONLY rankable member IDs and lazily hydrate (with per-call caching)
+        // ONLY the small candidate clusters evaluated by `is_covered`.
+        let mut inputs = self.repo.load_collection_rankable_ids(slug_or_id, want).await?;
         let is_priority = inputs.is_priority_scope;
-        let all_member_ids: Vec<String> = inputs.members.iter().map(|m| m.id.clone()).collect();
+        let all_member_set: HashSet<&str> = inputs.member_ids.iter().map(String::as_str).collect();
 
         let scope_id = is_priority.then_some(inputs.collection.id.as_str());
-        let (orderings, scope_scores) = self.load_scope_orderings_and_scores(scope_id).await?;
+        let scope = self.load_scope_orderings(scope_id).await?;
         inputs.collection.comparison_count =
-            count_relevant_comparisons(&all_member_ids, &orderings);
+            count_relevant_comparisons_with_set(&all_member_set, &scope.orderings);
 
-        let members = self.filter_cluster_members(inputs.members, filter).await?;
-        let scores: HashMap<String, Score> = members
+        let mut member_ids = inputs.member_ids;
+        if let Some(raw_parent_id) =
+            filter.from_parent_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            let child_ids = self.repo.load_child_entry_ids_for_parent(raw_parent_id).await?;
+            member_ids.retain(|id| child_ids.contains(id));
+        }
+        let filtered_set: HashSet<&str> = member_ids.iter().map(String::as_str).collect();
+        let compared_in_filtered: Vec<String> = scope
+            .compared_ids
             .iter()
-            .map(|m| (m.id.clone(), scope_scores.get(&m.id).copied().unwrap_or_default()))
+            .filter(|id| filtered_set.contains(id.as_str()))
+            .cloned()
             .collect();
+        let scope_scores = self.infer_scores_for_targets(&scope, &compared_in_filtered).await?;
+
         let seed_pool = self.resolve_cluster_seed_pool(filter).await?;
         let excluded_ids = self.resolve_cluster_excluded_ids(filter).await?;
-        let cluster_entries = pick_uncovered_cluster_prioritized(
-            members,
-            &scores,
-            filter,
+        let mut acceptor = LazyHydrateClusterAcceptor {
+            repo: self.repo,
+            cache: HashMap::new(),
+            is_covered: &is_covered,
+        };
+        let cluster_entries = pick_uncovered_cluster_async(
+            &member_ids,
+            &scope_scores,
+            filter.max_k,
+            filter.iteration,
+            !filter.focus_ids.is_empty(),
             seed_pool.as_deref(),
             &excluded_ids,
             max_covered_retries,
-            is_covered,
+            &mut acceptor,
         )
-        .entries;
-
+        .await?
+        .unwrap_or_default();
+        let scores: HashMap<String, Score> = member_ids
+            .iter()
+            .map(|id| (id.clone(), scope_scores.get(id).copied().unwrap_or_default()))
+            .collect();
         Ok((inputs.collection, cluster_entries, scores))
     }
 
@@ -1171,11 +1776,9 @@ impl<'a> CatalogService<'a> {
             return Vec::new();
         }
 
-        let Ok((orderings, global_scores)) = self.load_scope_orderings_and_scores(None).await
-        else {
+        let Ok(scope) = self.load_scope_orderings(None).await else {
             return Vec::new();
         };
-        let scope_compared_ids: Vec<String> = global_scores.keys().cloned().collect();
 
         let mut seen_col_ids: HashSet<String> = HashSet::new();
         let mut out = Vec::new();
@@ -1188,7 +1791,7 @@ impl<'a> CatalogService<'a> {
                 .load_collection_page_meta(
                     &key,
                     false,
-                    &scope_compared_ids,
+                    &scope.compared_ids,
                     std::slice::from_ref(&detail.entry.id),
                 )
                 .await
@@ -1205,7 +1808,11 @@ impl<'a> CatalogService<'a> {
             let total = meta.total_count;
             let compared_ids: Vec<String> =
                 meta.compared_members.iter().map(|m| m.id.clone()).collect();
-            let has_relevant_comp = count_relevant_comparisons(&compared_ids, &orderings) > 0;
+            let has_relevant_comp = count_relevant_comparisons(&compared_ids, &scope.orderings) > 0;
+            let Ok(global_scores) = self.infer_scores_for_targets(&scope, &compared_ids).await
+            else {
+                continue;
+            };
 
             let compared_scores: HashMap<String, Score> = meta
                 .compared_members
@@ -1430,104 +2037,213 @@ fn is_spotify_web_url(raw: &str) -> bool {
     })
 }
 
-fn pick_uncovered_cluster_prioritized<F>(
-    members: Vec<CatalogEntry>,
+enum ClusterCheckOutcome<T> {
+    Accepted(T),
+    TooShort,
+    Covered(Vec<String>),
+}
+
+trait ClusterAcceptor: Send {
+    type Output: Send;
+
+    fn evaluate(
+        &mut self,
+        selected: SelectedCluster,
+    ) -> impl Future<Output = Result<ClusterCheckOutcome<Self::Output>, AppError>> + Send;
+}
+
+struct IdClusterAcceptor<'a, F> {
+    is_covered: &'a F,
+}
+
+impl<F> ClusterAcceptor for IdClusterAcceptor<'_, F>
+where
+    F: Fn(&[String]) -> bool + Send + Sync,
+{
+    type Output = SelectedCluster;
+
+    fn evaluate(
+        &mut self,
+        selected: SelectedCluster,
+    ) -> impl Future<Output = Result<ClusterCheckOutcome<Self::Output>, AppError>> + Send {
+        std::future::ready(if selected.ordered_ids.len() < MIN_K {
+            Ok(ClusterCheckOutcome::TooShort)
+        } else if (self.is_covered)(&selected.ordered_ids) {
+            Ok(ClusterCheckOutcome::Covered(selected.ordered_ids))
+        } else {
+            Ok(ClusterCheckOutcome::Accepted(selected))
+        })
+    }
+}
+
+struct MapClusterAcceptor<'a, F> {
+    by_id: &'a HashMap<String, CatalogEntry>,
+    is_covered: &'a F,
+}
+
+impl<F> ClusterAcceptor for MapClusterAcceptor<'_, F>
+where
+    F: Fn(&[CatalogEntry]) -> bool + Send + Sync,
+{
+    type Output = PrioritizedCluster;
+
+    fn evaluate(
+        &mut self,
+        selected: SelectedCluster,
+    ) -> impl Future<Output = Result<ClusterCheckOutcome<Self::Output>, AppError>> + Send {
+        if selected.ordered_ids.len() < MIN_K {
+            return std::future::ready(Ok(ClusterCheckOutcome::TooShort));
+        }
+        let entries: Vec<CatalogEntry> =
+            selected.ordered_ids.iter().filter_map(|id| self.by_id.get(id).cloned()).collect();
+        std::future::ready(if entries.len() < MIN_K {
+            Ok(ClusterCheckOutcome::TooShort)
+        } else if (self.is_covered)(&entries) {
+            let ids = entries.into_iter().map(|e| e.id).collect();
+            Ok(ClusterCheckOutcome::Covered(ids))
+        } else {
+            Ok(ClusterCheckOutcome::Accepted(PrioritizedCluster {
+                entries,
+                priority_ids: selected.priority_ids,
+            }))
+        })
+    }
+}
+
+struct LazyHydrateClusterAcceptor<'a, F> {
+    repo: CatalogRepo<'a>,
+    cache: HashMap<String, Option<CatalogEntry>>,
+    is_covered: &'a F,
+}
+
+impl<F> ClusterAcceptor for LazyHydrateClusterAcceptor<'_, F>
+where
+    F: Fn(&[CatalogEntry]) -> bool + Send + Sync,
+{
+    type Output = Vec<CatalogEntry>;
+
+    async fn evaluate(
+        &mut self,
+        selected: SelectedCluster,
+    ) -> Result<ClusterCheckOutcome<Self::Output>, AppError> {
+        if selected.ordered_ids.len() < MIN_K {
+            return Ok(ClusterCheckOutcome::TooShort);
+        }
+        let missing: Vec<String> = selected
+            .ordered_ids
+            .iter()
+            .filter(|id| !self.cache.contains_key(id.as_str()))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let mut loaded = self.repo.load_entries_by_ids(&missing).await?;
+            for id in missing {
+                let entry = loaded.remove(&id);
+                self.cache.insert(id, entry);
+            }
+        }
+        let entries: Vec<CatalogEntry> = selected
+            .ordered_ids
+            .iter()
+            .filter_map(|id| self.cache.get(id).and_then(Option::as_ref).cloned())
+            .collect();
+        if entries.len() < MIN_K {
+            Ok(ClusterCheckOutcome::TooShort)
+        } else if (self.is_covered)(&entries) {
+            let ids = entries.into_iter().map(|e| e.id).collect();
+            Ok(ClusterCheckOutcome::Covered(ids))
+        } else {
+            Ok(ClusterCheckOutcome::Accepted(entries))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pick_uncovered_cluster_async<A: ClusterAcceptor>(
+    all_member_ids: &[String],
     scores: &HashMap<String, Score>,
-    filter: &ClusterSelectFilter,
+    raw_max_k: usize,
+    iteration: usize,
+    has_focus: bool,
     seed_pool: Option<&[String]>,
     excluded_ids: &HashSet<String>,
     max_covered_retries: usize,
-    is_covered: F,
-) -> PrioritizedCluster
-where
-    F: Fn(&[CatalogEntry]) -> bool,
-{
-    let all_member_ids: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
-    let by_id: HashMap<String, CatalogEntry> =
-        members.into_iter().map(|e| (e.id.clone(), e)).collect();
+    acceptor: &mut A,
+) -> Result<Option<A::Output>, AppError> {
+    let max_k = if raw_max_k == 0 { MAX_K_DEFAULT } else { raw_max_k };
+    let force_random =
+        seed_pool.is_none() && iteration > 0 && iteration.is_multiple_of(RANDOM_SEED_EVERY);
 
-    let max_k = if filter.max_k == 0 { MAX_K_DEFAULT } else { filter.max_k };
-    let force_random = seed_pool.is_none()
-        && filter.iteration > 0
-        && filter.iteration.is_multiple_of(RANDOM_SEED_EVERY);
-
-    let focus_set: HashSet<&str> = if filter.focus_ids.is_empty() {
-        HashSet::new()
-    } else {
+    let focus_set: HashSet<&str> = if has_focus {
         seed_pool.map_or_else(HashSet::new, |pool| pool.iter().map(String::as_str).collect())
+    } else {
+        HashSet::new()
     };
 
     if !excluded_ids.is_empty() {
-        let filtered_ids: Vec<String> = all_member_ids
+        let filtered_ids: Vec<&str> = all_member_ids
             .iter()
-            .filter(|id| focus_set.contains(id.as_str()) || !excluded_ids.contains(id.as_str()))
-            .cloned()
+            .map(String::as_str)
+            .filter(|id| focus_set.contains(*id) || !excluded_ids.contains(*id))
             .collect();
-        if filtered_ids.len() >= MIN_K {
-            let picked = pick_uncovered_from_pool(
+        if filtered_ids.len() >= MIN_K
+            && let Some(picked) = pick_uncovered_from_pool_async(
                 &filtered_ids,
-                &by_id,
                 scores,
                 max_k,
                 force_random,
                 seed_pool,
                 &focus_set,
                 max_covered_retries,
-                &is_covered,
-            );
-            if picked.entries.len() >= MIN_K {
-                return picked;
-            }
+                acceptor,
+            )
+            .await?
+        {
+            return Ok(Some(picked));
         }
     }
 
-    pick_uncovered_from_pool(
-        &all_member_ids,
-        &by_id,
+    let all_refs: Vec<&str> = all_member_ids.iter().map(String::as_str).collect();
+    pick_uncovered_from_pool_async(
+        &all_refs,
         scores,
         max_k,
         force_random,
         seed_pool,
         &focus_set,
         max_covered_retries,
-        &is_covered,
+        acceptor,
     )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pick_uncovered_from_pool<F>(
-    pool_member_ids: &[String],
-    by_id: &HashMap<String, CatalogEntry>,
+async fn pick_uncovered_from_pool_async<A: ClusterAcceptor>(
+    pool_member_ids: &[&str],
     scores: &HashMap<String, Score>,
     max_k: usize,
     force_random: bool,
     seed_pool: Option<&[String]>,
     focus_set: &HashSet<&str>,
     max_covered_retries: usize,
-    is_covered: &F,
-) -> PrioritizedCluster
-where
-    F: Fn(&[CatalogEntry]) -> bool,
-{
-    let materialize = |ordered_ids: &[String], priority_ids: Vec<String>| -> PrioritizedCluster {
-        let entries = ordered_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect();
-        PrioritizedCluster { entries, priority_ids }
+    acceptor: &mut A,
+) -> Result<Option<A::Output>, AppError> {
+    let initial = {
+        let mut rng = rand::rng();
+        select_cluster_prioritized_refs(
+            scores,
+            pool_member_ids,
+            max_k,
+            force_random,
+            seed_pool,
+            &mut rng,
+        )
     };
-
-    let mut rng = rand::rng();
-    let initial = select_cluster_prioritized(
-        scores,
-        pool_member_ids,
-        max_k,
-        force_random,
-        seed_pool,
-        &mut rng,
-    );
-    let mut chosen = materialize(&initial.ordered_ids, initial.priority_ids);
-
-    if chosen.entries.len() < MIN_K || !is_covered(&chosen.entries) {
-        return chosen;
-    }
+    let mut covered_ids = match acceptor.evaluate(initial).await? {
+        ClusterCheckOutcome::Accepted(out) => return Ok(Some(out)),
+        ClusterCheckOutcome::TooShort => return Ok(None),
+        ClusterCheckOutcome::Covered(ids) => ids,
+    };
 
     if !focus_set.is_empty() {
         // In focused mode (especially at k = 2 or 3), a single tie or small score update can
@@ -1537,85 +2253,119 @@ where
         let mut retry_excluded: HashSet<String> = HashSet::new();
         for _ in 0..MAX_FOCUSED_COVERED_RETRIES {
             let mut added_any = false;
-            for entry in &chosen.entries {
-                if !focus_set.contains(entry.id.as_str()) && retry_excluded.insert(entry.id.clone())
-                {
+            for id in &covered_ids {
+                if !focus_set.contains(id.as_str()) && retry_excluded.insert(id.clone()) {
                     added_any = true;
                 }
             }
             if !added_any {
                 break;
             }
-            let remaining_ids: Vec<String> = pool_member_ids
+            let remaining_ids: Vec<&str> = pool_member_ids
                 .iter()
-                .filter(|id| {
-                    focus_set.contains(id.as_str()) || !retry_excluded.contains(id.as_str())
-                })
-                .cloned()
+                .copied()
+                .filter(|id| focus_set.contains(*id) || !retry_excluded.contains(*id))
                 .collect();
             if remaining_ids.len() < MIN_K {
                 break;
             }
-            let cand_sel = select_cluster_prioritized(
-                scores,
-                &remaining_ids,
-                max_k,
-                false,
-                seed_pool,
-                &mut rng,
-            );
-            let cand = materialize(&cand_sel.ordered_ids, cand_sel.priority_ids);
-            if cand.entries.len() < MIN_K {
-                break;
-            }
-            chosen = cand;
-            if !is_covered(&chosen.entries) {
-                return chosen;
+            let cand = {
+                let mut rng = rand::rng();
+                select_cluster_prioritized_refs(
+                    scores,
+                    &remaining_ids,
+                    max_k,
+                    false,
+                    seed_pool,
+                    &mut rng,
+                )
+            };
+            match acceptor.evaluate(cand).await? {
+                ClusterCheckOutcome::Accepted(out) => return Ok(Some(out)),
+                ClusterCheckOutcome::TooShort => break,
+                ClusterCheckOutcome::Covered(ids) => covered_ids = ids,
             }
         }
-        return PrioritizedCluster::default();
+        return Ok(None);
     }
 
     if max_covered_retries > 0 {
         for _ in 0..max_covered_retries {
-            let cand_sel = select_cluster_prioritized(
-                scores,
-                pool_member_ids,
-                max_k,
-                true,
-                seed_pool,
-                &mut rng,
-            );
-            let cand = materialize(&cand_sel.ordered_ids, cand_sel.priority_ids);
-            if cand.entries.len() >= MIN_K && !is_covered(&cand.entries) {
-                return cand;
+            let cand = {
+                let mut rng = rand::rng();
+                select_cluster_prioritized_refs(
+                    scores,
+                    pool_member_ids,
+                    max_k,
+                    true,
+                    seed_pool,
+                    &mut rng,
+                )
+            };
+            if let ClusterCheckOutcome::Accepted(out) = acceptor.evaluate(cand).await? {
+                return Ok(Some(out));
             }
         }
     }
 
-    PrioritizedCluster::default()
+    Ok(None)
+}
+
+fn collect_compared_ids(orderings: &[Vec<Vec<String>>]) -> Vec<String> {
+    let mut compared_ids: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for ord in orderings {
+        for group in ord {
+            for id in group {
+                if seen.insert(id.as_str()) {
+                    compared_ids.push(id.clone());
+                }
+            }
+        }
+    }
+    compared_ids
 }
 
 fn count_relevant_comparisons(member_ids: &[String], orderings: &[Vec<Vec<String>>]) -> usize {
     let member_set: HashSet<&str> = member_ids.iter().map(String::as_str).collect();
+    count_relevant_comparisons_with_set(&member_set, orderings)
+}
+
+fn count_relevant_comparisons_with_set(
+    member_set: &HashSet<&str>,
+    orderings: &[Vec<Vec<String>>],
+) -> usize {
     orderings
         .iter()
         .filter(|ord| ord.iter().flat_map(|g| g.iter()).any(|id| member_set.contains(id.as_str())))
         .count()
 }
 
-async fn run_infer_scores(
-    member_ids: Vec<String>,
-    orderings: Vec<Vec<Vec<String>>>,
-) -> Result<HashMap<String, Score>, AppError> {
-    if member_ids.len() >= SPAWN_BLOCKING_EP_THRESHOLD
-        || orderings.len() >= SPAWN_BLOCKING_EP_THRESHOLD
-    {
-        tokio::task::spawn_blocking(move || infer_scores(&member_ids, &orderings))
-            .await
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("EP inference task failed: {e}")))
+async fn run_solve_ep_components(
+    components: Vec<IndexedEpComponent>,
+) -> Result<Vec<(IndexedEpComponent, Option<Vec<Score>>)>, AppError> {
+    let total_items: usize = components.iter().map(|c| c.component.items.len()).sum();
+    let total_pairs: usize = components.iter().map(|c| c.component.pairs.len()).sum();
+    if total_items >= SPAWN_BLOCKING_EP_THRESHOLD || total_pairs >= SPAWN_BLOCKING_EP_THRESHOLD {
+        tokio::task::spawn_blocking(move || {
+            components
+                .into_iter()
+                .map(|indexed| {
+                    let solved = solve_ep_component(&indexed.component);
+                    (indexed, solved)
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("EP inference task failed: {e}")))
     } else {
-        Ok(infer_scores(&member_ids, &orderings))
+        Ok(components
+            .into_iter()
+            .map(|indexed| {
+                let solved = solve_ep_component(&indexed.component);
+                (indexed, solved)
+            })
+            .collect())
     }
 }
 
@@ -1648,31 +2398,53 @@ const fn tier_index(tier: char) -> Option<usize> {
     }
 }
 
-struct ZeroSplitBands {
-    above: Vec<CatalogEntry>,
-    zero_compared: Vec<CatalogEntry>,
-    below: Vec<CatalogEntry>,
+struct ZeroSplitBands<T = CatalogEntry> {
+    above: Vec<T>,
+    zero_compared: Vec<T>,
+    below: Vec<T>,
 }
 
-enum BandItem {
-    Compared(Box<CatalogEntry>),
+enum BandItem<T> {
+    Compared(T),
     UncomparedMarker,
 }
 
 /// Partitions compared members into strictly-above, tied-with-0.0, and strictly-below bands
 /// matching the exact descending tie-chaining behavior of [`sort_by_score_with_ties`].
 fn split_compared_bands_around_zero(
-    mut compared_members: Vec<CatalogEntry>,
+    compared_members: Vec<CatalogEntry>,
     scores: &HashMap<String, Score>,
     has_uncompared: bool,
-) -> ZeroSplitBands {
+) -> ZeroSplitBands<CatalogEntry> {
+    split_compared_bands_around_zero_by(
+        compared_members,
+        scores,
+        has_uncompared,
+        |e| e.id.as_str(),
+        |e| e.title.as_str(),
+    )
+}
+
+fn split_compared_bands_around_zero_by<T, IdFn, TitleFn>(
+    mut compared_members: Vec<T>,
+    scores: &HashMap<String, Score>,
+    has_uncompared: bool,
+    id_of: IdFn,
+    title_of: TitleFn,
+) -> ZeroSplitBands<T>
+where
+    IdFn: Fn(&T) -> &str,
+    TitleFn: Fn(&T) -> &str,
+{
+    let cmp_title_id = |a: &T, b: &T| {
+        title_of(a)
+            .to_ascii_lowercase()
+            .cmp(&title_of(b).to_ascii_lowercase())
+            .then_with(|| id_of(a).cmp(id_of(b)))
+    };
+
     if !has_uncompared {
-        sort_by_score_with_ties(
-            &mut compared_members,
-            scores,
-            |e| e.id.as_str(),
-            cmp_entry_title_id_ascii,
-        );
+        sort_by_score_with_ties(&mut compared_members, scores, &id_of, cmp_title_id);
         return ZeroSplitBands {
             above: compared_members,
             zero_compared: Vec::new(),
@@ -1680,26 +2452,26 @@ fn split_compared_bands_around_zero(
         };
     }
 
-    let mean_of = |item: &BandItem| match item {
-        BandItem::Compared(e) => scores.get(&e.id).copied().unwrap_or_default().mean,
+    let mean_of = |item: &BandItem<T>| match item {
+        BandItem::Compared(e) => scores.get(id_of(e)).copied().unwrap_or_default().mean,
         BandItem::UncomparedMarker => 0.0,
     };
 
     compared_members.sort_by(|a, b| {
-        let ma = scores.get(&a.id).copied().unwrap_or_default().mean;
-        let mb = scores.get(&b.id).copied().unwrap_or_default().mean;
-        mb.total_cmp(&ma).then_with(|| cmp_entry_title_id_ascii(a, b))
+        let ma = scores.get(id_of(a)).copied().unwrap_or_default().mean;
+        let mb = scores.get(id_of(b)).copied().unwrap_or_default().mean;
+        mb.total_cmp(&ma).then_with(|| cmp_title_id(a, b))
     });
 
-    let mut seq: Vec<BandItem> = Vec::with_capacity(compared_members.len() + 1);
+    let mut seq: Vec<BandItem<T>> = Vec::with_capacity(compared_members.len() + 1);
     let mut inserted_marker = false;
     for entry in compared_members {
-        let m = scores.get(&entry.id).copied().unwrap_or_default().mean;
+        let m = scores.get(id_of(&entry)).copied().unwrap_or_default().mean;
         if !inserted_marker && m.total_cmp(&0.0) != std::cmp::Ordering::Greater {
             seq.push(BandItem::UncomparedMarker);
             inserted_marker = true;
         }
-        seq.push(BandItem::Compared(Box::new(entry)));
+        seq.push(BandItem::Compared(entry));
     }
     if !inserted_marker {
         seq.push(BandItem::UncomparedMarker);
@@ -1728,13 +2500,13 @@ fn split_compared_bands_around_zero(
     let mut seen_marker_group = false;
     let mut seq_iter = seq.into_iter();
     for (count, has_marker) in group_sizes {
-        let mut group_entries: Vec<CatalogEntry> = Vec::with_capacity(count);
+        let mut group_entries: Vec<T> = Vec::with_capacity(count);
         for item in seq_iter.by_ref().take(count) {
             if let BandItem::Compared(entry) = item {
-                group_entries.push(*entry);
+                group_entries.push(entry);
             }
         }
-        group_entries.sort_by(cmp_entry_title_id_ascii);
+        group_entries.sort_by(cmp_title_id);
         if has_marker {
             zero_compared.extend(group_entries);
             seen_marker_group = true;
@@ -2558,5 +3330,409 @@ mod tests {
             bands2.above.into_iter().chain(zero_band2).chain(bands2.below).map(|e| e.id).collect();
         let full_ids2: Vec<String> = full2.into_iter().map(|e| e.id).collect();
         assert_eq!(reconstructed2, full_ids2);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_ep_component_cache_isolates_artists_from_albums_and_reuses_on_undo() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let cache = EpScoreCache::new();
+        let svc = CatalogService::with_cache(&db, &cache);
+
+        let mut album_ids = Vec::new();
+        for title in ["Album One", "Album Two", "Album Three"] {
+            let e = svc
+                .upsert_entry(&UpsertEntryInput {
+                    kind: Some(EntryKind::Album),
+                    title: title.to_owned(),
+                    creators: vec!["Some Band".to_owned()],
+                    ..UpsertEntryInput::default()
+                })
+                .await
+                .unwrap();
+            svc.log_consumption(&e.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+            album_ids.push(e.id);
+        }
+        let mut artist_ids = Vec::new();
+        for title in ["Artist Alpha", "Artist Beta", "Artist Gamma", "Artist Delta"] {
+            let e = svc
+                .upsert_entry(&UpsertEntryInput {
+                    kind: Some(EntryKind::Artist),
+                    title: title.to_owned(),
+                    ..UpsertEntryInput::default()
+                })
+                .await
+                .unwrap();
+            svc.log_consumption(&e.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+            artist_ids.push(e.id);
+        }
+
+        // Seed an album comparison and an artist comparison in the shared global scope.
+        svc.append_comparison(
+            None,
+            &[vec![album_ids[0].clone()], vec![album_ids[1].clone()], vec![album_ids[2].clone()]],
+            None,
+        )
+        .await
+        .unwrap();
+        svc.append_comparison(
+            None,
+            &[vec![artist_ids[0].clone()], vec![artist_ids[1].clone()]],
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 1. Loading `albums` solves ONLY the album component (1 solve).
+        let albums_before = svc.get_ranked_collection("albums", false).await.unwrap();
+        assert_eq!(albums_before.rows[0].entry.id, album_ids[0]);
+        assert_eq!(cache.component_solve_count(), 1);
+
+        // 2. Preparing an `artists` rank session solves ONLY the artist component (2 total solves).
+        let empty_excluded = HashSet::new();
+        let sess1 = svc
+            .prepare_rank_session(
+                "artists",
+                false,
+                None,
+                false,
+                false,
+                5,
+                0,
+                0,
+                5,
+                &empty_excluded,
+                |id| id.char_indices().nth(8).map_or(id, |(idx, _)| &id[..idx]),
+                |_| false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sess1.comparison_count, 1);
+        assert!(sess1.cluster.entries.len() >= 2);
+        assert_eq!(cache.component_solve_count(), 2);
+
+        // 3. Submitting a new artist comparison solves ONLY the new artist component (3 total),
+        //    and NEVER re-solves the untouched album component!
+        let new_comp = svc
+            .append_comparison(
+                None,
+                &[vec![artist_ids[2].clone()], vec![artist_ids[3].clone()]],
+                None,
+            )
+            .await
+            .unwrap();
+        let sess2 = svc
+            .prepare_rank_session(
+                "artists",
+                false,
+                None,
+                false,
+                false,
+                5,
+                1,
+                0,
+                5,
+                &empty_excluded,
+                |id| id.char_indices().nth(8).map_or(id, |(idx, _)| &id[..idx]),
+                |_| false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sess2.comparison_count, 2);
+        assert_eq!(cache.component_solve_count(), 3);
+
+        // 4. Reloading `albums` after the artist comparison hits the cached album component (0 solves!).
+        let albums_after = svc.get_ranked_collection("albums", false).await.unwrap();
+        assert_eq!(albums_after.rows[0].entry.id, album_ids[0]);
+        assert_eq!(cache.component_solve_count(), 3);
+
+        // 5. Undoing the artist comparison immediately hits the cached prior artist component (0 solves!).
+        assert!(svc.delete_comparison(&new_comp.id).await.unwrap());
+        let sess3 = svc
+            .prepare_rank_session(
+                "artists",
+                false,
+                None,
+                false,
+                false,
+                5,
+                0,
+                0,
+                5,
+                &empty_excluded,
+                |id| id.char_indices().nth(8).map_or(id, |(idx, _)| &id[..idx]),
+                |_| false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sess3.comparison_count, 1);
+        assert_eq!(cache.component_solve_count(), 3);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_prepare_rank_session_focus_row_matches_full_ranked_collection() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let cache = EpScoreCache::new();
+        let svc = CatalogService::with_cache(&db, &cache);
+
+        let mut ids = Vec::new();
+        for title in ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"] {
+            let e = svc
+                .upsert_entry(&UpsertEntryInput {
+                    kind: Some(EntryKind::Book),
+                    title: title.to_owned(),
+                    ..UpsertEntryInput::default()
+                })
+                .await
+                .unwrap();
+            svc.log_consumption(&e.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+            ids.push(e.id);
+        }
+        // Alpha > Epsilon puts Alpha above-zero, Beta/Gamma/Delta in zero-band, Epsilon below-zero.
+        svc.append_comparison(None, &[vec![ids[0].clone()], vec![ids[4].clone()]], None)
+            .await
+            .unwrap();
+
+        let full = svc.get_ranked_collection("books", false).await.unwrap();
+        let empty_excluded = HashSet::new();
+
+        for expected_row in &full.rows {
+            let sess = svc
+                .prepare_rank_session(
+                    "books",
+                    false,
+                    Some(&expected_row.entry.id),
+                    false,
+                    false,
+                    5,
+                    0,
+                    0,
+                    5,
+                    &empty_excluded,
+                    |id| id.char_indices().nth(8).map_or(id, |(idx, _)| &id[..idx]),
+                    |_| false,
+                )
+                .await
+                .unwrap();
+            assert!(!sess.focus_missing);
+            assert_eq!(sess.total_rows, full.rows.len());
+            assert_eq!(sess.comparison_count, full.comparison_count);
+            let actual_row = sess.focus_row.unwrap();
+            assert_eq!(actual_row.entry.id, expected_row.entry.id);
+            assert_eq!(actual_row.rank, expected_row.rank);
+            assert_eq!(actual_row.tier, expected_row.tier);
+            assert!((actual_row.score.mean - expected_row.score.mean).abs() <= 1e-12);
+            assert!((actual_row.score.variance - expected_row.score.variance).abs() <= 1e-12);
+            assert!((actual_row.bar_pct - expected_row.bar_pct).abs() <= 1e-9);
+        }
+
+        // Missing focus ID reports `focus_missing = true` and yields an empty settled cluster.
+        let missing = svc
+            .prepare_rank_session(
+                "books",
+                false,
+                Some("nonexistent-entry-id"),
+                false,
+                false,
+                5,
+                0,
+                0,
+                5,
+                &empty_excluded,
+                |id| id.char_indices().nth(8).map_or(id, |(idx, _)| &id[..idx]),
+                |_| false,
+            )
+            .await
+            .unwrap();
+        assert!(missing.focus_missing);
+        assert!(missing.focus_row.is_none());
+        assert_eq!(missing.cluster.entries.len(), 0);
+
+        // Large `skip` in random mode saturates safely without overflowing.
+        let random_max_skip = svc
+            .prepare_rank_session(
+                "books",
+                false,
+                None,
+                false,
+                true,
+                5,
+                0,
+                usize::MAX,
+                5,
+                &empty_excluded,
+                |id| id.char_indices().nth(8).map_or(id, |(idx, _)| &id[..idx]),
+                |_| false,
+            )
+            .await
+            .unwrap();
+        assert!(random_max_skip.cluster.entries.len() >= 2);
+
+        // `done=true` without focus skips EP inference completely on a fresh cache.
+        let fresh_cache = EpScoreCache::new();
+        let fresh_svc = CatalogService::with_cache(&db, &fresh_cache);
+        let done_sess = fresh_svc
+            .prepare_rank_session(
+                "books",
+                false,
+                None,
+                true,
+                false,
+                5,
+                0,
+                0,
+                5,
+                &empty_excluded,
+                |id| id.char_indices().nth(8).map_or(id, |(idx, _)| &id[..idx]),
+                |_| false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(done_sess.cluster.entries.len(), 0);
+        assert_eq!(fresh_cache.component_solve_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ep_component_cache_coalesces_concurrent_misses() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let cache = EpScoreCache::new();
+        let svc = CatalogService::with_cache(&db, &cache);
+
+        let mut ids = Vec::new();
+        for i in 0..8 {
+            let e = svc
+                .upsert_entry(&UpsertEntryInput {
+                    kind: Some(EntryKind::Album),
+                    title: format!("Album {i}"),
+                    creators: vec!["Band".to_owned()],
+                    ..UpsertEntryInput::default()
+                })
+                .await
+                .unwrap();
+            svc.log_consumption(&e.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+            ids.push(e.id);
+        }
+        for w in ids.windows(2) {
+            svc.append_comparison(None, &[vec![w[0].clone()], vec![w[1].clone()]], None)
+                .await
+                .unwrap();
+        }
+
+        // Launch 8 concurrent requests against the same cold component; coalescing ensures EP
+        // runs once rather than 4x across all semaphore permits.
+        let mut join_set = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let db_c = db.clone();
+            let cache_c = cache.clone();
+            join_set.spawn(async move {
+                let s = CatalogService::with_cache(&db_c, &cache_c);
+                s.get_ranked_collection("albums", false).await.unwrap()
+            });
+        }
+        let mut results = Vec::with_capacity(8);
+        while let Some(res) = join_set.join_next().await {
+            results.push(res.unwrap());
+        }
+        assert_eq!(results.len(), 8);
+        for view in &results {
+            assert_eq!(view.rows[0].entry.id, ids[0]);
+        }
+        assert_eq!(cache.component_solve_count(), 1);
+
+        // Verify `load_entries_by_ids` deduplicates across >400-ID chunks without dropping
+        // hydrated identifiers.
+        let with_ident = svc
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Book),
+                title: "Chunk Dup Book".to_owned(),
+                identifiers: vec![EntryIdentifier {
+                    scheme: "isbn".to_owned(),
+                    value: "9780140449136".to_owned(),
+                }],
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        let mut dup_ids = vec![with_ident.id.clone()];
+        for i in 0..410 {
+            dup_ids.push(format!("missing-placeholder-{i}"));
+        }
+        dup_ids.push(with_ident.id.clone());
+        let loaded = db.catalog().load_entries_by_ids(&dup_ids).await.unwrap();
+        assert_eq!(loaded[&with_ident.id].identifiers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ep_component_cache_watch_delivers_directly_past_lru_cap() {
+        // Deterministically stage a leader and waiter over `MAX_CACHED_EP_COMPONENTS + 16`
+        // disjoint 2-item components. Because `InFlightGuard::finish` delivers each solved
+        // `ComponentScoresArc` directly over the `watch` channel, LRU eviction of 16 entries
+        // during batch insertion must NOT cause the waiting task to re-solve them.
+        let total_comps = MAX_CACHED_EP_COMPONENTS + 16;
+        let mut orderings = Vec::with_capacity(total_comps);
+        let mut target_ids = Vec::with_capacity(total_comps * 2);
+        for i in 0..total_comps {
+            let w = format!("w_{i:04}");
+            let l = format!("l_{i:04}");
+            orderings.push(vec![vec![w.clone()], vec![l.clone()]]);
+            target_ids.push(w);
+            target_ids.push(l);
+        }
+        let snapshot = build_scope_snapshot(orderings);
+        assert_eq!(snapshot.components.len(), total_comps);
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let cache = EpScoreCache::new();
+        let snap_arc = Arc::new(snapshot);
+        let targets_arc = Arc::new(target_ids);
+
+        // 1. Leader claims all `total_comps` components before the waiter runs.
+        let mut guards = Vec::with_capacity(total_comps);
+        for comp in snap_arc.components.iter() {
+            let ComponentClaim::Leader(guard) = cache.claim_or_wait_component(comp.digest) else {
+                panic!("expected leader claim for cold component");
+            };
+            guards.push(guard);
+        }
+
+        // 2. Spawn the waiter and yield until it has attached to all 528 watch channels
+        //    (1 receiver lives in `in_flight`, so count >= 2 means the waiter cloned it).
+        let waiter = {
+            let db_c = db.clone();
+            let cache_c = cache.clone();
+            let snap_c = Arc::clone(&snap_arc);
+            let targets_c = Arc::clone(&targets_arc);
+            tokio::spawn(async move {
+                let s = CatalogService::with_cache(&db_c, &cache_c);
+                s.infer_scores_for_targets(&snap_c, &targets_c).await.unwrap()
+            })
+        };
+        while guards.last().unwrap().tx.as_ref().unwrap().receiver_count() < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        // 3. Solve and insert all 528 entries into the 512-cap LRU *before* notifying the waiter,
+        //    proving 16 entries are genuinely evicted before watch delivery.
+        let solved = run_solve_ep_components(snap_arc.components.as_ref().clone()).await.unwrap();
+        let mut results = Vec::with_capacity(total_comps);
+        for (indexed, scores_opt) in solved {
+            let scores_arc = Arc::new(scores_opt);
+            cache.insert_component(indexed.digest, Arc::clone(&scores_arc));
+            results.push(scores_arc);
+        }
+        let evicted_count =
+            snap_arc.components.iter().filter(|c| cache.get_component(c.digest).is_none()).count();
+        assert_eq!(evicted_count, total_comps - MAX_CACHED_EP_COMPONENTS);
+
+        for (guard, scores_arc) in guards.into_iter().zip(results) {
+            guard.finish(scores_arc);
+        }
+
+        // 4. Waiter receives all 528 solved components directly over `watch` with zero re-solves.
+        let scores = waiter.await.unwrap();
+        assert_eq!(scores.len(), total_comps * 2);
+        assert!(scores["w_0000"].mean > scores["l_0000"].mean);
+        assert_eq!(cache.component_solve_count(), 0);
     }
 }

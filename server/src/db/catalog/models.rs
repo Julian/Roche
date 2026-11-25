@@ -583,6 +583,15 @@ pub struct CollectionRankingInputs {
     pub members: Vec<CatalogEntry>,
 }
 
+/// Lightweight collection snapshot containing only rankable member IDs (avoiding full-collection
+/// hydration when only a small comparison cluster is needed).
+#[derive(Debug, Clone)]
+pub struct CollectionRankableIds {
+    pub collection: CollectionSummary,
+    pub is_priority_scope: bool,
+    pub member_ids: Vec<String>,
+}
+
 /// Lightweight paginated metadata snapshot for a collection: full counts, per-kind counts, and
 /// hydrated records ONLY for compared members (never hydrating thousands of uncompared rows).
 #[derive(Debug, Clone)]

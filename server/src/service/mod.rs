@@ -30,7 +30,7 @@ pub use self::{
         BoardService, CreateBoardInput,
     },
     catalog::{
-        CatalogService, ClusterSelectFilter, EntryListAppearance, EpScoreCache, PrioritizedCluster,
+        CatalogService, ClusterSelectFilter, EntryListAppearance, EpScoreCache,
         RankedCollectionFilter, RankedCollectionView, RankedEntryRow,
     },
     error::AppError,
@@ -39,9 +39,11 @@ pub use self::{
     media::unlink_and_delete_media_rows,
     sync::{SyncChanges, SyncStatus},
 };
-// Re-exported for Web UI board reader fallback card rendering.
+// Re-exported for Web UI board reader fallback card rendering and rank session types.
 #[allow(unused_imports)]
 pub use self::boards::BoardReaderFallbackReason;
+#[allow(unused_imports)]
+pub use self::catalog::RankSessionSelection;
 
 use self::{
     auth::{AuthService, PairingRateLimiter},
