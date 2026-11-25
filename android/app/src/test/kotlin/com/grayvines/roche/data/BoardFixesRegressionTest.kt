@@ -35,6 +35,8 @@ import com.grayvines.roche.data.sync.PeerSyncRequestConfig
 import com.grayvines.roche.data.sync.buildTrackedPeerSyncRequest
 import com.grayvines.roche.data.sync.reconcilePeerSyncResponse
 import java.io.File
+import java.time.Instant
+import java.time.temporal.ChronoUnit
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -339,13 +341,16 @@ class BoardFixesRegressionTest {
                         title = "Synced Top",
                         hlc = "001795460500000-0000-server",
                     )
+                val syncNow = Instant.now().truncatedTo(ChronoUnit.SECONDS)
+                val recentStateIso = syncNow.minusSeconds(300).toString()
+                val syncNowIso = syncNow.toString()
                 val incomingState =
                     SyncBoardItemStateDto(
                         boardId = remoteId,
                         externalId = "777",
-                        seenAt = "2026-11-23T18:55:00Z",
-                        lastSeenInSnapshotAt = "2026-11-23T18:55:00Z",
-                        updatedAt = "2026-11-23T18:55:00Z",
+                        seenAt = recentStateIso,
+                        lastSeenInSnapshotAt = recentStateIso,
+                        updatedAt = recentStateIso,
                         hlc = "001795460500001-0000-server",
                     )
                 reconcilePeerSyncResponse(
@@ -355,7 +360,7 @@ class BoardFixesRegressionTest {
                             serverPeerId = "server",
                             syncSeq = 10L,
                             serverHlc = "001795460500000-0000-server",
-                            syncTimestamp = "2026-11-23T19:00:00Z",
+                            syncTimestamp = syncNowIso,
                             boards = listOf(incomingBoard),
                             boardItemStates = listOf(incomingState),
                         ),

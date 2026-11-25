@@ -593,53 +593,55 @@ class UnifiedQueueAndInProgressTest {
 
     private suspend fun seedLegacyMigrationEdgesFixture() {
         val dao = env.database.dao()
-        dao.upsertFeed(
-            FeedRow("f-mig", "https://example.com/mig.xml", "Mig", "https://example.com")
-        )
-        seedReaderProgressEntry(dao)
-        seedAudioBelowThresholdEntry(dao)
-        dao.upsertEntries(
-            listOf(
-                EntryEntity(
-                    id = "art-dup",
-                    kind = "article",
-                    title = "Dup",
-                    mergedIntoId = "art-prog",
-                    createdAt = "2026-05-01T00:00:00Z",
-                    updatedAt = "2026-05-01T00:00:00Z",
-                ),
-                EntryEntity(
-                    id = "ep-dup",
-                    kind = "podcast_episode",
-                    title = "Ep Dup",
-                    mergedIntoId = "ep-audio",
-                    createdAt = "2026-05-01T00:00:00Z",
-                    updatedAt = "2026-05-01T00:00:00Z",
-                ),
+        dao.executeInTransaction {
+            dao.upsertFeed(
+                FeedRow("f-mig", "https://example.com/mig.xml", "Mig", "https://example.com")
             )
-        )
-        dao.upsertItem(
-            InboxItemRow(
-                id = "art-arch",
-                feedId = "f-mig",
-                feedTitle = "Mig",
-                title = "Archived Article",
-                url = "https://example.com/arch",
-                author = null,
-                summary = null,
-                contentText = null,
-                contentHtml = "<p>Old</p>",
-                contentType = "article",
-                status = "archived",
-                isFavorite = false,
-                isCachedOffline = false,
-                publishedAt = "2026-05-01T07:00:00Z",
-                createdAt = "2026-05-01T07:00:00Z",
-                readProgress = 0.0,
-                thumbnailMediaId = null,
-                duration = null,
+            seedReaderProgressEntry(dao)
+            seedAudioBelowThresholdEntry(dao)
+            dao.upsertEntries(
+                listOf(
+                    EntryEntity(
+                        id = "art-dup",
+                        kind = "article",
+                        title = "Dup",
+                        mergedIntoId = "art-prog",
+                        createdAt = "2026-05-01T00:00:00Z",
+                        updatedAt = "2026-05-01T00:00:00Z",
+                    ),
+                    EntryEntity(
+                        id = "ep-dup",
+                        kind = "podcast_episode",
+                        title = "Ep Dup",
+                        mergedIntoId = "ep-audio",
+                        createdAt = "2026-05-01T00:00:00Z",
+                        updatedAt = "2026-05-01T00:00:00Z",
+                    ),
+                )
             )
-        )
+            dao.upsertItem(
+                InboxItemRow(
+                    id = "art-arch",
+                    feedId = "f-mig",
+                    feedTitle = "Mig",
+                    title = "Archived Article",
+                    url = "https://example.com/arch",
+                    author = null,
+                    summary = null,
+                    contentText = null,
+                    contentHtml = "<p>Old</p>",
+                    contentType = "article",
+                    status = "archived",
+                    isFavorite = false,
+                    isCachedOffline = false,
+                    publishedAt = "2026-05-01T07:00:00Z",
+                    createdAt = "2026-05-01T07:00:00Z",
+                    readProgress = 0.0,
+                    thumbnailMediaId = null,
+                    duration = null,
+                )
+            )
+        }
     }
 
     private fun sampleEntry(id: String, progress: Double, ts: String): InboxEntry =
