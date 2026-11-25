@@ -1,7 +1,6 @@
 package com.grayvines.roche.ui
 
 import androidx.lifecycle.viewModelScope
-import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COMPARISON
 import com.grayvines.roche.data.SearchScopeFilter
 import com.grayvines.roche.data.TestRocheEnv
@@ -94,7 +93,7 @@ class CatalogRankAndDiaryFlowsTest {
             val focusId = albumIds.first()
             val uiJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first {
-                it.catalog.entriesByCollectionId.values.any { list -> list.size >= 6 }
+                it.catalog.lists.any { list -> list.entryCount >= 6 }
             }
 
             viewModel.dispatch(MainAction.StartRankingSession("albums", focusId))
@@ -153,7 +152,7 @@ class CatalogRankAndDiaryFlowsTest {
             val focusId = albumIds.first()
             val uiJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first {
-                it.catalog.entriesByCollectionId.values.any { list -> list.size >= 8 }
+                it.catalog.lists.any { list -> list.entryCount >= 8 }
             }
 
             viewModel.dispatch(MainAction.StartRankingSession("albums", focusId))
@@ -190,7 +189,7 @@ class CatalogRankAndDiaryFlowsTest {
             val focusId = albumIds.first()
             val uiJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first {
-                it.catalog.entriesByCollectionId.values.any { list -> list.size >= 8 }
+                it.catalog.lists.any { list -> list.entryCount >= 8 }
             }
 
             viewModel.dispatch(MainAction.StartRankingSession("albums", focusId))
@@ -237,7 +236,7 @@ class CatalogRankAndDiaryFlowsTest {
         val focusId = albumIds.first()
         val uiJob = collectInBackground(viewModel.uiState)
         viewModel.uiState.first {
-            it.catalog.entriesByCollectionId.values.any { list -> list.size >= 8 }
+            it.catalog.lists.any { list -> list.entryCount >= 8 }
         }
 
         viewModel.dispatch(MainAction.StartRankingSession("albums", focusId))
@@ -270,7 +269,7 @@ class CatalogRankAndDiaryFlowsTest {
             seedAlbums(5)
             val uiJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first {
-                it.catalog.entriesByCollectionId.values.any { list -> list.size >= 5 }
+                it.catalog.lists.any { list -> list.entryCount >= 5 }
             }
 
             viewModel.dispatch(MainAction.StartRankingSession("albums", null))
@@ -299,7 +298,7 @@ class CatalogRankAndDiaryFlowsTest {
             seedAlbums(5)
             val uiJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first {
-                it.catalog.entriesByCollectionId.values.any { list -> list.size >= 5 }
+                it.catalog.lists.any { list -> list.entryCount >= 5 }
             }
 
             viewModel.dispatch(MainAction.StartRankingSession("albums", null))
@@ -386,31 +385,20 @@ class CatalogRankAndDiaryFlowsTest {
                     )
                 )
             val uiJob = collectInBackground(viewModel.uiState)
-            viewModel.uiState.first { albumId in it.catalog.entriesById }
+            viewModel.uiState.first { it.catalog.lists.isNotEmpty() }
 
             viewModel.dispatch(MainAction.ToggleCatalogStar(albumId))
-            viewModel.uiState.first { st ->
-                st.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().any {
-                    it.entry.id == albumId
-                }
-            }
+            viewModel.uiState.first { st -> albumId in st.catalog.starredEntryIds }
             viewModel.dispatch(MainAction.ToggleCatalogStar(albumId))
             val unstarred =
                 viewModel.uiState.first { st ->
-                    st.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().none {
-                        it.entry.id == albumId
-                    } && st.undoEvent?.kind is UndoActionKind.RestoreCollectionEntry
+                    albumId !in st.catalog.starredEntryIds &&
+                        st.undoEvent?.kind is UndoActionKind.RestoreCollectionEntry
                 }
             assertNotNull(unstarred.undoEvent)
 
             viewModel.dispatch(MainAction.ToggleCatalogWant(albumId))
-            viewModel.uiState.first { st ->
-                st.catalog.wantQueues.any { q ->
-                    st.catalog.entriesByCollectionId[q.collectionId].orEmpty().any {
-                        it.entry.id == albumId
-                    }
-                }
-            }
+            viewModel.uiState.first { st -> albumId in st.catalog.wantEntryIds }
 
             val quickLogState =
                 reduceUiAction(

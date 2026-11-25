@@ -246,6 +246,7 @@ data class InboxEntry(
     val entryKind: EntryKind = EntryKind.ARTICLE,
     val isFinished: Boolean = false,
     val discussions: List<DiscussionLink> = emptyList(),
+    val releaseYear: Int? = null,
 ) {
     val isPlayableAudio: Boolean
         get() = contentType == ContentType.AUDIO || !audioUrl.isNullOrBlank()

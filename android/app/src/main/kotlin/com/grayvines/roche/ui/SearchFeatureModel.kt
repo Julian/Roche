@@ -21,9 +21,11 @@ internal class SearchFeatureModel(
     private val transientState: MutableStateFlow<TransientUiState>,
 ) {
     private var deepSearchJob: Job? = null
+    private var catalogSearchLimit: Int = DEFAULT_CATALOG_SEARCH_PAGE_SIZE
 
     fun scheduleWorkspaceSearch(rawQuery: String) {
         deepSearchJob?.cancel()
+        catalogSearchLimit = DEFAULT_CATALOG_SEARCH_PAGE_SIZE
         val normalized = rawQuery.trim().lowercase()
         if (normalized.isBlank()) {
             deepSearchJob = null
@@ -31,12 +33,33 @@ internal class SearchFeatureModel(
         }
         deepSearchJob = scope.launch {
             delay(DEEP_SEARCH_DEBOUNCE_MS)
-            val workspace = repository.searchWorkspace(rawQuery)
+            executeSearch(rawQuery, normalized, catalogSearchLimit)
+        }
+    }
+
+    fun loadMoreCatalogSearch() {
+        val rawQuery = transientState.value.searchQuery
+        val normalized = rawQuery.trim().lowercase()
+        if (normalized.isBlank()) return
+        catalogSearchLimit += DEFAULT_CATALOG_SEARCH_PAGE_SIZE
+        val targetLimit = catalogSearchLimit
+        deepSearchJob?.cancel()
+        deepSearchJob = scope.launch {
+            val catalogPage =
+                repository.catalog.searchCatalogEntries(
+                    rawQuery = rawQuery,
+                    includeWhenBlank = false,
+                    limit = targetLimit,
+                )
             transientState.update { current ->
                 if (current.searchQuery.trim().lowercase() == normalized) {
                     current.copy(
                         deepSearchQuery = normalized,
-                        workspaceSearch = workspace,
+                        workspaceSearch =
+                            current.workspaceSearch.copy(
+                                matchedCatalogEntries = catalogPage.matches,
+                                catalogTotalCount = catalogPage.totalCount,
+                            ),
                     )
                 } else {
                     current
@@ -45,9 +68,24 @@ internal class SearchFeatureModel(
         }
     }
 
+    private suspend fun executeSearch(rawQuery: String, normalized: String, catalogLimit: Int) {
+        val workspace = repository.searchWorkspace(rawQuery, catalogLimit = catalogLimit)
+        transientState.update { current ->
+            if (current.searchQuery.trim().lowercase() == normalized) {
+                current.copy(
+                    deepSearchQuery = normalized,
+                    workspaceSearch = workspace,
+                )
+            } else {
+                current
+            }
+        }
+    }
+
     fun cancelSearch() {
         deepSearchJob?.cancel()
         deepSearchJob = null
+        catalogSearchLimit = DEFAULT_CATALOG_SEARCH_PAGE_SIZE
     }
 
     suspend fun awaitSearchForTest() {
@@ -56,6 +94,7 @@ internal class SearchFeatureModel(
 
     companion object {
         private const val DEEP_SEARCH_DEBOUNCE_MS = 140L
+        private const val DEFAULT_CATALOG_SEARCH_PAGE_SIZE = 24
     }
 }
 

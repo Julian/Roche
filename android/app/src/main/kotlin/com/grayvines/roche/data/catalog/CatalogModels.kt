@@ -232,8 +232,11 @@ data class RankedCatalogEntry(
     val variance: Double,
     val scoreOutOfTen: Double,
     val tier: Char?,
-    val latestStatus: ConsumptionStatus?,
-    val latestNotes: String?,
+)
+
+data class CatalogThumbnailPreview(
+    val thumbnailUrl: String,
+    val kind: EntryKind,
 )
 
 data class CatalogListSummary(
@@ -248,6 +251,66 @@ data class CatalogListSummary(
     val generatorEnabled: Boolean = false,
     val poolTotalCount: Int = 0,
     val poolRemainingCount: Int = 0,
+    val previewThumbnails: List<CatalogThumbnailPreview> = emptyList(),
+)
+
+@Suppress("DataClassContainsFunctions")
+data class GlobalTierIndex(
+    val tierByComparedEntryId: Map<String, Char> = emptyMap(),
+    val defaultTierByKind: Map<EntryKind, Char> = emptyMap(),
+) {
+    fun tierForConsumed(entryId: String, kind: EntryKind): Char? =
+        tierByComparedEntryId[entryId] ?: defaultTierByKind[kind]
+}
+
+data class CatalogListAppearance(
+    val collectionId: String,
+    val title: String,
+    val rank: Int,
+    val totalCount: Int,
+    val tier: Char?,
+    val isDynamic: Boolean,
+)
+
+data class ArtistLibraryAlbum(
+    val entry: CatalogEntryItem,
+    val tier: Char?,
+)
+
+data class ProvisionalFocusRank(
+    val rank: Int,
+    val totalCount: Int,
+    val tier: Char?,
+)
+
+data class CatalogCollectionPageResult(
+    val collectionId: String,
+    val entries: List<RankedCatalogEntry> = emptyList(),
+    val totalCount: Int = 0,
+    val filteredTotalCount: Int = totalCount,
+    val tierCounts: Map<Char, Int> = emptyMap(),
+    val hasMore: Boolean = false,
+)
+
+data class CatalogEntryDetailResult(
+    val entry: CatalogEntryItem,
+    val appearances: List<CatalogListAppearance> = emptyList(),
+    val matchingArtistId: String? = null,
+    val artistLibraryAlbums: List<ArtistLibraryAlbum> = emptyList(),
+    val isStarred: Boolean = false,
+    val isInWantQueue: Boolean = false,
+    val previousEntryTitle: String? = null,
+)
+
+data class CatalogSearchEntryMatch(
+    val entry: CatalogEntryItem,
+    val tier: Char? = null,
+)
+
+data class CatalogSearchPageResult(
+    val matches: List<CatalogSearchEntryMatch> = emptyList(),
+    val totalCount: Int = 0,
+    val hasMore: Boolean = false,
 )
 
 data class DiaryEntryItem(
@@ -304,20 +367,16 @@ data class CollectionGeneratorState(
 data class CatalogSnapshot(
     val lists: List<CatalogListSummary> = emptyList(),
     val wantQueues: List<CatalogListSummary> = emptyList(),
-    val entriesByCollectionId: Map<String, List<RankedCatalogEntry>> = emptyMap(),
-    val entriesById: Map<String, CatalogEntryItem> = emptyMap(),
     val recentDiaryEntries: List<DiaryEntryItem> = emptyList(),
     val totalDiaryCount: Int = recentDiaryEntries.size,
-    val consumedEntryIds: Set<String> =
-        recentDiaryEntries
-            .filter { it.status == ConsumptionStatus.CONSUMED }
-            .mapTo(HashSet()) { it.entryId },
-    val consumedCount: Int = consumedEntryIds.count { id ->
-        entriesById[id]?.kind?.isDiaryVisibleKind != false
-    },
-    val globalTiersByEntryId: Map<String, Char> = emptyMap(),
+    val consumedCount: Int = 0,
+    val globalTiers: GlobalTierIndex = GlobalTierIndex(),
     val generators: List<CollectionGeneratorState> = emptyList(),
     val comparisonCount: Int = 0,
+    val wantToReadPreview: List<RankedCatalogEntry> = emptyList(),
+    val wantToReadEntryIds: Set<String> = wantToReadPreview.mapTo(HashSet()) { it.entry.id },
+    val starredEntryIds: Set<String> = emptySet(),
+    val wantEntryIds: Set<String> = wantToReadEntryIds,
 ) {
     val wantItemCount: Int
         get() = wantQueues.sumOf { it.entryCount }
@@ -369,6 +428,9 @@ data class RankSettlementSummary(
     val rank: Int,
     val totalCount: Int,
     val tier: Char?,
+    val subtitle: String = "",
+    val thumbnailUrl: String? = null,
+    val neighbors: List<RankedCatalogEntry> = emptyList(),
 )
 
 data class CollectionDrawStepResult(

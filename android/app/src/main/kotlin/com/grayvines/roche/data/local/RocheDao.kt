@@ -57,7 +57,7 @@ private const val IS_FAVORITE_EXPR =
 
 private const val IS_FINISHED_EXPR =
     "EXISTS (SELECT 1 FROM consumption_log cl_fin " +
-        "WHERE cl_fin.entryId = e.id AND LOWER(cl_fin.status) = 'consumed')"
+        "WHERE cl_fin.entryId = e.id AND cl_fin.status = 'consumed')"
 
 private const val HACKER_NEWS_ID_SUBQUERY =
     "(SELECT ei_hn.value FROM entry_identifiers ei_hn " +
@@ -95,7 +95,28 @@ private const val INBOX_FROM_WHERE =
         "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
         "WHERE $IS_LIVE_ITEM_WHERE"
 
-private const val INBOX_SELECT_LIST_PREFIX =
+private const val LIVE_INBOX_IDS_CTE =
+    "WITH live_inbox_ids(id) AS (" +
+        "SELECT entryId FROM entry_state WHERE inboxState IN ('unread', 'dismissed') " +
+        "UNION " +
+        "SELECT entryId FROM entry_content " +
+        "UNION " +
+        "SELECT e_r.id FROM entries e_r " +
+        "WHERE e_r.kind IN ('article', 'paper', 'video', 'podcast_episode') " +
+        "AND e_r.mergedIntoId IS NULL " +
+        "AND EXISTS (SELECT 1 FROM collection_entries ce_li " +
+        "INNER JOIN collection_specs cs_li ON cs_li.collectionId = ce_li.collectionId " +
+        "WHERE ce_li.entryId = e_r.id AND cs_li.role IN ('want', 'list'))" +
+        ") "
+
+private const val INBOX_CTE_FROM_WHERE =
+    "FROM live_inbox_ids l " +
+        "CROSS JOIN entries e ON e.id = l.id " +
+        "LEFT JOIN entry_state es ON es.entryId = e.id " +
+        "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
+        "WHERE e.mergedIntoId IS NULL AND COALESCE(es.inboxState, 'none') != 'deleted'"
+
+private const val INBOX_LIST_COLUMNS =
     "SELECT e.id AS id, " +
         "$FEED_ID_SUBQUERY AS feedId, " +
         "$FEED_TITLE_EXPR AS feedTitle, " +
@@ -123,10 +144,10 @@ private const val INBOX_SELECT_LIST_PREFIX =
         "e.kind AS entryKind, " +
         "$IS_FINISHED_EXPR AS isFinished, " +
         "e.metadataJson AS metadataJson, " +
-        "$HACKER_NEWS_ID_SUBQUERY AS hackerNewsId " +
-        INBOX_FROM_WHERE
+        "$HACKER_NEWS_ID_SUBQUERY AS hackerNewsId, " +
+        "e.releaseYear AS releaseYear "
 
-private const val INBOX_SELECT_FULL_PREFIX =
+private const val INBOX_FULL_COLUMNS =
     "SELECT e.id AS id, " +
         "$FEED_ID_SUBQUERY AS feedId, " +
         "$FEED_TITLE_EXPR AS feedTitle, " +
@@ -154,8 +175,18 @@ private const val INBOX_SELECT_FULL_PREFIX =
         "e.kind AS entryKind, " +
         "$IS_FINISHED_EXPR AS isFinished, " +
         "e.metadataJson AS metadataJson, " +
-        "$HACKER_NEWS_ID_SUBQUERY AS hackerNewsId " +
-        INBOX_FROM_WHERE
+        "$HACKER_NEWS_ID_SUBQUERY AS hackerNewsId, " +
+        "e.releaseYear AS releaseYear "
+
+private const val INBOX_SELECT_LIST_PREFIX = "$INBOX_LIST_COLUMNS$INBOX_FROM_WHERE"
+
+private const val INBOX_SELECT_FULL_PREFIX = "$INBOX_FULL_COLUMNS$INBOX_FROM_WHERE"
+
+private const val INBOX_SELECT_LIST_CTE =
+    "$LIVE_INBOX_IDS_CTE$INBOX_LIST_COLUMNS$INBOX_CTE_FROM_WHERE"
+
+private const val INBOX_SELECT_FULL_CTE =
+    "$LIVE_INBOX_IDS_CTE$INBOX_FULL_COLUMNS$INBOX_CTE_FROM_WHERE"
 
 private const val INBOX_SELECT_SEARCH_PREFIX =
     "SELECT e.id AS id, " +
@@ -185,7 +216,8 @@ private const val INBOX_SELECT_SEARCH_PREFIX =
         "e.kind AS entryKind, " +
         "$IS_FINISHED_EXPR AS isFinished, " +
         "e.metadataJson AS metadataJson, " +
-        "$HACKER_NEWS_ID_SUBQUERY AS hackerNewsId " +
+        "$HACKER_NEWS_ID_SUBQUERY AS hackerNewsId, " +
+        "e.releaseYear AS releaseYear " +
         INBOX_FROM_WHERE
 
 private const val CATALOG_STAMP_SELECT =
@@ -278,7 +310,318 @@ interface RocheDao {
 
     @Query("SELECT * FROM entries") suspend fun getAllEntries(): List<EntryEntity>
 
+    @Query("SELECT EXISTS(SELECT 1 FROM entries)") suspend fun hasAnyEntries(): Boolean
+
     @Query("SELECT id FROM entries") suspend fun getAllEntryIds(): List<String>
+
+    @Query(
+        "SELECT id, mergedIntoId FROM entries " +
+            "WHERE mergedIntoId IS NOT NULL AND mergedIntoId != ''"
+    )
+    suspend fun getMergedEntryRedirects(): List<MergeRedirectRow>
+
+    @Query("SELECT id, title FROM entries WHERE id IN (:ids)")
+    suspend fun getEntryTitlesByIds(ids: List<String>): List<EntryTitleRow>
+
+    @Query("SELECT id, kind, thumbnailUrl FROM entries WHERE id IN (:ids)")
+    suspend fun getEntryThumbnailsByIds(ids: List<String>): List<EntryThumbnailRow>
+
+    @Query(
+        "SELECT * FROM entries " +
+            "WHERE kind = 'album' AND (mergedIntoId IS NULL OR mergedIntoId = '') " +
+            "AND creatorsJson LIKE :likePattern ESCAPE '\\'"
+    )
+    suspend fun getActiveAlbumsByCreatorLike(likePattern: String): List<EntryEntity>
+
+    @Query(
+        "SELECT * FROM entries e " +
+            "WHERE e.kind = :kind AND (e.mergedIntoId IS NULL OR e.mergedIntoId = '') " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC"
+    )
+    suspend fun getActiveConsumedEntriesByKind(kind: String): List<EntryEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed')"
+    )
+    suspend fun countConsumedEntriesForKind(kind: String): Int
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getConsumedKindEntriesPage(
+        kind: String,
+        limit: Int,
+        offset: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.id NOT IN (:excludedIds) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getConsumedKindPageExcluding(
+        kind: String,
+        excludedIds: List<String>,
+        limit: Int,
+        offset: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND (LOWER(e.title) < LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id < :id)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed')"
+    )
+    suspend fun countConsumedKindBefore(
+        kind: String,
+        title: String,
+        id: String,
+    ): Int
+
+    @Query(
+        "SELECT COUNT(*) FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.id NOT IN (:excludedIds) " +
+            "AND (LOWER(e.title) < LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id < :id)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed')"
+    )
+    suspend fun countConsumedKindBeforeExcl(
+        kind: String,
+        title: String,
+        id: String,
+        excludedIds: List<String>,
+    ): Int
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.id NOT IN (:excludedIds) " +
+            "AND (LOWER(e.title) < LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id < :id)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) DESC, e.id DESC LIMIT 1"
+    )
+    suspend fun getConsumedKindPrevExcl(
+        kind: String,
+        title: String,
+        id: String,
+        excludedIds: List<String>,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND (LOWER(e.title) < LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id < :id)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) DESC, e.id DESC LIMIT 1"
+    )
+    suspend fun getConsumedKindPrev(
+        kind: String,
+        title: String,
+        id: String,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND (LOWER(e.title) < LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id < :id)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) DESC, e.id DESC LIMIT :limit"
+    )
+    suspend fun getConsumedKindPrevBatch(
+        kind: String,
+        title: String,
+        id: String,
+        limit: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.id NOT IN (:excludedIds) " +
+            "AND (LOWER(e.title) > LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id > :id)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT 1"
+    )
+    suspend fun getConsumedKindNextExcl(
+        kind: String,
+        title: String,
+        id: String,
+        excludedIds: List<String>,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND (LOWER(e.title) > LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id > :id)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT 1"
+    )
+    suspend fun getConsumedKindNext(
+        kind: String,
+        title: String,
+        id: String,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND (LOWER(e.title) > LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id > :id)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit"
+    )
+    suspend fun getConsumedKindNextBatch(
+        kind: String,
+        title: String,
+        id: String,
+        limit: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY RANDOM() LIMIT :limit"
+    )
+    suspend fun getRandomConsumedKindEntries(kind: String, limit: Int): List<EntryEntity>
+
+    @Query(
+        "SELECT e.id AS id, e.kind AS kind, e.thumbnailUrl AS thumbnailUrl FROM entries e " +
+            "WHERE e.kind = :kind AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.thumbnailUrl IS NOT NULL AND e.thumbnailUrl != '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "LIMIT :limit"
+    )
+    suspend fun getDynamicThumbnailPreviews(kind: String, limit: Int): List<EntryThumbnailRow>
+
+    @Query(
+        "SELECT e.* FROM entries_fts " +
+            "INNER JOIN entries e ON e.rowid = entries_fts.rowid " +
+            "WHERE entries_fts MATCH :tokenMatchQuery " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN ('album', 'artist', 'movie', 'tv', 'book', 'game', 'song') " +
+            "ORDER BY CASE WHEN LOWER(e.title) LIKE :prefixPattern ESCAPE '\\' THEN 0 ELSE 1 END, " +
+            "LOWER(e.title) ASC, e.id ASC LIMIT :limit"
+    )
+    suspend fun searchCatalogEntriesByFts(
+        tokenMatchQuery: String,
+        prefixPattern: String,
+        limit: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM entries_fts " +
+            "INNER JOIN entries e ON e.rowid = entries_fts.rowid " +
+            "WHERE entries_fts MATCH :tokenMatchQuery " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN ('album', 'artist', 'movie', 'tv', 'book', 'game', 'song')"
+    )
+    suspend fun countCatalogEntriesByFts(tokenMatchQuery: String): Int
+
+    @Query(
+        """
+        SELECT e.* FROM entries e
+        WHERE COALESCE(e.mergedIntoId, '') = ''
+          AND e.kind IN ('album', 'artist', 'movie', 'tv', 'book', 'game', 'song')
+          AND (
+              e.title LIKE :likePattern ESCAPE '\'
+              OR e.creatorsJson LIKE :likePattern ESCAPE '\'
+              OR CAST(e.releaseYear AS TEXT) LIKE :likePattern ESCAPE '\'
+              OR e.kind LIKE :likePattern ESCAPE '\'
+          )
+        ORDER BY CASE WHEN LOWER(e.title) LIKE :prefixPattern ESCAPE '\' THEN 0 ELSE 1 END,
+                 LOWER(e.title) ASC, e.id ASC
+        LIMIT :limit
+        """
+    )
+    suspend fun searchCatalogEntriesByLike(
+        likePattern: String,
+        prefixPattern: String,
+        limit: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        """
+        SELECT COUNT(*) FROM entries e
+        WHERE COALESCE(e.mergedIntoId, '') = ''
+          AND e.kind IN ('album', 'artist', 'movie', 'tv', 'book', 'game', 'song')
+          AND (
+              e.title LIKE :likePattern ESCAPE '\'
+              OR e.creatorsJson LIKE :likePattern ESCAPE '\'
+              OR CAST(e.releaseYear AS TEXT) LIKE :likePattern ESCAPE '\'
+              OR e.kind LIKE :likePattern ESCAPE '\'
+          )
+        """
+    )
+    suspend fun countCatalogEntriesByLike(likePattern: String): Int
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN ('album', 'artist', 'movie', 'tv', 'book', 'game', 'song') " +
+            "AND e.releaseYear = :year " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit"
+    )
+    suspend fun searchCatalogEntriesByYear(year: Int, limit: Int): List<EntryEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM entries e " +
+            "WHERE COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN ('album', 'artist', 'movie', 'tv', 'book', 'game', 'song') " +
+            "AND e.releaseYear = :year"
+    )
+    suspend fun countCatalogEntriesByYear(year: Int): Int
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN (:kinds) " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit"
+    )
+    suspend fun searchCatalogEntriesByKinds(kinds: List<String>, limit: Int): List<EntryEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM entries e " +
+            "WHERE COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN (:kinds)"
+    )
+    suspend fun countCatalogEntriesByKinds(kinds: List<String>): Int
+
+    @Query(
+        "SELECT e.* FROM entries e " +
+            "WHERE COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN ('album', 'artist', 'movie', 'tv', 'book', 'game', 'song') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getBrowseCatalogEntriesPage(limit: Int, offset: Int): List<EntryEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM entries e " +
+            "WHERE COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN ('album', 'artist', 'movie', 'tv', 'book', 'game', 'song')"
+    )
+    suspend fun countBrowseCatalogEntries(): Int
 
     @Query(
         "SELECT * FROM entries " +
@@ -442,9 +785,9 @@ interface RocheDao {
     @Query("$INBOX_SELECT_FULL_PREFIX AND e.id = :id LIMIT 1")
     suspend fun getItemById(id: String): InboxItemRow?
 
-    @Query(INBOX_SELECT_FULL_PREFIX) suspend fun getAllItems(): List<InboxItemRow>
+    @Query(INBOX_SELECT_FULL_CTE) suspend fun getAllItems(): List<InboxItemRow>
 
-    @Query("$INBOX_SELECT_LIST_PREFIX ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC")
+    @Query("$INBOX_SELECT_LIST_CTE ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC")
     suspend fun getAllPreviewItems(): List<InboxItemRow>
 
     @Query("$INBOX_SELECT_LIST_PREFIX AND e.id IN (:ids)")
@@ -815,6 +1158,18 @@ interface RocheDao {
     )
     suspend fun getIdentifiersForEntry(entryId: String): List<EntryIdentifierEntity>
 
+    @Query(
+        "SELECT * FROM entry_identifiers WHERE entryId IN (:entryIds) " +
+            "ORDER BY entryId ASC, scheme ASC, value ASC"
+    )
+    suspend fun getIdentifiersForEntries(entryIds: List<String>): List<EntryIdentifierEntity>
+
+    @Query("SELECT * FROM entry_identifiers WHERE scheme = :scheme AND value IN (:values)")
+    suspend fun getIdentifiersBySchemeValues(
+        scheme: String,
+        values: List<String>,
+    ): List<EntryIdentifierEntity>
+
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertEntryIdentifierIgnore(identifier: EntryIdentifierEntity)
 
@@ -908,6 +1263,123 @@ interface RocheDao {
 
     @Query("SELECT * FROM collection_entries WHERE entryId = :entryId")
     suspend fun getCollectionEntriesForEntry(entryId: String): List<CollectionEntryEntity>
+
+    @Query(
+        "SELECT ce.collectionId AS collectionId, " +
+            "COUNT(*) AS totalCount, " +
+            "SUM(CASE WHEN EXISTS (" +
+            "SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = ce.entryId AND cl.status = 'consumed'" +
+            ") THEN 1 ELSE 0 END) AS consumedCount, " +
+            "SUM(CASE WHEN NOT EXISTS (" +
+            "SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = ce.entryId AND cl.status = 'consumed'" +
+            ") AND EXISTS (" +
+            "SELECT 1 FROM consumption_log cl2 " +
+            "WHERE cl2.entryId = ce.entryId AND cl2.status = 'abandoned'" +
+            ") THEN 1 ELSE 0 END) AS abandonedCount " +
+            "FROM collection_specs cs " +
+            "CROSS JOIN collection_entries ce ON ce.collectionId = cs.collectionId " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE cs.role NOT IN ('feed', 'tag') " +
+            "AND (cs.ruleJson IS NULL OR TRIM(cs.ruleJson) = '') " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "GROUP BY ce.collectionId"
+    )
+    suspend fun getManualCollectionAggregates(): List<CollectionAggregateRow>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "INNER JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND (e.mergedIntoId IS NULL OR e.mergedIntoId = '') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC"
+    )
+    suspend fun getActiveEntriesForCollection(collectionId: String): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "INNER JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND (e.mergedIntoId IS NULL OR e.mergedIntoId = '') " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC"
+    )
+    suspend fun getConsumedCollectionEntries(collectionId: String): List<EntryEntity>
+
+    @Query(
+        "SELECT e.id AS id, e.kind AS kind, e.thumbnailUrl AS thumbnailUrl " +
+            "FROM collection_entries ce " +
+            "INNER JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND (e.mergedIntoId IS NULL OR e.mergedIntoId = '') " +
+            "AND e.thumbnailUrl IS NOT NULL AND e.thumbnailUrl != '' " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit"
+    )
+    suspend fun getManualThumbPreviews(
+        collectionId: String,
+        limit: Int,
+    ): List<EntryThumbnailRow>
+
+    @Query(
+        "SELECT e.id AS id, e.kind AS kind, e.thumbnailUrl AS thumbnailUrl " +
+            "FROM collection_entries ce " +
+            "INNER JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND (e.mergedIntoId IS NULL OR e.mergedIntoId = '') " +
+            "AND e.thumbnailUrl IS NOT NULL AND e.thumbnailUrl != '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit"
+    )
+    suspend fun getGeneratorThumbPreviews(
+        collectionId: String,
+        limit: Int,
+    ): List<EntryThumbnailRow>
+
+    @Query(
+        "SELECT ce.entryId FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = '$STARRED_COLLECTION_ID' " +
+            "AND COALESCE(e.mergedIntoId, '') = ''"
+    )
+    suspend fun getAllStarredEntryIds(): List<String>
+
+    @Query(
+        "SELECT DISTINCT ce.entryId FROM (" +
+            "SELECT collectionId FROM collection_specs WHERE LOWER(role) = 'want' " +
+            "UNION SELECT '$WANT_TO_READ_COLLECTION_ID' " +
+            "UNION SELECT '$UP_NEXT_COLLECTION_ID'" +
+            ") wc " +
+            "CROSS JOIN collection_entries ce ON ce.collectionId = wc.collectionId " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE COALESCE(e.mergedIntoId, '') = ''"
+    )
+    suspend fun getAllWantEntryIds(): List<String>
+
+    @Query(
+        "SELECT ce.entryId FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = ''"
+    )
+    suspend fun getActiveCollectionEntryIds(collectionId: String): List<String>
+
+    @Query(
+        "SELECT DISTINCT ce.entryId FROM collection_entries ce " +
+            "LEFT JOIN collection_specs cs ON cs.collectionId = ce.collectionId " +
+            "WHERE ce.entryId IN (:entryIds) " +
+            "AND (ce.collectionId IN ('$WANT_TO_READ_COLLECTION_ID', '$UP_NEXT_COLLECTION_ID') " +
+            "OR LOWER(COALESCE(cs.role, '')) = 'want')"
+    )
+    suspend fun getWantEntryIdsIn(entryIds: List<String>): List<String>
+
+    @Query(
+        "SELECT entryId FROM collection_entries " +
+            "WHERE collectionId = '$STARRED_COLLECTION_ID' AND entryId IN (:entryIds)"
+    )
+    suspend fun getStarredEntryIdsIn(entryIds: List<String>): List<String>
 
     @Query("SELECT COUNT(*) FROM collection_entries WHERE collectionId = :collectionId")
     suspend fun countCollectionEntries(collectionId: String): Int
@@ -1009,6 +1481,35 @@ interface RocheDao {
             "WHERE entryId = :entryId AND status = 'consumed')"
     )
     suspend fun hasConsumedLogForEntry(entryId: String): Boolean
+
+    @Query("SELECT DISTINCT status FROM consumption_log WHERE entryId = :entryId")
+    suspend fun getStatusesForEntry(entryId: String): List<String>
+
+    @Query("SELECT DISTINCT entryId, status FROM consumption_log WHERE entryId IN (:entryIds)")
+    suspend fun getEntryStatusesByIds(entryIds: List<String>): List<EntryStatusRow>
+
+    @Query(
+        "SELECT DISTINCT entryId FROM consumption_log " +
+            "WHERE entryId IN (:entryIds) AND status = 'consumed'"
+    )
+    suspend fun getConsumedEntryIdsIn(entryIds: List<String>): List<String>
+
+    @Query(
+        "SELECT e.kind AS kind, COUNT(*) AS count " +
+            "FROM (SELECT DISTINCT entryId FROM consumption_log WHERE status = 'consumed') c " +
+            "CROSS JOIN entries e ON e.id = c.entryId " +
+            "WHERE COALESCE(e.mergedIntoId, '') = '' " +
+            "GROUP BY e.kind"
+    )
+    suspend fun getConsumedEntryCountsByKind(): List<KindCountRow>
+
+    @Query(
+        "SELECT e.id AS id, e.kind AS kind FROM entries e " +
+            "WHERE e.id IN (:ids) AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed')"
+    )
+    suspend fun getConsumedEntryKindsByIds(ids: List<String>): List<EntryKindRow>
 
     @Query(
         "SELECT COUNT(*) FROM consumption_log cl " +
@@ -1134,6 +1635,18 @@ interface RocheDao {
 
     @Query("SELECT * FROM comparisons ORDER BY ts ASC")
     suspend fun getAllComparisons(): List<ComparisonEntity>
+
+    @Query(
+        "SELECT * FROM comparisons " +
+            "WHERE scopeCollectionId IS NULL OR TRIM(scopeCollectionId) = '' " +
+            "ORDER BY ts ASC"
+    )
+    suspend fun getGlobalComparisons(): List<ComparisonEntity>
+
+    @Query("SELECT * FROM comparisons WHERE scopeCollectionId IN (:scopeIds) ORDER BY ts ASC")
+    suspend fun getScopedComparisonsIn(scopeIds: List<String>): List<ComparisonEntity>
+
+    @Query("SELECT COUNT(*) FROM comparisons") suspend fun countComparisons(): Int
 
     @Query("SELECT * FROM comparisons WHERE isLocalDirty = 1")
     suspend fun getDirtyComparisons(): List<ComparisonEntity>

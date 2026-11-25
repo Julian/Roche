@@ -102,7 +102,7 @@ private sealed interface StarredDisplayRow {
 
 private fun buildOrderedStarredRows(state: MainUiState): List<StarredDisplayRow> {
     val readerById = state.starredEntries.associateBy { it.id }
-    val catalogRanked = state.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty()
+    val catalogRanked = state.starredCollection.entries
     val seenIds = HashSet<String>(readerById.size + catalogRanked.size)
     return buildList {
         for (catItem in catalogRanked) {
@@ -186,14 +186,19 @@ fun StarredTabContent(
 ) {
     var selectedFilter by rememberSaveable { mutableStateOf(StarredFilterTab.ALL) }
     val orderedRows =
-        remember(state.starredEntries, state.catalog.entriesByCollectionId) {
+        remember(state.starredEntries, state.starredCollection.entries) {
             buildOrderedStarredRows(state)
         }
     val visibleRows =
         remember(orderedRows, selectedFilter) {
             orderedRows.filter { matchesStarredFilter(it, selectedFilter) }
         }
-    val totalCount = orderedRows.size
+    val totalCount =
+        if (state.starredCollection.isLoaded) {
+            orderedRows.size
+        } else {
+            maxOf(orderedRows.size, state.catalog.starredEntryIds.size)
+        }
 
     RocheRefreshableTabScaffold(
         isRefreshing = state.isManualRefreshing,
@@ -213,7 +218,9 @@ fun StarredTabContent(
         },
     ) {
         if (visibleRows.isEmpty()) {
-            StarredEmptyPlaceholder(selectedFilter = selectedFilter)
+            if (state.starredCollection.isLoaded || state.catalog.starredEntryIds.isEmpty()) {
+                StarredEmptyPlaceholder(selectedFilter = selectedFilter)
+            }
         } else {
             StarredEntriesList(
                 rows = visibleRows,
@@ -680,8 +687,17 @@ private fun WantQueuesPane(
         remember(queues, state.selectedWantCollectionId) {
             resolveActiveWantQueue(queues, state.selectedWantCollectionId)
         }
+    val wantState = state.activeWantQueue
     val entries =
-        activeQueue?.let { state.catalog.entriesByCollectionId[it.collectionId] }.orEmpty()
+        if (activeQueue != null && wantState.collectionId == activeQueue.collectionId) {
+            wantState.entries
+        } else {
+            emptyList()
+        }
+    val isLoadingQueue =
+        activeQueue != null &&
+            activeQueue.entryCount > 0 &&
+            (!wantState.isLoaded || wantState.collectionId != activeQueue.collectionId)
 
     Column(modifier = Modifier.fillMaxSize()) {
         if (queues.size > 1) {
@@ -692,7 +708,9 @@ private fun WantQueuesPane(
             )
         }
         if (entries.isEmpty()) {
-            WantQueueEmptySection(activeQueue = activeQueue, onAction = onAction)
+            if (!isLoadingQueue) {
+                WantQueueEmptySection(activeQueue = activeQueue, onAction = onAction)
+            }
         } else {
             WantQueueEntriesList(
                 activeQueue = activeQueue,

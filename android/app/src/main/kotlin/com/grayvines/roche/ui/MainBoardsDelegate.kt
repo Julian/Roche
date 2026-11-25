@@ -487,15 +487,7 @@ internal class MainBoardsDelegate(
     }
 
     private suspend fun removeEntryFromWantCollections(entryId: String) {
-        val snap = host.repository.catalog.getSnapshot()
-        val matchingCols =
-            snap.wantQueues
-                .map { it.collectionId }
-                .plus(WANT_TO_READ_COLLECTION_ID)
-                .distinct()
-                .filter { colId ->
-                    snap.entriesByCollectionId[colId].orEmpty().any { it.entry.id == entryId }
-                }
+        val matchingCols = host.repository.catalog.findWantCollectionsForEntry(entryId)
         val targets = matchingCols.ifEmpty { listOf(WANT_TO_READ_COLLECTION_ID) }
         for (colId in targets) {
             host.repository.catalog.removeCollectionEntry(colId, entryId)

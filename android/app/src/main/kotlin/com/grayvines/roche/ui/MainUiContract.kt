@@ -10,12 +10,16 @@ import com.grayvines.roche.data.boards.BoardItemView
 import com.grayvines.roche.data.boards.BoardOrderMode
 import com.grayvines.roche.data.boards.BoardSummary
 import com.grayvines.roche.data.boards.DEFAULT_BOARD_POLL_INTERVAL_MINUTES
+import com.grayvines.roche.data.catalog.CatalogEntryDetailResult
+import com.grayvines.roche.data.catalog.CatalogEntryItem
+import com.grayvines.roche.data.catalog.CatalogSearchPageResult
 import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryDiaryLogsResult
 import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.ProvisionalFocusRank
 import com.grayvines.roche.data.catalog.RankSettlementSummary
 import com.grayvines.roche.data.catalog.UpdateCatalogEntryInput
 import com.grayvines.roche.data.matchesSearchQuery
@@ -94,6 +98,7 @@ data class ActiveRankSessionUiState(
     val excludedOpponents: Set<String> = emptySet(),
     val history: List<RankRoundUndoStep> = emptyList(),
     val settlement: RankSettlementSummary? = null,
+    val provisionalRank: ProvisionalFocusRank? = null,
 )
 
 internal fun ActiveRankSessionUiState.maxSelectableClusterSize(): Int =
@@ -212,6 +217,12 @@ data class MainUiState(
     val catalog: CatalogSnapshot = CatalogSnapshot(),
     val diary: DiaryUiState = DiaryUiState(),
     val catalogDetailLogs: EntryDiaryLogsResult? = null,
+    val activeCollection: CatalogCollectionUiState = CatalogCollectionUiState(),
+    val starredCollection: CatalogCollectionUiState = CatalogCollectionUiState(),
+    val activeWantQueue: CatalogCollectionUiState = CatalogCollectionUiState(),
+    val catalogDetail: CatalogEntryDetailResult? = null,
+    val editingCatalogEntry: CatalogEntryItem? = null,
+    val catalogBrowseSearch: CatalogSearchPageResult = CatalogSearchPageResult(),
     val resolvingMusicEntryId: String? = null,
     val companionSubTab: CompanionSubTab = CompanionSubTab.LISTS,
     val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
@@ -613,6 +624,15 @@ sealed interface MainAction {
     data object LoadMoreDiary : CatalogUi
 
     data object LoadMoreCatalogDetailLogs : CatalogUi
+
+    data class SetCatalogCollectionTierFilter(
+        val collectionId: String?,
+        val tier: Char?,
+    ) : CatalogUi
+
+    data object LoadMoreCatalogCollection : CatalogUi
+
+    data object LoadMoreCatalogSearch : CatalogUi
 
     data class OpenCatalogDetailSheet(val entryId: String) : CatalogUi
 
@@ -1073,6 +1093,17 @@ internal fun updateBottomNavSlot(
     }
 }
 
+internal data class OnDemandCatalogUiState(
+    val diary: DiaryUiState = DiaryUiState(),
+    val catalogDetailLogs: EntryDiaryLogsResult? = null,
+    val activeCollection: CatalogCollectionUiState = CatalogCollectionUiState(),
+    val starredCollection: CatalogCollectionUiState = CatalogCollectionUiState(),
+    val activeWantQueue: CatalogCollectionUiState = CatalogCollectionUiState(),
+    val catalogDetail: CatalogEntryDetailResult? = null,
+    val editingCatalogEntry: CatalogEntryItem? = null,
+    val catalogBrowseSearch: CatalogSearchPageResult = CatalogSearchPageResult(),
+)
+
 @Suppress("LongMethod", "LongParameterList")
 internal fun assembleMainUiState(
     snapshot: RepositorySnapshot,
@@ -1083,8 +1114,7 @@ internal fun assembleMainUiState(
     local: TransientUiState,
     resolvingMusicEntryId: String?,
     settingsHubResetTick: Int,
-    diary: DiaryUiState = DiaryUiState(),
-    catalogDetailLogs: EntryDiaryLogsResult? = null,
+    onDemandCatalog: OnDemandCatalogUiState = OnDemandCatalogUiState(),
 ): MainUiState {
     val isSyncing = local.isSyncing || inboxDerived.isSyncActive
     val visible =
@@ -1157,8 +1187,14 @@ internal fun assembleMainUiState(
         offlineBytesByEntryId = inboxDerived.offlineSizes.bytesByEntryId,
         totalOfflineCacheBytes = inboxDerived.offlineSizes.totalBytes,
         catalog = catalogProjections.catalog,
-        diary = diary,
-        catalogDetailLogs = catalogDetailLogs,
+        diary = onDemandCatalog.diary,
+        catalogDetailLogs = onDemandCatalog.catalogDetailLogs,
+        activeCollection = onDemandCatalog.activeCollection,
+        starredCollection = onDemandCatalog.starredCollection,
+        activeWantQueue = onDemandCatalog.activeWantQueue,
+        catalogDetail = onDemandCatalog.catalogDetail,
+        editingCatalogEntry = onDemandCatalog.editingCatalogEntry,
+        catalogBrowseSearch = onDemandCatalog.catalogBrowseSearch,
         resolvingMusicEntryId = resolvingMusicEntryId,
         companionSubTab = local.companionSubTab,
         queueSubTab = local.queueSubTab,

@@ -1998,14 +1998,19 @@ class MainViewModelTest {
                 )
                 val populatedCustom =
                     viewModel.uiState.first { state ->
-                        state.catalog.entriesByCollectionId[customListId].orEmpty().size == 1
+                        state.catalog.lists
+                            .firstOrNull { it.collectionId == customListId }
+                            ?.entryCount == 1
                     }
                 assertEquals(
+                    1,
+                    populatedCustom.catalog.lists
+                        .first { it.collectionId == customListId }
+                        .entryCount,
+                )
+                assertEquals(
                     "Mirror",
-                    populatedCustom.catalog.entriesByCollectionId[customListId]!!
-                        .single()
-                        .entry
-                        .title,
+                    repository.catalog.loadCollectionEntries(customListId).single().entry.title,
                 )
             } finally {
                 collectJob.cancel()

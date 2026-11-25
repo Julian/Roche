@@ -60,7 +60,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
@@ -1043,16 +1042,17 @@ internal fun HomeWantQueueWidget(
     onOpenExternalUrl: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val wantToReadItems = state.catalog.entriesByCollectionId[WANT_TO_READ_COLLECTION_ID].orEmpty()
+    val wantToReadItems = state.catalog.wantToReadPreview
     val previewItems =
         remember(state.queueEntries, wantToReadItems, maxItems) {
             buildHomeQueuePreviewItems(state.queueEntries, wantToReadItems, maxItems)
         }
     val totalCount =
-        remember(state.queueEntries, wantToReadItems) {
-            val ids = HashSet<String>(state.queueEntries.size + wantToReadItems.size)
+        remember(state.queueEntries, state.catalog.wantToReadEntryIds) {
+            val ids =
+                HashSet<String>(state.queueEntries.size + state.catalog.wantToReadEntryIds.size)
             state.queueEntries.forEach { ids.add(it.id) }
-            wantToReadItems.forEach { ids.add(it.entry.id) }
+            ids.addAll(state.catalog.wantToReadEntryIds)
             ids.size
         }
     val offlineCount = state.offlineEntries.size

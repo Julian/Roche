@@ -11,7 +11,6 @@ import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
 import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.RocheRepository
-import com.grayvines.roche.data.catalog.EntryDiaryLogsResult
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
@@ -114,6 +113,16 @@ class MainViewModel(
             scope = viewModelScope,
             repository = repository,
         )
+    private val catalogCollectionFeature =
+        CatalogCollectionFeatureModel(
+            scope = viewModelScope,
+            repository = repository,
+        )
+    private val catalogDetailFeature =
+        CatalogDetailFeatureModel(
+            scope = viewModelScope,
+            repository = repository,
+        )
     private val searchFeature =
         SearchFeatureModel(
             scope = viewModelScope,
@@ -123,12 +132,32 @@ class MainViewModel(
 
     val drawLaunchEffects: Flow<CollectionDrawLaunchEffect> = catalogRankFeature.drawLaunchEffects
 
+    private val onDemandCatalogMetaFlow =
+        combine(
+            diaryFeature.diaryState,
+            diaryFeature.detailLogsState,
+            catalogCollectionFeature.activeCollectionState,
+            catalogCollectionFeature.starredCollectionState,
+            catalogCollectionFeature.activeWantQueueState,
+        ) { _, _, _, _, _ ->
+            currentOnDemandCatalogUiState()
+        }
+
+    private val catalogDetailAuxFlow =
+        combine(
+            catalogDetailFeature.detailState,
+            catalogDetailFeature.editingEntryState,
+            catalogCollectionFeature.catalogBrowseState,
+        ) { _, _, _ ->
+            Unit
+        }
+
     private val auxUiMetaFlow =
         combine(
             catalogRankFeature.resolvingMusicEntryId,
             settingsFeature.settingsHubResetTick,
-            diaryFeature.diaryState,
-            diaryFeature.detailLogsState,
+            onDemandCatalogMetaFlow,
+            catalogDetailAuxFlow,
         ) { _, _, _, _ ->
             currentAuxUiMeta()
         }
@@ -196,15 +225,34 @@ class MainViewModel(
             snapshotFlow = sharedSnapshotFlow,
             detailEntryIdFlow = transientState.map { it.catalogDetailEntryId },
         )
+        catalogCollectionFeature.startObserving(
+            snapshotFlow = sharedSnapshotFlow,
+            transientFlow = transientState,
+        )
+        catalogDetailFeature.startObserving(
+            snapshotFlow = sharedSnapshotFlow,
+            transientFlow = transientState,
+        )
         restoredNavState?.let(::restoreNavigationSideEffects)
     }
+
+    private fun currentOnDemandCatalogUiState(): OnDemandCatalogUiState =
+        OnDemandCatalogUiState(
+            diary = diaryFeature.diaryState.value,
+            catalogDetailLogs = diaryFeature.detailLogsState.value,
+            activeCollection = catalogCollectionFeature.activeCollectionState.value,
+            starredCollection = catalogCollectionFeature.starredCollectionState.value,
+            activeWantQueue = catalogCollectionFeature.activeWantQueueState.value,
+            catalogDetail = catalogDetailFeature.detailState.value,
+            editingCatalogEntry = catalogDetailFeature.editingEntryState.value,
+            catalogBrowseSearch = catalogCollectionFeature.catalogBrowseState.value,
+        )
 
     private fun currentAuxUiMeta(): AuxUiMeta =
         AuxUiMeta(
             resolvingMusicEntryId = catalogRankFeature.resolvingMusicEntryId.value,
             settingsHubResetTick = settingsFeature.settingsHubResetTick.value,
-            diary = diaryFeature.diaryState.value,
-            catalogDetailLogs = diaryFeature.detailLogsState.value,
+            onDemandCatalog = currentOnDemandCatalogUiState(),
         )
 
     private fun observeSettledStars() {
@@ -341,13 +389,18 @@ class MainViewModel(
     }
 
     private fun handleUiSideEffects(action: MainAction.Ui) {
-        if (diaryFeature.handleUiAction(action)) return
+        if (
+            diaryFeature.handleUiAction(action) || catalogCollectionFeature.handleUiAction(action)
+        ) {
+            return
+        }
         when (action) {
             is MainAction.OpenReader -> openReaderAndCancelBoardLoad(action.entryId)
             is MainAction.OpenBoardReader ->
                 boardsDelegate.loadBoardReader(action.boardId, action.externalId, action.item)
             MainAction.CloseBoardReader -> boardsDelegate.cancelBoardReaderLoad()
-            is MainAction.UpdateSearchQuery -> searchFeature.scheduleWorkspaceSearch(action.query)
+            is MainAction.UpdateSearchQuery -> handleUpdateSearchQuery(action.query)
+            MainAction.LoadMoreCatalogSearch -> loadMoreCatalogSearch()
             MainAction.ResetSettingsToHub -> settingsFeature.requestResetToHub()
             is MainAction.LaunchCollectionDraw ->
                 catalogRankFeature.launchCollectionDraw(
@@ -360,13 +413,32 @@ class MainViewModel(
                 )
             is MainAction.EnrichAndLaunchMusicDraw ->
                 catalogRankFeature.enrichAndLaunchMusicDraw(action.draw)
-            MainAction.CloseSearch -> searchFeature.cancelSearch()
+            MainAction.CloseSearch -> handleCloseSearch()
             is MainAction.SelectTab,
             is MainAction.FilterByTag,
             is MainAction.FilterByFeed,
             is MainAction.OpenCompanionSection -> cancelSearchAndBoardReader()
             else -> Unit
         }
+    }
+
+    private fun loadMoreCatalogSearch() {
+        val cleanQuery = transientState.value.searchQuery.trim().trimStart('#').trim()
+        if (cleanQuery.isEmpty()) {
+            catalogCollectionFeature.loadMoreBrowseCatalog()
+        } else {
+            searchFeature.loadMoreCatalogSearch()
+        }
+    }
+
+    private fun handleUpdateSearchQuery(query: String) {
+        catalogCollectionFeature.resetBrowseCatalogLimit()
+        searchFeature.scheduleWorkspaceSearch(query)
+    }
+
+    private fun handleCloseSearch() {
+        catalogCollectionFeature.resetBrowseCatalogLimit()
+        searchFeature.cancelSearch()
     }
 
     private fun openReaderAndCancelBoardLoad(entryId: String) {
@@ -653,8 +725,7 @@ class MainViewModel(
 private data class AuxUiMeta(
     val resolvingMusicEntryId: String?,
     val settingsHubResetTick: Int,
-    val diary: DiaryUiState,
-    val catalogDetailLogs: EntryDiaryLogsResult?,
+    val onDemandCatalog: OnDemandCatalogUiState,
 )
 
 private data class RootUiStateInput(
@@ -717,8 +788,7 @@ private fun reduceDerivedUiStateSlice(
             local = input.local,
             resolvingMusicEntryId = input.auxMeta.resolvingMusicEntryId,
             settingsHubResetTick = input.auxMeta.settingsHubResetTick,
-            diary = input.auxMeta.diary,
-            catalogDetailLogs = input.auxMeta.catalogDetailLogs,
+            onDemandCatalog = input.auxMeta.onDemandCatalog,
         )
     return DerivedUiStateSlice(
         rawEntries = input.snapshot.entries,

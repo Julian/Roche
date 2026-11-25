@@ -42,7 +42,6 @@ import com.grayvines.roche.core.isLocalPdfUrl
 import com.grayvines.roche.core.normalizeDoi
 import com.grayvines.roche.core.normalizeIsbn
 import com.grayvines.roche.core.parsePublicationDateStr
-import com.grayvines.roche.core.splitAuthorNames
 import com.grayvines.roche.data.catalog.CatalogEntryItem
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.UpdateCatalogEntryInput
@@ -431,26 +430,11 @@ private fun findIdentVal(entry: CatalogEntryItem, scheme: String): String =
     entry.identifiers.firstOrNull { it.scheme.equals(scheme, ignoreCase = true) }?.value.orEmpty()
 
 private fun resolveEditableEntry(entryId: String, state: MainUiState): CatalogEntryItem? =
-    state.catalog.entriesById[entryId]
-        ?: state.catalog.entriesByCollectionId.values
-            .asSequence()
-            .flatten()
-            .firstOrNull { it.entry.id == entryId }
-            ?.entry
-        ?: state.entryById[entryId]?.let { inbox ->
-            CatalogEntryItem(
-                id = inbox.id,
-                kind = inbox.entryKind,
-                title = inbox.title,
-                creators = inbox.author?.let(::splitAuthorNames).orEmpty(),
-                url = inbox.url.takeIf { it.isNotBlank() },
-                publishedAt = inbox.publishedAt,
-                releaseYear = inbox.publishedAt?.take(YEAR_MAX_DIGITS)?.toIntOrNull(),
-                summary = inbox.summary,
-                thumbnailUrl = inbox.thumbnailUrl,
-                identifiers = emptyList(),
-            )
-        }
+    state.editingCatalogEntry?.takeIf { it.id == entryId }
+        ?: state.catalogDetail?.entry?.takeIf { it.id == entryId }
+        ?: state.activeCollection.entries.firstOrNull { it.entry.id == entryId }?.entry
+        ?: state.activeWantQueue.entries.firstOrNull { it.entry.id == entryId }?.entry
+        ?: state.starredCollection.entries.firstOrNull { it.entry.id == entryId }?.entry
 
 private fun extractIsoDatePrefix(publishedAt: String?): String {
     val clean = publishedAt?.trim().orEmpty()

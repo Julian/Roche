@@ -72,7 +72,9 @@ import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.data.catalog.AlbumTrackItem
+import com.grayvines.roche.data.catalog.ArtistLibraryAlbum
 import com.grayvines.roche.data.catalog.CatalogEntryItem
+import com.grayvines.roche.data.catalog.CatalogListAppearance
 import com.grayvines.roche.data.catalog.CatalogListSummary
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.ConsumptionStatus
@@ -99,20 +101,6 @@ import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Locale
-
-private data class CatalogListAppearance(
-    val collectionId: String,
-    val title: String,
-    val rank: Int,
-    val totalCount: Int,
-    val tier: Char?,
-    val isDynamic: Boolean,
-)
-
-private data class ArtistLibraryAlbum(
-    val entry: CatalogEntryItem,
-    val tier: Char?,
-)
 
 private data class CatalogDetailModel(
     val entry: CatalogEntryItem,
@@ -143,18 +131,11 @@ internal fun CatalogDetailBottomSheet(
     onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
-    val model =
-        remember(entryId, state.catalog, state.catalogDetailLogs, state.diary.entries) {
-            buildCatalogDetailModel(entryId, state)
-        }
-    if (model == null) return
+    val model = rememberCatalogDetailModel(entryId, state) ?: return
     val colors = LocalRocheColors.current
     val scrollState = rememberScrollState()
     val previousEntryId = state.catalogDetailStack.dropLast(1).lastOrNull()
-    val previousTitle =
-        remember(previousEntryId, state.catalog) {
-            previousEntryId?.let { resolveCatalogEntryById(it, state)?.title }
-        }
+    val previousTitle = rememberPreviousDetailTitle(entryId, previousEntryId, state)
     val isEnriching = entryId in state.enrichingCatalogEntryIds
     var editingLogId by rememberSaveable(entryId) { mutableStateOf<String?>(null) }
     val editingLog =
@@ -190,6 +171,44 @@ internal fun CatalogDetailBottomSheet(
         )
     }
 }
+
+@Composable
+private fun rememberCatalogDetailModel(entryId: String, state: MainUiState): CatalogDetailModel? =
+    remember(
+        entryId,
+        state.catalog,
+        state.catalogDetail,
+        state.catalogDetailLogs,
+        state.diary.entries,
+        state.activeCollection.entries,
+        state.activeWantQueue.entries,
+        state.starredCollection.entries,
+        state.workspaceSearch.matchedCatalogEntries,
+        state.catalogBrowseSearch.matches,
+    ) {
+        buildCatalogDetailModel(entryId, state)
+    }
+
+@Composable
+private fun rememberPreviousDetailTitle(
+    entryId: String,
+    previousEntryId: String?,
+    state: MainUiState,
+): String? =
+    remember(
+        previousEntryId,
+        state.catalogDetail,
+        state.activeCollection.entries,
+        state.activeWantQueue.entries,
+        state.starredCollection.entries,
+        state.workspaceSearch.matchedCatalogEntries,
+        state.catalogBrowseSearch.matches,
+    ) {
+        previousEntryId?.let { prevId ->
+            state.catalogDetail?.takeIf { it.entry.id == entryId }?.previousEntryTitle
+                ?: resolveCatalogEntryById(prevId, state)?.title
+        }
+    }
 
 @Suppress("LongParameterList")
 @Composable
@@ -1849,20 +1868,11 @@ private fun startFocusedRank(
 
 private fun buildCatalogDetailModel(entryId: String, state: MainUiState): CatalogDetailModel? {
     val catalog = state.catalog
-    val entry = resolveCatalogEntryById(entryId, state) ?: return null
-    val appearances = collectListAppearances(entryId, state)
-    val matchingArtistId =
-        if (entry.kind == EntryKind.ALBUM && entry.primaryCreator.isNotBlank()) {
-            findArtistEntryId(entry.primaryCreator, state)
-        } else {
-            null
-        }
-    val artistAlbums =
-        if (entry.kind == EntryKind.ARTIST) {
-            collectArtistLibraryAlbums(entry.title, state)
-        } else {
-            emptyList()
-        }
+    val loadedDetail = state.catalogDetail?.takeIf { it.entry.id == entryId }
+    val entry = loadedDetail?.entry ?: resolveCatalogEntryById(entryId, state) ?: return null
+    val appearances = loadedDetail?.appearances.orEmpty()
+    val matchingArtistId = loadedDetail?.matchingArtistId
+    val artistAlbums = loadedDetail?.artistLibraryAlbums.orEmpty()
     val inLibTitleKeys = artistAlbums.mapTo(HashSet()) { it.entry.title.trim().lowercase() }
     val externalDiscog =
         if (entry.kind == EntryKind.ARTIST) {
@@ -1872,7 +1882,15 @@ private fun buildCatalogDetailModel(entryId: String, state: MainUiState): Catalo
         } else {
             emptyList()
         }
-    val membership = resolveCatalogDetailMembership(entry.id, appearances, catalog)
+    val isStarred = loadedDetail?.isStarred ?: (entry.id in catalog.starredEntryIds)
+    val isInWantQueue = loadedDetail?.isInWantQueue ?: (entry.id in catalog.wantEntryIds)
+    val appearanceIds = appearances.mapTo(HashSet()) { it.collectionId }
+    val addableManualLists =
+        catalog.lists.filter { list ->
+            isEditableManualUserList(list) &&
+                list.collectionId != STARRED_COLLECTION_ID &&
+                list.collectionId !in appearanceIds
+        }
     val loadedDetailLogs = state.catalogDetailLogs?.takeIf { it.entryId == entry.id }
     val diaryLogs =
         loadedDetailLogs?.logs ?: catalog.recentDiaryEntries.filter { it.entryId == entry.id }
@@ -1899,50 +1917,20 @@ private fun buildCatalogDetailModel(entryId: String, state: MainUiState): Catalo
         wikiUrl = entry.resolveWikipediaUrl(),
         artistLibraryAlbums = artistAlbums,
         artistExternalDiscography = externalDiscog,
-        isStarred = membership.isStarred,
-        isInWantQueue = membership.isInWantQueue,
-        addableManualLists = membership.addableManualLists,
+        isStarred = isStarred,
+        isInWantQueue = isInWantQueue,
+        addableManualLists = addableManualLists,
     )
 }
 
-private data class CatalogDetailMembership(
-    val isStarred: Boolean,
-    val isInWantQueue: Boolean,
-    val addableManualLists: List<CatalogListSummary>,
-)
-
-private fun resolveCatalogDetailMembership(
-    entryId: String,
-    appearances: List<CatalogListAppearance>,
-    catalog: com.grayvines.roche.data.catalog.CatalogSnapshot,
-): CatalogDetailMembership {
-    val isStarred =
-        catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().any {
-            it.entry.id == entryId
-        }
-    val isInWantQueue =
-        catalog.wantQueues.any { queue ->
-            catalog.entriesByCollectionId[queue.collectionId].orEmpty().any {
-                it.entry.id == entryId
-            }
-        }
-    val appearanceIds = appearances.mapTo(HashSet()) { it.collectionId }
-    val addableManualLists =
-        catalog.lists.filter { list ->
-            isEditableManualUserList(list) &&
-                list.collectionId != STARRED_COLLECTION_ID &&
-                list.collectionId !in appearanceIds
-        }
-    return CatalogDetailMembership(isStarred, isInWantQueue, addableManualLists)
-}
-
 private fun resolveCatalogEntryById(entryId: String, state: MainUiState): CatalogEntryItem? =
-    state.catalog.entriesById[entryId]
-        ?: state.catalog.entriesByCollectionId.values
-            .asSequence()
-            .flatten()
-            .firstOrNull { it.entry.id == entryId }
-            ?.entry
+    state.catalogDetail?.entry?.takeIf { it.id == entryId }
+        ?: state.activeCollection.entries.firstOrNull { it.entry.id == entryId }?.entry
+        ?: state.activeWantQueue.entries.firstOrNull { it.entry.id == entryId }?.entry
+        ?: state.starredCollection.entries.firstOrNull { it.entry.id == entryId }?.entry
+        ?: state.catalog.wantToReadPreview.firstOrNull { it.entry.id == entryId }?.entry
+        ?: state.workspaceSearch.matchedCatalogEntries.firstOrNull { it.entry.id == entryId }?.entry
+        ?: state.catalogBrowseSearch.matches.firstOrNull { it.entry.id == entryId }?.entry
         ?: (state.catalog.recentDiaryEntries + state.diary.entries)
             .firstOrNull { it.entryId == entryId }
             ?.let { diary ->
@@ -1959,78 +1947,6 @@ private fun resolveCatalogEntryById(entryId: String, state: MainUiState): Catalo
                     identifiers = emptyList(),
                 )
             }
-
-private fun collectListAppearances(
-    entryId: String,
-    state: MainUiState,
-): List<CatalogListAppearance> {
-    val result = mutableListOf<CatalogListAppearance>()
-    for (summary in state.catalog.lists) {
-        val ranked = state.catalog.entriesByCollectionId[summary.collectionId].orEmpty()
-        val match = ranked.firstOrNull { it.entry.id == entryId } ?: continue
-        result.add(
-            CatalogListAppearance(
-                collectionId = summary.collectionId,
-                title = summary.title,
-                rank = match.rank,
-                totalCount = ranked.size,
-                tier = match.tier,
-                isDynamic = summary.isDynamic,
-            )
-        )
-    }
-    return result.sortedWith(
-        compareByDescending<CatalogListAppearance> { it.isDynamic }.thenBy { it.title.lowercase() }
-    )
-}
-
-private fun findArtistEntryId(artistName: String, state: MainUiState): String? {
-    val clean = artistName.trim()
-    if (clean.isEmpty()) return null
-    return state.catalog.entriesById.values
-        .firstOrNull { it.kind == EntryKind.ARTIST && it.title.equals(clean, ignoreCase = true) }
-        ?.id
-        ?: state.catalog.entriesByCollectionId.values
-            .asSequence()
-            .flatten()
-            .firstOrNull {
-                it.entry.kind == EntryKind.ARTIST && it.entry.title.equals(clean, ignoreCase = true)
-            }
-            ?.entry
-            ?.id
-}
-
-private fun collectArtistLibraryAlbums(
-    artistName: String,
-    state: MainUiState,
-): List<ArtistLibraryAlbum> {
-    val tierByEntryId = buildMap {
-        state.catalog.lists
-            .filter { it.isDynamic }
-            .forEach { list ->
-                state.catalog.entriesByCollectionId[list.collectionId].orEmpty().forEach { ranked ->
-                    if (ranked.tier != null) put(ranked.entry.id, ranked.tier)
-                }
-            }
-    }
-    val allEntries =
-        buildMap<String, CatalogEntryItem> {
-            state.catalog.entriesById.values.forEach { put(it.id, it) }
-            state.catalog.entriesByCollectionId.values.flatten().forEach {
-                putIfAbsent(it.entry.id, it.entry)
-            }
-        }
-    return allEntries.values
-        .filter { entry ->
-            entry.kind == EntryKind.ALBUM &&
-                entry.creators.any { it.equals(artistName, ignoreCase = true) }
-        }
-        .sortedWith(
-            compareByDescending<CatalogEntryItem> { it.releaseYear ?: Int.MIN_VALUE }
-                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.title }
-        )
-        .map { ArtistLibraryAlbum(entry = it, tier = tierByEntryId[it.id]) }
-}
 
 private fun formatTracklistSummary(tracks: List<AlbumTrackItem>): String {
     if (tracks.isEmpty()) return ""

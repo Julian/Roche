@@ -4,11 +4,13 @@ package com.grayvines.roche.data.catalog
 
 import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
 import com.grayvines.roche.core.HlcTimestamp
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_GENERATOR
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COMPARISON
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_CONSUMPTION_LOG
 import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.canonicalOrderingJson
 import com.grayvines.roche.core.collectionEntryNaturalKey
 import com.grayvines.roche.core.deriveCollectionIdentity
@@ -77,10 +79,10 @@ class CatalogStore(
         year: String? = null,
         limit: Int = DEFAULT_DIARY_PAGE_SIZE,
         offset: Int = 0,
-        globalTiers: Map<String, Char>? = null,
+        globalTiers: GlobalTierIndex? = null,
     ): DiaryPageResult {
         ensureSystemSeeded()
-        val tiers = globalTiers ?: getOrBuildCatalogSnapshot().globalTiersByEntryId
+        val tiers = globalTiers ?: getOrBuildCatalogSnapshot().globalTiers
         val safeLimit = limit.coerceAtLeast(1)
         val safeOffset = offset.coerceAtLeast(0)
         var result = DiaryPageResult()
@@ -126,12 +128,12 @@ class CatalogStore(
         entryId: String,
         limit: Int = DEFAULT_ENTRY_DETAIL_LOGS_LIMIT,
         offset: Int = 0,
-        globalTiers: Map<String, Char>? = null,
+        globalTiers: GlobalTierIndex? = null,
     ): EntryDiaryLogsResult {
         ensureSystemSeeded()
         val resolvedId = followMergedId(entryId) ?: entryId.trim()
         if (resolvedId.isEmpty()) return EntryDiaryLogsResult(entryId = resolvedId)
-        val tiers = globalTiers ?: getOrBuildCatalogSnapshot().globalTiersByEntryId
+        val tiers = globalTiers ?: getOrBuildCatalogSnapshot().globalTiers
         val safeLimit = limit.coerceAtLeast(1)
         val safeOffset = offset.coerceAtLeast(0)
         var result = EntryDiaryLogsResult(entryId = resolvedId)
@@ -147,6 +149,129 @@ class CatalogStore(
                 )
         }
         return result
+    }
+
+    suspend fun loadCollectionPage(
+        collectionIdOrSlug: String,
+        tierFilter: Char? = null,
+        limit: Int = DEFAULT_COLLECTION_PAGE_SIZE,
+        offset: Int = 0,
+    ): CatalogCollectionPageResult {
+        ensureSystemSeeded()
+        val spec =
+            resolveCollectionSpec(collectionIdOrSlug)
+                ?: return CatalogCollectionPageResult(collectionId = collectionIdOrSlug)
+        var result = CatalogCollectionPageResult(collectionId = spec.collectionId)
+        dao.executeInTransaction {
+            result =
+                loadCollectionPageFromDao(
+                    dao = dao,
+                    spec = spec,
+                    epScoreCache = epScoreCache,
+                    tierFilter = tierFilter,
+                    limit = limit,
+                    offset = offset,
+                )
+        }
+        return result
+    }
+
+    suspend fun loadCollectionEntries(collectionIdOrSlug: String): List<RankedCatalogEntry> {
+        ensureSystemSeeded()
+        val spec = resolveCollectionSpec(collectionIdOrSlug) ?: return emptyList()
+        var entries: List<RankedCatalogEntry> = emptyList()
+        dao.executeInTransaction {
+            entries = loadSmallCollectionRanked(dao, spec, epScoreCache)
+        }
+        return entries
+    }
+
+    suspend fun loadEntryDetail(
+        entryId: String,
+        previousEntryId: String? = null,
+        globalTiers: GlobalTierIndex? = null,
+    ): CatalogEntryDetailResult? {
+        ensureSystemSeeded()
+        val tiers = globalTiers ?: getOrBuildCatalogSnapshot().globalTiers
+        var result: CatalogEntryDetailResult? = null
+        dao.executeInTransaction {
+            result =
+                loadEntryDetailFromDao(
+                    dao = dao,
+                    entryId = entryId,
+                    previousEntryId = previousEntryId,
+                    globalTiers = tiers,
+                    epScoreCache = epScoreCache,
+                )
+        }
+        return result
+    }
+
+    suspend fun loadCatalogEntry(entryId: String): CatalogEntryItem? {
+        ensureSystemSeeded()
+        return loadCatalogEntryFromDao(dao, entryId)
+    }
+
+    suspend fun searchCatalogEntries(
+        rawQuery: String,
+        includeWhenBlank: Boolean = false,
+        limit: Int = DEFAULT_COLLECTION_PAGE_SIZE,
+        globalTiers: GlobalTierIndex? = null,
+    ): CatalogSearchPageResult {
+        ensureSystemSeeded()
+        val tiers = globalTiers ?: getOrBuildCatalogSnapshot().globalTiers
+        return searchCatalogEntriesFromDao(
+            dao = dao,
+            rawQuery = rawQuery,
+            includeWhenBlank = includeWhenBlank,
+            limit = limit,
+            globalTiers = tiers,
+        )
+    }
+
+    suspend fun isEntryStarred(entryId: String): Boolean {
+        ensureSystemSeeded()
+        val resolved = followMergedId(entryId) ?: entryId.trim()
+        return resolved.isNotEmpty() &&
+            dao.hasCollectionMembership(STARRED_COLLECTION_ID, resolved) > 0
+    }
+
+    suspend fun findWantCollectionForEntry(entryId: String): String? =
+        findWantCollectionsForEntry(entryId).firstOrNull()
+
+    suspend fun findWantCollectionsForEntry(entryId: String): List<String> {
+        ensureSystemSeeded()
+        val resolved = followMergedId(entryId) ?: entryId.trim()
+        val memberCols =
+            if (resolved.isEmpty()) {
+                emptyList()
+            } else {
+                dao.getCollectionEntriesForEntry(resolved).map { it.collectionId }.distinct()
+            }
+        if (memberCols.isEmpty()) return emptyList()
+        val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
+        return memberCols.filter { colId ->
+            colId == WANT_TO_READ_COLLECTION_ID ||
+                colId == UP_NEXT_COLLECTION_ID ||
+                CollectionRole.fromWireValue(specsById[colId]?.role) == CollectionRole.WANT
+        }
+    }
+
+    suspend fun resolveProvisionalFocusRank(
+        collectionIdOrSlug: String,
+        focusEntryId: String,
+    ): ProvisionalFocusRank? {
+        val settlement =
+            resolveEntrySettlement(
+                entryId = focusEntryId,
+                preferredCollectionIdOrSlug = collectionIdOrSlug,
+                includeNeighbors = false,
+            ) ?: return null
+        return ProvisionalFocusRank(
+            rank = settlement.rank,
+            totalCount = settlement.totalCount,
+            tier = settlement.tier,
+        )
     }
 
     internal suspend fun resolveLocalPeerId(): String =
@@ -827,92 +952,47 @@ class CatalogStore(
     ): List<RankClusterCandidate> = mutationMutex.withLock {
         ensureSystemSeeded()
         val spec = resolveCollectionSpec(collectionIdOrSlug)
-        val snap = getOrBuildCatalogSnapshot()
-        val members = spec?.let { snap.entriesByCollectionId[it.collectionId] }.orEmpty()
-        if (members.size < EpRankingEngine.MIN_K) {
+        if (spec == null) {
             emptyList()
         } else {
-            pickClusterForMembers(
-                members = members,
-                focusEntryId = focusEntryId,
-                roundIndex = roundIndex,
-                forceRandomNext = forceRandomNext,
-                maxK = maxK,
-                excludedOpponentIds = excludedOpponentIds,
-            )
+            var cluster: List<RankClusterCandidate> = emptyList()
+            dao.executeInTransaction {
+                cluster =
+                    selectNextRankClusterFromDao(
+                        dao = dao,
+                        spec = spec,
+                        epScoreCache = epScoreCache,
+                        focusEntryId = focusEntryId,
+                        roundIndex = roundIndex,
+                        forceRandomNext = forceRandomNext,
+                        maxK = maxK,
+                        excludedOpponentIds = excludedOpponentIds,
+                        random = random,
+                    )
+            }
+            cluster
         }
     }
 
-    @Suppress("LongParameterList")
-    private suspend fun pickClusterForMembers(
-        members: List<RankedCatalogEntry>,
-        focusEntryId: String?,
-        roundIndex: Int,
-        forceRandomNext: Boolean,
-        maxK: Int,
-        excludedOpponentIds: Set<String> = emptySet(),
-    ): List<RankClusterCandidate> {
-        val resolvedFocus = focusEntryId?.let { followMergedId(it) ?: it }
-        val filteredMembers =
-            if (excludedOpponentIds.isEmpty()) {
-                members
-            } else {
-                val reduced = members.filter { ranked ->
-                    ranked.entry.id == resolvedFocus || ranked.entry.id !in excludedOpponentIds
-                }
-                if (reduced.size < EpRankingEngine.MIN_K) {
-                    return emptyList()
-                }
-                reduced
-            }
-        val memberIds = filteredMembers.map { it.entry.id }
-        val scores = filteredMembers.associate { ranked ->
-            ranked.entry.id to EpRankingEngine.Score(ranked.mean, ranked.variance)
-        }
-        val seedPool = resolvedFocus?.takeIf { it in scores }?.let(::listOf)
-        val forceRandom =
-            forceRandomNext ||
-                seedPool == null &&
-                    roundIndex > 0 &&
-                    roundIndex % EpRankingEngine.RANDOM_SEED_EVERY == 0
-        val selected =
-            EpRankingEngine.selectClusterPrioritized(
-                scores = scores,
-                itemIds = memberIds,
-                maxK = maxK,
-                forceRandomSeed = forceRandom,
-                seedPool = seedPool,
-                random = random,
+    suspend fun resolveCollectionRankMeta(
+        collectionIdOrSlug: String,
+        includeMemberCount: Boolean = true,
+    ): CollectionRankMeta? = mutationMutex.withLock {
+        ensureSystemSeeded()
+        resolveCollectionSpec(collectionIdOrSlug)?.let { spec ->
+            val role = CollectionRole.fromWireValue(spec.role)
+            val isPriorityScoped =
+                role == CollectionRole.WANT || spec.collectionId == UP_NEXT_COLLECTION_ID
+            val memberCount = if (includeMemberCount) resolveCollectionMemberCount(dao, spec) else 0
+            CollectionRankMeta(
+                collectionId = spec.collectionId,
+                slug = spec.slug ?: spec.collectionId,
+                title = lookupSpecTitle(spec),
+                scopeCollectionId = spec.collectionId.takeIf { isPriorityScoped },
+                memberCount = memberCount,
             )
-        val priorityById = selected.priorityIds.withIndex().associate { (idx, id) -> id to idx }
-        val byId = filteredMembers.associateBy { it.entry.id }
-        return if (selected.orderedIds.size < EpRankingEngine.MIN_K) {
-            emptyList()
-        } else {
-            selected.orderedIds.mapIndexedNotNull { idx, id ->
-                byId[id]?.toRankCandidate(selectionPriority = priorityById[id] ?: idx)
-            }
         }
     }
-
-    suspend fun resolveCollectionRankMeta(collectionIdOrSlug: String): CollectionRankMeta? =
-        mutationMutex.withLock {
-            ensureSystemSeeded()
-            resolveCollectionSpec(collectionIdOrSlug)?.let { spec ->
-                val role = CollectionRole.fromWireValue(spec.role)
-                val isPriorityScoped =
-                    role == CollectionRole.WANT || spec.collectionId == UP_NEXT_COLLECTION_ID
-                val snap = getOrBuildCatalogSnapshot()
-                val memberCount = snap.entriesByCollectionId[spec.collectionId]?.size ?: 0
-                CollectionRankMeta(
-                    collectionId = spec.collectionId,
-                    slug = spec.slug ?: spec.collectionId,
-                    title = lookupSpecTitle(spec),
-                    scopeCollectionId = spec.collectionId.takeIf { isPriorityScoped },
-                    memberCount = memberCount,
-                )
-            }
-        }
 
     suspend fun resolveEntrySystemListSlug(entryId: String): String? = mutationMutex.withLock {
         ensureSystemSeeded()
@@ -923,29 +1003,31 @@ class CatalogStore(
     suspend fun resolveEntrySettlement(
         entryId: String,
         preferredCollectionIdOrSlug: String? = null,
+        includeNeighbors: Boolean = true,
     ): RankSettlementSummary? = mutationMutex.withLock {
         ensureSystemSeeded()
         val resolved = followMergedId(entryId) ?: entryId
-        val snap = getOrBuildCatalogSnapshot()
         val preferredSpec = preferredCollectionIdOrSlug?.let { resolveCollectionSpec(it) }
         val rawEntry = dao.getEntryById(resolved)
         val fallbackSpec = rawEntry?.let {
             dao.getCollectionSpecBySlug(EntryKind.fromWireValue(it.kind).systemListSlug)
         }
         val targetSpec = preferredSpec ?: fallbackSpec
-        val rankedList = targetSpec?.let { snap.entriesByCollectionId[it.collectionId] }.orEmpty()
-        val match = rankedList.firstOrNull { it.entry.id == resolved }
-        if (targetSpec == null || match == null) {
-            null
-        } else {
-            RankSettlementSummary(
-                entryId = resolved,
-                title = match.entry.title,
-                collectionTitle = lookupSpecTitle(targetSpec),
-                rank = match.rank,
-                totalCount = rankedList.size,
-                tier = match.tier,
-            )
+        targetSpec?.let { spec ->
+            val specTitle = lookupSpecTitle(spec)
+            var summary: RankSettlementSummary? = null
+            dao.executeInTransaction {
+                summary =
+                    resolveEntrySettlementFromDao(
+                        dao = dao,
+                        entryId = resolved,
+                        targetSpec = spec,
+                        specTitle = specTitle,
+                        epScoreCache = epScoreCache,
+                        includeNeighbors = includeNeighbors,
+                    )
+            }
+            summary
         }
     }
 
@@ -1126,142 +1208,43 @@ class CatalogStore(
         return snap.generatorFor(collectionId)?.currentDraw?.takeIf { it.entryId == entryId }
     }
 
-    internal suspend fun resolveFromPreloadedTables(
-        stamp: CatalogStampRow,
-        tables: RawCatalogTables,
-    ): CatalogSnapshot = snapshotCacheMutex.withLock {
-        val existing = cachedState
-        if (existing != null && existing.stamp == stamp) {
-            catalogSnapshotCacheHits += 1
-            existing.snapshot
-        } else {
-            val built = buildCatalogSnapshot(tables, epScoreCache)
-            catalogSnapshotBuilds += 1
-            cachedState = CachedCatalogState(stamp, tables, built)
-            built
-        }
-    }
-
-    internal suspend fun getOrBuildCatalogSnapshot(): CatalogSnapshot =
-        snapshotCacheMutex.withLock {
-            var loadedStamp: CatalogStampRow? = null
-            var loadedTables: RawCatalogTables? = null
+    internal suspend fun resolveOverviewSnapshot(
+        observedStamp: CatalogStampRow? = null
+    ): CatalogSnapshot {
+        ensureSystemSeeded()
+        return snapshotCacheMutex.withLock {
             val existing = cachedState
-            dao.executeInTransaction {
-                val currentStamp = dao.getCatalogStamp()
-                loadedStamp = currentStamp
-                if (existing == null || existing.stamp != currentStamp) {
-                    loadedTables = loadIncrementalCatalogTables(currentStamp, existing)
-                }
-            }
-            val finalStamp = checkNotNull(loadedStamp)
-            val freshTables = loadedTables
-            if (freshTables == null && existing != null && existing.stamp == finalStamp) {
+            if (observedStamp != null && existing != null && existing.stamp == observedStamp) {
                 catalogSnapshotCacheHits += 1
                 existing.snapshot
             } else {
-                val tables = checkNotNull(freshTables)
-                val built = buildCatalogSnapshot(tables, epScoreCache)
-                catalogSnapshotBuilds += 1
-                cachedState = CachedCatalogState(finalStamp, tables, built)
-                built
+                var resolvedStamp: CatalogStampRow? = null
+                var built: CatalogSnapshot? = null
+                dao.executeInTransaction {
+                    val currentStamp = dao.getCatalogStamp()
+                    resolvedStamp = currentStamp
+                    if (existing == null || existing.stamp != currentStamp) {
+                        catalogTableReloads += 1
+                        built = loadCatalogOverviewSnapshot(dao, epScoreCache)
+                    }
+                }
+                val finalStamp = checkNotNull(resolvedStamp)
+                val fresh = built
+                if (fresh == null && existing != null && existing.stamp == finalStamp) {
+                    catalogSnapshotCacheHits += 1
+                    existing.snapshot
+                } else {
+                    val snapshot = checkNotNull(fresh)
+                    catalogSnapshotBuilds += 1
+                    cachedState = CachedCatalogState(finalStamp, snapshot)
+                    snapshot
+                }
             }
         }
-
-    private suspend fun loadIncrementalCatalogTables(
-        stamp: CatalogStampRow,
-        previous: CachedCatalogState?,
-    ): RawCatalogTables {
-        val prevStamp = previous?.stamp
-        val prevTables = previous?.tables
-        return RawCatalogTables(
-            entries =
-                reloadIfChanged(
-                    stamp.entriesStamp != prevStamp?.entriesStamp,
-                    prevTables?.entries,
-                ) {
-                    dao.getAllEntries()
-                },
-            identifiers =
-                reloadIfChanged(
-                    stamp.identsStamp != prevStamp?.identsStamp,
-                    prevTables?.identifiers,
-                ) {
-                    dao.getAllEntryIdentifiers()
-                },
-            specs =
-                reloadIfChanged(stamp.specsStamp != prevStamp?.specsStamp, prevTables?.specs) {
-                    dao.getAllCollectionSpecs()
-                },
-            memberships =
-                reloadIfChanged(
-                    stamp.membersStamp != prevStamp?.membersStamp,
-                    prevTables?.memberships,
-                ) {
-                    dao.getAllCollectionEntries()
-                },
-            generators =
-                reloadIfChanged(
-                    stamp.generatorsStamp != prevStamp?.generatorsStamp,
-                    prevTables?.generators,
-                ) {
-                    dao.getAllCollectionGenerators()
-                },
-            logSummary =
-                reloadIfChanged(
-                    stamp.logsStamp != prevStamp?.logsStamp ||
-                        stamp.entriesStamp != prevStamp.entriesStamp,
-                    prevTables?.logSummary,
-                ) {
-                    loadRawCatalogLogSummary(dao)
-                },
-            comparisons =
-                reloadIfChanged(
-                    stamp.comparisonsStamp != prevStamp?.comparisonsStamp,
-                    prevTables?.comparisons,
-                ) {
-                    dao.getAllComparisons()
-                },
-        )
     }
 
-    private suspend fun <T> reloadIfChanged(
-        changed: Boolean,
-        previous: T?,
-        loader: suspend () -> T,
-    ): T =
-        if (!changed && previous != null) {
-            previous
-        } else {
-            catalogTableReloads += 1
-            loader()
-        }
-
-    internal suspend fun loadRawCatalogTables(): RawCatalogTables =
-        RawCatalogTables(
-            entries = dao.getAllEntries(),
-            identifiers = dao.getAllEntryIdentifiers(),
-            specs = dao.getAllCollectionSpecs(),
-            memberships = dao.getAllCollectionEntries(),
-            generators = dao.getAllCollectionGenerators(),
-            logSummary = loadRawCatalogLogSummary(dao),
-            comparisons = dao.getAllComparisons(),
-        )
+    internal suspend fun getOrBuildCatalogSnapshot(): CatalogSnapshot = resolveOverviewSnapshot()
 }
-
-internal suspend fun loadRawCatalogLogSummary(dao: RocheDao): RawCatalogLogSummary =
-    RawCatalogLogSummary(
-        entryStatuses = dao.getDistinctEntryLogStatuses(),
-        latestLogs = dao.getLatestLogsPerEntry(),
-        recentDiaryLogs =
-            dao.getDiaryLogPage(
-                minTs = "",
-                maxTs = MAX_ISO_TS_BOUND,
-                limit = RECENT_DIARY_PREVIEW_LIMIT,
-                offset = 0,
-            ),
-        totalDiaryCount = dao.countDiaryLogs(),
-    )
 
 internal fun resolveDiaryYearBounds(year: String?): Pair<String, String> {
     val yr = year?.trim()?.toIntOrNull()?.takeIf { it in MIN_DIARY_YEAR..MAX_DIARY_YEAR }
@@ -1276,7 +1259,6 @@ internal fun resolveDiaryYearBounds(year: String?): Pair<String, String> {
 
 internal data class CachedCatalogState(
     val stamp: CatalogStampRow,
-    val tables: RawCatalogTables,
     val snapshot: CatalogSnapshot,
 )
 

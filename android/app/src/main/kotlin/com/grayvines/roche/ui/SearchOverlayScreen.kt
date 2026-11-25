@@ -32,7 +32,6 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -61,15 +60,14 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.core.formatInlineMathAnnotated
-import com.grayvines.roche.data.CatalogSearchMatch
-import com.grayvines.roche.data.CatalogSearchResult
 import com.grayvines.roche.data.SearchScopeFilter
 import com.grayvines.roche.data.catalog.CatalogListSummary
+import com.grayvines.roche.data.catalog.CatalogSearchEntryMatch
+import com.grayvines.roche.data.catalog.CatalogSearchPageResult
 import com.grayvines.roche.data.catalog.CollectionRole
 import com.grayvines.roche.data.catalog.DiaryEntryItem
 import com.grayvines.roche.data.extractSearchMatchSnippet
 import com.grayvines.roche.data.matchesSearchScopeFilter
-import com.grayvines.roche.data.searchCatalogEntriesWithTotal
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.CatalogCoverThumbnail
 import com.grayvines.roche.ui.components.HeaderActionButton
@@ -83,7 +81,7 @@ import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
 private data class SearchOverlayComputed(
     val visibleResults: List<InboxEntry>,
-    val shownCatalogMatches: List<CatalogSearchMatch>,
+    val shownCatalogMatches: List<CatalogSearchEntryMatch>,
     val catalogTotalCount: Int,
     val shownListMatches: List<CatalogListSummary>,
     val listTotalCount: Int,
@@ -96,19 +94,18 @@ private data class SearchOverlayComputed(
 private fun rememberSearchOverlayComputed(
     displayState: MainUiState,
     scopeFilter: SearchScopeFilter,
-    catalogLimit: Int,
 ): SearchOverlayComputed =
     remember(
         displayState.searchResults,
         displayState.workspaceSearch,
+        displayState.catalogBrowseSearch,
         displayState.catalog,
         displayState.searchQuery,
         scopeFilter,
-        catalogLimit,
     ) {
         val visibleResults =
             displayState.searchResults.filter { matchesSearchScopeFilter(it, scopeFilter) }
-        val catalogResult = resolveSearchCatalogResult(displayState, scopeFilter, catalogLimit)
+        val catalogResult = resolveSearchCatalogResult(displayState, scopeFilter)
         val allListMatches =
             resolveSearchListMatches(
                 state = displayState,
@@ -211,11 +208,7 @@ fun SearchOverlay(
     val colors = LocalRocheColors.current
     val focusRequester = remember { FocusRequester() }
     var scopeFilter by rememberSaveable { mutableStateOf(SearchScopeFilter.ALL) }
-    var catalogLimit by
-        rememberSaveable(state.searchQuery) {
-            mutableIntStateOf(DEFAULT_CATALOG_SEARCH_LIMIT)
-        }
-    val computed = rememberSearchOverlayComputed(state, scopeFilter, catalogLimit)
+    val computed = rememberSearchOverlayComputed(state, scopeFilter)
 
     LaunchedEffect(isSearchActive) {
         if (isSearchActive && state.searchQuery.isBlank()) {
@@ -252,7 +245,7 @@ fun SearchOverlay(
             listTotalCount = computed.listTotalCount,
             diaryMatches = computed.shownDiaryMatches,
             diaryTotalCount = computed.diaryTotalCount,
-            onShowMoreCatalog = { catalogLimit += DEFAULT_CATALOG_SEARCH_LIMIT },
+            onShowMoreCatalog = { onAction(MainAction.LoadMoreCatalogSearch) },
             onSelectAllScope = { scopeFilter = SearchScopeFilter.ALL },
             state = state,
             selectedScope = scopeFilter,
@@ -267,14 +260,23 @@ fun SearchOverlay(
 private fun resolveSearchCatalogResult(
     state: MainUiState,
     scopeFilter: SearchScopeFilter,
-    limit: Int,
-): CatalogSearchResult =
-    searchCatalogEntriesWithTotal(
-        catalog = state.catalog,
-        rawQuery = state.searchQuery,
-        includeWhenBlank = scopeFilter == SearchScopeFilter.CATALOG,
-        limit = limit,
+): CatalogSearchPageResult {
+    val cleanQuery = state.searchQuery.trim().trimStart('#').trim()
+    if (cleanQuery.isEmpty()) {
+        return if (scopeFilter == SearchScopeFilter.CATALOG) {
+            state.catalogBrowseSearch
+        } else {
+            CatalogSearchPageResult()
+        }
+    }
+    return CatalogSearchPageResult(
+        matches = state.workspaceSearch.matchedCatalogEntries,
+        totalCount = state.workspaceSearch.catalogTotalCount,
+        hasMore =
+            state.workspaceSearch.matchedCatalogEntries.size <
+                state.workspaceSearch.catalogTotalCount,
     )
+}
 
 private fun computeSearchScopeCounts(
     searchResults: List<InboxEntry>,
@@ -457,7 +459,7 @@ internal fun SearchScopeFilterStrip(
 @Suppress("LongParameterList")
 internal fun SearchResultsBody(
     results: List<InboxEntry>,
-    catalogMatches: List<CatalogSearchMatch>,
+    catalogMatches: List<CatalogSearchEntryMatch>,
     state: MainUiState,
     selectedScope: SearchScopeFilter = SearchScopeFilter.ALL,
     catalogTotalCount: Int = catalogMatches.size,
@@ -514,7 +516,7 @@ internal fun SearchResultsBody(
 @Suppress("LongParameterList")
 private fun SearchResultsList(
     results: List<InboxEntry>,
-    catalogMatches: List<CatalogSearchMatch>,
+    catalogMatches: List<CatalogSearchEntryMatch>,
     listMatches: List<CatalogListSummary>,
     diaryMatches: List<DiaryEntryItem>,
     state: MainUiState,
@@ -785,7 +787,7 @@ private fun SearchEmptyState(
 
 @Composable
 private fun SearchCatalogMatchesSection(
-    matches: List<CatalogSearchMatch>,
+    matches: List<CatalogSearchEntryMatch>,
     totalCount: Int,
     onShowMore: (() -> Unit)?,
     onOpenEntry: (String) -> Unit,
@@ -839,7 +841,7 @@ private fun SearchCatalogMatchesSection(
 
 @Composable
 private fun SearchCatalogMatchRow(
-    match: CatalogSearchMatch,
+    match: CatalogSearchEntryMatch,
     onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -1073,5 +1075,4 @@ private fun SearchQuickTagChip(
     }
 }
 
-private const val DEFAULT_CATALOG_SEARCH_LIMIT = 24
 private const val MAX_DIARY_SEARCH_RESULTS = 20

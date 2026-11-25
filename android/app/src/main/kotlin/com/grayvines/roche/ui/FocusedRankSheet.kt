@@ -81,7 +81,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
-import com.grayvines.roche.data.catalog.CatalogSnapshot
+import com.grayvines.roche.data.catalog.ProvisionalFocusRank
 import com.grayvines.roche.data.catalog.RankSettlementSummary
 import com.grayvines.roche.data.catalog.RankedCatalogEntry
 import com.grayvines.roche.ranking.EpRankingEngine
@@ -131,7 +131,6 @@ private data class RankCardDragHandlers(
 internal fun FocusedRankBottomSheet(
     session: ActiveRankSessionUiState,
     onAction: (MainAction) -> Unit,
-    catalog: CatalogSnapshot = CatalogSnapshot(),
 ) {
     val colors = LocalRocheColors.current
     val sheetState =
@@ -155,13 +154,11 @@ internal fun FocusedRankBottomSheet(
             RankSettlementSheetBody(
                 session = session,
                 settlement = settlement,
-                catalog = catalog,
                 onAction = onAction,
             )
         } else {
             ActiveClusterRankBody(
                 session = session,
-                catalog = catalog,
                 onDragActiveChange = { isDraggingCard = it },
                 onAction = onAction,
             )
@@ -173,15 +170,10 @@ internal fun FocusedRankBottomSheet(
 private fun RankSettlementSheetBody(
     session: ActiveRankSessionUiState,
     settlement: RankSettlementSummary,
-    catalog: CatalogSnapshot,
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val entry = remember(settlement.entryId, catalog) { catalog.entriesById[settlement.entryId] }
-    val neighbors =
-        remember(session.collectionIdOrSlug, settlement.entryId, catalog) {
-            resolveSettlementNeighbors(session.collectionIdOrSlug, settlement.entryId, catalog)
-        }
+    val neighbors = settlement.neighbors
     Column(
         modifier =
             Modifier.fillMaxWidth()
@@ -199,8 +191,8 @@ private fun RankSettlementSheetBody(
         )
         SettlementHeroRow(
             title = settlement.title,
-            subtitle = entry?.subtitleLine.orEmpty(),
-            thumbnailUrl = entry?.thumbnailUrl,
+            subtitle = settlement.subtitle,
+            thumbnailUrl = settlement.thumbnailUrl,
         )
         SettlementSummaryCard(settlement = settlement, roundCount = session.roundIndex)
         if (neighbors.isNotEmpty()) {
@@ -461,7 +453,6 @@ private fun rankBoardStateSaver(
 @Composable
 private fun ActiveClusterRankBody(
     session: ActiveRankSessionUiState,
-    catalog: CatalogSnapshot,
     onDragActiveChange: (Boolean) -> Unit,
     onAction: (MainAction) -> Unit,
 ) {
@@ -477,10 +468,7 @@ private fun ActiveClusterRankBody(
     var activeDrag by
         remember(session.roundIndex, clusterKey) { mutableStateOf<ActiveRankDragState?>(null) }
     LaunchedEffect(activeDrag != null) { onDragActiveChange(activeDrag != null) }
-    val provisionalRank =
-        remember(session.collectionIdOrSlug, session.focusEntryId, catalog) {
-            resolveProvisionalFocusRank(session, catalog)
-        }
+    val provisionalRank = session.provisionalRank
 
     BoxWithConstraints(modifier = Modifier.fillMaxWidth().testTag("focused_rank_sheet")) {
         val isWide = maxWidth >= RANK_WIDE_BREAKPOINT
@@ -932,12 +920,6 @@ private fun ClusterRankHeader(
         }
     }
 }
-
-private data class ProvisionalFocusRank(
-    val rank: Int,
-    val totalCount: Int,
-    val tier: Char?,
-)
 
 @Composable
 private fun ProvisionalRankBadgeRow(provisional: ProvisionalFocusRank) {
@@ -2115,43 +2097,6 @@ private fun Modifier.dashedRoundBorder(color: Color, radius: Dp): Modifier = dra
                 pathEffect = PathEffect.dashPathEffect(floatArrayOf(14f, 8f)),
             ),
     )
-}
-
-private fun resolveProvisionalFocusRank(
-    session: ActiveRankSessionUiState,
-    catalog: CatalogSnapshot,
-): ProvisionalFocusRank? {
-    val focusId = session.focusEntryId ?: return null
-    val colId = resolveCatalogCollectionId(session.collectionIdOrSlug, catalog)
-    val entries = catalog.entriesByCollectionId[colId].orEmpty()
-    val match = entries.firstOrNull { it.entry.id == focusId } ?: return null
-    return ProvisionalFocusRank(rank = match.rank, totalCount = entries.size, tier = match.tier)
-}
-
-private fun resolveCatalogCollectionId(
-    collectionIdOrSlug: String,
-    catalog: CatalogSnapshot,
-): String =
-    catalog.lists
-        .firstOrNull { it.collectionId == collectionIdOrSlug || it.slug == collectionIdOrSlug }
-        ?.collectionId
-        ?: catalog.wantQueues
-            .firstOrNull { it.collectionId == collectionIdOrSlug || it.slug == collectionIdOrSlug }
-            ?.collectionId
-        ?: collectionIdOrSlug
-
-private fun resolveSettlementNeighbors(
-    collectionIdOrSlug: String,
-    focusEntryId: String,
-    catalog: CatalogSnapshot,
-): List<RankedCatalogEntry> {
-    val colId = resolveCatalogCollectionId(collectionIdOrSlug, catalog)
-    val entries = catalog.entriesByCollectionId[colId].orEmpty()
-    val idx = entries.indexOfFirst { it.entry.id == focusEntryId }
-    if (idx < 0 || entries.size < 2) return emptyList()
-    val start = (idx - 1).coerceAtLeast(0)
-    val end = (idx + 1).coerceAtMost(entries.lastIndex)
-    return entries.subList(start, end + 1)
 }
 
 internal fun computeDisplayGroupRanks(

@@ -1,23 +1,19 @@
 package com.grayvines.roche.data.boards
 
 import com.grayvines.roche.core.SCHEME_HACKER_NEWS
-import com.grayvines.roche.core.STARRED_COLLECTION_ID
-import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.extractArxivIdentifier
 import com.grayvines.roche.core.extractHackerNewsItemId
 import com.grayvines.roche.core.normalizeConsecutiveFailures
-import com.grayvines.roche.data.catalog.RawCatalogLogSummary
-import com.grayvines.roche.data.catalog.RawCatalogTables
 import com.grayvines.roche.data.local.BoardEntity
 import com.grayvines.roche.data.local.BoardItemEntity
 import com.grayvines.roche.data.local.BoardItemStateEntity
+import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.local.RocheDao
 
 private val BOARD_DEDUP_CONTAINER_KINDS =
     setOf("publication", "podcast", "channel", "collection", "artist")
-private const val STATUS_CONSUMED = "consumed"
-private const val ROLE_WANT = "want"
+private const val BOARD_DEDUP_CHUNK_SIZE = 450
 
 internal data class RawBoardTables(
     val boards: List<BoardEntity> = emptyList(),
@@ -31,13 +27,19 @@ internal data class ProjectedBoardsSnapshot(
     val boardItemStates: Map<Pair<String, String>, BoardItemStateEntity> = emptyMap(),
 )
 
+internal data class BoardDedupKey(
+    val adapterType: String,
+    val url: String,
+    val externalId: String,
+)
+
 internal data class BoardDedupLookup(
-    val entryIdByUrl: Map<String, String>,
-    val entryIdByArxiv: Map<String, String>,
-    val entryIdByHn: Map<String, String>,
-    val inQueueEntryIds: Set<String>,
-    val starredEntryIds: Set<String>,
-    val finishedEntryIds: Set<String>,
+    val entryIdByUrl: Map<String, String> = emptyMap(),
+    val entryIdByArxiv: Map<String, String> = emptyMap(),
+    val entryIdByHn: Map<String, String> = emptyMap(),
+    val inQueueEntryIds: Set<String> = emptySet(),
+    val starredEntryIds: Set<String> = emptySet(),
+    val finishedEntryIds: Set<String> = emptySet(),
 )
 
 internal fun BoardDedupLookup.resolveLinkedEntryId(
@@ -56,51 +58,36 @@ internal fun BoardDedupLookup.resolveLinkedEntryId(
     return byArxiv ?: byUrl ?: byHn
 }
 
-private data class IndexedEntryIdentMaps(
-    val byUrl: Map<String, String>,
-    val byArxiv: Map<String, String>,
-    val byHn: Map<String, String>,
+private data class ResolvedScopedEntries(
+    val redirects: Map<String, String>,
+    val kindById: Map<String, String>,
 )
 
-internal fun buildBoardDedupLookup(catalogTables: RawCatalogTables): BoardDedupLookup {
-    val redirects = HashMap<String, String>()
-    val entryKindById = HashMap<String, String>(catalogTables.entries.size)
-    for (entry in catalogTables.entries) {
-        entryKindById[entry.id] = entry.kind
-        val target = entry.mergedIntoId?.trim()?.takeIf { it.isNotEmpty() && it != entry.id }
-        if (target != null) {
-            redirects[entry.id] = target
-        }
-    }
-    val idents = indexIdentifiersForBoardDedup(catalogTables, redirects, entryKindById)
-    val (inQueueIds, starredIds) = collectMembershipBadges(catalogTables, redirects)
-    val finishedIds =
-        catalogTables.logSummary.entryStatuses
-            .asSequence()
-            .filter { it.status.equals(STATUS_CONSUMED, ignoreCase = true) }
-            .mapTo(HashSet()) { followRedirect(it.entryId, redirects) }
-    return BoardDedupLookup(
-        entryIdByUrl = idents.byUrl,
-        entryIdByArxiv = idents.byArxiv,
-        entryIdByHn = idents.byHn,
-        inQueueEntryIds = inQueueIds,
-        starredEntryIds = starredIds,
-        finishedEntryIds = finishedIds,
-    )
-}
+/**
+ * Loads deduplication links and badges ONLY for the provided active board [keys], using PK
+ * `(scheme, value)` lookups on `entry_identifiers` and targeted `IN` badge queries instead of
+ * scanning full catalog tables.
+ */
+internal suspend fun loadScopedBoardDedupLookup(
+    dao: RocheDao,
+    keys: List<BoardDedupKey>,
+): BoardDedupLookup {
+    if (keys.isEmpty()) return BoardDedupLookup()
+    val matchedIdents = queryScopedIdentifiers(dao, keys)
+    if (matchedIdents.isEmpty()) return BoardDedupLookup()
 
-private fun indexIdentifiersForBoardDedup(
-    catalogTables: RawCatalogTables,
-    redirects: Map<String, String>,
-    entryKindById: Map<String, String>,
-): IndexedEntryIdentMaps {
+    val rawEntryIds = matchedIdents.mapTo(LinkedHashSet()) { it.entryId }
+    val resolved = resolveScopedEntryRedirects(dao, rawEntryIds)
     val entryIdByUrl = HashMap<String, String>()
     val entryIdByArxiv = HashMap<String, String>()
     val entryIdByHn = HashMap<String, String>()
-    for (ident in catalogTables.identifiers) {
-        val owner = followRedirect(ident.entryId, redirects)
-        val kind = entryKindById[owner]
+    val canonicalOwnerIds = HashSet<String>(rawEntryIds.size)
+
+    for (ident in matchedIdents) {
+        val owner = followRedirect(ident.entryId, resolved.redirects)
+        val kind = resolved.kindById[owner]
         if (kind != null && kind !in BOARD_DEDUP_CONTAINER_KINDS) {
+            canonicalOwnerIds.add(owner)
             when (ident.scheme) {
                 "url" -> entryIdByUrl.putIfAbsent(ident.value, owner)
                 "arxiv" -> entryIdByArxiv.putIfAbsent(ident.value, owner)
@@ -108,55 +95,168 @@ private fun indexIdentifiersForBoardDedup(
             }
         }
     }
-    return IndexedEntryIdentMaps(byUrl = entryIdByUrl, byArxiv = entryIdByArxiv, byHn = entryIdByHn)
+    if (canonicalOwnerIds.isEmpty()) return BoardDedupLookup()
+
+    val allRedirects = mergeAllEntryRedirects(dao, resolved.redirects)
+    val badgeQueryIds = collectBadgeQueryIds(rawEntryIds, canonicalOwnerIds, allRedirects)
+    val inQueueIds = loadBadgeEntryIds(badgeQueryIds, allRedirects) { dao.getWantEntryIdsIn(it) }
+    val starredIds = loadBadgeEntryIds(badgeQueryIds, allRedirects) { dao.getStarredEntryIdsIn(it) }
+    val finishedIds =
+        loadBadgeEntryIds(badgeQueryIds, allRedirects) { dao.getConsumedEntryIdsIn(it) }
+
+    return BoardDedupLookup(
+        entryIdByUrl = entryIdByUrl,
+        entryIdByArxiv = entryIdByArxiv,
+        entryIdByHn = entryIdByHn,
+        inQueueEntryIds = inQueueIds,
+        starredEntryIds = starredIds,
+        finishedEntryIds = finishedIds,
+    )
 }
 
-private fun collectMembershipBadges(
-    catalogTables: RawCatalogTables,
-    redirects: Map<String, String>,
-): Pair<Set<String>, Set<String>> {
-    val wantColIds =
-        catalogTables.specs
+private suspend fun queryScopedIdentifiers(
+    dao: RocheDao,
+    keys: List<BoardDedupKey>,
+): List<EntryIdentifierEntity> {
+    val arxivValues = keys.mapNotNull { extractArxivIdentifier(it.url) }.distinct()
+    val urlValues =
+        keys.mapNotNull { canonicalizeSyncUrl(it.url).takeIf(String::isNotEmpty) }.distinct()
+    val hnValues =
+        keys
             .asSequence()
-            .filter { it.role.equals(ROLE_WANT, ignoreCase = true) }
-            .mapTo(HashSet()) { it.collectionId }
-            .apply { add(WANT_TO_READ_COLLECTION_ID) }
-    val inQueueIds = HashSet<String>()
-    val starredIds = HashSet<String>()
-    for (mem in catalogTables.memberships) {
-        val resolvedEntryId = followRedirect(mem.entryId, redirects)
-        if (mem.collectionId in wantColIds) {
-            inQueueIds.add(resolvedEntryId)
-        }
-        if (mem.collectionId == STARRED_COLLECTION_ID) {
-            starredIds.add(resolvedEntryId)
+            .filter { it.adapterType == SCHEME_HACKER_NEWS }
+            .mapNotNull { extractHackerNewsItemId(it.externalId) }
+            .distinct()
+            .toList()
+    val matched = ArrayList<EntryIdentifierEntity>()
+    querySchemeValuesChunked(dao, "arxiv", arxivValues, matched)
+    querySchemeValuesChunked(dao, "url", urlValues, matched)
+    querySchemeValuesChunked(dao, SCHEME_HACKER_NEWS, hnValues, matched)
+    return matched
+}
+
+private suspend fun querySchemeValuesChunked(
+    dao: RocheDao,
+    scheme: String,
+    values: List<String>,
+    out: MutableList<EntryIdentifierEntity>,
+) {
+    if (values.isEmpty()) return
+    for (chunk in values.chunked(BOARD_DEDUP_CHUNK_SIZE)) {
+        out.addAll(dao.getIdentifiersBySchemeValues(scheme, chunk))
+    }
+}
+
+private suspend fun resolveScopedEntryRedirects(
+    dao: RocheDao,
+    initialIds: Set<String>,
+): ResolvedScopedEntries {
+    val redirects = HashMap<String, String>()
+    val kindById = HashMap<String, String>(initialIds.size)
+    val visited = HashSet<String>(initialIds.size)
+    var frontier: List<String> = initialIds.toList()
+    while (frontier.isNotEmpty()) {
+        val toFetch = frontier.filter { visited.add(it) }
+        if (toFetch.isEmpty()) break
+        frontier =
+            fetchRedirectFrontier(
+                dao = dao,
+                toFetch = toFetch,
+                kindById = kindById,
+                redirects = redirects,
+                visited = visited,
+            )
+    }
+    return ResolvedScopedEntries(redirects = redirects, kindById = kindById)
+}
+
+private suspend fun fetchRedirectFrontier(
+    dao: RocheDao,
+    toFetch: List<String>,
+    kindById: MutableMap<String, String>,
+    redirects: MutableMap<String, String>,
+    visited: Set<String>,
+): List<String> {
+    val nextFrontier = ArrayList<String>()
+    for (chunk in toFetch.chunked(BOARD_DEDUP_CHUNK_SIZE)) {
+        for (entry in dao.getEntriesByIds(chunk)) {
+            kindById[entry.id] = entry.kind
+            val target = entry.mergedIntoId?.trim()?.takeIf { it.isNotEmpty() && it != entry.id }
+            if (target != null) {
+                redirects[entry.id] = target
+                if (target !in visited) nextFrontier.add(target)
+            }
         }
     }
-    return inQueueIds to starredIds
+    return nextFrontier
 }
 
-internal suspend fun loadBoardDedupLookupFromDao(dao: RocheDao): BoardDedupLookup {
-    val rawCatalog =
-        RawCatalogTables(
-            entries = dao.getAllEntries(),
-            identifiers = dao.getAllEntryIdentifiers(),
-            specs = dao.getAllCollectionSpecs(),
-            memberships = dao.getAllCollectionEntries(),
-            generators = emptyList(),
-            logSummary = RawCatalogLogSummary(entryStatuses = dao.getDistinctEntryLogStatuses()),
-            comparisons = emptyList(),
-        )
-    return buildBoardDedupLookup(rawCatalog)
+private suspend fun mergeAllEntryRedirects(
+    dao: RocheDao,
+    scopedRedirects: Map<String, String>,
+): Map<String, String> {
+    val mergedRows = dao.getMergedEntryRedirects()
+    if (mergedRows.isEmpty()) return scopedRedirects
+    val combined = HashMap<String, String>(scopedRedirects.size + mergedRows.size)
+    combined.putAll(scopedRedirects)
+    for (row in mergedRows) {
+        val target = row.mergedIntoId.trim()
+        if (target.isNotEmpty() && target != row.id) {
+            combined[row.id] = target
+        }
+    }
+    return combined
 }
 
-internal fun projectBoardsSnapshot(
+private fun collectBadgeQueryIds(
+    rawEntryIds: Set<String>,
+    canonicalOwnerIds: Set<String>,
+    allRedirects: Map<String, String>,
+): List<String> {
+    val ids = LinkedHashSet<String>(rawEntryIds.size + canonicalOwnerIds.size)
+    ids.addAll(rawEntryIds)
+    ids.addAll(canonicalOwnerIds)
+    for (src in allRedirects.keys) {
+        if (followRedirect(src, allRedirects) in canonicalOwnerIds) {
+            ids.add(src)
+        }
+    }
+    return ids.toList()
+}
+
+private suspend fun loadBadgeEntryIds(
+    entryIds: List<String>,
+    redirects: Map<String, String>,
+    query: suspend (List<String>) -> List<String>,
+): Set<String> {
+    val result = HashSet<String>()
+    for (chunk in entryIds.chunked(BOARD_DEDUP_CHUNK_SIZE)) {
+        for (id in query(chunk)) {
+            result.add(followRedirect(id, redirects))
+        }
+    }
+    return result
+}
+
+internal suspend fun projectBoardsSnapshot(
+    dao: RocheDao,
     boardTables: RawBoardTables,
-    catalogTables: RawCatalogTables,
 ): ProjectedBoardsSnapshot {
     if (boardTables.boards.isEmpty()) {
         return ProjectedBoardsSnapshot()
     }
-    val dedup = buildBoardDedupLookup(catalogTables)
+    val boardsById = boardTables.boards.associateBy { it.id }
+    val keys =
+        boardTables.boardItems.mapNotNull { item ->
+            boardsById[item.boardId]?.let { board ->
+                BoardDedupKey(
+                    adapterType = board.adapterType,
+                    url = item.url,
+                    externalId = item.externalId,
+                )
+            }
+        }
+    val dedup = loadScopedBoardDedupLookup(dao, keys)
     val statesByKey =
         boardTables.boardItemStates.associateBy { state -> state.boardId to state.externalId }
     val itemsByBoardId = boardTables.boardItems.groupBy { it.boardId }

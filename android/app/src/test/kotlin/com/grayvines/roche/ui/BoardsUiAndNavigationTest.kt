@@ -3,7 +3,6 @@ package com.grayvines.roche.ui
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.grayvines.roche.core.DiscussionLink
-import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.TestRocheEnv
@@ -534,10 +533,7 @@ class BoardsUiAndNavigationTest {
                 tags = emptyList(),
                 catalog =
                     CatalogSnapshot(
-                        entriesByCollectionId =
-                            mapOf(
-                                STARRED_COLLECTION_ID to listOf(sampleRankedCatalogEntry("e-ext"))
-                            ),
+                        starredEntryIds = setOf("e-ext"),
                         recentDiaryEntries = listOf(sampleConsumedDiaryItem("e-ext")),
                     ),
             )
@@ -748,9 +744,9 @@ class BoardsViewModelIntegrationTest {
             )
             val afterList =
                 vm.uiState.first { state ->
-                    state.catalog.entriesByCollectionId[listId].orEmpty().isNotEmpty()
+                    state.catalog.lists.firstOrNull { it.collectionId == listId }?.entryCount == 1
                 }
-            assertEquals(1, afterList.catalog.entriesByCollectionId[listId].orEmpty().size)
+            assertEquals(1, afterList.catalog.lists.first { it.collectionId == listId }.entryCount)
             uiJob.cancel()
         }
 
@@ -865,8 +861,6 @@ private fun sampleRankedCatalogEntry(entryId: String): RankedCatalogEntry =
         variance = 1.0,
         scoreOutOfTen = 5.0,
         tier = null,
-        latestStatus = null,
-        latestNotes = null,
     )
 
 private fun sampleConsumedDiaryItem(entryId: String): DiaryEntryItem =

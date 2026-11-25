@@ -223,8 +223,8 @@ class RocheCatalogAndSyncTest {
 
             // Global quality comparison ranks Stalker > Solaris
             catalog.recordComparison(listOf(listOf(movieB), listOf(movieA)), null)
-            val snap1 = repository.snapshot.first().catalog
-            val rankedMovies = snap1.entriesByCollectionId[moviesSpec.collectionId].orEmpty()
+            repository.snapshot.first()
+            val rankedMovies = catalog.loadCollectionEntries(moviesSpec.collectionId)
             assertEquals(listOf(movieB, movieA), rankedMovies.map { it.entry.id })
 
             // Want queue priority comparison is strictly local and never bleeds into global quality
@@ -251,22 +251,20 @@ class RocheCatalogAndSyncTest {
                 ordering = listOf(listOf(wantD), listOf(wantC)),
                 scopeCollectionId = wantMoviesSpec.collectionId,
             )
-            val snap2 = repository.snapshot.first().catalog
-            val wantRanked = snap2.entriesByCollectionId[wantMoviesSpec.collectionId].orEmpty()
+            repository.snapshot.first()
+            val wantRanked = catalog.loadCollectionEntries(wantMoviesSpec.collectionId)
             assertEquals(listOf(wantD, wantC), wantRanked.map { it.entry.id })
             assertTrue(wantRanked.all { it.tier == null })
 
             // Completing a Want item promotes it out of Want Queue into global Movies list
             catalog.logExistingEntry(wantD, ConsumptionStatus.CONSUMED, "Watched tonight")
-            val snap3 = repository.snapshot.first().catalog
+            repository.snapshot.first()
             assertEquals(
                 listOf(wantC),
-                snap3.entriesByCollectionId[wantMoviesSpec.collectionId].orEmpty().map {
-                    it.entry.id
-                },
+                catalog.loadCollectionEntries(wantMoviesSpec.collectionId).map { it.entry.id },
             )
             assertTrue(
-                snap3.entriesByCollectionId[moviesSpec.collectionId].orEmpty().any {
+                catalog.loadCollectionEntries(moviesSpec.collectionId).any {
                     it.entry.id == wantD
                 }
             )
@@ -600,13 +598,11 @@ class RocheCatalogAndSyncTest {
                 val booksSpec = peerSnap.lists.first { it.slug == "books" }
                 assertEquals(
                     listOf(bookA, bookB),
-                    peerSnap.entriesByCollectionId[booksSpec.collectionId].orEmpty().map {
-                        it.entry.id
-                    },
+                    peerCatalog.loadCollectionEntries(booksSpec.collectionId).map { it.entry.id },
                 )
                 val articlesSpec = peerSnap.lists.first { it.slug == "articles" }
                 assertTrue(
-                    peerSnap.entriesByCollectionId[articlesSpec.collectionId].orEmpty().any {
+                    peerCatalog.loadCollectionEntries(articlesSpec.collectionId).any {
                         it.entry.id == "remote-art-1"
                     }
                 )
@@ -655,7 +651,7 @@ class RocheCatalogAndSyncTest {
             assertEquals(1, listAfterOne.entryCount)
             assertEquals(
                 listOf(finished1.entryId),
-                afterOneSnap.entriesByCollectionId[listId].orEmpty().map { it.entry.id },
+                catalog.loadCollectionEntries(listId).map { it.entry.id },
             )
             // Synthesized ARTIST row is present in dynamic `artists` list, NOT in Diary or
             // consumedCount
@@ -742,12 +738,11 @@ class RocheCatalogAndSyncTest {
                 }
             )
             assertTrue(snap.recentDiaryEntries.none { it.entryId == dupId })
-            val customMembers =
-                snap.entriesByCollectionId[customListId].orEmpty().map { it.entry.id }
+            val customMembers = catalog.loadCollectionEntries(customListId).map { it.entry.id }
             assertEquals(listOf(canonId), customMembers)
             val moviesSpec = snap.lists.first { it.slug == "movies" }
             val rankedMovies =
-                snap.entriesByCollectionId[moviesSpec.collectionId].orEmpty().map { it.entry.id }
+                catalog.loadCollectionEntries(moviesSpec.collectionId).map { it.entry.id }
             assertEquals(listOf(canonId, otherId), rankedMovies)
         }
 
@@ -2252,23 +2247,20 @@ class RocheCatalogAndSyncTest {
                 }
             try {
                 awaitCatalogSnapshot(emissions) { snap ->
-                    snap.entriesByCollectionId[listId].orEmpty().any {
-                        it.entry.id == entryA && it.entry.identifiers.isNotEmpty()
-                    }
+                    snap.lists.any { it.collectionId == listId && it.entryCount == 2 }
                 }
+                assertTrue(catalog.loadCatalogEntry(entryA)?.identifiers?.isNotEmpty() == true)
 
                 // 1. Repoint identifier in-place bumps entry_identifiers revision trigger
                 val identsBefore = dao.getRepositoryStamp().identsStamp
                 dao.repointIdentifiersToEntry(entryA, entryB)
                 assertNotEquals(identsBefore, dao.getRepositoryStamp().identsStamp)
-                awaitCatalogSnapshot(emissions) { snap ->
-                    snap.entriesByCollectionId[listId]
-                        .orEmpty()
-                        .firstOrNull { it.entry.id == entryB }
-                        ?.entry
-                        ?.identifiers
-                        ?.any { it.value == "tt0069293" } == true
-                }
+                withContext(Dispatchers.Default) { withTimeout(5_000L) { emissions.receive() } }
+                assertTrue(
+                    catalog.loadCatalogEntry(entryB)?.identifiers?.any {
+                        it.value == "tt0069293"
+                    } == true
+                )
 
                 // 2. Update collection_specs.color bumps collection_specs revision trigger
                 val specsBeforeColor = dao.getRepositoryStamp().specsStamp

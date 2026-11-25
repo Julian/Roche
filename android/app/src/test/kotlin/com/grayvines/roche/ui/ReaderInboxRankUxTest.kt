@@ -1,25 +1,30 @@
 package com.grayvines.roche.ui
 
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
-import com.grayvines.roche.data.catalog.CatalogEntryItem
+import com.grayvines.roche.data.TestRocheEnv
 import com.grayvines.roche.data.catalog.CatalogListSummary
 import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CollectionRole
 import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
 import com.grayvines.roche.data.matchesScope
-import com.grayvines.roche.data.searchCatalogEntriesWithTotal
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
+import java.io.File
+import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
 
 class ReaderInboxRankUxTest {
+    @TempDir lateinit var tempDir: File
+
     @Test
     fun `matchesScope applies active InboxFilter within feed and tag scopes`() {
         val newPaper =
@@ -206,32 +211,28 @@ class ReaderInboxRankUxTest {
     }
 
     @Test
-    fun `searchCatalogEntriesWithTotal reports full totalCount beyond pagination limit`() {
-        val entries =
-            (1..30).associate { idx ->
-                val id = "album-$idx"
-                id to
-                    CatalogEntryItem(
-                        id = id,
+    fun `searchCatalogEntries reports full totalCount beyond pagination limit`() = runTest {
+        val env = TestRocheEnv(tempDir, "reader_inbox_search_total.preferences_pb")
+        try {
+            for (idx in 1..30) {
+                env.repository.catalog.upsertEntry(
+                    UpsertCatalogEntryInput(
+                        id = "album-$idx",
                         kind = EntryKind.ALBUM,
                         title = "Ambient Vol $idx",
                         creators = listOf("Brian Eno"),
-                        url = null,
-                        publishedAt = null,
                         releaseYear = 1978,
-                        summary = null,
-                        thumbnailUrl = null,
-                        identifiers = emptyList(),
                     )
+                )
             }
-        val result =
-            searchCatalogEntriesWithTotal(
-                catalog = CatalogSnapshot(entriesById = entries),
-                rawQuery = "ambient",
-                limit = 10,
-            )
-        assertEquals(10, result.matches.size)
-        assertEquals(30, result.totalCount)
+            val result =
+                env.repository.catalog.searchCatalogEntries(rawQuery = "ambient", limit = 10)
+            assertEquals(10, result.matches.size)
+            assertEquals(30, result.totalCount)
+            assertTrue(result.hasMore)
+        } finally {
+            env.close()
+        }
     }
 
     @Test

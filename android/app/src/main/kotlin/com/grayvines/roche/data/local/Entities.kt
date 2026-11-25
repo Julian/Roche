@@ -10,7 +10,7 @@ import androidx.room3.PrimaryKey
     tableName = "entries",
     indices =
         [
-            Index(value = ["kind"]),
+            Index(value = ["kind", "mergedIntoId"]),
             Index(value = ["mergedIntoId"]),
             Index(value = ["updatedAt"]),
             Index(value = ["publishedAt", "createdAt"]),
@@ -120,7 +120,7 @@ data class EntryContentFtsEntity(
                 onDelete = ForeignKey.CASCADE,
             )
         ],
-    indices = [Index(value = ["entryId"])],
+    indices = [Index(value = ["entryId", "scheme", "value"])],
 )
 data class EntryIdentifierEntity(
     val scheme: String,
@@ -220,7 +220,7 @@ internal fun CollectionSpecEntity.immutableReason(): String? =
         ],
     indices =
         [
-            Index(value = ["entryId"]),
+            Index(value = ["entryId", "addedAt", "collectionId"]),
             Index(value = ["addedAt"]),
             Index(value = ["isLocalDirty"]),
         ],
@@ -271,6 +271,7 @@ data class CollectionGeneratorEntity(
         [
             Index(value = ["entryId", "status"]),
             Index(value = ["entryId", "ts"]),
+            Index(value = ["status", "entryId"]),
             Index(value = ["status", "ts"]),
             Index(value = ["ts"]),
             Index(value = ["createdAt"]),
@@ -301,7 +302,7 @@ data class ConsumptionLogEntity(
         ],
     indices =
         [
-            Index(value = ["scopeCollectionId"]),
+            Index(value = ["scopeCollectionId", "ts"]),
             Index(value = ["ts"]),
             Index(value = ["createdAt"]),
             Index(value = ["isLocalDirty"]),
@@ -492,6 +493,7 @@ data class InboxItemRow(
     val isFinished: Boolean = false,
     val metadataJson: String = "{}",
     val hackerNewsId: String? = null,
+    val releaseYear: Int? = null,
 )
 
 @Suppress("LongParameterList")
@@ -544,6 +546,39 @@ data class DiaryYearCountRow(
 data class DiaryMonthCountRow(
     val monthKey: String,
     val count: Int,
+)
+
+data class KindCountRow(
+    val kind: String,
+    val count: Int,
+)
+
+data class EntryKindRow(
+    val id: String,
+    val kind: String,
+)
+
+data class MergeRedirectRow(
+    val id: String,
+    val mergedIntoId: String,
+)
+
+data class CollectionAggregateRow(
+    val collectionId: String,
+    val totalCount: Int,
+    val consumedCount: Int,
+    val abandonedCount: Int,
+)
+
+data class EntryThumbnailRow(
+    val id: String,
+    val kind: String,
+    val thumbnailUrl: String?,
+)
+
+data class EntryTitleRow(
+    val id: String,
+    val title: String,
 )
 
 @Suppress("LongParameterList")

@@ -26,6 +26,7 @@ import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.boards.BOARD_DEFAULT_PAGE_SIZE
 import com.grayvines.roche.data.boards.BoardAdapterRegistry
 import com.grayvines.roche.data.boards.BoardAdapterType
+import com.grayvines.roche.data.boards.BoardDedupKey
 import com.grayvines.roche.data.boards.BoardItemView
 import com.grayvines.roche.data.boards.BoardOrderMode
 import com.grayvines.roche.data.boards.BoardPageResult
@@ -38,11 +39,12 @@ import com.grayvines.roche.data.boards.DEFAULT_BOARD_POLL_INTERVAL_MINUTES
 import com.grayvines.roche.data.boards.HackerNewsSection
 import com.grayvines.roche.data.boards.LocalBoardPoller
 import com.grayvines.roche.data.boards.buildBoardSummary
-import com.grayvines.roche.data.boards.loadBoardDedupLookupFromDao
 import com.grayvines.roche.data.boards.loadBoardItemReaderContent
+import com.grayvines.roche.data.boards.loadScopedBoardDedupLookup
 import com.grayvines.roche.data.boards.projectBoardCandidateView
 import com.grayvines.roche.data.boards.projectBoardItemView
 import com.grayvines.roche.data.boards.resolveBoardItemForAction
+import com.grayvines.roche.data.catalog.CatalogSearchEntryMatch
 import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
@@ -198,6 +200,8 @@ data class WorkspaceSearchResult(
     val snippetsByEntryId: Map<String, String> = emptyMap(),
     val matchedCollectionIds: List<String> = emptyList(),
     val matchedDiaryLogs: List<DiaryEntryItem> = emptyList(),
+    val matchedCatalogEntries: List<CatalogSearchEntryMatch> = emptyList(),
+    val catalogTotalCount: Int = 0,
 )
 
 data class RepositorySnapshot(
@@ -210,6 +214,7 @@ data class RepositorySnapshot(
     val boardItems: Map<String, List<BoardItemView>> = emptyMap(),
     val boardItemStates: Map<Pair<String, String>, BoardItemStateEntity> = emptyMap(),
     val diaryRevisionStamp: String = "",
+    val catalogRevisionStamp: String = "",
 )
 
 @Suppress("TooManyFunctions", "LargeClass", "LongParameterList")
@@ -335,7 +340,10 @@ class RocheRepository(
     internal suspend fun searchDeepEntries(rawQuery: String): List<InboxEntry> =
         searchWorkspace(rawQuery).entries
 
-    internal suspend fun searchWorkspace(rawQuery: String): WorkspaceSearchResult =
+    internal suspend fun searchWorkspace(
+        rawQuery: String,
+        catalogLimit: Int = DEFAULT_CATALOG_WORKSPACE_SEARCH_LIMIT,
+    ): WorkspaceSearchResult =
         withContext(Dispatchers.Default) {
             val cleanQuery = rawQuery.replace("\u0000", "").trim().trimStart('#').trim()
             if (cleanQuery.isBlank()) {
@@ -360,8 +368,7 @@ class RocheRepository(
                     }
                 val snippetsById = buildFtsSnippetsMap(tokenQueries)
                 val matchedCollectionIds = dao.searchCollectionIdsByTitle(likePattern)
-                val globalTiers =
-                    (latestSnapshot?.catalog ?: catalog.getSnapshot()).globalTiersByEntryId
+                val globalTiers = (latestSnapshot?.catalog ?: catalog.getSnapshot()).globalTiers
                 val matchedDiaryRows =
                     if (tokenQueries.isNotEmpty()) {
                         val combinedMatch = tokenQueries.joinToString(" ")
@@ -374,11 +381,20 @@ class RocheRepository(
                         dao.searchDiaryLogsByLike(likePattern)
                     }
                 val matchedDiaryLogs = matchedDiaryRows.map { toDiaryEntryItem(it, globalTiers) }
+                val catalogSearch =
+                    catalog.searchCatalogEntries(
+                        rawQuery = cleanQuery,
+                        includeWhenBlank = false,
+                        limit = catalogLimit,
+                        globalTiers = globalTiers,
+                    )
                 WorkspaceSearchResult(
                     entries = entries,
                     snippetsByEntryId = snippetsById,
                     matchedCollectionIds = matchedCollectionIds,
                     matchedDiaryLogs = matchedDiaryLogs,
+                    matchedCatalogEntries = catalogSearch.matches,
+                    catalogTotalCount = catalogSearch.totalCount,
                 )
             }
         }
@@ -2410,7 +2426,11 @@ class RocheRepository(
                             limit = safeLimit,
                         )
                         .getOrThrow()
-                val dedup = loadBoardDedupLookupFromDao(dao)
+                val dedupKeys =
+                    batch.items.map { candidate ->
+                        BoardDedupKey(board.adapterType, candidate.url, candidate.externalId)
+                    }
+                val dedup = loadScopedBoardDedupLookup(dao, dedupKeys)
                 val statesByExtId =
                     dao.getBoardItemStatesForBoard(board.id).associateBy { it.externalId }
                 val projected =
@@ -2622,7 +2642,10 @@ class RocheRepository(
         val board = dao.getBoardById(boardId) ?: return null
         val items = dao.getBoardItemsForBoard(boardId)
         val statesByExtId = dao.getBoardItemStatesForBoard(boardId).associateBy { it.externalId }
-        val dedup = loadBoardDedupLookupFromDao(dao)
+        val dedupKeys = items.map { item ->
+            BoardDedupKey(board.adapterType, item.url, item.externalId)
+        }
+        val dedup = loadScopedBoardDedupLookup(dao, dedupKeys)
         val projected = items.map { item ->
             projectBoardItemView(
                 board = board,
@@ -2653,6 +2676,7 @@ class RocheRepository(
 }
 
 private const val LOG_TAG = "RocheRepository"
+private const val DEFAULT_CATALOG_WORKSPACE_SEARCH_LIMIT = 24
 private const val OFFLINE_BOARD_REFRESH_ERROR = "Offline — connect to refresh boards"
 
 internal fun missingFeedError(feedId: String): Nothing = error("Feed not found: $feedId")

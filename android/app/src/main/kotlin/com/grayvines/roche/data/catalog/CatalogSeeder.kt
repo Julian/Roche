@@ -49,7 +49,11 @@ internal class CatalogSeeder(
     private suspend fun seedSystemSpecs() {
         pruneLegacyPlaceholder()
         val existingSpecs = dao.getAllCollectionSpecs().associateBy { it.collectionId }
-        val existingEntryIds = dao.getAllEntries().map { it.id }.toHashSet()
+        val systemIds =
+            listOf(STARRED_COLLECTION_ID, UP_NEXT_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID) +
+                EntryKind.systemDynamicKinds.map { systemCollectionUuid(it.systemListSlug) }
+        val wasEmptyDatabase = !dao.hasAnyEntries()
+        val existingEntryIds = dao.getEntriesByIds(systemIds).mapTo(HashSet()) { it.id }
         val seedHlc = HlcTimestamp.fromIsoOrEpoch(SEED_EPOCH_ISO, DEFAULT_LOCAL_HLC_NODE).encode()
 
         val specsToInsert = ArrayList<CollectionSpecEntity>()
@@ -73,7 +77,6 @@ internal class CatalogSeeder(
             identsToInsert = identsToInsert,
         )
 
-        val wasEmptyDatabase = existingEntryIds.isEmpty()
         dao.executeInTransaction {
             if (entriesToInsert.isNotEmpty()) {
                 dao.upsertEntries(entriesToInsert)

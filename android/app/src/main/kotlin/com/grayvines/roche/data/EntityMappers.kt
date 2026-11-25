@@ -179,6 +179,7 @@ internal fun toInboxEntry(entity: InboxItemRow, tags: List<String>): InboxEntry 
         entryKind = EntryKind.fromWireValue(entity.entryKind),
         isFinished = entity.isFinished,
         discussions = extractDiscussionsForEntry(entity.metadataJson, entity.hackerNewsId),
+        releaseYear = entity.releaseYear,
     )
 
 internal fun createSavedItemEntity(

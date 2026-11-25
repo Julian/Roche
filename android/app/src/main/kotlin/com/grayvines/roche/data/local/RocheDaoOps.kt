@@ -166,17 +166,19 @@ private fun isFtsTokenCodePoint(cp: Int): Boolean =
             else -> false
         }
 
-internal fun buildSqlContainsPattern(rawQuery: String): String {
+internal fun buildSqlContainsPattern(rawQuery: String): String = "%${escapeSqlLikeValue(rawQuery)}%"
+
+internal fun buildSqlPrefixPattern(rawQuery: String): String = "${escapeSqlLikeValue(rawQuery)}%"
+
+private fun escapeSqlLikeValue(rawQuery: String): String {
     val sanitized = rawQuery.replace("\u0000", "").trim()
-    return buildString(sanitized.length + 2) {
-        append('%')
+    return buildString(sanitized.length) {
         for (ch in sanitized) {
             if (ch == '\\' || ch == '%' || ch == '_') {
                 append('\\')
             }
             append(ch)
         }
-        append('%')
     }
 }
 

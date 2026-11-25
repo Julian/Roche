@@ -91,19 +91,33 @@ internal suspend fun resolveBoardItemForAction(
     externalId: String,
     fallbackItem: BoardItemView?,
 ): BoardItemView? {
-    val dedup = loadBoardDedupLookupFromDao(dao)
     val state = dao.getBoardItemState(board.id, externalId)
     val dbItem = dao.getBoardItem(board.id, externalId)
     if (dbItem != null) {
+        val dedup =
+            loadScopedBoardDedupLookup(
+                dao,
+                listOf(BoardDedupKey(board.adapterType, dbItem.url, dbItem.externalId)),
+            )
         return projectBoardItemView(board = board, item = dbItem, state = state, dedup = dedup)
     }
     if (fallbackItem != null) {
+        val dedup =
+            loadScopedBoardDedupLookup(
+                dao,
+                listOf(BoardDedupKey(board.adapterType, fallbackItem.url, fallbackItem.externalId)),
+            )
         return hydrateBoardItemView(board, fallbackItem, state, dedup)
     }
     val adapter = adapterRegistry.resolve(board.adapterType) ?: return null
     val candidate =
         adapter.fetchSingleItem(board.sourceKey, board.sourceConfigJson, externalId).getOrNull()
             ?: return null
+    val dedup =
+        loadScopedBoardDedupLookup(
+            dao,
+            listOf(BoardDedupKey(board.adapterType, candidate.url, candidate.externalId)),
+        )
     return projectBoardCandidateView(
         board = board,
         candidate = candidate,

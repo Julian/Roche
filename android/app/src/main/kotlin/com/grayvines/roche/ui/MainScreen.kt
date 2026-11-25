@@ -693,7 +693,6 @@ private fun MainCatalogOverlaySheets(
         FocusedRankBottomSheet(
             session = activeRankSession,
             onAction = onAction,
-            catalog = state.catalog,
         )
     }
 
@@ -839,7 +838,7 @@ private fun MainReaderDestination(
                 settings = state.settings,
                 isHydrating = state.isReaderHydrating,
                 isDownloadingOffline = targetEntry.id in state.inFlightOfflineEntryIds,
-                catalogReleaseYear = state.catalog.entriesById[targetEntry.id]?.releaseYear,
+                catalogReleaseYear = targetEntry.releaseYear,
                 playerStateFlow = playerStateFlow,
                 onAction = onAction,
                 onShareEntry = onShareEntry,

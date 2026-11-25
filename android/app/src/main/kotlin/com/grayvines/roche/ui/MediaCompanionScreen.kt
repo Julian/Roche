@@ -107,16 +107,12 @@ fun MediaCompanionScreen(
                 lists.firstOrNull { it.collectionId == id }
             }
         }
-    val activeEntries =
-        activeList?.let { state.catalog.entriesByCollectionId[it.collectionId] }.orEmpty()
+    val activeCollection = resolveActiveCollectionState(activeList, state.activeCollection)
     val overviewCount =
         remember(lists) {
-            lists.count {
-                !it.isDynamic || it.entryCount > 0 || it.generatorEnabled
-            }
+            lists.count { !it.isDynamic || it.entryCount > 0 || it.generatorEnabled }
         }
-    val headerCount =
-        formatCompactInt(if (activeList != null) activeEntries.size else overviewCount)
+    val headerCount = formatCompactInt(activeList?.entryCount ?: overviewCount)
 
     BackHandler(enabled = activeList != null) { onAction(MainAction.SelectCatalogCollection(null)) }
     RocheRefreshableTabScaffold(
@@ -137,7 +133,7 @@ fun MediaCompanionScreen(
             state = state,
             lists = lists,
             activeList = activeList,
-            activeEntries = activeEntries,
+            activeCollection = activeCollection,
             listState = listState,
             overviewScrollState = overviewScrollState,
             onAction = onAction,
@@ -157,13 +153,23 @@ fun MediaCompanionScreen(
     }
 }
 
+private fun resolveActiveCollectionState(
+    activeList: CatalogListSummary?,
+    loaded: CatalogCollectionUiState,
+): CatalogCollectionUiState =
+    if (activeList != null && loaded.collectionId == activeList.collectionId) {
+        loaded
+    } else {
+        CatalogCollectionUiState(collectionId = activeList?.collectionId)
+    }
+
 @Composable
 @Suppress("LongParameterList")
 private fun MediaCompanionBody(
     state: MainUiState,
     lists: List<CatalogListSummary>,
     activeList: CatalogListSummary?,
-    activeEntries: List<RankedCatalogEntry>,
+    activeCollection: CatalogCollectionUiState,
     listState: LazyListState,
     overviewScrollState: ScrollState,
     onAction: (MainAction) -> Unit,
@@ -173,7 +179,6 @@ private fun MediaCompanionBody(
 ) {
     if (activeList == null) {
         ListsOverviewPane(
-            state = state,
             lists = lists,
             overviewScrollState = overviewScrollState,
             onOpenList = { onAction(MainAction.SelectCatalogCollection(it)) },
@@ -184,7 +189,7 @@ private fun MediaCompanionBody(
         RankedListDetailPane(
             state = state,
             activeList = activeList,
-            rankedEntries = activeEntries,
+            collectionState = activeCollection,
             listState = listState,
             onAction = onAction,
             onOpenCollectionDraw = onOpenCollectionDraw,
@@ -225,7 +230,6 @@ private fun ListsTopHeaderBar(
 
 @Composable
 private fun ListsOverviewPane(
-    state: MainUiState,
     lists: List<CatalogListSummary>,
     overviewScrollState: ScrollState,
     onOpenList: (String) -> Unit,
@@ -268,7 +272,6 @@ private fun ListsOverviewPane(
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             YourListsOverviewSection(
-                state = state,
                 manualLists = manualLists,
                 isWide = isWide,
                 onOpenList = onOpenList,
@@ -277,7 +280,6 @@ private fun ListsOverviewPane(
             )
             if (activeDynamic.isNotEmpty() || emptyDynamic.isNotEmpty()) {
                 MediaTypeOverviewSection(
-                    state = state,
                     activeDynamic = activeDynamic,
                     emptyDynamic = emptyDynamic,
                     isWide = isWide,
@@ -292,7 +294,6 @@ private fun ListsOverviewPane(
 
 @Composable
 private fun YourListsOverviewSection(
-    state: MainUiState,
     manualLists: List<CatalogListSummary>,
     isWide: Boolean,
     onOpenList: (String) -> Unit,
@@ -338,7 +339,6 @@ private fun YourListsOverviewSection(
             }
         } else {
             OverviewListCardGroup(
-                state = state,
                 summaries = manualLists,
                 isWide = isWide,
                 onOpenList = onOpenList,
@@ -350,7 +350,6 @@ private fun YourListsOverviewSection(
 
 @Composable
 private fun MediaTypeOverviewSection(
-    state: MainUiState,
     activeDynamic: List<CatalogListSummary>,
     emptyDynamic: List<CatalogListSummary>,
     isWide: Boolean,
@@ -381,7 +380,6 @@ private fun MediaTypeOverviewSection(
         }
         if (activeDynamic.isNotEmpty()) {
             OverviewListCardGroup(
-                state = state,
                 summaries = activeDynamic,
                 isWide = isWide,
                 onOpenList = onOpenList,
@@ -400,7 +398,6 @@ private fun MediaTypeOverviewSection(
 
 @Composable
 private fun OverviewListCardGroup(
-    state: MainUiState,
     summaries: List<CatalogListSummary>,
     isWide: Boolean,
     onOpenList: (String) -> Unit,
@@ -412,10 +409,8 @@ private fun OverviewListCardGroup(
             if (idx > 0) {
                 HorizontalDivider(color = colors.border, thickness = 1.dp)
             }
-            val previewEntries = state.catalog.entriesByCollectionId[summary.collectionId].orEmpty()
             ListOverviewRow(
                 summary = summary,
-                previewEntries = previewEntries,
                 showThumbs = isWide,
                 onOpen = { onOpenList(summary.collectionId) },
                 onRank = { onRankList(summary.collectionId) },
@@ -427,23 +422,11 @@ private fun OverviewListCardGroup(
 @Composable
 private fun ListOverviewRow(
     summary: CatalogListSummary,
-    previewEntries: List<RankedCatalogEntry>,
     showThumbs: Boolean,
     onOpen: () -> Unit,
     onRank: () -> Unit,
 ) {
-    val previewThumbs =
-        remember(previewEntries) {
-            previewEntries
-                .mapNotNull { entry ->
-                    entry.entry.thumbnailUrl
-                        ?.takeIf { it.isNotBlank() }
-                        ?.let {
-                            it to entry.entry.kind
-                        }
-                }
-                .take(4)
-        }
+    val previewThumbs = summary.previewThumbnails
 
     Row(
         modifier =
@@ -466,8 +449,12 @@ private fun ListOverviewRow(
         ) {
             if (showThumbs && previewThumbs.isNotEmpty()) {
                 Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                    previewThumbs.forEach { (url, kind) ->
-                        CatalogCoverThumbnail(thumbnailUrl = url, kind = kind, size = 28.dp)
+                    previewThumbs.forEach { preview ->
+                        CatalogCoverThumbnail(
+                            thumbnailUrl = preview.thumbnailUrl,
+                            kind = preview.kind,
+                            size = 28.dp,
+                        )
                     }
                 }
             }
@@ -613,46 +600,48 @@ private fun EmptyDynamicListsGrid(
 private fun RankedListDetailPane(
     state: MainUiState,
     activeList: CatalogListSummary,
-    rankedEntries: List<RankedCatalogEntry>,
+    collectionState: CatalogCollectionUiState,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
-    var selectedTier by rememberSaveable(activeList.collectionId) { mutableStateOf<Char?>(null) }
-    val tierCounts = remember(rankedEntries) { computeTierCounts(rankedEntries) }
-    val filteredEntries =
-        remember(rankedEntries, selectedTier) {
-            if (selectedTier == null) {
-                rankedEntries
-            } else {
-                rankedEntries.filter { it.tier == selectedTier }
+    val tierCounts =
+        remember(collectionState.tierCounts) {
+            TIER_DISPLAY_ORDER.mapNotNull { tier ->
+                collectionState.tierCounts[tier]?.takeIf { it > 0 }?.let { tier to it }
             }
         }
     val canEditManualList = isEditableManualUserList(activeList)
     val activeDraw = state.catalog.generatorFor(activeList.collectionId)?.currentDraw
+    val effectiveTotalCount =
+        if (collectionState.isLoaded) collectionState.totalCount else activeList.entryCount
 
     Column(modifier = Modifier.fillMaxSize()) {
         ListDetailSubHeader(
             list = activeList,
-            canRank = rankedEntries.size >= 2,
+            canRank = effectiveTotalCount >= 2,
             canEditManualList = canEditManualList,
             onBack = { onAction(MainAction.SelectCatalogCollection(null)) },
             onAction = onAction,
         )
         if (tierCounts.isNotEmpty()) {
             ListTierFilterStrip(
-                totalCount = rankedEntries.size,
+                totalCount = effectiveTotalCount,
                 tierCounts = tierCounts,
-                selectedTier = selectedTier,
-                onSelectTier = { selectedTier = it },
+                selectedTier = collectionState.selectedTier,
+                onSelectTier = { tier ->
+                    onAction(
+                        MainAction.SetCatalogCollectionTierFilter(activeList.collectionId, tier)
+                    )
+                },
             )
         }
         RankedDetailBody(
             activeList = activeList,
             activeDraw = activeDraw,
             canEditManualList = canEditManualList,
-            rankedEntries = filteredEntries,
+            collectionState = collectionState,
             readableIds = state.readableEntryIds,
             listState = listState,
             onAction = onAction,
@@ -825,61 +814,124 @@ private fun RankedDetailBody(
     activeList: CatalogListSummary,
     activeDraw: CollectionDrawSnapshot?,
     canEditManualList: Boolean,
-    rankedEntries: List<RankedCatalogEntry>,
+    collectionState: CatalogCollectionUiState,
     readableIds: Set<String>,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
-    if (rankedEntries.isEmpty() && activeDraw == null) {
-        RankedDetailEmptyCard(activeList, canEditManualList, onAction)
+    if (collectionState.entries.isEmpty() && activeDraw == null) {
+        if (collectionState.isLoaded || activeList.entryCount == 0) {
+            RankedDetailEmptyCard(activeList, canEditManualList, onAction)
+        }
         return
     }
-    val colors = LocalRocheColors.current
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-        val isWide = maxWidth >= LISTS_WIDE_BREAKPOINT
-        LazyColumn(
-            state = listState,
-            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-            modifier = Modifier.fillMaxSize(),
-        ) {
-            if (activeDraw != null) {
-                item(key = "active_draw_${activeDraw.collectionId}_${activeDraw.entryId}") {
-                    ActiveCollectionDrawListCard(
-                        draw = activeDraw,
-                        onAction = onAction,
-                        onOpen = { onOpenCollectionDraw(activeDraw) },
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                }
-            }
-            itemsIndexed(
-                items = rankedEntries,
-                key = { _, item -> "${activeList.collectionId}_${item.entry.id}" },
-            ) { idx, item ->
-                val isFirst = idx == 0
-                val isLast = idx == rankedEntries.lastIndex
-                val prevTier = if (idx > 0) rankedEntries[idx - 1].tier else null
-                val isTierBreak = idx > 0 && item.tier != prevTier && prevTier != null
-                RankedLazyCardRowItem(
-                    item = item,
-                    activeList = activeList,
-                    canEditManualList = canEditManualList,
-                    readableIds = readableIds,
-                    isWide = isWide,
-                    isFirst = isFirst,
-                    isLast = isLast,
-                    isTierBreak = isTierBreak,
+        RankedDetailLazyColumn(
+            activeList = activeList,
+            activeDraw = activeDraw,
+            canEditManualList = canEditManualList,
+            collectionState = collectionState,
+            readableIds = readableIds,
+            isWide = maxWidth >= LISTS_WIDE_BREAKPOINT,
+            listState = listState,
+            onAction = onAction,
+            onOpenCollectionDraw = onOpenCollectionDraw,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+    }
+}
+
+@Suppress("LongParameterList")
+@Composable
+private fun RankedDetailLazyColumn(
+    activeList: CatalogListSummary,
+    activeDraw: CollectionDrawSnapshot?,
+    canEditManualList: Boolean,
+    collectionState: CatalogCollectionUiState,
+    readableIds: Set<String>,
+    isWide: Boolean,
+    listState: LazyListState,
+    onAction: (MainAction) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val rankedEntries = collectionState.entries
+    LazyColumn(
+        state = listState,
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        if (activeDraw != null) {
+            item(key = "active_draw_${activeDraw.collectionId}_${activeDraw.entryId}") {
+                ActiveCollectionDrawListCard(
+                    draw = activeDraw,
                     onAction = onAction,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                    colors = colors,
+                    onOpen = { onOpenCollectionDraw(activeDraw) },
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+            }
+        }
+        itemsIndexed(
+            items = rankedEntries,
+            key = { _, item -> "${activeList.collectionId}_${item.entry.id}" },
+        ) { idx, item ->
+            val prevTier = if (idx > 0) rankedEntries[idx - 1].tier else null
+            RankedLazyCardRowItem(
+                item = item,
+                activeList = activeList,
+                canEditManualList = canEditManualList,
+                readableIds = readableIds,
+                isWide = isWide,
+                isFirst = idx == 0,
+                isLast = idx == rankedEntries.lastIndex,
+                isTierBreak = idx > 0 && item.tier != prevTier && prevTier != null,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+                colors = colors,
+            )
+        }
+        if (collectionState.hasMore) {
+            item(key = "lists_load_more") {
+                val remaining =
+                    (collectionState.filteredTotalCount - rankedEntries.size).coerceAtLeast(0)
+                CollectionLoadMoreFooter(
+                    remaining = remaining,
+                    isLoadingMore = collectionState.isLoadingMore,
+                    onLoadMore = { onAction(MainAction.LoadMoreCatalogCollection) },
                 )
             }
-            item(key = "ranked_bottom_spacer") { Spacer(modifier = Modifier.height(72.dp)) }
+        }
+        item(key = "ranked_bottom_spacer") { Spacer(modifier = Modifier.height(72.dp)) }
+    }
+}
+
+@Composable
+private fun CollectionLoadMoreFooter(
+    remaining: Int,
+    isLoadingMore: Boolean,
+    onLoadMore: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Spacer(modifier = Modifier.height(12.dp))
+    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+        TextButton(
+            enabled = !isLoadingMore,
+            onClick = onLoadMore,
+            modifier = Modifier.testTag("lists_load_more_btn"),
+        ) {
+            Text(
+                text = if (isLoadingMore) "Loading…" else "Load More ($remaining remaining)",
+                color = colors.accentBlue,
+                fontSize = 13.sp,
+            )
         }
     }
 }
+
+private val TIER_DISPLAY_ORDER = listOf('S', 'A', 'B', 'C', 'D')
 
 @Composable
 private fun RankedDetailEmptyCard(
@@ -1200,12 +1252,6 @@ private fun RankedScoreMark(scoreOutOfTen: Double, variance: Double) {
 
 internal fun isEditableManualUserList(list: CatalogListSummary?): Boolean =
     list != null && !list.isDynamic && list.role == CollectionRole.LIST && !list.isPriorityScoped
-
-private fun computeTierCounts(entries: List<RankedCatalogEntry>): List<Pair<Char, Int>> =
-    listOf('S', 'A', 'B', 'C', 'D').mapNotNull { tier ->
-        val count = entries.count { it.tier == tier }
-        if (count > 0) tier to count else null
-    }
 
 private fun formatCompactInt(value: Int): String =
     NumberFormat.getIntegerInstance(Locale.US).format(value)

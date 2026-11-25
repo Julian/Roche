@@ -2,6 +2,7 @@ package com.grayvines.roche.ui
 
 import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.runSuspendCatching
+import com.grayvines.roche.data.catalog.CollectionRankMeta
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.UpdateCatalogEntryInput
@@ -82,7 +83,11 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
         collectionIdOrSlug: String,
         enabled: Boolean,
     ) {
-        val meta = host.repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
+        val meta =
+            host.repository.catalog.resolveCollectionRankMeta(
+                collectionIdOrSlug,
+                includeMemberCount = false,
+            )
         val title = meta?.title ?: "List"
         runSuspendCatching {
             host.repository.catalog.setCollectionGeneratorEnabled(collectionIdOrSlug, enabled)
@@ -173,11 +178,7 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
     }
 
     private suspend fun performToggleCatalogStar(entryId: String) {
-        val snap = host.repository.catalog.getSnapshot()
-        val isStarred =
-            snap.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().any {
-                it.entry.id == entryId
-            }
+        val isStarred = host.repository.catalog.isEntryStarred(entryId)
         if (isStarred) {
             performRemoveWantEntry(STARRED_COLLECTION_ID, entryId)
             return
@@ -192,15 +193,9 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
     }
 
     private suspend fun performToggleCatalogWant(entryId: String) {
-        val snap = host.repository.catalog.getSnapshot()
-        val existingQueue =
-            snap.wantQueues.firstOrNull { queue ->
-                snap.entriesByCollectionId[queue.collectionId].orEmpty().any {
-                    it.entry.id == entryId
-                }
-            }
-        if (existingQueue != null) {
-            performRemoveWantEntry(existingQueue.collectionId, entryId)
+        val existingQueueId = host.repository.catalog.findWantCollectionForEntry(entryId)
+        if (existingQueueId != null) {
+            performRemoveWantEntry(existingQueueId, entryId)
             return
         }
         runSuspendCatching { host.repository.catalog.wantExistingEntry(entryId) }
@@ -214,7 +209,11 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
     }
 
     private suspend fun performAddCatalogEntryToList(collectionId: String, entryId: String) {
-        val meta = host.repository.catalog.resolveCollectionRankMeta(collectionId)
+        val meta =
+            host.repository.catalog.resolveCollectionRankMeta(
+                collectionId,
+                includeMemberCount = false,
+            )
         val title = meta?.title ?: "list"
         runSuspendCatching { host.repository.catalog.addCollectionEntry(collectionId, entryId) }
             .onSuccess { host.showStatusMessage("Added to $title") }
@@ -424,7 +423,11 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
     }
 
     private suspend fun performRemoveWantEntry(collectionId: String, entryId: String) {
-        val meta = host.repository.catalog.resolveCollectionRankMeta(collectionId)
+        val meta =
+            host.repository.catalog.resolveCollectionRankMeta(
+                collectionId,
+                includeMemberCount = false,
+            )
         val label =
             when {
                 collectionId == STARRED_COLLECTION_ID -> "Stars"
@@ -461,8 +464,6 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
 
     suspend fun openSession(collectionIdOrSlug: String, focusEntryId: String?): Boolean {
         val rankMeta = host.repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
-        val title = rankMeta?.title ?: "Rankings"
-        val scopeId = rankMeta?.scopeCollectionId
         val preferredK = readPreferredClusterSize()
         val cluster =
             host.repository.catalog.selectNextRankCluster(
@@ -471,49 +472,71 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
                 roundIndex = 0,
                 maxK = preferredK,
             )
-        val memberCount = (rankMeta?.memberCount ?: 0).coerceAtLeast(cluster.size)
         val nextSession =
-            if (cluster.isNotEmpty()) {
-                ActiveRankSessionUiState(
-                    collectionIdOrSlug = collectionIdOrSlug,
-                    collectionTitle = title,
-                    scopeCollectionId = scopeId,
-                    focusEntryId = focusEntryId,
-                    roundIndex = 0,
-                    targetClusterSize = preferredK,
-                    loadedMaxK = preferredK,
-                    collectionMemberCount = memberCount,
-                    cluster = cluster,
-                    settlement = null,
-                )
-            } else {
-                val settlement =
-                    focusEntryId
-                        ?.let {
-                            host.repository.catalog.resolveEntrySettlement(it, collectionIdOrSlug)
-                        }
-                        ?.takeIf { it.totalCount >= MIN_RANKABLE_COLLECTION_COUNT }
-                settlement?.let {
-                    ActiveRankSessionUiState(
-                        collectionIdOrSlug = collectionIdOrSlug,
-                        collectionTitle = title,
-                        scopeCollectionId = scopeId,
-                        focusEntryId = focusEntryId,
-                        roundIndex = 0,
-                        targetClusterSize = preferredK,
-                        loadedMaxK = preferredK,
-                        collectionMemberCount = it.totalCount.coerceAtLeast(memberCount),
-                        cluster = emptyList(),
-                        settlement = it,
-                    )
-                }
-            }
+            buildInitialRankSession(
+                collectionIdOrSlug = collectionIdOrSlug,
+                focusEntryId = focusEntryId,
+                rankMeta = rankMeta,
+                preferredK = preferredK,
+                cluster = cluster,
+            )
         if (nextSession != null) {
             host.updateTransient {
                 it.copy(rankSession = nextSession, catalogDetailStack = emptyList())
             }
         }
         return nextSession != null
+    }
+
+    private suspend fun buildInitialRankSession(
+        collectionIdOrSlug: String,
+        focusEntryId: String?,
+        rankMeta: CollectionRankMeta?,
+        preferredK: Int,
+        cluster: List<RankClusterCandidate>,
+    ): ActiveRankSessionUiState? {
+        val title = rankMeta?.title ?: "Rankings"
+        val scopeId = rankMeta?.scopeCollectionId
+        val memberCount = (rankMeta?.memberCount ?: 0).coerceAtLeast(cluster.size)
+        if (cluster.isNotEmpty()) {
+            val provisionalRank = focusEntryId?.let {
+                host.repository.catalog.resolveProvisionalFocusRank(
+                    collectionIdOrSlug = collectionIdOrSlug,
+                    focusEntryId = it,
+                )
+            }
+            return ActiveRankSessionUiState(
+                collectionIdOrSlug = collectionIdOrSlug,
+                collectionTitle = title,
+                scopeCollectionId = scopeId,
+                focusEntryId = focusEntryId,
+                roundIndex = 0,
+                targetClusterSize = preferredK,
+                loadedMaxK = preferredK,
+                collectionMemberCount = memberCount,
+                cluster = cluster,
+                settlement = null,
+                provisionalRank = provisionalRank,
+            )
+        }
+        val settlement =
+            focusEntryId
+                ?.let { host.repository.catalog.resolveEntrySettlement(it, collectionIdOrSlug) }
+                ?.takeIf { it.totalCount >= MIN_RANKABLE_COLLECTION_COUNT }
+        return settlement?.let {
+            ActiveRankSessionUiState(
+                collectionIdOrSlug = collectionIdOrSlug,
+                collectionTitle = title,
+                scopeCollectionId = scopeId,
+                focusEntryId = focusEntryId,
+                roundIndex = 0,
+                targetClusterSize = preferredK,
+                loadedMaxK = preferredK,
+                collectionMemberCount = it.totalCount.coerceAtLeast(memberCount),
+                cluster = emptyList(),
+                settlement = it,
+            )
+        }
     }
 
     suspend fun setClusterSize(
@@ -685,6 +708,10 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
                 host.settingsRepository.update { it.copy(rankClusterSize = restoredK) }
             }
         }
+        val provisionalRank =
+            session.focusEntryId?.let {
+                host.repository.catalog.resolveProvisionalFocusRank(session.collectionIdOrSlug, it)
+            }
         updateLiveRankSession(session) { cur ->
             cur.copy(
                 roundIndex = lastStep.previousRoundIndex,
@@ -696,6 +723,7 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
                 excludedOpponents = lastStep.previousExcludedOpponents,
                 history = cur.history.dropLast(1),
                 settlement = null,
+                provisionalRank = provisionalRank,
             )
         }
     }
@@ -747,12 +775,20 @@ internal class MainRankSessionDelegate(private val host: MainDelegateHost) {
         val nextRound = session.roundIndex + 1
         val nextCluster = selectDeduplicatedNextCluster(session, nextRound, forceRandomNext)
         if (nextCluster.isNotEmpty()) {
+            val provisionalRank =
+                session.focusEntryId?.let {
+                    host.repository.catalog.resolveProvisionalFocusRank(
+                        session.collectionIdOrSlug,
+                        it,
+                    )
+                }
             updateLiveRankSession(session) {
                 session.copy(
                     roundIndex = nextRound,
                     loadedMaxK = session.targetClusterSize,
                     cluster = nextCluster,
                     settlement = null,
+                    provisionalRank = provisionalRank,
                 )
             }
             return

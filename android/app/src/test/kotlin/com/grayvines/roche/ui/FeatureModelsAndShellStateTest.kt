@@ -210,26 +210,17 @@ class FeatureModelsAndShellStateTest {
             )
         env.repository.catalog.addCollectionEntry(STARRED_COLLECTION_ID, albumId)
         val collectJob = collectInBackground(viewModel.uiState)
-        viewModel.uiState.first {
-            it.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().any { r ->
-                r.entry.id == albumId
-            }
-        }
+        viewModel.uiState.first { albumId in it.catalog.starredEntryIds }
 
         viewModel.dispatch(MainAction.RemoveWantEntry(STARRED_COLLECTION_ID, albumId))
         val afterRemove =
             viewModel.uiState.first {
-                it.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().none { r ->
-                    r.entry.id == albumId
-                } && it.undoEvent?.kind is UndoActionKind.RestoreCollectionEntry
+                albumId !in it.catalog.starredEntryIds &&
+                    it.undoEvent?.kind is UndoActionKind.RestoreCollectionEntry
             }
         assertTrue(afterRemove.undoEvent?.message?.contains("Stars") == true)
 
-        val isRestored: (MainUiState) -> Boolean = { st ->
-            st.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().any { r ->
-                r.entry.id == albumId
-            }
-        }
+        val isRestored: (MainUiState) -> Boolean = { st -> albumId in st.catalog.starredEntryIds }
         val postUndoStates = CopyOnWriteArrayList<MainUiState>()
         val restoredDeferred = CompletableDeferred<MainUiState>()
         val undoTraceJob =

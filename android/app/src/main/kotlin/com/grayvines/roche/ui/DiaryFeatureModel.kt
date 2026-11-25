@@ -8,6 +8,7 @@ import com.grayvines.roche.data.catalog.DEFAULT_DIARY_PAGE_SIZE
 import com.grayvines.roche.data.catalog.DEFAULT_ENTRY_DETAIL_LOGS_LIMIT
 import com.grayvines.roche.data.catalog.DiaryEntryItem
 import com.grayvines.roche.data.catalog.EntryDiaryLogsResult
+import com.grayvines.roche.data.catalog.GlobalTierIndex
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,7 +36,7 @@ data class DiaryUiState(
 
 private data class DiaryInvalidationKey(
     val revisionStamp: String,
-    val globalTiersByEntryId: Map<String, Char>,
+    val globalTiers: GlobalTierIndex,
 )
 
 private data class DiaryQueryParams(
@@ -86,7 +87,7 @@ internal class DiaryFeatureModel(
                 .map { snap ->
                     DiaryInvalidationKey(
                         revisionStamp = snap.diaryRevisionStamp,
-                        globalTiersByEntryId = snap.catalog.globalTiersByEntryId,
+                        globalTiers = snap.catalog.globalTiers,
                     )
                 }
                 .distinctUntilChanged()
@@ -207,7 +208,7 @@ internal class DiaryFeatureModel(
                 year = query.yearFilter,
                 limit = delta,
                 offset = prevState.entries.size,
-                globalTiers = invalidation.globalTiersByEntryId,
+                globalTiers = invalidation.globalTiers,
             )
         }
         val loaded = result.getOrNull()
@@ -244,7 +245,7 @@ internal class DiaryFeatureModel(
                 year = query.yearFilter,
                 limit = query.pageLimit,
                 offset = 0,
-                globalTiers = invalidation.globalTiersByEntryId,
+                globalTiers = invalidation.globalTiers,
             )
         }
         val loaded = result.getOrNull()
@@ -302,7 +303,7 @@ internal class DiaryFeatureModel(
                 entryId = entryId,
                 limit = limit,
                 offset = offset,
-                globalTiers = invalidation.globalTiersByEntryId,
+                globalTiers = invalidation.globalTiers,
             )
         }
         val loaded = result.getOrNull() ?: return

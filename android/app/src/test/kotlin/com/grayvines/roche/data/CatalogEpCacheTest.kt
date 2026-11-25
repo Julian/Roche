@@ -1,13 +1,13 @@
 package com.grayvines.roche.data
 
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
-import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.CollectionRole
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.RankedCatalogEntry
 import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
-import com.grayvines.roche.data.catalog.buildCatalogSnapshot
+import com.grayvines.roche.data.catalog.loadSmallCollectionRanked
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.EntryContentEntity
 import com.grayvines.roche.data.local.EntryEntity
@@ -59,6 +59,8 @@ class CatalogEpCacheTest {
         runTest {
             val fixture = seedEpCacheFixture(catalog)
             catalog.getSnapshot()
+            catalog.loadCollectionEntries(fixture.wantBooksId)
+            catalog.loadCollectionEntries(fixture.wantGamesId)
             val baseline = catalog.epCacheStats
             assertEquals(1, baseline.globalRecomputes)
             assertEquals(2, baseline.localRecomputes)
@@ -70,6 +72,7 @@ class CatalogEpCacheTest {
                 notes = "Finished",
             )
             catalog.getSnapshot()
+            catalog.loadCollectionEntries(fixture.wantBooksId)
 
             // 2. Toggle and advance a generator draw
             val initialDraw =
@@ -96,6 +99,7 @@ class CatalogEpCacheTest {
                 )
             catalog.addCollectionEntry(fixture.albumListId, extraAlbum)
             catalog.getSnapshot()
+            catalog.loadCollectionEntries(fixture.wantGamesId)
 
             val after = catalog.epCacheStats
             assertEquals(baseline.globalRecomputes, after.globalRecomputes)
@@ -109,6 +113,8 @@ class CatalogEpCacheTest {
         runTest {
             val fixture = seedEpCacheFixture(catalog)
             catalog.getSnapshot()
+            catalog.loadCollectionEntries(fixture.wantBooksId)
+            catalog.loadCollectionEntries(fixture.wantGamesId)
             val before = catalog.epCacheStats
 
             val book3 =
@@ -119,7 +125,8 @@ class CatalogEpCacheTest {
                 ordering = listOf(listOf(fixture.book2), listOf(book3)),
                 scopeCollectionId = fixture.wantBooksId,
             )
-            val warmSnap = catalog.getSnapshot()
+            val warmBooks = catalog.loadCollectionEntries(fixture.wantBooksId)
+            val warmGames = catalog.loadCollectionEntries(fixture.wantGamesId)
             val after = catalog.epCacheStats
 
             assertEquals(before.globalRecomputes, after.globalRecomputes)
@@ -132,9 +139,20 @@ class CatalogEpCacheTest {
                 before.localRecomputesByScope[fixture.wantGamesId],
                 after.localRecomputesByScope[fixture.wantGamesId],
             )
-            val coldSnap = buildCatalogSnapshot(catalog.loadRawCatalogTables(), epScoreCache = null)
-            assertRankedCollectionParity(warmSnap, coldSnap, fixture.wantBooksId)
-            assertRankedCollectionParity(warmSnap, coldSnap, fixture.wantGamesId)
+            val coldBooks =
+                loadSmallCollectionRanked(
+                    dao,
+                    dao.getCollectionSpecById(fixture.wantBooksId)!!,
+                    epScoreCache = null,
+                )
+            val coldGames =
+                loadSmallCollectionRanked(
+                    dao,
+                    dao.getCollectionSpecById(fixture.wantGamesId)!!,
+                    epScoreCache = null,
+                )
+            assertRankedListParity(warmBooks, coldBooks)
+            assertRankedListParity(warmGames, coldGames)
 
             dao.deleteCollectionSpec(fixture.wantGamesId)
             catalog.getSnapshot()
@@ -156,14 +174,15 @@ class CatalogEpCacheTest {
             catalog.recordComparison(
                 ordering = listOf(listOf(fixture.movie2), listOf(fixture.movie3, movie4))
             )
-            val warmSnap = catalog.getSnapshot()
+            catalog.getSnapshot()
             val after = catalog.epCacheStats
             assertEquals(before.globalRecomputes + 1, after.globalRecomputes)
             assertEquals(before.localRecomputes, after.localRecomputes)
 
-            val coldSnap = buildCatalogSnapshot(catalog.loadRawCatalogTables(), epScoreCache = null)
-            val moviesSpecId = dao.getCollectionSpecBySlug(MOVIES_SLUG)!!.collectionId
-            assertRankedCollectionParity(warmSnap, coldSnap, moviesSpecId)
+            val moviesSpec = dao.getCollectionSpecBySlug(MOVIES_SLUG)!!
+            val warmMovies = catalog.loadCollectionEntries(moviesSpec.collectionId)
+            val coldMovies = loadSmallCollectionRanked(dao, moviesSpec, epScoreCache = null)
+            assertRankedListParity(warmMovies, coldMovies)
 
             val directOrderings =
                 listOf(
@@ -175,7 +194,7 @@ class CatalogEpCacheTest {
                     listOf(fixture.movie1, fixture.movie2, fixture.movie3, movie4),
                     directOrderings,
                 )
-            for (ranked in warmSnap.entriesByCollectionId[moviesSpecId].orEmpty()) {
+            for (ranked in warmMovies) {
                 val expected = directScores.getValue(ranked.entry.id)
                 assertTrue(
                     abs(ranked.mean - expected.mean) <= EP_PARITY_TOLERANCE,
@@ -212,17 +231,17 @@ class CatalogEpCacheTest {
         val dupEntity = dao.getEntryById(dup)!!
         dao.upsertEntry(dupEntity.copy(mergedIntoId = canon))
 
-        val warmSnap = catalog.getSnapshot()
-        val coldSnap = buildCatalogSnapshot(catalog.loadRawCatalogTables(), epScoreCache = null)
+        catalog.getSnapshot()
         assertTrue(catalog.epCacheStats.globalRecomputes > before.globalRecomputes)
 
-        val moviesSpecId = dao.getCollectionSpecBySlug(MOVIES_SLUG)!!.collectionId
-        val ranked = warmSnap.entriesByCollectionId[moviesSpecId].orEmpty()
+        val moviesSpec = dao.getCollectionSpecBySlug(MOVIES_SLUG)!!
+        val ranked = catalog.loadCollectionEntries(moviesSpec.collectionId)
+        val coldRanked = loadSmallCollectionRanked(dao, moviesSpec, epScoreCache = null)
         assertFalse(ranked.any { it.entry.id == dup })
         val canonRanked = ranked.first { it.entry.id == canon }
         val otherRanked = ranked.first { it.entry.id == other }
         assertTrue(canonRanked.mean > otherRanked.mean)
-        assertRankedCollectionParity(warmSnap, coldSnap, moviesSpecId)
+        assertRankedListParity(ranked, coldRanked)
     }
 
     @Test
@@ -252,18 +271,16 @@ class CatalogEpCacheTest {
             assertEquals(draw1, draw2)
             assertEquals(buildsBefore, catalog.catalogSnapshotBuilds)
             assertEquals(reloadsBefore, catalog.catalogTableReloads)
-            assertTrue(catalog.catalogSnapshotCacheHits >= hitsBefore + REPEATED_READ_CALLS)
+            assertTrue(catalog.catalogSnapshotCacheHits >= hitsBefore + 2)
             assertEquals(epBefore.globalRecomputes, catalog.epCacheStats.globalRecomputes)
 
-            // Unrelated write reloads only changed tables and still hits EpScoreCache
+            // Unrelated write still hits EpScoreCache with zero recomputes
             catalog.logEntry(
                 UpsertCatalogEntryInput(kind = EntryKind.BOOK, title = "Dune"),
                 ConsumptionStatus.CONSUMED,
             )
             assertNotNull(catalog.resolveEntrySettlement(fixture.movie1, MOVIES_SLUG))
             assertTrue(catalog.selectNextRankCluster(MOVIES_SLUG).size >= EpRankingEngine.MIN_K)
-            assertEquals(buildsBefore + 1, catalog.catalogSnapshotBuilds)
-            assertTrue(catalog.catalogTableReloads - reloadsBefore < ALL_CATALOG_TABLES_COUNT)
             assertEquals(epBefore.globalRecomputes, catalog.epCacheStats.globalRecomputes)
             assertEquals(epBefore.localRecomputes, catalog.epCacheStats.localRecomputes)
         }
@@ -351,12 +368,12 @@ class CatalogEpCacheTest {
             assertEquals(epGlobalBeforeState, catalog.epCacheStats.globalRecomputes)
             assertEquals(entriesLoads1, loader.entriesTableLoads)
 
-            // 3. Entry write loads entries table ONCE for both inbox and catalog with 0 EP work
+            // 3. Entry write never loads the full entries table and does 0 EP recomputation
             catalog.upsertEntry(
                 UpsertCatalogEntryInput(kind = EntryKind.MOVIE, title = "Andrei Rublev")
             )
             repository.snapshot.first()
-            assertEquals(entriesLoads1 + 1, loader.entriesTableLoads)
+            assertEquals(0, loader.entriesTableLoads)
             assertEquals(epGlobalBeforeState, catalog.epCacheStats.globalRecomputes)
         }
 }
@@ -483,13 +500,10 @@ internal suspend fun seedStatelessCollectionEntry(
     )
 }
 
-internal fun assertRankedCollectionParity(
-    warm: CatalogSnapshot,
-    cold: CatalogSnapshot,
-    collectionId: String,
+internal fun assertRankedListParity(
+    warmList: List<RankedCatalogEntry>,
+    coldList: List<RankedCatalogEntry>,
 ) {
-    val warmList = warm.entriesByCollectionId[collectionId].orEmpty()
-    val coldList = cold.entriesByCollectionId[collectionId].orEmpty()
     assertEquals(coldList.size, warmList.size)
     for (idx in coldList.indices) {
         assertEquals(coldList[idx].entry.id, warmList[idx].entry.id)
@@ -505,8 +519,6 @@ private const val FIXTURE_NOW_ISO = "2026-11-20T00:00:00Z"
 private const val EP_PARITY_TOLERANCE = 1e-12
 private const val PROGRESS_HALF = 0.5
 private const val PROGRESS_SAMPLE = 0.42
-private const val REPEATED_READ_CALLS = 6
-private const val ALL_CATALOG_TABLES_COUNT = 7
 private const val STATELESS_ART_ID = "stateless-art"
 private const val STATELESS_PAPER_ID = "stateless-paper"
 private const val STATELESS_VIDEO_ID = "stateless-video"

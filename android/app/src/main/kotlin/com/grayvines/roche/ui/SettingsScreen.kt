@@ -49,7 +49,6 @@ import androidx.compose.ui.unit.sp
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
-import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
@@ -310,13 +309,8 @@ private fun SettingsMoreViewsCard(
     if (unpinnedTabs.isEmpty()) return
 
     val totalStarred =
-        remember(state.starredEntries, state.catalog.entriesByCollectionId) {
-            (state.starredEntries.map { it.id } +
-                    state.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().map {
-                        it.entry.id
-                    })
-                .distinct()
-                .size
+        remember(state.starredEntries, state.catalog.starredEntryIds) {
+            (state.starredEntries.map { it.id } + state.catalog.starredEntryIds).distinct().size
         }
 
     Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {

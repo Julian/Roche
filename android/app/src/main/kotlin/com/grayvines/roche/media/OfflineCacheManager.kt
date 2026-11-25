@@ -409,7 +409,7 @@ internal class OfflineCacheManager(
             val totalBytes = entries.sumOf { it.sizeBytes }
             if (totalBytes > maxOfflineCacheBytes) {
                 val archivedIds = loadArchivedEntryIds()
-                val localPdfIds = loadLocalPdfEntryIds()
+                val localPdfIds = loadLocalPdfEntryIds(entries.map { it.itemId })
                 val protectedIds =
                     activeCacheTokens.keys + localPdfIds + listOfNotNull(protectedItemId)
                 val candidates = sortQuotaEvictionCandidates(entries, protectedIds, archivedIds)
@@ -418,8 +418,18 @@ internal class OfflineCacheManager(
         }
     }
 
-    private suspend fun loadLocalPdfEntryIds(): Set<String> =
-        dao.getAllEntries().filter { isLocalPdfUrl(it.url) }.mapTo(HashSet()) { it.id }
+    private suspend fun loadLocalPdfEntryIds(cachedItemIds: List<String>): Set<String> {
+        if (cachedItemIds.isEmpty()) return emptySet()
+        val result = HashSet<String>()
+        for (chunk in cachedItemIds.distinct().chunked(LOCAL_PDF_LOOKUP_CHUNK_SIZE)) {
+            for (entry in dao.getEntriesByIds(chunk)) {
+                if (isLocalPdfUrl(entry.url)) {
+                    result.add(entry.id)
+                }
+            }
+        }
+        return result
+    }
 
     private suspend fun loadArchivedEntryIds(): Set<String> {
         val wantIds =
@@ -652,6 +662,7 @@ internal const val AUDIO_ENCLOSURE_FILE_NAME = "audio_enclosure"
 private const val CONTENT_TYPE_AUDIO = "audio"
 private const val CONTENT_TYPE_PODCAST = "podcast"
 private const val AUTO_DOWNLOAD_FEED_CHUNK_SIZE = 500
+private const val LOCAL_PDF_LOOKUP_CHUNK_SIZE = 450
 private const val MAX_OFFLINE_MEDIA_BYTES = 50L * 1024L * 1024L
 private const val MAX_OFFLINE_THUMBNAIL_BYTES = 10L * 1024L * 1024L
 private const val MAX_OFFLINE_EXTERNAL_IMAGES = 16

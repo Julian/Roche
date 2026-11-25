@@ -1,8 +1,6 @@
 package com.grayvines.roche.ui
 
 import com.grayvines.roche.core.DiscussionLink
-import com.grayvines.roche.core.STARRED_COLLECTION_ID
-import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.extractArxivIdentifier
 import com.grayvines.roche.core.isArxivPaperUrl
@@ -14,6 +12,7 @@ import com.grayvines.roche.data.boards.BoardItemView
 import com.grayvines.roche.data.boards.BoardReaderContent
 import com.grayvines.roche.data.boards.BoardSummary
 import com.grayvines.roche.data.boards.HackerNewsSection
+import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.inferContentType
@@ -163,30 +162,23 @@ internal fun reconcileBoardPaginationMap(
 private fun buildEphemeralDedupSets(snapshot: RepositorySnapshot): EphemeralDedupSets {
     val byCanonUrl = HashMap<String, String>(snapshot.entries.size)
     val byArxiv = HashMap<String, String>()
+    val finishedIds = HashSet<String>()
+    val starredIds = HashSet<String>(snapshot.catalog.starredEntryIds)
     for (entry in snapshot.entries) {
         val canon = canonicalizeSyncUrl(entry.url)
         if (canon.isNotEmpty()) {
             byCanonUrl.putIfAbsent(canon, entry.id)
         }
         extractArxivIdentifier(entry.url)?.let { arxiv -> byArxiv.putIfAbsent(arxiv, entry.id) }
+        if (entry.isFinished) finishedIds.add(entry.id)
+        if (entry.isFavorite) starredIds.add(entry.id)
     }
-    val starredIds =
-        snapshot.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().mapTo(HashSet()) {
-            it.entry.id
-        }
-    val wantColIds =
-        snapshot.catalog.wantQueues
-            .mapTo(HashSet()) { it.collectionId }
-            .apply {
-                add(WANT_TO_READ_COLLECTION_ID)
-            }
-    val inQueueIds = HashSet<String>()
-    for (colId in wantColIds) {
-        snapshot.catalog.entriesByCollectionId[colId].orEmpty().forEach {
-            inQueueIds.add(it.entry.id)
+    for (diary in snapshot.catalog.recentDiaryEntries) {
+        if (diary.status == ConsumptionStatus.CONSUMED) {
+            finishedIds.add(diary.entryId)
         }
     }
-    val finishedIds = snapshot.catalog.consumedEntryIds
+    val inQueueIds = snapshot.catalog.wantEntryIds
     return EphemeralDedupSets(
         entryIdByCanonUrl = byCanonUrl,
         entryIdByArxiv = byArxiv,
@@ -236,7 +228,7 @@ private fun reconcileSingleEphemeralItem(
         linkedEntryId = resolvedLinkedId,
         isStarred = resolvedLinkedId?.let { it in dedup.starredIds } ?: item.isStarred,
         isInQueue = resolvedLinkedId?.let { it in dedup.inQueueIds } ?: item.isInQueue,
-        isFinished = resolvedLinkedId?.let { it in dedup.finishedIds } ?: item.isFinished,
+        isFinished = item.isFinished || resolvedLinkedId?.let { it in dedup.finishedIds } == true,
     )
 }
 
