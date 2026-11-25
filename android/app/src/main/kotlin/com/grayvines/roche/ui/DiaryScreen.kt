@@ -49,6 +49,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.DiaryEntryItem
+import com.grayvines.roche.data.catalog.DiaryKindFilter
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.ui.components.CatalogCoverThumbnail
 import com.grayvines.roche.ui.components.RocheAlertDialog
@@ -88,23 +90,17 @@ fun DiaryScreen(
         pullToRefreshTestTag = "diary_pull_to_refresh",
         modifier = Modifier.testTag("diary_screen"),
         header = {
-            DiaryTopHeaderBar(
-                entryCount = diary.totalFilteredCount,
+            DiaryHeaderSection(
+                diary = diary,
                 showBackToHome = state.isUnpinnedDestination(AppTab.DIARY),
-                onBackToHome = { onAction(MainAction.SelectTab(AppTab.HOME)) },
-                onOpenSearch = { onAction(MainAction.OpenSearch) },
-            )
-            DiaryStatusFilterStrip(
-                selectedStatus = diary.statusFilter,
-                onSelectStatus = { onAction(MainAction.SetDiaryStatusFilter(it)) },
-                availableYears = diary.availableYears,
-                selectedYear = diary.yearFilter,
-                onSelectYear = { onAction(MainAction.SetDiaryYearFilter(it)) },
+                onAction = onAction,
             )
         },
     ) {
         if (diary.entries.isEmpty()) {
-            if (diary.isLoaded || state.catalog.totalDiaryCount == 0) {
+            val isEmptySnapshot =
+                state.catalog.totalDiaryCount == 0 && state.catalog.consumedCount == 0
+            if (diary.isLoaded || isEmptySnapshot) {
                 DiaryEmptyBody(
                     hasAnyEntries = diary.hasAnyEntries,
                     onQuickLog = { onAction(MainAction.OpenQuickLogSheet(false)) },
@@ -163,6 +159,31 @@ internal fun DiaryEditLogDialogHost(
 }
 
 @Composable
+private fun DiaryHeaderSection(
+    diary: DiaryUiState,
+    showBackToHome: Boolean,
+    onAction: (MainAction) -> Unit,
+) {
+    DiaryTopHeaderBar(
+        entryCount = diary.totalFilteredCount,
+        showBackToHome = showBackToHome,
+        onBackToHome = { onAction(MainAction.SelectTab(AppTab.HOME)) },
+        onOpenSearch = { onAction(MainAction.OpenSearch) },
+    )
+    DiaryStatusFilterStrip(
+        selectedStatus = diary.statusFilter,
+        onSelectStatus = { onAction(MainAction.SetDiaryStatusFilter(it)) },
+        availableYears = diary.availableYears,
+        selectedYear = diary.yearFilter,
+        onSelectYear = { onAction(MainAction.SetDiaryYearFilter(it)) },
+        selectedKindFilter = diary.kindFilter,
+        nonSongKindCounts = diary.nonSongKindCounts,
+        hasSongLogs = diary.hasSongLogs,
+        onSelectKindFilter = { onAction(MainAction.SetDiaryKindFilter(it)) },
+    )
+}
+
+@Composable
 private fun DiaryTopHeaderBar(
     entryCount: Int,
     showBackToHome: Boolean,
@@ -191,6 +212,7 @@ private fun DiaryTopHeaderBar(
     }
 }
 
+@Suppress("LongParameterList")
 @Composable
 private fun DiaryStatusFilterStrip(
     selectedStatus: ConsumptionStatus?,
@@ -198,6 +220,10 @@ private fun DiaryStatusFilterStrip(
     availableYears: List<String>,
     selectedYear: String?,
     onSelectYear: (String?) -> Unit,
+    selectedKindFilter: DiaryKindFilter,
+    nonSongKindCounts: List<Pair<EntryKind, Int>>,
+    hasSongLogs: Boolean,
+    onSelectKindFilter: (DiaryKindFilter) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     Row(
@@ -233,6 +259,18 @@ private fun DiaryStatusFilterStrip(
             modifier = Modifier.testTag("diary_filter_abandoned"),
         )
     }
+    val showKindBar =
+        hasSongLogs ||
+            nonSongKindCounts.size >= 2 ||
+            selectedKindFilter != DiaryKindFilter.DefaultNonSong
+    if (showKindBar) {
+        DiaryKindFilterStrip(
+            selectedKindFilter = selectedKindFilter,
+            nonSongKindCounts = nonSongKindCounts,
+            hasSongLogs = hasSongLogs,
+            onSelectKindFilter = onSelectKindFilter,
+        )
+    }
     if (availableYears.size >= 2) {
         DiaryYearFilterStrip(
             years = availableYears,
@@ -241,6 +279,69 @@ private fun DiaryStatusFilterStrip(
         )
     }
     HorizontalDivider(color = colors.border, thickness = 1.dp)
+}
+
+@Composable
+private fun DiaryKindFilterStrip(
+    selectedKindFilter: DiaryKindFilter,
+    nonSongKindCounts: List<Pair<EntryKind, Int>>,
+    hasSongLogs: Boolean,
+    onSelectKindFilter: (DiaryKindFilter) -> Unit,
+) {
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RocheStripTab(
+            label = if (hasSongLogs) "Diary (excl. songs)" else "All Types",
+            selected = selectedKindFilter == DiaryKindFilter.DefaultNonSong,
+            onClick = { onSelectKindFilter(DiaryKindFilter.DefaultNonSong) },
+            modifier = Modifier.testTag("diary_kind_default"),
+        )
+        nonSongKindCounts.forEach { (kind, count) ->
+            val target = DiaryKindFilter.Only(kind)
+            RocheStripTab(
+                label = "${kind.displayLabel} ($count)",
+                selected = selectedKindFilter == target,
+                onClick = { onSelectKindFilter(target) },
+                modifier = Modifier.testTag("diary_kind_${kind.wireValue}"),
+            )
+        }
+        val missingSelectedKind =
+            (selectedKindFilter as? DiaryKindFilter.Only)?.kind?.takeIf { kind ->
+                kind != EntryKind.SONG && nonSongKindCounts.none { it.first == kind }
+            }
+        if (missingSelectedKind != null) {
+            val target = DiaryKindFilter.Only(missingSelectedKind)
+            RocheStripTab(
+                label = "${missingSelectedKind.displayLabel} (0)",
+                selected = true,
+                onClick = { onSelectKindFilter(target) },
+                modifier = Modifier.testTag("diary_kind_${missingSelectedKind.wireValue}"),
+            )
+        }
+        if (hasSongLogs || selectedKindFilter == DiaryKindFilter.Only(EntryKind.SONG)) {
+            val target = DiaryKindFilter.Only(EntryKind.SONG)
+            RocheStripTab(
+                label = "Songs",
+                selected = selectedKindFilter == target,
+                onClick = { onSelectKindFilter(target) },
+                modifier = Modifier.testTag("diary_kind_song"),
+            )
+        }
+        if (hasSongLogs || selectedKindFilter == DiaryKindFilter.All) {
+            RocheStripTab(
+                label = "All (incl. songs)",
+                selected = selectedKindFilter == DiaryKindFilter.All,
+                onClick = { onSelectKindFilter(DiaryKindFilter.All) },
+                modifier = Modifier.testTag("diary_kind_all"),
+            )
+        }
+    }
 }
 
 @Composable

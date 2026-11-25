@@ -195,8 +195,12 @@ private fun reduceCatalogUiAction(
         is MainAction.EnrichAndLaunchMusicDraw,
         is MainAction.SetDiaryStatusFilter,
         is MainAction.SetDiaryYearFilter,
+        is MainAction.SetDiaryKindFilter,
         MainAction.LoadMoreDiary,
-        MainAction.LoadMoreCatalogDetailLogs -> state
+        MainAction.LoadMoreCatalogDetailLogs,
+        is MainAction.SetCatalogCollectionKindFilter,
+        is MainAction.SetStarredKindFilter,
+        MainAction.LoadMoreStarredCollection -> state
         else -> reduceCatalogSheetUiAction(state, action)
     }
 

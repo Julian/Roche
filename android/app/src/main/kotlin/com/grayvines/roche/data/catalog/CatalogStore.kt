@@ -74,9 +74,11 @@ class CatalogStore(
 
     suspend fun getSnapshot(): CatalogSnapshot = getOrBuildCatalogSnapshot()
 
+    @Suppress("LongParameterList")
     suspend fun loadDiaryPage(
         status: ConsumptionStatus? = null,
         year: String? = null,
+        kindFilter: DiaryKindFilter = DiaryKindFilter.DefaultNonSong,
         limit: Int = DEFAULT_DIARY_PAGE_SIZE,
         offset: Int = 0,
         globalTiers: GlobalTierIndex? = null,
@@ -85,43 +87,44 @@ class CatalogStore(
         val tiers = globalTiers ?: getOrBuildCatalogSnapshot().globalTiers
         val safeLimit = limit.coerceAtLeast(1)
         val safeOffset = offset.coerceAtLeast(0)
-        var result = DiaryPageResult()
+        var result = DiaryPageResult(kindFilter = kindFilter)
         dao.executeInTransaction {
-            val yearCounts = dao.getDiaryYearCounts()
-            val availableYears = yearCounts.map { it.year }
-            val effectiveYear = year?.takeIf { it in availableYears }
-            val (minTs, maxTs) = resolveDiaryYearBounds(effectiveYear)
-            val monthRows =
-                if (status == null) {
-                    dao.getDiaryMonthCounts(minTs, maxTs)
-                } else {
-                    dao.getDiaryMonthCountsByStatus(status.wireValue, minTs, maxTs)
-                }
-            val totalFiltered = monthRows.sumOf { it.count }
-            val rows =
-                if (status == null) {
-                    dao.getDiaryLogPage(minTs, maxTs, safeLimit, safeOffset)
-                } else {
-                    dao.getDiaryLogPageByStatus(
-                        status.wireValue,
-                        minTs,
-                        maxTs,
-                        safeLimit,
-                        safeOffset,
-                    )
-                }
             result =
-                DiaryPageResult(
-                    entries = rows.map { toDiaryEntryItem(it, tiers) },
-                    availableYears = availableYears,
-                    monthCounts = monthRows.associate { it.monthKey to it.count },
-                    totalFilteredCount = totalFiltered,
-                    hasAnyEntries = yearCounts.isNotEmpty() || totalFiltered > 0,
-                    effectiveYear = effectiveYear,
-                    hasMore = safeOffset + rows.size < totalFiltered,
+                loadDiaryPageFromDao(
+                    dao = dao,
+                    status = status,
+                    year = year,
+                    kindFilter = kindFilter,
+                    limit = safeLimit,
+                    offset = safeOffset,
+                    tiers = tiers,
                 )
         }
         return result
+    }
+
+    @Suppress("LongParameterList")
+    suspend fun loadDiaryLogSlice(
+        status: ConsumptionStatus? = null,
+        year: String? = null,
+        kindFilter: DiaryKindFilter = DiaryKindFilter.DefaultNonSong,
+        limit: Int = DEFAULT_DIARY_PAGE_SIZE,
+        offset: Int = 0,
+        globalTiers: GlobalTierIndex? = null,
+    ): List<DiaryEntryItem> {
+        ensureSystemSeeded()
+        val tiers = globalTiers ?: getOrBuildCatalogSnapshot().globalTiers
+        val safeLimit = limit.coerceAtLeast(1)
+        val safeOffset = offset.coerceAtLeast(0)
+        return loadDiaryLogSliceFromDao(
+            dao = dao,
+            status = status,
+            year = year,
+            kindFilter = kindFilter,
+            limit = safeLimit,
+            offset = safeOffset,
+            tiers = tiers,
+        )
     }
 
     suspend fun loadEntryDiaryLogs(
@@ -151,9 +154,12 @@ class CatalogStore(
         return result
     }
 
+    @Suppress("LongParameterList")
     suspend fun loadCollectionPage(
         collectionIdOrSlug: String,
         tierFilter: Char? = null,
+        kindFilter: EntryKind? = null,
+        kindFilters: Set<EntryKind> = emptySet(),
         limit: Int = DEFAULT_COLLECTION_PAGE_SIZE,
         offset: Int = 0,
     ): CatalogCollectionPageResult {
@@ -169,6 +175,8 @@ class CatalogStore(
                     spec = spec,
                     epScoreCache = epScoreCache,
                     tierFilter = tierFilter,
+                    kindFilter = kindFilter,
+                    kindFilters = kindFilters,
                     limit = limit,
                     offset = offset,
                 )

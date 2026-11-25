@@ -66,35 +66,150 @@ internal suspend fun loadCollectionPageFromDao(
     spec: CollectionSpecEntity,
     epScoreCache: EpScoreCache?,
     tierFilter: Char? = null,
+    kindFilter: EntryKind? = null,
+    kindFilters: Set<EntryKind> = emptySet(),
     limit: Int = DEFAULT_COLLECTION_PAGE_SIZE,
     offset: Int = 0,
 ): CatalogCollectionPageResult {
     val safeLimit = limit.coerceAtLeast(1)
     val safeOffset = offset.coerceAtLeast(0)
+    val effectiveKinds = kindFilters.ifEmpty { kindFilter?.let(::setOf) ?: emptySet() }
+    val largePage =
+        loadLargeCollectionPageOrNull(
+            dao = dao,
+            spec = spec,
+            epScoreCache = epScoreCache,
+            tierFilter = tierFilter,
+            kindFilters = effectiveKinds,
+            limit = safeLimit,
+            offset = safeOffset,
+        )
+    return largePage
+        ?: loadSmallCollectionPage(
+            dao = dao,
+            spec = spec,
+            epScoreCache = epScoreCache,
+            tierFilter = tierFilter,
+            kindFilters = effectiveKinds,
+            limit = safeLimit,
+            offset = safeOffset,
+        )
+}
+
+@Suppress("LongParameterList")
+private suspend fun loadLargeCollectionPageOrNull(
+    dao: RocheDao,
+    spec: CollectionSpecEntity,
+    epScoreCache: EpScoreCache?,
+    tierFilter: Char?,
+    kindFilters: Set<EntryKind>,
+    limit: Int,
+    offset: Int,
+): CatalogCollectionPageResult? {
     val simpleKind = if (spec.isDynamic) parseSimpleConsumedKindRule(spec.ruleJson) else null
     if (simpleKind != null) {
-        val totalCount = countConsumedEntriesForKind(dao, simpleKind)
+        return loadLargeDynamicPageOrNull(
+            dao = dao,
+            collectionId = spec.collectionId,
+            kind = simpleKind,
+            epScoreCache = epScoreCache,
+            tierFilter = tierFilter,
+            kindFilters = kindFilters,
+            limit = limit,
+            offset = offset,
+        )
+    }
+    if (!spec.isDynamic) {
+        val hasGenerator =
+            isGeneratorEligible(spec) && dao.getCollectionGenerator(spec.collectionId) != null
+        val kindCounts = loadManualKindCounts(dao, spec.collectionId, hasGenerator)
+        val totalCount = kindCounts.sumOf { it.second }
         if (totalCount > SMALL_COLLECTION_IN_MEMORY_LIMIT) {
-            return loadLargeDynamicKindPage(
+            return loadLargeManualCollectionPage(
                 dao = dao,
-                collectionId = spec.collectionId,
-                kind = simpleKind,
+                spec = spec,
+                hasGenerator = hasGenerator,
                 totalCount = totalCount,
+                kindCounts = kindCounts,
                 epScoreCache = epScoreCache,
                 tierFilter = tierFilter,
-                limit = safeLimit,
-                offset = safeOffset,
+                kindFilters = kindFilters,
+                limit = limit,
+                offset = offset,
             )
         }
     }
+    return null
+}
+
+@Suppress("LongParameterList")
+private suspend fun loadLargeDynamicPageOrNull(
+    dao: RocheDao,
+    collectionId: String,
+    kind: EntryKind,
+    epScoreCache: EpScoreCache?,
+    tierFilter: Char?,
+    kindFilters: Set<EntryKind>,
+    limit: Int,
+    offset: Int,
+): CatalogCollectionPageResult? {
+    val totalCount = countConsumedEntriesForKind(dao, kind)
+    if (totalCount <= SMALL_COLLECTION_IN_MEMORY_LIMIT) return null
+    if (kindFilters.isNotEmpty() && kind !in kindFilters) {
+        val ctx = buildBandedDynamicContext(dao, kind, totalCount, epScoreCache)
+        return CatalogCollectionPageResult(
+            collectionId = collectionId,
+            entries = emptyList(),
+            totalCount = totalCount,
+            filteredTotalCount = 0,
+            tierCounts = if (ctx.hasComparisons) ctx.quantiles.tierCounts else emptyMap(),
+            kindCounts = listOf(kind to totalCount),
+            hasMore = false,
+        )
+    }
+    return loadLargeDynamicKindPage(
+        dao = dao,
+        collectionId = collectionId,
+        kind = kind,
+        totalCount = totalCount,
+        epScoreCache = epScoreCache,
+        tierFilter = tierFilter,
+        limit = limit,
+        offset = offset,
+    )
+}
+
+@Suppress("LongParameterList")
+private suspend fun loadSmallCollectionPage(
+    dao: RocheDao,
+    spec: CollectionSpecEntity,
+    epScoreCache: EpScoreCache?,
+    tierFilter: Char?,
+    kindFilters: Set<EntryKind>,
+    limit: Int,
+    offset: Int,
+): CatalogCollectionPageResult {
     val allRanked = loadSmallCollectionRanked(dao, spec, epScoreCache)
     val tierCounts = computeRankedTierCounts(allRanked)
-    val filtered = if (tierFilter == null) allRanked else allRanked.filter { it.tier == tierFilter }
+    val kindCounts = computeRankedKindCounts(allRanked)
+    val isFiltered = tierFilter != null || kindFilters.isNotEmpty()
+    val filtered =
+        if (!isFiltered) {
+            allRanked
+        } else {
+            allRanked
+                .filter { item ->
+                    (tierFilter == null || item.tier == tierFilter) &&
+                        (kindFilters.isEmpty() || item.entry.kind in kindFilters)
+                }
+                .mapIndexed { idx, item -> item.copy(rank = idx + 1) }
+        }
     val page =
-        if (safeOffset >= filtered.size) {
+        if (offset >= filtered.size) {
             emptyList()
         } else {
-            filtered.subList(safeOffset, minOf(safeOffset + safeLimit, filtered.size))
+            val takeCount = minOf(limit, filtered.size - offset)
+            filtered.subList(offset, offset + takeCount)
         }
     return CatalogCollectionPageResult(
         collectionId = spec.collectionId,
@@ -102,7 +217,8 @@ internal suspend fun loadCollectionPageFromDao(
         totalCount = allRanked.size,
         filteredTotalCount = filtered.size,
         tierCounts = tierCounts,
-        hasMore = safeOffset + page.size < filtered.size,
+        kindCounts = kindCounts,
+        hasMore = offset + page.size < filtered.size,
     )
 }
 
@@ -175,7 +291,8 @@ private suspend fun loadLargeDynamicKindPage(
             if (offset >= matched.size) {
                 emptyList()
             } else {
-                matched.subList(offset, minOf(offset + limit, matched.size))
+                val takeCount = minOf(limit, matched.size - offset)
+                matched.subList(offset, offset + takeCount)
             }
         return CatalogCollectionPageResult(
             collectionId = collectionId,
@@ -183,6 +300,7 @@ private suspend fun loadLargeDynamicKindPage(
             totalCount = totalCount,
             filteredTotalCount = matched.size,
             tierCounts = tierCounts,
+            kindCounts = if (totalCount > 0) listOf(kind to totalCount) else emptyList(),
             hasMore = offset + slice.size < matched.size,
         )
     }
@@ -210,15 +328,16 @@ private suspend fun loadBandedPageWithZeroBand(
             .filter { tierFilter == null || it.tier == tierFilter }
     val zeroTotal = ctx.zeroBandTotalCount
     val filteredTotal = aboveFiltered.size + zeroTotal + belowFiltered.size
-    val result = ArrayList<RankedCatalogEntry>(limit)
+    val initCap = minOf(limit, (filteredTotal - offset).coerceAtLeast(0), MAX_DYNAMIC_SLICE_CAP)
+    val result = ArrayList<RankedCatalogEntry>(initCap)
     var cursor = offset
     var remaining = limit
 
     if (remaining > 0 && cursor < aboveFiltered.size) {
-        val takeEnd = minOf(aboveFiltered.size, cursor + remaining)
-        result.addAll(aboveFiltered.subList(cursor, takeEnd))
-        remaining -= takeEnd - cursor
-        cursor = takeEnd
+        val takeCount = minOf(remaining, aboveFiltered.size - cursor)
+        result.addAll(aboveFiltered.subList(cursor, cursor + takeCount))
+        remaining -= takeCount
+        cursor += takeCount
     }
     val zeroStartOffset = (cursor - aboveFiltered.size).coerceAtLeast(0)
     if (remaining > 0 && zeroStartOffset < zeroTotal) {
@@ -233,8 +352,8 @@ private suspend fun loadBandedPageWithZeroBand(
     }
     val belowStartOffset = (cursor - aboveFiltered.size - zeroTotal).coerceAtLeast(0)
     if (remaining > 0 && belowStartOffset < belowFiltered.size) {
-        val takeEnd = minOf(belowFiltered.size, belowStartOffset + remaining)
-        result.addAll(belowFiltered.subList(belowStartOffset, takeEnd))
+        val takeCount = minOf(remaining, belowFiltered.size - belowStartOffset)
+        result.addAll(belowFiltered.subList(belowStartOffset, belowStartOffset + takeCount))
     }
     return CatalogCollectionPageResult(
         collectionId = collectionId,
@@ -242,6 +361,7 @@ private suspend fun loadBandedPageWithZeroBand(
         totalCount = ctx.totalCount,
         filteredTotalCount = filteredTotal,
         tierCounts = tierCounts,
+        kindCounts = if (ctx.totalCount > 0) listOf(ctx.kind to ctx.totalCount) else emptyList(),
         hasMore = offset + result.size < filteredTotal,
     )
 }
@@ -372,19 +492,25 @@ internal suspend fun selectNextRankClusterFromDao(
     val resolvedFocus = focusEntryId?.let { followMergedIdInDao(dao, it) ?: it }
     val simpleKind = if (spec.isDynamic) parseSimpleConsumedKindRule(spec.ruleJson) else null
     val candidates =
-        if (
+        when {
             simpleKind != null &&
-                countConsumedEntriesForKind(dao, simpleKind) > SMALL_COLLECTION_IN_MEMORY_LIMIT
-        ) {
-            loadLargeKindRankCandidates(
-                dao = dao,
-                kind = simpleKind,
-                epScoreCache = epScoreCache,
-                focusEntryId = resolvedFocus,
-                excludedOpponentIds = excludedOpponentIds,
-            )
-        } else {
-            loadSmallCollectionRanked(dao, spec, epScoreCache)
+                countConsumedEntriesForKind(dao, simpleKind) > SMALL_COLLECTION_IN_MEMORY_LIMIT ->
+                loadLargeKindRankCandidates(
+                    dao = dao,
+                    kind = simpleKind,
+                    epScoreCache = epScoreCache,
+                    focusEntryId = resolvedFocus,
+                    excludedOpponentIds = excludedOpponentIds,
+                )
+            !spec.isDynamic ->
+                loadManualRankCandidates(
+                    dao = dao,
+                    spec = spec,
+                    epScoreCache = epScoreCache,
+                    focusEntryId = resolvedFocus,
+                    excludedOpponentIds = excludedOpponentIds,
+                )
+            else -> loadSmallCollectionRanked(dao, spec, epScoreCache)
         }
     if (candidates.size < EpRankingEngine.MIN_K) return emptyList()
     return pickClusterCandidates(
@@ -396,6 +522,30 @@ internal suspend fun selectNextRankClusterFromDao(
         excludedOpponentIds = excludedOpponentIds,
         random = random,
     )
+}
+
+private suspend fun loadManualRankCandidates(
+    dao: RocheDao,
+    spec: CollectionSpecEntity,
+    epScoreCache: EpScoreCache?,
+    focusEntryId: String?,
+    excludedOpponentIds: Set<String>,
+): List<RankedCatalogEntry> {
+    val hasGenerator =
+        isGeneratorEligible(spec) && dao.getCollectionGenerator(spec.collectionId) != null
+    val totalCount = loadManualKindCounts(dao, spec.collectionId, hasGenerator).sumOf { it.second }
+    return if (totalCount > SMALL_COLLECTION_IN_MEMORY_LIMIT) {
+        loadLargeManualRankCandidates(
+            dao = dao,
+            spec = spec,
+            hasGenerator = hasGenerator,
+            epScoreCache = epScoreCache,
+            focusEntryId = focusEntryId,
+            excludedOpponentIds = excludedOpponentIds,
+        )
+    } else {
+        loadSmallCollectionRanked(dao, spec, epScoreCache)
+    }
 }
 
 private suspend fun loadLargeKindRankCandidates(
@@ -525,8 +675,8 @@ internal suspend fun resolveEntrySettlementFromDao(
     val largeTotal = simpleKind?.let { kind ->
         countConsumedEntriesForKind(dao, kind).takeIf { it > SMALL_COLLECTION_IN_MEMORY_LIMIT }
     }
-    return if (simpleKind != null && largeTotal != null) {
-        resolveLargeDynamicSettlement(
+    if (simpleKind != null && largeTotal != null) {
+        return resolveLargeDynamicSettlement(
             dao = dao,
             entryId = entryId,
             kind = simpleKind,
@@ -535,16 +685,35 @@ internal suspend fun resolveEntrySettlementFromDao(
             epScoreCache = epScoreCache,
             includeNeighbors = includeNeighbors,
         )
-    } else {
-        resolveSmallListSettlement(
-            dao = dao,
-            entryId = entryId,
-            targetSpec = targetSpec,
-            specTitle = specTitle,
-            epScoreCache = epScoreCache,
-            includeNeighbors = includeNeighbors,
-        )
     }
+    if (!targetSpec.isDynamic) {
+        val hasGenerator =
+            isGeneratorEligible(targetSpec) &&
+                dao.getCollectionGenerator(targetSpec.collectionId) != null
+        val kindCounts = loadManualKindCounts(dao, targetSpec.collectionId, hasGenerator)
+        val manualTotal = kindCounts.sumOf { it.second }
+        if (manualTotal > SMALL_COLLECTION_IN_MEMORY_LIMIT) {
+            return resolveLargeManualSettlement(
+                dao = dao,
+                entryId = entryId,
+                spec = targetSpec,
+                hasGenerator = hasGenerator,
+                totalCount = manualTotal,
+                kindCounts = kindCounts,
+                specTitle = specTitle,
+                epScoreCache = epScoreCache,
+                includeNeighbors = includeNeighbors,
+            )
+        }
+    }
+    return resolveSmallListSettlement(
+        dao = dao,
+        entryId = entryId,
+        targetSpec = targetSpec,
+        specTitle = specTitle,
+        epScoreCache = epScoreCache,
+        includeNeighbors = includeNeighbors,
+    )
 }
 
 @Suppress("LongParameterList")
@@ -611,7 +780,7 @@ private suspend fun resolveLargeDynamicSettlement(
     )
 }
 
-private data class EntryPlacementWithNeighbors(
+internal data class EntryPlacementWithNeighbors(
     val ranked: RankedCatalogEntry,
     val neighbors: List<RankedCatalogEntry>,
 )
@@ -816,7 +985,7 @@ private suspend fun countZeroBandBeforeOverflow(
 }
 
 /** Matches SQLite's built-in ASCII-only `LOWER()` semantics for exact cursor parity. */
-private fun asciiLowercase(value: String): String {
+internal fun asciiLowercase(value: String): String {
     var hasUpper = false
     for (ch in value) {
         if (ch in 'A'..'Z') {
@@ -1201,13 +1370,13 @@ private suspend fun loadEntryTitlesChunked(
     return result
 }
 
-private suspend fun loadMergeRedirectsMap(dao: RocheDao): Map<String, String> =
+internal suspend fun loadMergeRedirectsMap(dao: RocheDao): Map<String, String> =
     dao.getMergedEntryRedirects()
         .asSequence()
         .filter { it.mergedIntoId.isNotBlank() && it.mergedIntoId != it.id }
         .associate { it.id to it.mergedIntoId }
 
-private suspend fun resolveGlobalEpScores(
+internal suspend fun resolveGlobalEpScores(
     dao: RocheDao,
     mergeRedirects: Map<String, String>,
     epScoreCache: EpScoreCache?,
@@ -1226,6 +1395,18 @@ private fun computeRankedTierCounts(entries: List<RankedCatalogEntry>): Map<Char
     return counts
 }
 
+private fun computeRankedKindCounts(entries: List<RankedCatalogEntry>): List<Pair<EntryKind, Int>> {
+    val counts = HashMap<EntryKind, Int>()
+    for (item in entries) {
+        counts[item.entry.kind] = (counts[item.entry.kind] ?: 0) + 1
+    }
+    return counts.entries
+        .sortedWith(
+            compareByDescending<Map.Entry<EntryKind, Int>> { it.value }.thenBy { it.key.wireValue }
+        )
+        .map { it.key to it.value }
+}
+
 private val SEARCHABLE_CATALOG_ENTRY_KINDS =
     listOf(
         EntryKind.ALBUM,
@@ -1238,6 +1419,7 @@ private val SEARCHABLE_CATALOG_ENTRY_KINDS =
     )
 private const val CATALOG_SEARCH_SQL_FETCH_FLOOR = 64
 private const val ZERO_NEIGHBOR_BATCH_SIZE = 32
+private const val MAX_DYNAMIC_SLICE_CAP = 256
 private const val ASCII_CASE_DELTA = 'a'.code - 'A'.code
 private const val MIN_CATALOG_YEAR = 1_000
 private const val MAX_CATALOG_YEAR = 2_999

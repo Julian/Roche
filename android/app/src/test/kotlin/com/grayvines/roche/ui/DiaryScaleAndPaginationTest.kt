@@ -5,6 +5,7 @@ import com.grayvines.roche.data.TestRocheEnv
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.DEFAULT_DIARY_PAGE_SIZE
 import com.grayvines.roche.data.catalog.DEFAULT_ENTRY_DETAIL_LOGS_LIMIT
+import com.grayvines.roche.data.catalog.DiaryKindFilter
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.RECENT_DIARY_PREVIEW_LIMIT
 import com.grayvines.roche.data.catalog.SyncConsumptionLogDto
@@ -63,59 +64,90 @@ class DiaryScaleAndPaginationTest {
     }
 
     @Test
-    fun `snapshot bounds recent diary preview and counts only diary-visible entries`() = runTest {
-        seedScaleFixture()
+    fun `snapshot bounds recent diary preview and hides individual song plays by default`() =
+        runTest {
+            seedScaleFixture()
 
-        val snap = env.repository.catalog.getSnapshot()
-        assertEquals(RECENT_DIARY_PREVIEW_LIMIT, snap.recentDiaryEntries.size)
-        assertEquals(150, snap.totalDiaryCount)
-        // 1 consumed song + 70 consumed books = 71 distinct diary-visible consumed entries
-        assertEquals(71, snap.consumedCount)
-        assertTrue(snap.recentDiaryEntries.all { it.url != null })
-    }
-
-    @Test
-    fun `diary tab paginates past 500 rows and filters by status and year via SQL`() = runTest {
-        seedScaleFixture(songPlayCount = 520, bookCount = 40)
-        val uiJob = launch(UnconfinedTestDispatcher()) { viewModel.uiState.collect {} }
-
-        val initial =
-            viewModel.uiState.first {
-                it.diary.isLoaded && it.diary.entries.size == DEFAULT_DIARY_PAGE_SIZE
-            }
-        assertEquals(560, initial.diary.totalFilteredCount)
-        assertTrue(initial.diary.hasMore)
-        assertEquals(listOf("2026", "2025"), initial.diary.availableYears)
-
-        repeat(5) { step ->
-            val targetSize = minOf(560, DEFAULT_DIARY_PAGE_SIZE * (step + 2))
-            viewModel.dispatch(MainAction.LoadMoreDiary)
-            val page = viewModel.uiState.first { it.diary.entries.size == targetSize }
-            assertEquals(targetSize < 560, page.diary.hasMore)
+            val snap = env.repository.catalog.getSnapshot()
+            assertEquals(RECENT_DIARY_PREVIEW_LIMIT, snap.recentDiaryEntries.size)
+            // 80 non-song book logs (70 song plays hidden by default)
+            assertEquals(80, snap.totalDiaryCount)
+            assertTrue(snap.recentDiaryEntries.none { it.kind == EntryKind.SONG })
+            // 1 consumed song + 70 consumed books = 71 distinct diary-visible consumed entries
+            assertEquals(71, snap.consumedCount)
+            assertTrue(snap.recentDiaryEntries.all { it.url != null })
         }
 
-        viewModel.dispatch(MainAction.SetDiaryStatusFilter(ConsumptionStatus.ABANDONED))
-        val skippedOnly =
-            viewModel.uiState.first {
-                it.diary.statusFilter == ConsumptionStatus.ABANDONED &&
-                    it.diary.totalFilteredCount == 10
-            }
-        assertEquals(10, skippedOnly.diary.entries.size)
-        assertFalse(skippedOnly.diary.hasMore)
+    @Test
+    fun `diary tab hides songs by default and paginates past 500 rows across kind status and year`() =
+        runTest {
+            seedScaleFixture(songPlayCount = 520, bookCount = 40)
+            val uiJob = launch(UnconfinedTestDispatcher()) { viewModel.uiState.collect {} }
 
-        viewModel.dispatch(MainAction.SetDiaryStatusFilter(null))
-        viewModel.dispatch(MainAction.SetDiaryYearFilter("2025"))
-        val year2025 =
-            viewModel.uiState.first {
-                it.diary.statusFilter == null &&
-                    it.diary.yearFilter == "2025" &&
-                    it.diary.totalFilteredCount == 520
-            }
-        assertEquals(DEFAULT_DIARY_PAGE_SIZE, year2025.diary.entries.size)
-        assertTrue(year2025.diary.entries.all { it.entryId == REPEAT_SONG_ID })
+            // Default view excludes 520 individual song plays and shows only the 40 books.
+            val defaultNonSong =
+                viewModel.uiState.first {
+                    it.diary.isLoaded &&
+                        it.diary.kindFilter == DiaryKindFilter.DefaultNonSong &&
+                        it.diary.totalFilteredCount == 40
+                }
+            assertEquals(40, defaultNonSong.diary.entries.size)
+            assertTrue(defaultNonSong.diary.entries.all { it.kind == EntryKind.BOOK })
+            assertTrue(defaultNonSong.diary.hasSongLogs)
+            assertEquals(listOf(EntryKind.BOOK to 40), defaultNonSong.diary.nonSongKindCounts)
+            assertEquals(listOf("2026"), defaultNonSong.diary.availableYears)
 
-        uiJob.cancel()
-    }
+            // Switching to Songs isolates the 520 song plays and paginates cleanly.
+            viewModel.dispatch(MainAction.SetDiaryKindFilter(DiaryKindFilter.Only(EntryKind.SONG)))
+            val songsOnly =
+                viewModel.uiState.first {
+                    it.diary.kindFilter == DiaryKindFilter.Only(EntryKind.SONG) &&
+                        it.diary.totalFilteredCount == 520
+                }
+            assertEquals(DEFAULT_DIARY_PAGE_SIZE, songsOnly.diary.entries.size)
+            assertTrue(songsOnly.diary.entries.all { it.kind == EntryKind.SONG })
+            assertEquals(listOf("2025"), songsOnly.diary.availableYears)
+
+            // Switching to All includes all 560 logs across 2026 & 2025 and paginates past 500.
+            viewModel.dispatch(MainAction.SetDiaryKindFilter(DiaryKindFilter.All))
+            val initial =
+                viewModel.uiState.first {
+                    it.diary.kindFilter == DiaryKindFilter.All &&
+                        it.diary.entries.size == DEFAULT_DIARY_PAGE_SIZE &&
+                        it.diary.totalFilteredCount == 560
+                }
+            assertTrue(initial.diary.hasMore)
+            assertEquals(listOf("2026", "2025"), initial.diary.availableYears)
+
+            repeat(5) { step ->
+                val targetSize = minOf(560, DEFAULT_DIARY_PAGE_SIZE * (step + 2))
+                viewModel.dispatch(MainAction.LoadMoreDiary)
+                val page = viewModel.uiState.first { it.diary.entries.size == targetSize }
+                assertEquals(targetSize < 560, page.diary.hasMore)
+            }
+
+            viewModel.dispatch(MainAction.SetDiaryStatusFilter(ConsumptionStatus.ABANDONED))
+            val skippedOnly =
+                viewModel.uiState.first {
+                    it.diary.statusFilter == ConsumptionStatus.ABANDONED &&
+                        it.diary.totalFilteredCount == 10
+                }
+            assertEquals(10, skippedOnly.diary.entries.size)
+            assertFalse(skippedOnly.diary.hasMore)
+
+            viewModel.dispatch(MainAction.SetDiaryStatusFilter(null))
+            viewModel.dispatch(MainAction.SetDiaryYearFilter("2025"))
+            val year2025 =
+                viewModel.uiState.first {
+                    it.diary.statusFilter == null &&
+                        it.diary.yearFilter == "2025" &&
+                        it.diary.totalFilteredCount == 520
+                }
+            assertEquals(DEFAULT_DIARY_PAGE_SIZE, year2025.diary.entries.size)
+            assertTrue(year2025.diary.entries.all { it.entryId == REPEAT_SONG_ID })
+
+            uiJob.cancel()
+        }
 
     @Test
     fun `entry detail sheet paginates past 500 logs and refreshes edits outside top 12`() =
@@ -168,8 +200,13 @@ class DiaryScaleAndPaginationTest {
         seedScaleFixture(songPlayCount = 1, bookCount = 5)
         val uiJob = launch(UnconfinedTestDispatcher()) { viewModel.uiState.collect {} }
 
+        viewModel.dispatch(MainAction.SetDiaryKindFilter(DiaryKindFilter.All))
         viewModel.dispatch(MainAction.SetDiaryYearFilter("2025"))
-        viewModel.uiState.first { it.diary.yearFilter == "2025" && it.diary.entries.size == 1 }
+        viewModel.uiState.first {
+            it.diary.kindFilter == DiaryKindFilter.All &&
+                it.diary.yearFilter == "2025" &&
+                it.diary.entries.size == 1
+        }
 
         env.repository.catalog.deleteConsumptionLog("song-play-1")
         val cleared =
@@ -221,7 +258,8 @@ class DiaryScaleAndPaginationTest {
             assertEquals(listOf("special-log"), byEscapedNote.matchedDiaryLogs.map { it.id })
 
             val uiJob = launch(UnconfinedTestDispatcher()) { viewModel.uiState.collect {} }
-            viewModel.uiState.first { it.diary.totalFilteredCount == 151 }
+            // Default diary hides 70 song plays -> 80 books + 1 special book = 81
+            viewModel.uiState.first { it.diary.totalFilteredCount == 81 }
             val freshBookId =
                 env.repository.catalog.logEntry(
                     UpsertCatalogEntryInput(kind = EntryKind.BOOK, title = "Piranesi"),
@@ -231,7 +269,7 @@ class DiaryScaleAndPaginationTest {
                 viewModel.uiState.first { st ->
                     st.diary.entries.any { it.entryId == freshBookId }
                 }
-            assertEquals(152, afterNewLog.diary.totalFilteredCount)
+            assertEquals(82, afterNewLog.diary.totalFilteredCount)
             uiJob.cancel()
         }
 
@@ -368,6 +406,29 @@ class DiaryScaleAndPaginationTest {
             }
         return listOf(artistLog) + songLogs + bookLogs
     }
+
+    @Test
+    fun `song only diary keeps hasAnyEntries and hasSongLogs under empty status filters`() =
+        runTest {
+            seedScaleFixture(songPlayCount = 40, bookCount = 0)
+            val uiJob = launch(UnconfinedTestDispatcher()) { viewModel.uiState.collect {} }
+
+            val defaultView = viewModel.uiState.first { it.diary.isLoaded }
+            assertEquals(0, defaultView.diary.totalFilteredCount)
+            assertTrue(defaultView.diary.hasAnyEntries)
+            assertTrue(defaultView.diary.hasSongLogs)
+
+            viewModel.dispatch(MainAction.SetDiaryStatusFilter(ConsumptionStatus.STARTED))
+            val startedView =
+                viewModel.uiState.first {
+                    it.diary.isLoaded && it.diary.statusFilter == ConsumptionStatus.STARTED
+                }
+            assertEquals(0, startedView.diary.totalFilteredCount)
+            assertTrue(startedView.diary.hasAnyEntries)
+            assertTrue(startedView.diary.hasSongLogs)
+
+            uiJob.cancel()
+        }
 
     private companion object {
         const val REPEAT_SONG_ID = "song-repeat"

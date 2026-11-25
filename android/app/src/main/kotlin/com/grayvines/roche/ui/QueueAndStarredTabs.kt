@@ -104,38 +104,143 @@ private fun buildOrderedStarredRows(state: MainUiState): List<StarredDisplayRow>
     val readerById = state.starredEntries.associateBy { it.id }
     val catalogRanked = state.starredCollection.entries
     val seenIds = HashSet<String>(readerById.size + catalogRanked.size)
+    val includeRemainingReaders = !state.starredCollection.hasMore
+    val starredIds = state.catalog.starredEntryIds
     return buildList {
-        for (catItem in catalogRanked) {
-            val id = catItem.entry.id
-            if (seenIds.add(id)) {
-                val readerEntry = readerById[id]
-                if (readerEntry != null) {
-                    add(StarredDisplayRow.ReaderRow(readerEntry))
-                } else {
-                    add(StarredDisplayRow.CatalogRow(catItem))
-                }
+        catalogRanked.forEach { catItem ->
+            if (seenIds.add(catItem.entry.id)) {
+                add(toStarredDisplayRow(catItem, readerById))
             }
         }
-        for (readerEntry in state.starredEntries) {
-            if (seenIds.add(readerEntry.id)) {
-                add(StarredDisplayRow.ReaderRow(readerEntry))
+        state.starredEntries
+            .filter { includeRemainingReaders || it.id !in starredIds }
+            .forEach { readerEntry ->
+                if (seenIds.add(readerEntry.id)) {
+                    add(StarredDisplayRow.ReaderRow(readerEntry))
+                }
             }
+    }
+}
+
+private fun toStarredDisplayRow(
+    catItem: RankedCatalogEntry,
+    readerById: Map<String, InboxEntry>,
+): StarredDisplayRow =
+    readerById[catItem.entry.id]?.let(StarredDisplayRow::ReaderRow)
+        ?: StarredDisplayRow.CatalogRow(catItem)
+
+private val STARRED_INBOX_KINDS =
+    setOf(EntryKind.ARTICLE, EntryKind.PAPER, EntryKind.VIDEO, EntryKind.PODCAST_EPISODE)
+
+private val STARRED_CATALOG_KINDS: Set<EntryKind> =
+    EntryKind.entries.filterTo(LinkedHashSet()) { it !in STARRED_INBOX_KINDS }
+
+private enum class StarredFilterTab(
+    val key: String,
+    val label: String,
+    val emptyPluralLabel: String,
+    val testTag: String,
+    val sqlKinds: Set<EntryKind>,
+) {
+    ALL("all", "All", "items", "starred_filter_all", emptySet()),
+    ARTICLES(
+        "articles",
+        "Articles",
+        "articles",
+        "starred_filter_articles",
+        setOf(EntryKind.ARTICLE),
+    ),
+    PAPERS("papers", "Papers", "papers", "starred_filter_papers", setOf(EntryKind.PAPER)),
+    VIDEOS(
+        "videos",
+        "Videos",
+        "videos",
+        "starred_filter_videos",
+        setOf(EntryKind.VIDEO, EntryKind.CHANNEL),
+    ),
+    PODCASTS(
+        "podcasts",
+        "Podcasts",
+        "podcasts",
+        "starred_filter_podcasts",
+        setOf(EntryKind.PODCAST_EPISODE, EntryKind.PODCAST),
+    ),
+    AUDIO(
+        "audio",
+        "Audio",
+        "audio items",
+        "starred_filter_audio",
+        setOf(EntryKind.PODCAST_EPISODE, EntryKind.PODCAST),
+    ),
+    CATALOG(
+        "catalog",
+        "Catalog",
+        "catalog items",
+        "starred_filter_catalog",
+        STARRED_CATALOG_KINDS,
+    ),
+}
+
+private val STARRED_READER_FILTER_KINDS =
+    setOf(
+        EntryKind.ARTICLE,
+        EntryKind.PAPER,
+        EntryKind.VIDEO,
+        EntryKind.PODCAST_EPISODE,
+        EntryKind.PODCAST,
+        EntryKind.CHANNEL,
+    )
+
+private data class StarredFilterChipSpec(
+    val key: String,
+    val label: String,
+    val emptyPluralLabel: String,
+    val testTag: String,
+    val sqlKinds: Set<EntryKind>,
+    val fixedTab: StarredFilterTab? = null,
+    val catalogKind: EntryKind? = null,
+)
+
+private fun buildStarredFilterChips(
+    allCount: Int,
+    kindCounts: List<Pair<EntryKind, Int>>,
+): List<StarredFilterChipSpec> = buildList {
+    StarredFilterTab.entries.forEach { tab ->
+        add(
+            StarredFilterChipSpec(
+                key = tab.key,
+                label = if (tab == StarredFilterTab.ALL) "All ($allCount)" else tab.label,
+                emptyPluralLabel = tab.emptyPluralLabel,
+                testTag = tab.testTag,
+                sqlKinds = tab.sqlKinds,
+                fixedTab = tab,
+            )
+        )
+    }
+    kindCounts.forEach { (kind, count) ->
+        if (kind !in STARRED_READER_FILTER_KINDS && count > 0) {
+            add(
+                StarredFilterChipSpec(
+                    key = "kind_${kind.wireValue}",
+                    label = "${kind.systemListTitle} ($count)",
+                    emptyPluralLabel = kind.systemListTitle.lowercase(),
+                    testTag = "starred_filter_${kind.wireValue}",
+                    sqlKinds = setOf(kind),
+                    catalogKind = kind,
+                )
+            )
         }
     }
 }
 
-private enum class StarredFilterTab(
-    val label: String,
-    val emptyPluralLabel: String,
-    val testTag: String,
-) {
-    ALL("All", "items", "starred_filter_all"),
-    ARTICLES("Articles", "articles", "starred_filter_articles"),
-    PAPERS("Papers", "papers", "starred_filter_papers"),
-    VIDEOS("Videos", "videos", "starred_filter_videos"),
-    PODCASTS("Podcasts", "podcasts", "starred_filter_podcasts"),
-    AUDIO("Audio", "audio items", "starred_filter_audio"),
-    CATALOG("Catalog", "catalog items", "starred_filter_catalog"),
+private fun matchesStarredChip(row: StarredDisplayRow, chip: StarredFilterChipSpec): Boolean {
+    val fixed = chip.fixedTab
+    if (fixed != null) return matchesStarredFilter(row, fixed)
+    val targetKind = chip.catalogKind ?: return true
+    return when (row) {
+        is StarredDisplayRow.ReaderRow -> row.entry.entryKind == targetKind
+        is StarredDisplayRow.CatalogRow -> row.item.entry.kind == targetKind
+    }
 }
 
 private fun matchesStarredFilter(row: StarredDisplayRow, filter: StarredFilterTab): Boolean =
@@ -184,22 +289,32 @@ fun StarredTabContent(
     activeAudioEntryId: String? = null,
     onOpenExternalUrl: (String) -> Unit = {},
 ) {
-    var selectedFilter by rememberSaveable { mutableStateOf(StarredFilterTab.ALL) }
     val orderedRows =
-        remember(state.starredEntries, state.starredCollection.entries) {
+        remember(
+            state.starredEntries,
+            state.starredCollection.entries,
+            state.starredCollection.hasMore,
+            state.catalog.starredEntryIds,
+        ) {
             buildOrderedStarredRows(state)
         }
+    val totalCount = resolveStarredTotalCount(state, orderedRows.size)
+    val filterChips =
+        remember(totalCount, state.starredCollection.kindCounts) {
+            buildStarredFilterChips(totalCount, state.starredCollection.kindCounts)
+        }
+    val selectedFilterKey =
+        state.starredCollection.requestedFilterKey
+            ?: state.starredCollection.selectedFilterKey
+            ?: StarredFilterTab.ALL.key
+    val activeChip =
+        remember(filterChips, selectedFilterKey) {
+            filterChips.firstOrNull { it.key == selectedFilterKey } ?: filterChips.first()
+        }
     val visibleRows =
-        remember(orderedRows, selectedFilter) {
-            orderedRows.filter { matchesStarredFilter(it, selectedFilter) }
+        remember(orderedRows, activeChip) {
+            orderedRows.filter { matchesStarredChip(it, activeChip) }
         }
-    val totalCount =
-        if (state.starredCollection.isLoaded) {
-            orderedRows.size
-        } else {
-            maxOf(orderedRows.size, state.catalog.starredEntryIds.size)
-        }
-
     RocheRefreshableTabScaffold(
         isRefreshing = state.isManualRefreshing,
         onRefresh = { onAction(MainAction.ManualRefresh) },
@@ -211,37 +326,95 @@ fun StarredTabContent(
                 onAction = onAction,
             )
             StarredTypeFilterStrip(
-                allCount = totalCount,
-                selectedFilter = selectedFilter,
-                onSelectFilter = { selectedFilter = it },
+                chips = filterChips,
+                selectedKey = activeChip.key,
+                onSelectChip = { dispatchStarredChipAction(it, onAction) },
             )
         },
     ) {
-        if (visibleRows.isEmpty()) {
-            if (state.starredCollection.isLoaded || state.catalog.starredEntryIds.isEmpty()) {
-                StarredEmptyPlaceholder(selectedFilter = selectedFilter)
-            }
-        } else {
-            StarredEntriesList(
-                rows = visibleRows,
-                state = state,
-                activeAudioEntryId = activeAudioEntryId,
-                onAction = onAction,
-                onOpenExternalUrl = onOpenExternalUrl,
-                listState = listState,
-            )
-        }
+        StarredTabBody(
+            visibleRows = visibleRows,
+            activeChip = activeChip,
+            state = state,
+            activeAudioEntryId = activeAudioEntryId,
+            onAction = onAction,
+            onOpenExternalUrl = onOpenExternalUrl,
+            listState = listState,
+        )
     }
 }
 
+private fun resolveStarredTotalCount(state: MainUiState, orderedCount: Int): Int =
+    if (state.starredCollection.isLoaded) {
+        maxOf(state.starredCollection.totalCount, orderedCount)
+    } else {
+        maxOf(orderedCount, state.catalog.starredEntryIds.size)
+    }
+
+private fun dispatchStarredChipAction(chip: StarredFilterChipSpec, onAction: (MainAction) -> Unit) {
+    onAction(
+        MainAction.SetStarredKindFilter(
+            kind = chip.sqlKinds.singleOrNull(),
+            filterKey = chip.key,
+            kinds = chip.sqlKinds,
+        )
+    )
+}
+
+@Suppress("LongParameterList")
 @Composable
-private fun StarredEmptyPlaceholder(selectedFilter: StarredFilterTab) {
+private fun StarredTabBody(
+    visibleRows: List<StarredDisplayRow>,
+    activeChip: StarredFilterChipSpec,
+    state: MainUiState,
+    activeAudioEntryId: String?,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+    listState: LazyListState,
+) {
+    val loadedKey = state.starredCollection.selectedFilterKey ?: StarredFilterTab.ALL.key
+    val isFilterSettled = state.starredCollection.isLoaded && loadedKey == activeChip.key
+    val remainingToLoad =
+        (state.starredCollection.filteredTotalCount - state.starredCollection.entries.size)
+            .coerceAtLeast(0)
+    if (visibleRows.isEmpty()) {
+        if (isFilterSettled && state.starredCollection.hasMore) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(32.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                StarredLoadMoreButton(
+                    isLoadingMore = state.starredCollection.isLoadingMore,
+                    remainingCount = remainingToLoad,
+                    onLoadMore = { onAction(MainAction.LoadMoreStarredCollection) },
+                )
+            }
+        } else if (isFilterSettled || state.catalog.starredEntryIds.isEmpty()) {
+            StarredEmptyPlaceholder(activeChip = activeChip)
+        }
+        return
+    }
+    StarredEntriesList(
+        rows = visibleRows,
+        state = state,
+        activeAudioEntryId = activeAudioEntryId,
+        hasMore = state.starredCollection.hasMore,
+        isLoadingMore = state.starredCollection.isLoadingMore,
+        remainingCount = remainingToLoad,
+        onAction = onAction,
+        onOpenExternalUrl = onOpenExternalUrl,
+        listState = listState,
+    )
+}
+
+@Composable
+private fun StarredEmptyPlaceholder(activeChip: StarredFilterChipSpec) {
     val colors = LocalRocheColors.current
     val message =
-        if (selectedFilter == StarredFilterTab.ALL) {
+        if (activeChip.fixedTab == StarredFilterTab.ALL) {
             "No starred entries yet. Tap ★ on any post or catalog item to collect favorites here."
         } else {
-            "No starred ${selectedFilter.emptyPluralLabel} yet."
+            "No starred ${activeChip.emptyPluralLabel} yet."
         }
     Box(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(32.dp),
@@ -290,9 +463,9 @@ private fun StarredListHeaderBar(
 
 @Composable
 private fun StarredTypeFilterStrip(
-    allCount: Int,
-    selectedFilter: StarredFilterTab,
-    onSelectFilter: (StarredFilterTab) -> Unit,
+    chips: List<StarredFilterChipSpec>,
+    selectedKey: String,
+    onSelectChip: (StarredFilterChipSpec) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     Row(
@@ -303,25 +476,27 @@ private fun StarredTypeFilterStrip(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        StarredFilterTab.entries.forEach { tab ->
-            val label = if (tab == StarredFilterTab.ALL) "All ($allCount)" else tab.label
+        chips.forEach { chip ->
             RocheStripTab(
-                label = label,
-                selected = selectedFilter == tab,
-                onClick = { onSelectFilter(tab) },
-                modifier = Modifier.testTag(tab.testTag),
+                label = chip.label,
+                selected = selectedKey == chip.key,
+                onClick = { onSelectChip(chip) },
+                modifier = Modifier.testTag(chip.testTag),
             )
         }
     }
     HorizontalDivider(color = colors.border, thickness = 1.dp)
 }
 
-@Suppress("LongMethod")
+@Suppress("LongMethod", "LongParameterList")
 @Composable
 private fun StarredEntriesList(
     rows: List<StarredDisplayRow>,
     state: MainUiState,
     activeAudioEntryId: String?,
+    hasMore: Boolean,
+    isLoadingMore: Boolean,
+    remainingCount: Int,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     listState: LazyListState,
@@ -401,7 +576,44 @@ private fun StarredEntriesList(
                 }
                 HorizontalDivider(color = colors.border, thickness = 1.dp)
             }
+            if (hasMore) {
+                item(key = "starred_load_more") {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        StarredLoadMoreButton(
+                            isLoadingMore = isLoadingMore,
+                            remainingCount = remainingCount,
+                            onLoadMore = { onAction(MainAction.LoadMoreStarredCollection) },
+                        )
+                    }
+                }
+            }
         }
+    }
+}
+
+@Composable
+private fun StarredLoadMoreButton(
+    isLoadingMore: Boolean,
+    remainingCount: Int,
+    onLoadMore: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    TextButton(
+        enabled = !isLoadingMore,
+        onClick = onLoadMore,
+        modifier = Modifier.testTag("starred_load_more_btn"),
+    ) {
+        Text(
+            text =
+                when {
+                    isLoadingMore -> "Loading…"
+                    remainingCount > 0 -> "Load More ($remainingCount remaining)"
+                    else -> "Load More"
+                },
+            color = colors.accentBlue,
+            fontSize = 13.sp,
+        )
     }
 }
 

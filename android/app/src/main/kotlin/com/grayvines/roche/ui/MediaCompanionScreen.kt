@@ -637,6 +637,18 @@ private fun RankedListDetailPane(
                 },
             )
         }
+        if (collectionState.kindCounts.size >= 2 || collectionState.selectedKind != null) {
+            ListKindFilterStrip(
+                totalCount = effectiveTotalCount,
+                kindCounts = collectionState.kindCounts,
+                selectedKind = collectionState.selectedKind,
+                onSelectKind = { kind ->
+                    onAction(
+                        MainAction.SetCatalogCollectionKindFilter(activeList.collectionId, kind)
+                    )
+                },
+            )
+        }
         RankedDetailBody(
             activeList = activeList,
             activeDraw = activeDraw,
@@ -808,6 +820,48 @@ private fun ListTierFilterStrip(
     HorizontalDivider(color = colors.border, thickness = 1.dp)
 }
 
+@Composable
+private fun ListKindFilterStrip(
+    totalCount: Int,
+    kindCounts: List<Pair<EntryKind, Int>>,
+    selectedKind: EntryKind?,
+    onSelectKind: (EntryKind?) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RocheStripTab(
+            label = "All Types (${formatCompactInt(totalCount)})",
+            selected = selectedKind == null,
+            onClick = { onSelectKind(null) },
+            modifier = Modifier.testTag("list_kind_all"),
+        )
+        kindCounts.forEach { (kind, count) ->
+            RocheStripTab(
+                label = "${kind.displayLabel} (${formatCompactInt(count)})",
+                selected = selectedKind == kind,
+                onClick = { onSelectKind(kind) },
+                modifier = Modifier.testTag("list_kind_${kind.wireValue}"),
+            )
+        }
+        if (selectedKind != null && kindCounts.none { it.first == selectedKind }) {
+            RocheStripTab(
+                label = "${selectedKind.displayLabel} (0)",
+                selected = true,
+                onClick = { onSelectKind(selectedKind) },
+                modifier = Modifier.testTag("list_kind_${selectedKind.wireValue}"),
+            )
+        }
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+}
+
 @Suppress("LongParameterList")
 @Composable
 private fun RankedDetailBody(
@@ -823,7 +877,21 @@ private fun RankedDetailBody(
 ) {
     if (collectionState.entries.isEmpty() && activeDraw == null) {
         if (collectionState.isLoaded || activeList.entryCount == 0) {
-            RankedDetailEmptyCard(activeList, canEditManualList, onAction)
+            if (collectionState.selectedTier != null || collectionState.selectedKind != null) {
+                val colors = LocalRocheColors.current
+                Box(
+                    modifier = Modifier.fillMaxSize().padding(32.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "No entries in ${activeList.title} match this filter.",
+                        color = colors.textMuted,
+                        fontSize = 13.sp,
+                    )
+                }
+            } else {
+                RankedDetailEmptyCard(activeList, canEditManualList, onAction)
+            }
         }
         return
     }

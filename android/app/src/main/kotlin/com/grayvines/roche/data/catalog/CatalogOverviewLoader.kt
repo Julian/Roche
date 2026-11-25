@@ -59,14 +59,14 @@ internal suspend fun loadCatalogOverviewSnapshot(
     epScoreCache?.evictUnusedScopes(buckets.activeWantScopeIds)
 
     val recentDiary =
-        dao.getDiaryLogPage(
+        dao.getDiaryLogPageNonSong(
                 minTs = "",
                 maxTs = OVERVIEW_MAX_ISO_TS_BOUND,
                 limit = RECENT_DIARY_PREVIEW_LIMIT,
                 offset = 0,
             )
             .map { toDiaryEntryItem(it, globalTiers) }
-    val totalDiaryCount = dao.countDiaryLogs()
+    val totalDiaryCount = dao.countDiaryLogsNonSong()
     val diaryConsumedCount =
         ctx.consumedCountByKind.entries.sumOf { (kind, count) ->
             if (kind.isDiaryVisibleKind) count else 0

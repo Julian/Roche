@@ -283,12 +283,21 @@ data class ProvisionalFocusRank(
     val tier: Char?,
 )
 
+sealed interface DiaryKindFilter {
+    data object DefaultNonSong : DiaryKindFilter
+
+    data object All : DiaryKindFilter
+
+    data class Only(val kind: EntryKind) : DiaryKindFilter
+}
+
 data class CatalogCollectionPageResult(
     val collectionId: String,
     val entries: List<RankedCatalogEntry> = emptyList(),
     val totalCount: Int = 0,
     val filteredTotalCount: Int = totalCount,
     val tierCounts: Map<Char, Int> = emptyMap(),
+    val kindCounts: List<Pair<EntryKind, Int>> = emptyList(),
     val hasMore: Boolean = false,
 )
 
@@ -334,6 +343,9 @@ data class DiaryPageResult(
     val entries: List<DiaryEntryItem> = emptyList(),
     val availableYears: List<String> = emptyList(),
     val monthCounts: Map<String, Int> = emptyMap(),
+    val nonSongKindCounts: List<Pair<EntryKind, Int>> = emptyList(),
+    val hasSongLogs: Boolean = false,
+    val kindFilter: DiaryKindFilter = DiaryKindFilter.DefaultNonSong,
     val totalFilteredCount: Int = 0,
     val hasAnyEntries: Boolean = false,
     val effectiveYear: String? = null,

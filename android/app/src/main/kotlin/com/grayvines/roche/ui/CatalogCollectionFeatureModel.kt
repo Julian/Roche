@@ -6,6 +6,7 @@ import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.catalog.CatalogSearchPageResult
 import com.grayvines.roche.data.catalog.DEFAULT_COLLECTION_PAGE_SIZE
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.GlobalTierIndex
 import com.grayvines.roche.data.catalog.RankedCatalogEntry
 import com.grayvines.roche.model.AppTab
@@ -27,15 +28,28 @@ data class CatalogCollectionUiState(
     val totalCount: Int = 0,
     val filteredTotalCount: Int = totalCount,
     val tierCounts: Map<Char, Int> = emptyMap(),
+    val kindCounts: List<Pair<EntryKind, Int>> = emptyList(),
     val selectedTier: Char? = null,
+    val selectedKind: EntryKind? = null,
+    val selectedKinds: Set<EntryKind> = emptySet(),
+    val selectedFilterKey: String? = null,
+    val requestedFilterKey: String? = selectedFilterKey,
     val hasMore: Boolean = false,
     val isLoadingMore: Boolean = false,
     val isLoaded: Boolean = false,
 )
 
+private const val DEFAULT_STARRED_FILTER_KEY = "all"
+
+private data class StarredFilterQuery(
+    val filterKey: String = DEFAULT_STARRED_FILTER_KEY,
+    val kindFilters: Set<EntryKind> = emptySet(),
+)
+
 private data class ActiveCollectionQueryParams(
     val collectionId: String? = null,
     val tierFilter: Char? = null,
+    val kindFilter: EntryKind? = null,
     val pageLimit: Int = DEFAULT_COLLECTION_PAGE_SIZE,
     val loadMoreNonce: Int = 0,
     val isListsTabActive: Boolean = false,
@@ -45,6 +59,21 @@ private data class ActiveCollectionCacheKey(
     val revisionStamp: String,
     val collectionId: String,
     val tierFilter: Char?,
+    val kindFilter: EntryKind?,
+)
+
+private data class StarredQueryParams(
+    val filterKey: String = DEFAULT_STARRED_FILTER_KEY,
+    val kindFilters: Set<EntryKind> = emptySet(),
+    val pageLimit: Int = DEFAULT_COLLECTION_PAGE_SIZE,
+    val loadMoreNonce: Int = 0,
+    val isStarredTabActive: Boolean = false,
+)
+
+private data class StarredCacheKey(
+    val revisionStamp: String,
+    val filterKey: String,
+    val kindFilters: Set<EntryKind>,
 )
 
 private data class BrowseCatalogQueryKey(
@@ -60,10 +89,14 @@ internal class CatalogCollectionFeatureModel(
     private val repository: RocheRepository,
 ) {
     private val activeTierOverride = MutableStateFlow<Pair<String, Char?>?>(null)
+    private val activeKindOverride = MutableStateFlow<Pair<String, EntryKind?>?>(null)
     private val activeLimitOverride = MutableStateFlow<Triple<String, Int, Int>?>(null)
+    private val starredFilterOverride = MutableStateFlow(StarredFilterQuery())
+    private val starredLimitOverride = MutableStateFlow(DEFAULT_COLLECTION_PAGE_SIZE to 0)
     private val browseCatalogLimit = MutableStateFlow(DEFAULT_BROWSE_CATALOG_LIMIT)
 
     private var lastActiveCacheKey: ActiveCollectionCacheKey? = null
+    private var lastStarredCacheKey: StarredCacheKey? = null
 
     private val _activeCollectionState = MutableStateFlow(CatalogCollectionUiState())
     val activeCollectionState: StateFlow<CatalogCollectionUiState> =
@@ -97,6 +130,12 @@ internal class CatalogCollectionFeatureModel(
         activeLimitOverride.value = Triple(colId, DEFAULT_COLLECTION_PAGE_SIZE, 0)
     }
 
+    fun setCollectionKindFilter(collectionId: String?, kind: EntryKind?) {
+        val colId = collectionId?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        activeKindOverride.value = colId to kind
+        activeLimitOverride.value = Triple(colId, DEFAULT_COLLECTION_PAGE_SIZE, 0)
+    }
+
     fun loadMoreActiveCollection() {
         val current = _activeCollectionState.value
         val colId = current.collectionId ?: return
@@ -105,6 +144,30 @@ internal class CatalogCollectionFeatureModel(
         val nextLimit = current.entries.size + DEFAULT_COLLECTION_PAGE_SIZE
         val nextNonce = (activeLimitOverride.value?.third ?: 0) + 1
         activeLimitOverride.value = Triple(colId, nextLimit, nextNonce)
+    }
+
+    fun setStarredKindFilter(
+        kind: EntryKind?,
+        filterKey: String? = null,
+        kinds: Set<EntryKind> = emptySet(),
+    ) {
+        val effectiveKinds = kinds.ifEmpty { kind?.let(::setOf) ?: emptySet() }
+        val effectiveKey =
+            filterKey ?: kind?.let { "kind_${it.wireValue}" } ?: DEFAULT_STARRED_FILTER_KEY
+        val next = StarredFilterQuery(filterKey = effectiveKey, kindFilters = effectiveKinds)
+        if (starredFilterOverride.value == next) return
+        _starredCollectionState.update { it.copy(requestedFilterKey = effectiveKey) }
+        starredFilterOverride.value = next
+        starredLimitOverride.value = DEFAULT_COLLECTION_PAGE_SIZE to 0
+    }
+
+    fun loadMoreStarredCollection() {
+        val current = _starredCollectionState.value
+        if (!current.hasMore || current.isLoadingMore) return
+        _starredCollectionState.update { it.copy(isLoadingMore = true) }
+        val nextLimit = current.entries.size + DEFAULT_COLLECTION_PAGE_SIZE
+        val nextNonce = starredLimitOverride.value.second + 1
+        starredLimitOverride.value = nextLimit to nextNonce
     }
 
     fun loadMoreBrowseCatalog() {
@@ -121,7 +184,12 @@ internal class CatalogCollectionFeatureModel(
         when (action) {
             is MainAction.SetCatalogCollectionTierFilter ->
                 setCollectionTierFilter(action.collectionId, action.tier)
+            is MainAction.SetCatalogCollectionKindFilter ->
+                setCollectionKindFilter(action.collectionId, action.kind)
             MainAction.LoadMoreCatalogCollection -> loadMoreActiveCollection()
+            is MainAction.SetStarredKindFilter ->
+                setStarredKindFilter(action.kind, action.filterKey, action.kinds)
+            MainAction.LoadMoreStarredCollection -> loadMoreStarredCollection()
             else -> return false
         }
         return true
@@ -136,34 +204,18 @@ internal class CatalogCollectionFeatureModel(
                 .map { Pair(it.activeTab == AppTab.LISTS, it.selectedCatalogCollectionId) }
                 .distinctUntilChanged()
         val paramsFlow =
-            combine(selectedTargetFlow, activeTierOverride, activeLimitOverride) {
-                    (isListsTab, colId),
-                    tierOverride,
-                    limitOverride ->
-                    val tier =
-                        if (colId != null && tierOverride?.first == colId) {
-                            tierOverride.second
-                        } else {
-                            null
-                        }
-                    val limit =
-                        if (colId != null && limitOverride?.first == colId) {
-                            limitOverride.second
-                        } else {
-                            DEFAULT_COLLECTION_PAGE_SIZE
-                        }
-                    val nonce =
-                        if (colId != null && limitOverride?.first == colId) {
-                            limitOverride.third
-                        } else {
-                            0
-                        }
-                    ActiveCollectionQueryParams(
-                        collectionId = colId,
-                        tierFilter = tier,
-                        pageLimit = limit,
-                        loadMoreNonce = nonce,
-                        isListsTabActive = isListsTab,
+            combine(
+                    selectedTargetFlow,
+                    activeTierOverride,
+                    activeKindOverride,
+                    activeLimitOverride,
+                ) { (isListsTab, colId), tierOverride, kindOverride, limitOverride ->
+                    buildActiveCollectionParams(
+                        isListsTab = isListsTab,
+                        colId = colId,
+                        tierOverride = tierOverride,
+                        kindOverride = kindOverride,
+                        limitOverride = limitOverride,
                     )
                 }
                 .distinctUntilChanged()
@@ -175,22 +227,128 @@ internal class CatalogCollectionFeatureModel(
         }
     }
 
+    private fun buildActiveCollectionParams(
+        isListsTab: Boolean,
+        colId: String?,
+        tierOverride: Pair<String, Char?>?,
+        kindOverride: Pair<String, EntryKind?>?,
+        limitOverride: Triple<String, Int, Int>?,
+    ): ActiveCollectionQueryParams {
+        val sameTier = colId != null && tierOverride?.first == colId
+        val sameKind = colId != null && kindOverride?.first == colId
+        val sameLimit = colId != null && limitOverride?.first == colId
+        return ActiveCollectionQueryParams(
+            collectionId = colId,
+            tierFilter = if (sameTier) tierOverride.second else null,
+            kindFilter = if (sameKind) kindOverride.second else null,
+            pageLimit = if (sameLimit) limitOverride.second else DEFAULT_COLLECTION_PAGE_SIZE,
+            loadMoreNonce = if (sameLimit) limitOverride.third else 0,
+            isListsTabActive = isListsTab,
+        )
+    }
+
     private fun observeStarredCollection(
         revisionFlow: Flow<String>,
         transientFlow: Flow<TransientUiState>,
     ) {
         val starredActiveFlow =
             transientFlow.map { it.activeTab == AppTab.STARRED }.distinctUntilChanged()
+        val paramsFlow =
+            combine(starredActiveFlow, starredFilterOverride, starredLimitOverride) {
+                    active,
+                    filter,
+                    (limit, nonce) ->
+                    StarredQueryParams(
+                        filterKey = filter.filterKey,
+                        kindFilters = filter.kindFilters,
+                        pageLimit = limit,
+                        loadMoreNonce = nonce,
+                        isStarredTabActive = active,
+                    )
+                }
+                .distinctUntilChanged()
         scope.launch {
-            combine(revisionFlow, starredActiveFlow) { rev, active -> rev to active }
-                .collectLatest { (_, active) ->
-                    if (active) refreshStarredCollection()
+            combine(revisionFlow, paramsFlow) { rev, params -> rev to params }
+                .collectLatest { (rev, params) ->
+                    if (params.isStarredTabActive) {
+                        refreshStarredCollection(rev, params)
+                    }
                 }
         }
     }
 
-    private suspend fun refreshStarredCollection() {
-        refreshStaticCollection(STARRED_COLLECTION_ID, _starredCollectionState)
+    private suspend fun refreshStarredCollection(
+        revisionStamp: String,
+        params: StarredQueryParams,
+    ) {
+        val cacheKey = StarredCacheKey(revisionStamp, params.filterKey, params.kindFilters)
+        val prev = _starredCollectionState.value
+        val sameCache =
+            prev.isLoaded &&
+                lastStarredCacheKey == cacheKey &&
+                prev.collectionId == STARRED_COLLECTION_ID
+        if (sameCache && (params.pageLimit <= prev.entries.size || !prev.hasMore)) {
+            if (prev.isLoadingMore) {
+                _starredCollectionState.update { it.copy(isLoadingMore = false) }
+            }
+            return
+        }
+        val canAppend = sameCache && params.pageLimit > prev.entries.size
+        val offset = if (canAppend) prev.entries.size else 0
+        val limit = if (canAppend) params.pageLimit - prev.entries.size else params.pageLimit
+        val loaded = runSuspendCatching {
+            repository.catalog.loadCollectionPage(
+                collectionIdOrSlug = STARRED_COLLECTION_ID,
+                kindFilters = params.kindFilters,
+                limit = limit,
+                offset = offset,
+            )
+        }
+            .getOrNull()
+        if (loaded == null) {
+            _starredCollectionState.update { it.copy(isLoadingMore = false) }
+            return
+        }
+        applyStarredPageResult(cacheKey, params, prev, canAppend, loaded)
+    }
+
+    private fun applyStarredPageResult(
+        cacheKey: StarredCacheKey,
+        params: StarredQueryParams,
+        prev: CatalogCollectionUiState,
+        canAppend: Boolean,
+        loaded: com.grayvines.roche.data.catalog.CatalogCollectionPageResult,
+    ) {
+        val vanishedDynamicKind =
+            params.filterKey.startsWith("kind_") &&
+                loaded.filteredTotalCount == 0 &&
+                loaded.kindCounts.none { "kind_${it.first.wireValue}" == params.filterKey }
+        val mergedEntries =
+            if (canAppend && loaded.collectionId == prev.collectionId) {
+                mergeUniqueRankedEntries(prev.entries, loaded.entries)
+            } else {
+                loaded.entries
+            }
+        lastStarredCacheKey = cacheKey
+        _starredCollectionState.value =
+            CatalogCollectionUiState(
+                collectionId = loaded.collectionId,
+                entries = mergedEntries,
+                totalCount = loaded.totalCount,
+                filteredTotalCount = loaded.filteredTotalCount,
+                tierCounts = loaded.tierCounts,
+                kindCounts = loaded.kindCounts,
+                selectedKind = params.kindFilters.singleOrNull(),
+                selectedKinds = params.kindFilters,
+                selectedFilterKey = params.filterKey,
+                requestedFilterKey = starredFilterOverride.value.filterKey,
+                hasMore = loaded.hasMore,
+                isLoadingMore = false,
+                isLoaded = true,
+            )
+        if (vanishedDynamicKind && starredFilterOverride.value.filterKey == params.filterKey) {
+            setStarredKindFilter(kind = null, filterKey = DEFAULT_STARRED_FILTER_KEY)
+        }
     }
 
     private fun observeActiveWantQueue(
@@ -231,7 +389,7 @@ internal class CatalogCollectionFeatureModel(
         val result = runSuspendCatching {
             repository.catalog.loadCollectionPage(
                 collectionIdOrSlug = collectionIdOrSlug,
-                limit = STARRED_AND_WANT_FULL_LIMIT,
+                limit = WANT_QUEUE_FULL_LIMIT,
                 offset = 0,
             )
         }
@@ -243,6 +401,7 @@ internal class CatalogCollectionFeatureModel(
                 totalCount = loaded.totalCount,
                 filteredTotalCount = loaded.filteredTotalCount,
                 tierCounts = loaded.tierCounts,
+                kindCounts = loaded.kindCounts,
                 hasMore = loaded.hasMore,
                 isLoaded = true,
             )
@@ -291,31 +450,61 @@ internal class CatalogCollectionFeatureModel(
     ) {
         val colId = params.collectionId
         if (colId == null) {
-            activeTierOverride.value = null
-            activeLimitOverride.value = null
-            lastActiveCacheKey = null
-            _activeCollectionState.value = CatalogCollectionUiState()
+            clearActiveCollectionState()
             return
         }
-        if (!params.isListsTabActive) return
-        val cacheKey = ActiveCollectionCacheKey(revisionStamp, colId, params.tierFilter)
         val prev = _activeCollectionState.value
-        val canAppend =
-            prev.isLoaded &&
-                lastActiveCacheKey == cacheKey &&
-                prev.collectionId == colId &&
-                params.pageLimit > prev.entries.size
+        if (prev.collectionId != null && prev.collectionId != colId) {
+            clearStaleActiveOverridesFor(colId)
+        }
+        if (!params.isListsTabActive) return
+        val cacheKey =
+            ActiveCollectionCacheKey(revisionStamp, colId, params.tierFilter, params.kindFilter)
+        val sameCache =
+            prev.isLoaded && lastActiveCacheKey == cacheKey && prev.collectionId == colId
+        if (sameCache && (params.pageLimit <= prev.entries.size || !prev.hasMore)) {
+            if (prev.isLoadingMore) {
+                _activeCollectionState.update { it.copy(isLoadingMore = false) }
+            }
+            return
+        }
+        fetchAndApplyActiveCollection(cacheKey, colId, params, prev, sameCache)
+    }
+
+    private fun clearActiveCollectionState() {
+        activeTierOverride.value = null
+        activeKindOverride.value = null
+        activeLimitOverride.value = null
+        lastActiveCacheKey = null
+        _activeCollectionState.value = CatalogCollectionUiState()
+    }
+
+    private fun clearStaleActiveOverridesFor(colId: String) {
+        if (activeTierOverride.value?.first != colId) activeTierOverride.value = null
+        if (activeKindOverride.value?.first != colId) activeKindOverride.value = null
+        if (activeLimitOverride.value?.first != colId) activeLimitOverride.value = null
+    }
+
+    private suspend fun fetchAndApplyActiveCollection(
+        cacheKey: ActiveCollectionCacheKey,
+        colId: String,
+        params: ActiveCollectionQueryParams,
+        prev: CatalogCollectionUiState,
+        sameCache: Boolean,
+    ) {
+        val canAppend = sameCache && params.pageLimit > prev.entries.size
         val offset = if (canAppend) prev.entries.size else 0
         val limit = if (canAppend) params.pageLimit - prev.entries.size else params.pageLimit
-        val result = runSuspendCatching {
+        val loaded = runSuspendCatching {
             repository.catalog.loadCollectionPage(
                 collectionIdOrSlug = colId,
                 tierFilter = params.tierFilter,
+                kindFilter = params.kindFilter,
                 limit = limit,
                 offset = offset,
             )
         }
-        val loaded = result.getOrNull()
+            .getOrNull()
         if (loaded == null) {
             _activeCollectionState.update { it.copy(isLoadingMore = false) }
             return
@@ -334,7 +523,9 @@ internal class CatalogCollectionFeatureModel(
                 totalCount = loaded.totalCount,
                 filteredTotalCount = loaded.filteredTotalCount,
                 tierCounts = loaded.tierCounts,
+                kindCounts = loaded.kindCounts,
                 selectedTier = params.tierFilter,
+                selectedKind = params.kindFilter,
                 hasMore = loaded.hasMore,
                 isLoadingMore = false,
                 isLoaded = true,
@@ -343,7 +534,7 @@ internal class CatalogCollectionFeatureModel(
 
     private companion object {
         const val DEFAULT_BROWSE_CATALOG_LIMIT = 24
-        const val STARRED_AND_WANT_FULL_LIMIT = Int.MAX_VALUE
+        const val WANT_QUEUE_FULL_LIMIT = 10_000
     }
 }
 

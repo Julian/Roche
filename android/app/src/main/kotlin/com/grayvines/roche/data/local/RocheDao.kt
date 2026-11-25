@@ -243,8 +243,14 @@ private const val DEFAULT_FTS_SEARCH_LIMIT = 150
 private const val DEFAULT_FTS_TOKEN_ID_LIMIT = 600
 private const val DEFAULT_EXTRA_SEARCH_LIMIT = 50
 
+private const val DIARY_ACTIVE_ENTRY_WHERE = "(e.mergedIntoId IS NULL OR e.mergedIntoId = '')"
+
+private const val DIARY_NON_SONG_KIND_IN =
+    "('article', 'paper', 'video', 'podcast_episode', " +
+        "'movie', 'book', 'game', 'album', 'tv', 'collection')"
+
 private const val DIARY_VISIBLE_ENTRY_WHERE =
-    "(e.mergedIntoId IS NULL OR e.mergedIntoId = '') " +
+    "$DIARY_ACTIVE_ENTRY_WHERE " +
         "AND e.kind NOT IN ('artist', 'podcast', 'publication', 'channel')"
 
 private const val DIARY_LOG_ROW_COLUMNS =
@@ -271,6 +277,12 @@ private const val DIARY_LOG_ROW_CROSS_SELECT =
         "FROM consumption_log cl " +
         "CROSS JOIN entries e ON e.id = cl.entryId " +
         "WHERE $DIARY_VISIBLE_ENTRY_WHERE"
+
+private const val DIARY_LOG_ROW_ENTRIES_CROSS_SELECT =
+    "SELECT $DIARY_LOG_ROW_COLUMNS " +
+        "FROM entries e " +
+        "CROSS JOIN consumption_log cl ON cl.entryId = e.id " +
+        "WHERE $DIARY_ACTIVE_ENTRY_WHERE"
 
 private const val FEED_ROW_SELECT =
     "SELECT fs.collectionId AS id, " +
@@ -1356,6 +1368,406 @@ interface RocheDao {
     suspend fun getConsumedCollectionEntries(collectionId: String): List<EntryEntity>
 
     @Query(
+        "SELECT e.kind AS kind, COUNT(*) AS count " +
+            "FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "GROUP BY e.kind ORDER BY count DESC, e.kind ASC"
+    )
+    suspend fun getManualCollectionKindCounts(collectionId: String): List<KindCountRow>
+
+    @Query(
+        "SELECT e.kind AS kind, COUNT(*) AS count " +
+            "FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "GROUP BY e.kind ORDER BY count DESC, e.kind ASC"
+    )
+    suspend fun getGenColKindCounts(collectionId: String): List<KindCountRow>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND ce.entryId IN (:ids) " +
+            "AND COALESCE(e.mergedIntoId, '') = ''"
+    )
+    suspend fun getManualColMembersIn(
+        collectionId: String,
+        ids: List<String>,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND ce.entryId IN (:ids) " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed')"
+    )
+    suspend fun getGenColMembersIn(
+        collectionId: String,
+        ids: List<String>,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN (SELECT value FROM json_each(:kindsJson))"
+    )
+    suspend fun countManualColByKinds(collectionId: String, kindsJson: String): Int
+
+    @Query(
+        "SELECT COUNT(*) FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN (SELECT value FROM json_each(:kindsJson)) " +
+            "AND e.id NOT IN (SELECT value FROM json_each(:excludedJson))"
+    )
+    suspend fun countManualColKindsExcl(
+        collectionId: String,
+        kindsJson: String,
+        excludedJson: String,
+    ): Int
+
+    @Query(
+        "SELECT COUNT(*) FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN (SELECT value FROM json_each(:kindsJson)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed')"
+    )
+    suspend fun countGenColByKinds(collectionId: String, kindsJson: String): Int
+
+    @Query(
+        "SELECT COUNT(*) FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN (SELECT value FROM json_each(:kindsJson)) " +
+            "AND e.id NOT IN (SELECT value FROM json_each(:excludedJson)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed')"
+    )
+    suspend fun countGenColKindsExcl(
+        collectionId: String,
+        kindsJson: String,
+        excludedJson: String,
+    ): Int
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getManualCollectionPage(
+        collectionId: String,
+        limit: Int,
+        offset: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.id NOT IN (SELECT value FROM json_each(:excludedJson)) " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getManualColPageExcl(
+        collectionId: String,
+        excludedJson: String,
+        limit: Int,
+        offset: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN (SELECT value FROM json_each(:kindsJson)) " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getManualColKindsPage(
+        collectionId: String,
+        kindsJson: String,
+        limit: Int,
+        offset: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN (SELECT value FROM json_each(:kindsJson)) " +
+            "AND e.id NOT IN (SELECT value FROM json_each(:excludedJson)) " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getManualColKindsPageExcl(
+        collectionId: String,
+        kindsJson: String,
+        excludedJson: String,
+        limit: Int,
+        offset: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getGeneratorCollectionPage(
+        collectionId: String,
+        limit: Int,
+        offset: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.id NOT IN (SELECT value FROM json_each(:excludedJson)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getGenColPageExcl(
+        collectionId: String,
+        excludedJson: String,
+        limit: Int,
+        offset: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN (SELECT value FROM json_each(:kindsJson)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getGenColKindsPage(
+        collectionId: String,
+        kindsJson: String,
+        limit: Int,
+        offset: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.kind IN (SELECT value FROM json_each(:kindsJson)) " +
+            "AND e.id NOT IN (SELECT value FROM json_each(:excludedJson)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getGenColKindsPageExcl(
+        collectionId: String,
+        kindsJson: String,
+        excludedJson: String,
+        limit: Int,
+        offset: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND (LOWER(e.title) < LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id < :id))"
+    )
+    suspend fun countManualCollectionBefore(collectionId: String, title: String, id: String): Int
+
+    @Query(
+        "SELECT COUNT(*) FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND (LOWER(e.title) < LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id < :id)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed')"
+    )
+    suspend fun countGeneratorCollectionBefore(collectionId: String, title: String, id: String): Int
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND (LOWER(e.title) < LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id < :id)) " +
+            "ORDER BY LOWER(e.title) DESC, e.id DESC LIMIT 1"
+    )
+    suspend fun getManualCollectionPrev(
+        collectionId: String,
+        title: String,
+        id: String,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.id NOT IN (SELECT value FROM json_each(:excludedJson)) " +
+            "AND (LOWER(e.title) < LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id < :id)) " +
+            "ORDER BY LOWER(e.title) DESC, e.id DESC LIMIT 1"
+    )
+    suspend fun getManualColPrevExcl(
+        collectionId: String,
+        title: String,
+        id: String,
+        excludedJson: String,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND (LOWER(e.title) > LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id > :id)) " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT 1"
+    )
+    suspend fun getManualCollectionNext(
+        collectionId: String,
+        title: String,
+        id: String,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.id NOT IN (SELECT value FROM json_each(:excludedJson)) " +
+            "AND (LOWER(e.title) > LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id > :id)) " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT 1"
+    )
+    suspend fun getManualColNextExcl(
+        collectionId: String,
+        title: String,
+        id: String,
+        excludedJson: String,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "AND (LOWER(e.title) < LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id < :id)) " +
+            "ORDER BY LOWER(e.title) DESC, e.id DESC LIMIT 1"
+    )
+    suspend fun getGeneratorCollectionPrev(
+        collectionId: String,
+        title: String,
+        id: String,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.id NOT IN (SELECT value FROM json_each(:excludedJson)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "AND (LOWER(e.title) < LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id < :id)) " +
+            "ORDER BY LOWER(e.title) DESC, e.id DESC LIMIT 1"
+    )
+    suspend fun getGenColPrevExcl(
+        collectionId: String,
+        title: String,
+        id: String,
+        excludedJson: String,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "AND (LOWER(e.title) > LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id > :id)) " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT 1"
+    )
+    suspend fun getGeneratorCollectionNext(
+        collectionId: String,
+        title: String,
+        id: String,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND e.id NOT IN (SELECT value FROM json_each(:excludedJson)) " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "AND (LOWER(e.title) > LOWER(:title) OR (LOWER(e.title) = LOWER(:title) AND e.id > :id)) " +
+            "ORDER BY LOWER(e.title) ASC, e.id ASC LIMIT 1"
+    )
+    suspend fun getGenColNextExcl(
+        collectionId: String,
+        title: String,
+        id: String,
+        excludedJson: String,
+    ): EntryEntity?
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "ORDER BY RANDOM() LIMIT :limit"
+    )
+    suspend fun getRandomManualColEntries(
+        collectionId: String,
+        limit: Int,
+    ): List<EntryEntity>
+
+    @Query(
+        "SELECT e.* FROM collection_entries ce " +
+            "CROSS JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :collectionId " +
+            "AND COALESCE(e.mergedIntoId, '') = '' " +
+            "AND EXISTS (SELECT 1 FROM consumption_log cl " +
+            "WHERE cl.entryId = e.id AND cl.status = 'consumed') " +
+            "ORDER BY RANDOM() LIMIT :limit"
+    )
+    suspend fun getRandomGenColEntries(
+        collectionId: String,
+        limit: Int,
+    ): List<EntryEntity>
+
+    @Query(
         "SELECT e.id AS id, e.kind AS kind, e.thumbnailUrl AS thumbnailUrl " +
             "FROM collection_entries ce " +
             "INNER JOIN entries e ON e.id = ce.entryId " +
@@ -1578,18 +1990,45 @@ interface RocheDao {
     suspend fun countDiaryLogs(): Int
 
     @Query(
+        "SELECT COUNT(*) FROM entries e " +
+            "CROSS JOIN consumption_log cl ON cl.entryId = e.id " +
+            "WHERE e.kind IN $DIARY_NON_SONG_KIND_IN AND $DIARY_ACTIVE_ENTRY_WHERE"
+    )
+    suspend fun countDiaryLogsNonSong(): Int
+
+    @Query(
         "SELECT SUBSTR(cl.ts, 1, 4) AS year, COUNT(*) AS count " +
             "FROM consumption_log cl " +
-            "INNER JOIN entries e ON e.id = cl.entryId " +
+            "CROSS JOIN entries e ON e.id = cl.entryId " +
             "WHERE $DIARY_VISIBLE_ENTRY_WHERE AND cl.ts GLOB '[0-9][0-9][0-9][0-9]*' " +
             "GROUP BY year ORDER BY year DESC"
     )
     suspend fun getDiaryYearCounts(): List<DiaryYearCountRow>
 
     @Query(
+        "SELECT SUBSTR(cl.ts, 1, 4) AS year, COUNT(*) AS count " +
+            "FROM entries e " +
+            "CROSS JOIN consumption_log cl ON cl.entryId = e.id " +
+            "WHERE e.kind IN $DIARY_NON_SONG_KIND_IN AND $DIARY_ACTIVE_ENTRY_WHERE " +
+            "AND cl.ts GLOB '[0-9][0-9][0-9][0-9]*' " +
+            "GROUP BY year ORDER BY year DESC"
+    )
+    suspend fun getDiaryYearCountsNonSong(): List<DiaryYearCountRow>
+
+    @Query(
+        "SELECT SUBSTR(cl.ts, 1, 4) AS year, COUNT(*) AS count " +
+            "FROM entries e " +
+            "CROSS JOIN consumption_log cl ON cl.entryId = e.id " +
+            "WHERE e.kind = :kind AND $DIARY_ACTIVE_ENTRY_WHERE " +
+            "AND cl.ts GLOB '[0-9][0-9][0-9][0-9]*' " +
+            "GROUP BY year ORDER BY year DESC"
+    )
+    suspend fun getDiaryYearCountsForKind(kind: String): List<DiaryYearCountRow>
+
+    @Query(
         "SELECT SUBSTR(cl.ts, 1, 7) AS monthKey, COUNT(*) AS count " +
             "FROM consumption_log cl " +
-            "INNER JOIN entries e ON e.id = cl.entryId " +
+            "CROSS JOIN entries e ON e.id = cl.entryId " +
             "WHERE $DIARY_VISIBLE_ENTRY_WHERE " +
             "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
             "GROUP BY monthKey ORDER BY monthKey DESC"
@@ -1599,7 +2038,7 @@ interface RocheDao {
     @Query(
         "SELECT SUBSTR(cl.ts, 1, 7) AS monthKey, COUNT(*) AS count " +
             "FROM consumption_log cl " +
-            "INNER JOIN entries e ON e.id = cl.entryId " +
+            "CROSS JOIN entries e ON e.id = cl.entryId " +
             "WHERE $DIARY_VISIBLE_ENTRY_WHERE " +
             "AND cl.status = :status " +
             "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
@@ -1610,6 +2049,128 @@ interface RocheDao {
         minTs: String,
         maxTs: String,
     ): List<DiaryMonthCountRow>
+
+    @Query(
+        "SELECT SUBSTR(cl.ts, 1, 7) AS monthKey, COUNT(*) AS count " +
+            "FROM consumption_log cl " +
+            "CROSS JOIN entries e ON e.id = cl.entryId " +
+            "WHERE $DIARY_VISIBLE_ENTRY_WHERE " +
+            "AND +cl.status = 'consumed' " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "GROUP BY monthKey ORDER BY monthKey DESC"
+    )
+    suspend fun getDiaryMonthCountsConsumed(minTs: String, maxTs: String): List<DiaryMonthCountRow>
+
+    @Query(
+        "SELECT SUBSTR(cl.ts, 1, 7) AS monthKey, COUNT(*) AS count " +
+            "FROM entries e " +
+            "CROSS JOIN consumption_log cl ON cl.entryId = e.id " +
+            "WHERE e.kind IN $DIARY_NON_SONG_KIND_IN AND $DIARY_ACTIVE_ENTRY_WHERE " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "GROUP BY monthKey ORDER BY monthKey DESC"
+    )
+    suspend fun getDiaryMonthCountsNonSong(minTs: String, maxTs: String): List<DiaryMonthCountRow>
+
+    @Query(
+        "SELECT SUBSTR(cl.ts, 1, 7) AS monthKey, COUNT(*) AS count " +
+            "FROM entries e " +
+            "CROSS JOIN consumption_log cl ON cl.entryId = e.id " +
+            "WHERE e.kind IN $DIARY_NON_SONG_KIND_IN AND $DIARY_ACTIVE_ENTRY_WHERE " +
+            "AND +cl.status = :status " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "GROUP BY monthKey ORDER BY monthKey DESC"
+    )
+    suspend fun getDiaryMonthNonSongStatus(
+        status: String,
+        minTs: String,
+        maxTs: String,
+    ): List<DiaryMonthCountRow>
+
+    @Query(
+        "SELECT SUBSTR(cl.ts, 1, 7) AS monthKey, COUNT(*) AS count " +
+            "FROM entries e " +
+            "CROSS JOIN consumption_log cl ON cl.entryId = e.id " +
+            "WHERE e.kind = :kind AND $DIARY_ACTIVE_ENTRY_WHERE " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "GROUP BY monthKey ORDER BY monthKey DESC"
+    )
+    suspend fun getDiaryMonthCountsForKind(
+        kind: String,
+        minTs: String,
+        maxTs: String,
+    ): List<DiaryMonthCountRow>
+
+    @Query(
+        "SELECT SUBSTR(cl.ts, 1, 7) AS monthKey, COUNT(*) AS count " +
+            "FROM entries e " +
+            "CROSS JOIN consumption_log cl ON cl.entryId = e.id " +
+            "WHERE e.kind = :kind AND $DIARY_ACTIVE_ENTRY_WHERE " +
+            "AND +cl.status = :status " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "GROUP BY monthKey ORDER BY monthKey DESC"
+    )
+    suspend fun getDiaryMonthKindStatus(
+        kind: String,
+        status: String,
+        minTs: String,
+        maxTs: String,
+    ): List<DiaryMonthCountRow>
+
+    @Query(
+        "SELECT SUBSTR(cl.ts, 1, 7) AS monthKey, COUNT(*) AS count " +
+            "FROM consumption_log cl " +
+            "CROSS JOIN entries e ON e.id = cl.entryId " +
+            "WHERE e.kind = 'song' AND $DIARY_ACTIVE_ENTRY_WHERE " +
+            "AND cl.status = :status " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "GROUP BY monthKey ORDER BY monthKey DESC"
+    )
+    suspend fun getDiaryMonthSongStatus(
+        status: String,
+        minTs: String,
+        maxTs: String,
+    ): List<DiaryMonthCountRow>
+
+    @Query(
+        "SELECT e.kind AS kind, COUNT(*) AS count " +
+            "FROM entries e " +
+            "CROSS JOIN consumption_log cl ON cl.entryId = e.id " +
+            "WHERE e.kind IN $DIARY_NON_SONG_KIND_IN AND $DIARY_ACTIVE_ENTRY_WHERE " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "GROUP BY e.kind ORDER BY count DESC, e.kind ASC"
+    )
+    suspend fun getDiaryNonSongKindCounts(minTs: String, maxTs: String): List<KindCountRow>
+
+    @Query(
+        "SELECT e.kind AS kind, COUNT(*) AS count " +
+            "FROM entries e " +
+            "CROSS JOIN consumption_log cl ON cl.entryId = e.id " +
+            "WHERE e.kind IN $DIARY_NON_SONG_KIND_IN AND $DIARY_ACTIVE_ENTRY_WHERE " +
+            "AND +cl.status = :status " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "GROUP BY e.kind ORDER BY count DESC, e.kind ASC"
+    )
+    suspend fun getDiaryNonSongKindsStatus(
+        status: String,
+        minTs: String,
+        maxTs: String,
+    ): List<KindCountRow>
+
+    @Query(
+        "SELECT EXISTS(" +
+            "SELECT 1 FROM entries e " +
+            "CROSS JOIN consumption_log cl ON cl.entryId = e.id " +
+            "WHERE e.kind = 'song' AND $DIARY_ACTIVE_ENTRY_WHERE)"
+    )
+    suspend fun hasAnyDiarySongLogs(): Boolean
+
+    @Query(
+        "SELECT EXISTS(" +
+            "SELECT 1 FROM consumption_log cl " +
+            "CROSS JOIN entries e ON e.id = cl.entryId " +
+            "WHERE $DIARY_VISIBLE_ENTRY_WHERE)"
+    )
+    suspend fun hasAnyDiaryLogs(): Boolean
 
     @Query(
         "$DIARY_LOG_ROW_CROSS_SELECT " +
@@ -1630,6 +2191,96 @@ interface RocheDao {
             "ORDER BY cl.ts DESC, cl.id DESC LIMIT :limit OFFSET :offset"
     )
     suspend fun getDiaryLogPageByStatus(
+        status: String,
+        minTs: String,
+        maxTs: String,
+        limit: Int,
+        offset: Int,
+    ): List<DiaryLogRow>
+
+    @Query(
+        "$DIARY_LOG_ROW_ENTRIES_CROSS_SELECT " +
+            "AND e.kind IN $DIARY_NON_SONG_KIND_IN " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "ORDER BY cl.ts DESC, cl.id DESC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getDiaryLogPageNonSong(
+        minTs: String,
+        maxTs: String,
+        limit: Int,
+        offset: Int,
+    ): List<DiaryLogRow>
+
+    @Query(
+        "$DIARY_LOG_ROW_ENTRIES_CROSS_SELECT " +
+            "AND e.kind IN $DIARY_NON_SONG_KIND_IN " +
+            "AND +cl.status = :status " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "ORDER BY cl.ts DESC, cl.id DESC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getDiaryLogPageNonSongByStatus(
+        status: String,
+        minTs: String,
+        maxTs: String,
+        limit: Int,
+        offset: Int,
+    ): List<DiaryLogRow>
+
+    @Query(
+        "$DIARY_LOG_ROW_ENTRIES_CROSS_SELECT " +
+            "AND e.kind = :kind " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "ORDER BY cl.ts DESC, cl.id DESC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getDiaryLogPageForKind(
+        kind: String,
+        minTs: String,
+        maxTs: String,
+        limit: Int,
+        offset: Int,
+    ): List<DiaryLogRow>
+
+    @Query(
+        "$DIARY_LOG_ROW_ENTRIES_CROSS_SELECT " +
+            "AND e.kind = :kind " +
+            "AND +cl.status = :status " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "ORDER BY cl.ts DESC, cl.id DESC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getDiaryLogPageForKindByStatus(
+        kind: String,
+        status: String,
+        minTs: String,
+        maxTs: String,
+        limit: Int,
+        offset: Int,
+    ): List<DiaryLogRow>
+
+    @Query(
+        "SELECT $DIARY_LOG_ROW_COLUMNS " +
+            "FROM consumption_log cl " +
+            "CROSS JOIN entries e ON e.id = cl.entryId " +
+            "WHERE e.kind = 'song' AND $DIARY_ACTIVE_ENTRY_WHERE " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "ORDER BY cl.ts DESC, cl.id DESC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getDiaryLogPageForSong(
+        minTs: String,
+        maxTs: String,
+        limit: Int,
+        offset: Int,
+    ): List<DiaryLogRow>
+
+    @Query(
+        "SELECT $DIARY_LOG_ROW_COLUMNS " +
+            "FROM consumption_log cl " +
+            "CROSS JOIN entries e ON e.id = cl.entryId " +
+            "WHERE e.kind = 'song' AND $DIARY_ACTIVE_ENTRY_WHERE " +
+            "AND cl.status = :status " +
+            "AND cl.ts >= :minTs AND cl.ts < :maxTs " +
+            "ORDER BY cl.ts DESC, cl.id DESC LIMIT :limit OFFSET :offset"
+    )
+    suspend fun getDiaryLogPageForSongByStatus(
         status: String,
         minTs: String,
         maxTs: String,

@@ -17,6 +17,7 @@ import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.DiaryKindFilter
 import com.grayvines.roche.data.catalog.EntryDiaryLogsResult
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.ProvisionalFocusRank
@@ -621,6 +622,8 @@ sealed interface MainAction {
 
     data class SetDiaryYearFilter(val year: String?) : CatalogUi
 
+    data class SetDiaryKindFilter(val kindFilter: DiaryKindFilter) : CatalogUi
+
     data object LoadMoreDiary : CatalogUi
 
     data object LoadMoreCatalogDetailLogs : CatalogUi
@@ -630,7 +633,20 @@ sealed interface MainAction {
         val tier: Char?,
     ) : CatalogUi
 
+    data class SetCatalogCollectionKindFilter(
+        val collectionId: String?,
+        val kind: EntryKind?,
+    ) : CatalogUi
+
     data object LoadMoreCatalogCollection : CatalogUi
+
+    data class SetStarredKindFilter(
+        val kind: EntryKind?,
+        val filterKey: String? = null,
+        val kinds: Set<EntryKind> = emptySet(),
+    ) : CatalogUi
+
+    data object LoadMoreStarredCollection : CatalogUi
 
     data object LoadMoreCatalogSearch : CatalogUi
 

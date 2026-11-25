@@ -7,7 +7,9 @@ import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.DEFAULT_DIARY_PAGE_SIZE
 import com.grayvines.roche.data.catalog.DEFAULT_ENTRY_DETAIL_LOGS_LIMIT
 import com.grayvines.roche.data.catalog.DiaryEntryItem
+import com.grayvines.roche.data.catalog.DiaryKindFilter
 import com.grayvines.roche.data.catalog.EntryDiaryLogsResult
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.GlobalTierIndex
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
@@ -25,10 +27,13 @@ data class DiaryUiState(
     val entries: List<DiaryEntryItem> = emptyList(),
     val availableYears: List<String> = emptyList(),
     val monthCounts: Map<String, Int> = emptyMap(),
+    val nonSongKindCounts: List<Pair<EntryKind, Int>> = emptyList(),
+    val hasSongLogs: Boolean = false,
     val totalFilteredCount: Int = 0,
     val hasAnyEntries: Boolean = false,
     val statusFilter: ConsumptionStatus? = null,
     val yearFilter: String? = null,
+    val kindFilter: DiaryKindFilter = DiaryKindFilter.DefaultNonSong,
     val hasMore: Boolean = false,
     val isLoadingMore: Boolean = false,
     val isLoaded: Boolean = false,
@@ -42,6 +47,7 @@ private data class DiaryInvalidationKey(
 private data class DiaryQueryParams(
     val statusFilter: ConsumptionStatus? = null,
     val yearFilter: String? = null,
+    val kindFilter: DiaryKindFilter = DiaryKindFilter.DefaultNonSong,
     val pageLimit: Int = DEFAULT_DIARY_PAGE_SIZE,
     val loadMoreNonce: Int = 0,
 )
@@ -50,6 +56,7 @@ private data class LoadedDiaryCacheKey(
     val invalidation: DiaryInvalidationKey,
     val statusFilter: ConsumptionStatus?,
     val effectiveYear: String?,
+    val kindFilter: DiaryKindFilter,
 )
 
 private data class DetailLogsQueryParams(
@@ -142,6 +149,16 @@ internal class DiaryFeatureModel(
         }
     }
 
+    fun setKindFilter(kindFilter: DiaryKindFilter) {
+        diaryQuery.update { current ->
+            if (current.kindFilter == kindFilter) {
+                current
+            } else {
+                current.copy(kindFilter = kindFilter, pageLimit = DEFAULT_DIARY_PAGE_SIZE)
+            }
+        }
+    }
+
     fun loadMoreDiary() {
         val currentState = _diaryState.value
         if (!currentState.hasMore || currentState.isLoadingMore) return
@@ -163,6 +180,7 @@ internal class DiaryFeatureModel(
         when (action) {
             is MainAction.SetDiaryStatusFilter -> setStatusFilter(action.status)
             is MainAction.SetDiaryYearFilter -> setYearFilter(action.year)
+            is MainAction.SetDiaryKindFilter -> setKindFilter(action.kindFilter)
             MainAction.LoadMoreDiary -> loadMoreDiary()
             MainAction.LoadMoreCatalogDetailLogs -> loadMoreDetailLogs()
             else -> return false
@@ -180,9 +198,10 @@ internal class DiaryFeatureModel(
                 invalidation = invalidation,
                 statusFilter = query.statusFilter,
                 effectiveYear = query.yearFilter,
+                kindFilter = query.kindFilter,
             )
         if (prevState.isLoaded && lastLoadedDiaryKey == desiredCacheKey) {
-            if (query.pageLimit <= prevState.entries.size) {
+            if (query.pageLimit <= prevState.entries.size || !prevState.hasMore) {
                 if (prevState.isLoadingMore) {
                     _diaryState.update { it.copy(isLoadingMore = false) }
                 }
@@ -203,35 +222,25 @@ internal class DiaryFeatureModel(
     ): Boolean {
         val delta = (query.pageLimit - prevState.entries.size).coerceAtLeast(1)
         val result = runSuspendCatching {
-            repository.catalog.loadDiaryPage(
+            repository.catalog.loadDiaryLogSlice(
                 status = query.statusFilter,
-                year = query.yearFilter,
+                year = prevState.yearFilter,
+                kindFilter = query.kindFilter,
                 limit = delta,
                 offset = prevState.entries.size,
                 globalTiers = invalidation.globalTiers,
             )
         }
-        val loaded = result.getOrNull()
-        if (loaded == null) {
+        val loadedRows = result.getOrNull()
+        if (loadedRows == null) {
             _diaryState.update { it.copy(isLoadingMore = false) }
             return true
         }
-        if (loaded.effectiveYear != prevState.yearFilter) return false
-        val merged = mergeUniqueDiaryItems(prevState.entries, loaded.entries)
-        lastLoadedDiaryKey = cacheKey.copy(effectiveYear = loaded.effectiveYear)
+        val merged = mergeUniqueDiaryItems(prevState.entries, loadedRows)
+        val hasMore = loadedRows.size >= delta && merged.size < prevState.totalFilteredCount
+        lastLoadedDiaryKey = cacheKey
         _diaryState.value =
-            DiaryUiState(
-                entries = merged,
-                availableYears = loaded.availableYears,
-                monthCounts = loaded.monthCounts,
-                totalFilteredCount = loaded.totalFilteredCount,
-                hasAnyEntries = loaded.hasAnyEntries,
-                statusFilter = query.statusFilter,
-                yearFilter = loaded.effectiveYear,
-                hasMore = loaded.hasMore,
-                isLoadingMore = false,
-                isLoaded = true,
-            )
+            prevState.copy(entries = merged, hasMore = hasMore, isLoadingMore = false)
         return true
     }
 
@@ -243,6 +252,7 @@ internal class DiaryFeatureModel(
             repository.catalog.loadDiaryPage(
                 status = query.statusFilter,
                 year = query.yearFilter,
+                kindFilter = query.kindFilter,
                 limit = query.pageLimit,
                 offset = 0,
                 globalTiers = invalidation.globalTiers,
@@ -258,16 +268,20 @@ internal class DiaryFeatureModel(
                 invalidation = invalidation,
                 statusFilter = query.statusFilter,
                 effectiveYear = loaded.effectiveYear,
+                kindFilter = query.kindFilter,
             )
         _diaryState.value =
             DiaryUiState(
                 entries = loaded.entries,
                 availableYears = loaded.availableYears,
                 monthCounts = loaded.monthCounts,
+                nonSongKindCounts = loaded.nonSongKindCounts,
+                hasSongLogs = loaded.hasSongLogs,
                 totalFilteredCount = loaded.totalFilteredCount,
                 hasAnyEntries = loaded.hasAnyEntries,
                 statusFilter = query.statusFilter,
                 yearFilter = loaded.effectiveYear,
+                kindFilter = query.kindFilter,
                 hasMore = loaded.hasMore,
                 isLoadingMore = false,
                 isLoaded = true,

@@ -1896,7 +1896,8 @@ private fun buildCatalogDetailModel(entryId: String, state: MainUiState): Catalo
         loadedDetailLogs?.logs ?: catalog.recentDiaryEntries.filter { it.entryId == entry.id }
     val isLoadingDiaryLogs =
         loadedDetailLogs == null &&
-            catalog.totalDiaryCount > catalog.recentDiaryEntries.size &&
+            (entry.kind == EntryKind.SONG ||
+                catalog.totalDiaryCount > catalog.recentDiaryEntries.size) &&
             state.catalogDetailStack.lastOrNull() == entry.id
     return CatalogDetailModel(
         entry = entry,
