@@ -393,10 +393,19 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
             }
             is UndoActionKind.RestoreCollectionEntry -> {
                 val targetCols = kind.collectionIds.ifEmpty { listOf(kind.collectionId) }
-                targetCols.forEach { colId ->
-                    host.repository.catalog.addCollectionEntry(colId, kind.entryId)
-                }
-                host.showStatusMessage("Restored to ${kind.label}")
+                val restored =
+                    host.repository.catalog.addEntryToCollections(
+                        collectionIds = targetCols,
+                        entryId = kind.entryId,
+                        ignoreMissingCollections = true,
+                    )
+                val msg =
+                    if (restored.isNotEmpty()) {
+                        "Restored to ${kind.label}"
+                    } else {
+                        "Could not restore to ${kind.label}"
+                    }
+                host.showStatusMessage(msg)
             }
             is UndoActionKind.RestoreQueueItem -> {
                 restoreQueueItemAtIndex(kind.entryId, kind.previousIndex)

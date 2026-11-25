@@ -12,6 +12,15 @@ import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.tryPerformAccessibilityChecks
 import androidx.compose.ui.unit.Density
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.data.catalog.CatalogEntryItem
+import com.grayvines.roche.data.catalog.CatalogListSummary
+import com.grayvines.roche.data.catalog.CatalogSnapshot
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.CollectionGeneratorState
+import com.grayvines.roche.data.catalog.CollectionRole
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.RankedCatalogEntry
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
@@ -85,20 +94,66 @@ class AccessibilityTest {
     @Test
     fun homePassesAccessibilityChecksInDarkTheme() {
         renderAndAudit(
-            state = populatedState(activeTab = AppTab.HOME, themeMode = ThemeMode.DARK),
+            state =
+                populatedState(
+                    activeTab = AppTab.HOME,
+                    themeMode = ThemeMode.DARK,
+                    includeCollectionDraw = true,
+                ),
             expectedVisibleText = SAMPLE_ARTICLE_TITLE,
             themeMode = ThemeMode.DARK,
-            scrollToTagAndAudit = "home_widget_recent_diary",
+            scrollToTagAndAudit = "home_bottom_spacer",
+            assertVisibleTagAfterScroll = "home_widget_collection_draw",
         )
     }
 
     @Test
     fun homePassesAccessibilityChecksInLightTheme() {
         renderAndAudit(
-            state = populatedState(activeTab = AppTab.HOME, themeMode = ThemeMode.LIGHT),
+            state =
+                populatedState(
+                    activeTab = AppTab.HOME,
+                    themeMode = ThemeMode.LIGHT,
+                    includeCollectionDraw = true,
+                ),
             expectedVisibleText = SAMPLE_ARTICLE_TITLE,
             themeMode = ThemeMode.LIGHT,
-            scrollToTagAndAudit = "home_widget_recent_diary",
+            scrollToTagAndAudit = "home_bottom_spacer",
+            assertVisibleTagAfterScroll = "home_widget_collection_draw",
+        )
+    }
+
+    @Test
+    fun homePassesAccessibilityChecksAtLargeFontScale() {
+        renderAndAudit(
+            state =
+                populatedState(
+                    activeTab = AppTab.HOME,
+                    themeMode = ThemeMode.DARK,
+                    includeCollectionDraw = true,
+                ),
+            expectedVisibleText = SAMPLE_ARTICLE_TITLE,
+            themeMode = ThemeMode.DARK,
+            fontScale = 1.5f,
+            scrollToTagAndAudit = "home_bottom_spacer",
+            assertVisibleTagAfterScroll = "home_widget_collection_draw",
+        )
+    }
+
+    @Test
+    fun homePassesAccessibilityChecksAtMaxFontScaleInLightTheme() {
+        renderAndAudit(
+            state =
+                populatedState(
+                    activeTab = AppTab.HOME,
+                    themeMode = ThemeMode.LIGHT,
+                    includeCollectionDraw = true,
+                ),
+            expectedVisibleText = SAMPLE_ARTICLE_TITLE,
+            themeMode = ThemeMode.LIGHT,
+            fontScale = 2.0f,
+            scrollToTagAndAudit = "home_bottom_spacer",
+            assertVisibleTagAfterScroll = "home_widget_collection_draw",
         )
     }
 
@@ -215,6 +270,7 @@ class AccessibilityTest {
         themeMode: ThemeMode,
         fontScale: Float = 1.0f,
         scrollToTagAndAudit: String? = null,
+        assertVisibleTagAfterScroll: String? = null,
     ) {
         composeRule.setContent {
             val baseDensity = LocalDensity.current
@@ -238,24 +294,55 @@ class AccessibilityTest {
             .assertIsDisplayed()
         composeRule.onRoot().tryPerformAccessibilityChecks()
         if (scrollToTagAndAudit != null) {
-            composeRule.onNodeWithTag(scrollToTagAndAudit).performScrollTo().assertIsDisplayed()
+            composeRule.onNodeWithTag(scrollToTagAndAudit).performScrollTo()
+            composeRule
+                .onNodeWithTag(assertVisibleTagAfterScroll ?: scrollToTagAndAudit)
+                .assertIsDisplayed()
             composeRule.onRoot().tryPerformAccessibilityChecks()
         }
     }
 
-    private fun populatedState(activeTab: AppTab, themeMode: ThemeMode): MainUiState {
+    private fun populatedState(
+        activeTab: AppTab,
+        themeMode: ThemeMode,
+        includeCollectionDraw: Boolean = false,
+    ): MainUiState {
         val article = sampleArticleEntry()
+        val freshUnread =
+            article.copy(
+                id = "entry-a11y-fresh",
+                title = "Fresh Inbox Essay on Layout Systems",
+                readProgress = 0.0,
+            )
         val archived = sampleArchivedEntry()
         val podcast = samplePodcastEntry()
-        val allEntries = listOf(article, archived, podcast)
+        val allEntries =
+            if (includeCollectionDraw) {
+                listOf(article, freshUnread, archived, podcast)
+            } else {
+                listOf(article, archived, podcast)
+            }
         val feeds = listOf(sampleActiveFeed(), sampleArchivedFeed())
         val tags = listOf(TagItem(id = "tag-1", name = "accessibility", unreadCount = 2))
+        val catalog =
+            if (includeCollectionDraw) {
+                CatalogSnapshot(
+                    wantQueues = sampleHomeWantQueues(),
+                    wantToReadPreview = listOf(sampleHomeWantPreview()),
+                    wantToReadEntryIds = setOf("want-a11y-1"),
+                    wantEntryIds = setOf("want-a11y-1"),
+                    generators = listOf(sampleCollectionGenerator()),
+                )
+            } else {
+                CatalogSnapshot()
+            }
         return MainUiState(
             activeTab = activeTab,
             visibleEntries = allEntries,
             allEntries = allEntries,
             feeds = feeds,
             tags = tags,
+            catalog = catalog,
             settings =
                 Settings(
                     themeMode = themeMode,
@@ -263,6 +350,76 @@ class AccessibilityTest {
                 ),
         )
     }
+
+    private fun sampleCollectionGenerator(): CollectionGeneratorState =
+        CollectionGeneratorState(
+            collectionId = "col-1001-albums",
+            collectionSlug = "1001_albums",
+            collectionTitle = "1001 Albums",
+            enabled = true,
+            currentDraw =
+                CollectionDrawSnapshot(
+                    collectionId = "col-1001-albums",
+                    collectionSlug = "1001_albums",
+                    collectionTitle = "1001 Albums",
+                    entryId = "album-a11y-1",
+                    title = "Kind of Blue",
+                    creator = "Miles Davis",
+                    releaseDate = "1959",
+                    tags = listOf("jazz", "modal jazz"),
+                    drawNumber = 14,
+                    totalCount = 1001,
+                    remainingCount = 988,
+                    wikipediaUrl = "https://en.wikipedia.org/wiki/Kind_of_Blue",
+                ),
+            consumedCount = 13,
+            abandonedCount = 0,
+            totalCount = 1001,
+        )
+
+    private fun sampleHomeWantQueues(): List<CatalogListSummary> =
+        listOf(
+            CatalogListSummary(
+                collectionId = WANT_TO_READ_COLLECTION_ID,
+                slug = "want:read",
+                title = "Want to Read",
+                isDynamic = false,
+                role = CollectionRole.WANT,
+                entryCount = 1,
+                isPriorityScoped = true,
+            ),
+            CatalogListSummary(
+                collectionId = "col-want-watch",
+                slug = "want:watch",
+                title = "Want to Watch",
+                isDynamic = false,
+                role = CollectionRole.WANT,
+                entryCount = 2,
+                isPriorityScoped = true,
+            ),
+        )
+
+    private fun sampleHomeWantPreview(): RankedCatalogEntry =
+        RankedCatalogEntry(
+            entry =
+                CatalogEntryItem(
+                    id = "want-a11y-1",
+                    kind = EntryKind.ARTICLE,
+                    title = "Queued Systems Reading Note",
+                    creators = emptyList(),
+                    url = "https://example.com/queued-note",
+                    publishedAt = null,
+                    releaseYear = null,
+                    summary = null,
+                    thumbnailUrl = null,
+                    identifiers = emptyList(),
+                ),
+            rank = 1,
+            mean = 0.0,
+            variance = 1.0,
+            scoreOutOfTen = 5.0,
+            tier = null,
+        )
 
     private fun sampleArticleEntry(): InboxEntry =
         InboxEntry(

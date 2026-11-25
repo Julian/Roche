@@ -741,7 +741,11 @@ internal fun RocheSectionHeader(
     when {
         onActionClick == null && onSecondaryActionClick == null ->
             Box(modifier = modifier.padding(horizontal = 2.dp)) {
-                SectionHeaderLabelGroup(label = label, badgeText = badgeText)
+                SectionHeaderLabelGroup(
+                    label = label,
+                    badgeText = badgeText,
+                    singleLineLabel = false,
+                )
             }
         onSecondaryActionClick == null && onActionClick != null ->
             SingleActionSectionHeaderRow(
@@ -792,13 +796,20 @@ private fun SingleActionSectionHeaderRow(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        SectionHeaderLabelGroup(label = label, badgeText = badgeText)
+        SectionHeaderLabelGroup(
+            label = label,
+            badgeText = badgeText,
+            modifier = Modifier.weight(1f, fill = false),
+        )
         if (!actionLabel.isNullOrBlank()) {
             Text(
                 text = actionLabel,
                 color = colors.accentBlue,
                 fontWeight = FontWeight.Normal,
                 fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(start = 6.dp),
             )
         }
     }
@@ -823,7 +834,11 @@ private fun DualActionSectionHeaderRow(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        SectionHeaderLabelGroup(label = label, badgeText = badgeText)
+        SectionHeaderLabelGroup(
+            label = label,
+            badgeText = badgeText,
+            modifier = Modifier.weight(1f, fill = false).padding(end = 4.dp),
+        )
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -868,14 +883,22 @@ private fun SectionHeaderInlineAction(
             color = color,
             fontWeight = FontWeight.Medium,
             fontSize = 12.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
 
 @Composable
-internal fun SectionHeaderLabelGroup(label: String, badgeText: String?) {
+internal fun SectionHeaderLabelGroup(
+    label: String,
+    badgeText: String?,
+    modifier: Modifier = Modifier,
+    singleLineLabel: Boolean = true,
+) {
     val colors = LocalRocheColors.current
     Row(
+        modifier = modifier,
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
@@ -885,14 +908,17 @@ internal fun SectionHeaderLabelGroup(label: String, badgeText: String?) {
             fontWeight = FontWeight.Medium,
             fontSize = 11.sp,
             letterSpacing = 0.8.sp,
-            modifier = Modifier.semantics { heading() },
+            maxLines = if (singleLineLabel) 1 else Int.MAX_VALUE,
+            overflow = if (singleLineLabel) TextOverflow.Ellipsis else TextOverflow.Clip,
+            modifier = Modifier.weight(1f, fill = false).semantics { heading() },
         )
         if (!badgeText.isNullOrBlank()) {
             val badgeShape = RoundedCornerShape(999.dp)
             Box(
                 contentAlignment = Alignment.Center,
                 modifier =
-                    Modifier.clip(badgeShape)
+                    Modifier.widthIn(max = SECTION_HEADER_BADGE_MAX_WIDTH)
+                        .clip(badgeShape)
                         .background(colors.surfaceElevated)
                         .border(1.dp, colors.border, badgeShape)
                         .padding(horizontal = 6.dp, vertical = 1.dp),
@@ -903,11 +929,15 @@ internal fun SectionHeaderLabelGroup(label: String, badgeText: String?) {
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Normal,
                     fontSize = 10.5.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
         }
     }
 }
+
+private val SECTION_HEADER_BADGE_MAX_WIDTH = 150.dp
 
 @Composable
 internal fun RocheSurfaceCard(

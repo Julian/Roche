@@ -830,6 +830,55 @@ class CatalogStore(
         notifyLocalMutation()
     }
 
+    suspend fun addEntryToCollections(
+        collectionIds: List<String>,
+        entryId: String,
+        ignoreMissingCollections: Boolean = false,
+    ): List<String> {
+        val distinctIds = collectionIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (distinctIds.isEmpty()) return emptyList()
+        val addedIds = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val resolvedEntry =
+                followMergedId(entryId) ?: error("Catalog entry not found: $entryId")
+            val specs =
+                distinctIds
+                    .mapNotNull { colId ->
+                        resolveCollectionSpec(colId)
+                            ?: if (ignoreMissingCollections) {
+                                null
+                            } else {
+                                error("Collection not found: $colId")
+                            }
+                    }
+                    .distinctBy { it.collectionId }
+            if (specs.isEmpty()) {
+                emptyList()
+            } else {
+                val nowIso = nowUtcIso()
+                val nodeId = resolveLocalPeerId()
+                dao.executeInTransaction {
+                    for (spec in specs) {
+                        addCollectionMemberInDao(
+                            dao = dao,
+                            spec = spec,
+                            entryId = resolvedEntry,
+                            position = null,
+                            nowIso = nowIso,
+                            markDirty = true,
+                            nodeId = nodeId,
+                        )
+                    }
+                }
+                specs.map { it.collectionId }
+            }
+        }
+        if (addedIds.isNotEmpty()) {
+            notifyLocalMutation()
+        }
+        return addedIds
+    }
+
     suspend fun removeCollectionEntry(
         collectionIdOrSlug: String,
         entryId: String,

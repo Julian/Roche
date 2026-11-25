@@ -398,7 +398,7 @@ private fun StartedCatalogMetaColumn(
     val subtitle =
         remember(item.creators, item.releaseYear, item.dateLabel) {
             buildList {
-                    val base = buildHomeDiarySubtitle(item)
+                    val base = formatDiaryEntrySubtitle(item)
                     if (base.isNotBlank()) add(base)
                     if (item.dateLabel.isNotBlank()) add("Started ${item.dateLabel}")
                 }
@@ -532,5 +532,16 @@ private fun InProgressEntryThumbnail(entry: InboxEntry) {
                 modifier = Modifier.fillMaxSize(),
             )
         }
+    }
+}
+
+private fun formatDiaryEntrySubtitle(diary: DiaryEntryItem): String {
+    val creatorText = diary.creators.joinToString(", ")
+    val year = diary.releaseYear?.takeIf { it > 0 }
+    return when {
+        creatorText.isNotBlank() && year != null -> "$creatorText ($year)"
+        creatorText.isNotBlank() -> creatorText
+        year != null -> year.toString()
+        else -> ""
     }
 }

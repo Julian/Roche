@@ -23,7 +23,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -46,31 +45,34 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.isSpecified
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.formatInlineMathAnnotated
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
-import com.grayvines.roche.data.catalog.DiaryEntryItem
 import com.grayvines.roche.data.catalog.RankedCatalogEntry
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.extractCleanDomain
 import com.grayvines.roche.ui.components.BottomTabIcon
-import com.grayvines.roche.ui.components.CatalogCoverThumbnail
 import com.grayvines.roche.ui.components.EntrySourceMetadataRow
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
@@ -81,7 +83,6 @@ import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.components.SkipDrawIcon
-import com.grayvines.roche.ui.components.TierBadgePill
 import com.grayvines.roche.ui.components.WikipediaIcon
 import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
 import com.grayvines.roche.ui.components.rememberHighResImageBitmap
@@ -91,6 +92,7 @@ import com.grayvines.roche.ui.theme.RocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import java.text.NumberFormat
 import java.util.Locale
+import kotlin.math.roundToInt
 
 @Composable
 fun HomeTabContent(
@@ -103,6 +105,7 @@ fun HomeTabContent(
         onAction(MainAction.LaunchCollectionDraw(draw))
     },
 ) {
+    val fontScale = LocalDensity.current.fontScale
     RocheRefreshableTabScaffold(
         isRefreshing = state.isManualRefreshing,
         onRefresh = { onAction(MainAction.ManualRefresh) },
@@ -111,11 +114,18 @@ fun HomeTabContent(
         header = { HomeTopHeaderBar(onAction = onAction) },
     ) {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-            val isWideLayout = maxWidth >= WIDE_DASHBOARD_BREAKPOINT
+            val inboxMaxItems =
+                computeHomeInboxMaxItems(
+                    viewportWidth = maxWidth,
+                    viewportHeight = maxHeight,
+                    fontScale = fontScale,
+                )
             HomeScrollableGrid(
                 state = state,
                 scrollState = scrollState,
-                isWideLayout = isWideLayout,
+                viewportWidth = maxWidth,
+                fontScale = fontScale,
+                inboxMaxItems = inboxMaxItems,
                 activeAudioEntryId = activeAudioEntryId,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
@@ -157,13 +167,21 @@ private fun HomeTopHeaderBar(onAction: (MainAction) -> Unit) {
 internal fun HomeScrollableGrid(
     state: MainUiState,
     scrollState: ScrollState,
-    isWideLayout: Boolean,
+    viewportWidth: Dp,
+    inboxMaxItems: Int,
     activeAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+    fontScale: Float = 1f,
 ) {
     val activeDraws = state.activeCollectionDraws
+    val bottomLayout =
+        resolveHomeBottomLayout(
+            viewportWidth = viewportWidth,
+            hasActiveDraws = activeDraws.isNotEmpty(),
+            fontScale = fontScale,
+        )
     val homeContinueItems =
         remember(state.inProgressItems) { state.inProgressItems.take(HOME_CONTINUE_ITEMS) }
     val shownContinueIds =
@@ -172,156 +190,91 @@ internal fun HomeScrollableGrid(
         modifier =
             Modifier.fillMaxSize()
                 .verticalScroll(scrollState)
-                .padding(horizontal = 14.dp, vertical = 12.dp),
+                .padding(horizontal = HOME_HORIZONTAL_PADDING, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        if (isWideLayout) {
-            HomeWideTwoColumnDashboard(
-                state = state,
-                activeDraws = activeDraws,
-                homeContinueItems = homeContinueItems,
-                shownContinueIds = shownContinueIds,
+        if (homeContinueItems.isNotEmpty()) {
+            HomeContinueWidget(
+                items = homeContinueItems,
+                totalInProgressCount = state.inProgressItems.size,
+                readableIds = state.readableEntryIds,
                 activeAudioEntryId = activeAudioEntryId,
-                onAction = onAction,
-                onOpenExternalUrl = onOpenExternalUrl,
-                onOpenCollectionDraw = onOpenCollectionDraw,
-            )
-        } else {
-            HomeSingleColumnDashboard(
-                state = state,
-                activeDraws = activeDraws,
-                homeContinueItems = homeContinueItems,
-                shownContinueIds = shownContinueIds,
-                activeAudioEntryId = activeAudioEntryId,
-                onAction = onAction,
-                onOpenExternalUrl = onOpenExternalUrl,
-                onOpenCollectionDraw = onOpenCollectionDraw,
-            )
-        }
-        Spacer(modifier = Modifier.height(76.dp))
-    }
-}
-
-@Composable
-@Suppress("LongParameterList")
-private fun HomeWideTwoColumnDashboard(
-    state: MainUiState,
-    activeDraws: List<CollectionGeneratorState>,
-    homeContinueItems: List<InProgressItem>,
-    shownContinueIds: Set<String>,
-    activeAudioEntryId: String?,
-    onAction: (MainAction) -> Unit,
-    onOpenExternalUrl: (String) -> Unit,
-    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
-        verticalAlignment = Alignment.Top,
-    ) {
-        Column(
-            modifier = Modifier.weight(1.12f),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            if (homeContinueItems.isNotEmpty()) {
-                HomeContinueWidget(
-                    items = homeContinueItems,
-                    totalInProgressCount = state.inProgressItems.size,
-                    readableIds = state.readableEntryIds,
-                    activeAudioEntryId = activeAudioEntryId,
-                    onAction = onAction,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                )
-            }
-            HomeInboxWidget(
-                state = state,
-                maxItems = WIDE_INBOX_ITEMS,
-                excludeEntryIds = shownContinueIds,
-                activeAudioEntryId = activeAudioEntryId,
-                onAction = onAction,
-            )
-            HomeWantQueueWidget(
-                state = state,
-                maxItems = HOME_QUEUE_PREVIEW_ITEMS,
-                excludeEntryIds = shownContinueIds,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
             )
         }
-        Column(
-            modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            activeDraws.forEach { gen ->
-                HomeCollectionDrawWidget(
-                    generator = gen,
-                    resolvingMusicEntryId = state.resolvingMusicEntryId,
-                    onAction = onAction,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                    onOpenCollectionDraw = onOpenCollectionDraw,
-                )
-            }
-            HomeRecentDiaryWidget(
-                state = state,
-                maxItems = WIDE_DIARY_ITEMS,
-                onAction = onAction,
-                onOpenExternalUrl = onOpenExternalUrl,
-            )
-        }
-    }
-}
-
-@Composable
-@Suppress("LongParameterList")
-private fun HomeSingleColumnDashboard(
-    state: MainUiState,
-    activeDraws: List<CollectionGeneratorState>,
-    homeContinueItems: List<InProgressItem>,
-    shownContinueIds: Set<String>,
-    activeAudioEntryId: String?,
-    onAction: (MainAction) -> Unit,
-    onOpenExternalUrl: (String) -> Unit,
-    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
-) {
-    activeDraws.forEach { gen ->
-        HomeCollectionDrawWidget(
-            generator = gen,
-            resolvingMusicEntryId = state.resolvingMusicEntryId,
+        HomeInboxWidget(
+            state = state,
+            maxItems = inboxMaxItems,
+            excludeEntryIds = shownContinueIds,
+            activeAudioEntryId = activeAudioEntryId,
+            onAction = onAction,
+        )
+        HomeBottomWidgetsSection(
+            state = state,
+            activeDraws = activeDraws,
+            bottomLayout = bottomLayout,
+            shownContinueIds = shownContinueIds,
             onAction = onAction,
             onOpenExternalUrl = onOpenExternalUrl,
             onOpenCollectionDraw = onOpenCollectionDraw,
         )
+        Spacer(modifier = Modifier.fillMaxWidth().height(76.dp).testTag("home_bottom_spacer"))
     }
-    if (homeContinueItems.isNotEmpty()) {
-        HomeContinueWidget(
-            items = homeContinueItems,
-            totalInProgressCount = state.inProgressItems.size,
-            readableIds = state.readableEntryIds,
-            activeAudioEntryId = activeAudioEntryId,
+}
+
+@Composable
+@Suppress("LongParameterList")
+private fun HomeBottomWidgetsSection(
+    state: MainUiState,
+    activeDraws: List<CollectionGeneratorState>,
+    bottomLayout: HomeBottomLayout,
+    shownContinueIds: Set<String>,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+) {
+    val renderQueue: @Composable (Modifier) -> Unit = { queueModifier ->
+        HomeWantQueueWidget(
+            state = state,
+            maxItems = HOME_QUEUE_PREVIEW_ITEMS,
+            excludeEntryIds = shownContinueIds,
+            isCompactColumn = bottomLayout.isCompactColumn,
             onAction = onAction,
             onOpenExternalUrl = onOpenExternalUrl,
+            modifier = queueModifier,
         )
     }
-    HomeInboxWidget(
-        state = state,
-        maxItems = COMPACT_INBOX_ITEMS,
-        excludeEntryIds = shownContinueIds,
-        activeAudioEntryId = activeAudioEntryId,
-        onAction = onAction,
-    )
-    HomeWantQueueWidget(
-        state = state,
-        maxItems = HOME_QUEUE_PREVIEW_ITEMS,
-        excludeEntryIds = shownContinueIds,
-        onAction = onAction,
-        onOpenExternalUrl = onOpenExternalUrl,
-    )
-    HomeRecentDiaryWidget(
-        state = state,
-        maxItems = COMPACT_DIARY_ITEMS,
-        onAction = onAction,
-        onOpenExternalUrl = onOpenExternalUrl,
-    )
+    val renderDraws: @Composable () -> Unit = {
+        activeDraws.forEach { gen ->
+            HomeCollectionDrawWidget(
+                generator = gen,
+                resolvingMusicEntryId = state.resolvingMusicEntryId,
+                isCompactColumn = bottomLayout.isCompactColumn,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+                onOpenCollectionDraw = onOpenCollectionDraw,
+            )
+        }
+    }
+    if (bottomLayout.useTwoColumns) {
+        Row(
+            modifier = Modifier.fillMaxWidth().testTag("home_bottom_two_column_row"),
+            horizontalArrangement = Arrangement.spacedBy(bottomLayout.columnGap),
+            verticalAlignment = Alignment.Top,
+        ) {
+            renderQueue(Modifier.weight(1f))
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                renderDraws()
+            }
+        }
+    } else {
+        renderQueue(Modifier)
+        renderDraws()
+    }
 }
 
 @Composable
@@ -332,6 +285,7 @@ internal fun HomeCollectionDrawWidget(
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
     modifier: Modifier = Modifier,
     resolvingMusicEntryId: String? = null,
+    isCompactColumn: Boolean = false,
 ) {
     val draw = generator.currentDraw
     val openCollectionList = {
@@ -342,19 +296,20 @@ internal fun HomeCollectionDrawWidget(
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         RocheSectionHeader(
-            label = "Daily Draw",
-            actionLabel = "${generator.collectionTitle} →",
+            label = generator.collectionTitle,
+            actionLabel = "List →",
             actionTestTag = "collection_draw_header_open_list_btn",
             onActionClick = openCollectionList,
         )
         RocheSurfaceCard {
             if (draw != null) {
-                CollectionDrawSleeveCardBody(
+                CollectionDrawCardBody(
                     generator = generator,
                     draw = draw,
                     isResolvingMusic =
                         resolvingMusicEntryId != null &&
                             resolvingMusicEntryId == draw.musicResolveKey(),
+                    isCompactColumn = isCompactColumn,
                     onAction = onAction,
                     onOpenExternalUrl = onOpenExternalUrl,
                     onOpenCollectionDraw = onOpenCollectionDraw,
@@ -372,10 +327,11 @@ internal fun HomeCollectionDrawWidget(
 }
 
 @Composable
-private fun CollectionDrawSleeveCardBody(
+private fun CollectionDrawCardBody(
     generator: CollectionGeneratorState,
     draw: CollectionDrawSnapshot,
     isResolvingMusic: Boolean,
+    isCompactColumn: Boolean,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
@@ -389,11 +345,14 @@ private fun CollectionDrawSleeveCardBody(
         }
     }
     Column(
-        modifier = Modifier.fillMaxWidth().padding(bottom = 11.dp),
+        modifier = Modifier.fillMaxWidth().padding(bottom = if (isCompactColumn) 8.dp else 11.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        CollectionDrawTitleRow(
+        CollectionDrawUpperBody(
             draw = draw,
+            isResolvingMusic = isResolvingMusic,
+            isCompactColumn = isCompactColumn,
+            onOpenCover = { onOpenCollectionDraw(draw) },
             onOpenDetail = openDrawDetail,
             onSkip = {
                 onAction(
@@ -403,22 +362,21 @@ private fun CollectionDrawSleeveCardBody(
                     )
                 )
             },
-        )
-        CollectionDrawMediaRow(
-            draw = draw,
-            isResolvingMusic = isResolvingMusic,
-            onOpenCover = { onOpenCollectionDraw(draw) },
-            onOpenDetail = openDrawDetail,
             onOpenExternalUrl = onOpenExternalUrl,
         )
         HorizontalDivider(
             color = colors.border,
             thickness = 1.dp,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
+            modifier =
+                Modifier.padding(
+                    horizontal = if (isCompactColumn) 10.dp else 12.dp,
+                    vertical = if (isCompactColumn) 0.dp else 2.dp,
+                ),
         )
         CollectionDrawFooterRow(
             generator = generator,
             draw = draw,
+            isCompactColumn = isCompactColumn,
             onRank = {
                 onAction(
                     MainAction.OpenDrawNoteDialog(
@@ -432,66 +390,211 @@ private fun CollectionDrawSleeveCardBody(
 }
 
 @Composable
+private fun CollectionDrawUpperBody(
+    draw: CollectionDrawSnapshot,
+    isResolvingMusic: Boolean,
+    isCompactColumn: Boolean,
+    onOpenCover: () -> Unit,
+    onOpenDetail: () -> Unit,
+    onSkip: () -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    if (isCompactColumn) {
+        CollectionDrawCompactHeader(
+            draw = draw,
+            isResolvingMusic = isResolvingMusic,
+            onOpenCover = onOpenCover,
+            onSkip = onSkip,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+        CollectionDrawCompactMeta(draw = draw, onOpenDetail = onOpenDetail)
+    } else {
+        CollectionDrawTitleRow(
+            draw = draw,
+            onOpenDetail = onOpenDetail,
+            onSkip = onSkip,
+        )
+        CollectionDrawMediaRow(
+            draw = draw,
+            isResolvingMusic = isResolvingMusic,
+            onOpenCover = onOpenCover,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+    }
+}
+
+@Composable
+private fun CollectionDrawCompactHeader(
+    draw: CollectionDrawSnapshot,
+    isResolvingMusic: Boolean,
+    onOpenCover: () -> Unit,
+    onSkip: () -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(start = 10.dp, end = 2.dp, top = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.Top,
+    ) {
+        CollectionDrawCompactCover(
+            draw = draw,
+            isResolvingMusic = isResolvingMusic,
+            coverSize = 84.dp,
+            onClick = onOpenCover,
+        )
+        Column(horizontalAlignment = Alignment.End) {
+            CollectionDrawSkipButton(title = draw.title, onClick = onSkip)
+            val wikiUrl = draw.wikipediaUrl
+            if (!wikiUrl.isNullOrBlank()) {
+                CollectionDrawWikiIconButton(
+                    title = draw.title,
+                    onClick = { onOpenExternalUrl(wikiUrl) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CollectionDrawCompactMeta(
+    draw: CollectionDrawSnapshot,
+    onOpenDetail: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val titleText =
+        rememberDrawTitleText(
+            title = draw.title,
+            releaseDate = draw.releaseDate,
+            titleFontSize = 15.sp,
+        )
+    val genreText = remember(draw.tags) { buildCollectionDrawGenresLine(draw) }
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .heightIn(min = 48.dp)
+                .clickable(role = Role.Button, onClick = onOpenDetail)
+                .padding(horizontal = 10.dp, vertical = 2.dp)
+                .testTag("collection_draw_meta"),
+        verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically),
+    ) {
+        Text(
+            text = titleText,
+            lineHeight = 19.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (draw.creator.isNotBlank()) {
+            Text(
+                text = draw.creator,
+                color = colors.textSecondary,
+                fontSize = 12.5.sp,
+                lineHeight = 16.sp,
+                fontWeight = FontWeight.Normal,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (genreText.isNotBlank()) {
+            Text(
+                text = genreText,
+                color = colors.textMuted,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Normal,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun CollectionDrawSkipButton(
+    title: String,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    RocheIconActionButton(
+        contentDescription = "Skip $title",
+        outlined = false,
+        onClick = onClick,
+        modifier = Modifier.testTag("collection_draw_skip_btn"),
+    ) {
+        SkipDrawIcon(tint = colors.textMuted, size = 15.dp)
+    }
+}
+
+@Composable
+private fun rememberDrawTitleText(
+    title: String,
+    releaseDate: String,
+    titleFontSize: TextUnit,
+): AnnotatedString {
+    val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    return remember(title, releaseDate, titleFontSize, colors, headlineFamily) {
+        buildAnnotatedString {
+            withStyle(
+                SpanStyle(
+                    color = colors.textPrimary,
+                    fontFamily = headlineFamily,
+                    fontSize = titleFontSize,
+                    fontWeight = FontWeight.Medium,
+                )
+            ) {
+                append(title)
+            }
+            if (releaseDate.isNotBlank()) {
+                append("  ")
+                withStyle(
+                    SpanStyle(
+                        color = colors.textMuted,
+                        fontFamily = FontFamily.SansSerif,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Normal,
+                    )
+                ) {
+                    append(releaseDate)
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun CollectionDrawTitleRow(
     draw: CollectionDrawSnapshot,
     onOpenDetail: () -> Unit,
     onSkip: () -> Unit,
 ) {
-    val colors = LocalRocheColors.current
-    val headlineFamily = currentHeadlineFontFamily()
     val titleText =
-        remember(draw.title, draw.releaseDate, colors, headlineFamily) {
-            buildAnnotatedString {
-                withStyle(
-                    SpanStyle(
-                        color = colors.textPrimary,
-                        fontFamily = headlineFamily,
-                        fontSize = 16.5.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                ) {
-                    append(draw.title)
-                }
-                if (draw.releaseDate.isNotBlank()) {
-                    append("  ")
-                    withStyle(
-                        SpanStyle(
-                            color = colors.textMuted,
-                            fontFamily = FontFamily.SansSerif,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Normal,
-                        )
-                    ) {
-                        append(draw.releaseDate)
-                    }
-                }
-            }
-        }
+        rememberDrawTitleText(
+            title = draw.title,
+            releaseDate = draw.releaseDate,
+            titleFontSize = 16.5.sp,
+        )
 
     Row(
         modifier = Modifier.fillMaxWidth().padding(start = 12.dp, top = 4.dp, end = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        Text(
-            text = titleText,
-            lineHeight = 21.sp,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
+        Box(
+            contentAlignment = Alignment.CenterStart,
             modifier =
                 Modifier.weight(1f)
-                    .clickable(onClick = onOpenDetail)
+                    .heightIn(min = 48.dp)
+                    .clickable(role = Role.Button, onClick = onOpenDetail)
                     .padding(vertical = 4.dp)
                     .testTag("collection_draw_meta"),
-        )
-        RocheIconActionButton(
-            contentDescription = "Skip ${draw.title}",
-            outlined = false,
-            onClick = onSkip,
-            modifier = Modifier.testTag("collection_draw_skip_btn"),
         ) {
-            SkipDrawIcon(tint = colors.textMuted, size = 15.dp)
+            Text(
+                text = titleText,
+                lineHeight = 21.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
+        CollectionDrawSkipButton(title = draw.title, onClick = onSkip)
     }
 }
 
@@ -500,7 +603,6 @@ private fun CollectionDrawMediaRow(
     draw: CollectionDrawSnapshot,
     isResolvingMusic: Boolean,
     onOpenCover: () -> Unit,
-    onOpenDetail: () -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -529,10 +631,7 @@ private fun CollectionDrawMediaRow(
                     fontWeight = FontWeight.Normal,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
-                    modifier =
-                        Modifier.fillMaxWidth()
-                            .clickable(onClick = onOpenDetail)
-                            .padding(top = 1.dp),
+                    modifier = Modifier.fillMaxWidth().padding(top = 1.dp),
                 )
             } else {
                 Spacer(modifier = Modifier.height(1.dp))
@@ -599,6 +698,7 @@ private fun CollectionDrawWikiIconButton(
 private fun CollectionDrawFooterRow(
     generator: CollectionGeneratorState,
     draw: CollectionDrawSnapshot,
+    isCompactColumn: Boolean,
     onRank: () -> Unit,
 ) {
     val totalCount = generator.totalCount.coerceAtLeast(draw.totalCount)
@@ -616,27 +716,45 @@ private fun CollectionDrawFooterRow(
         }
     val progressLabel = formatDrawProgressLabel(draw.drawNumber, completedCount, totalCount)
 
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-        horizontalArrangement = Arrangement.spacedBy(11.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        CollectionDrawProgressMeter(
-            collectionTitle = generator.collectionTitle,
-            progressLabel = progressLabel,
-            progressFraction = progressFraction,
-            modifier = Modifier.weight(1f),
-        )
-        CompactRankButton(
-            onClick = onRank,
-            modifier = Modifier.testTag("collection_draw_rank_btn"),
-        )
+    if (isCompactColumn) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            CollectionDrawProgressMeter(
+                leadingLabel = null,
+                progressLabel = progressLabel,
+                progressFraction = progressFraction,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            CompactRankButton(
+                onClick = onRank,
+                modifier = Modifier.testTag("collection_draw_rank_btn"),
+            )
+        }
+    } else {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(11.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CompactRankButton(
+                onClick = onRank,
+                modifier = Modifier.testTag("collection_draw_rank_btn"),
+            )
+            CollectionDrawProgressMeter(
+                leadingLabel = "Daily Draw",
+                progressLabel = progressLabel,
+                progressFraction = progressFraction,
+                modifier = Modifier.weight(1f),
+            )
+        }
     }
 }
 
 @Composable
 private fun CollectionDrawProgressMeter(
-    collectionTitle: String,
+    leadingLabel: String?,
     progressLabel: String,
     progressFraction: Float,
     modifier: Modifier = Modifier,
@@ -649,24 +767,28 @@ private fun CollectionDrawProgressMeter(
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement =
+                if (leadingLabel != null) Arrangement.SpaceBetween else Arrangement.Start,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                text = collectionTitle,
-                color = colors.textMuted,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Normal,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false).padding(end = 6.dp),
-            )
+            if (leadingLabel != null) {
+                Text(
+                    text = leadingLabel,
+                    color = colors.textMuted,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false).padding(end = 6.dp),
+                )
+            }
             Text(
                 text = progressLabel,
                 color = colors.textMuted,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Normal,
                 maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
         }
         Box(
@@ -731,6 +853,7 @@ private fun CollectionDrawCompactCover(
     draw: CollectionDrawSnapshot,
     isResolvingMusic: Boolean,
     onClick: () -> Unit,
+    coverSize: Dp = 74.dp,
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(7.dp)
@@ -739,21 +862,27 @@ private fun CollectionDrawCompactCover(
             primaryKey = draw.imageUrl,
             fallbackKey = draw.thumbnailUrl,
         )
-    val desc = if (draw.creator.isNotBlank()) "${draw.title} by ${draw.creator}" else draw.title
+    val desc =
+        (if (draw.creator.isNotBlank()) "${draw.title} by ${draw.creator}" else draw.title)
+            .ifBlank { "Open draw" }
 
     Box(
         modifier =
-            Modifier.size(74.dp)
+            Modifier.size(coverSize)
                 .clip(shape)
                 .background(colors.surfaceElevated)
                 .border(1.dp, colors.border, shape)
                 .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    contentDescription = desc
+                }
                 .testTag("collection_draw_cover")
     ) {
         if (bitmap != null) {
             Image(
                 bitmap = bitmap,
-                contentDescription = desc,
+                contentDescription = null,
                 contentScale = ContentScale.Crop,
                 filterQuality = FilterQuality.Medium,
                 modifier = Modifier.fillMaxSize(),
@@ -974,7 +1103,7 @@ internal fun HomeInboxWidget(
         RocheSurfaceCard {
             when {
                 allNewInContinue ->
-                    HomeAllInContinueNote(
+                    HomeActionNoteCardBody(
                         message = "All unread items are currently in Continue above.",
                         actionLabel = "Open Inbox",
                         onActionClick = openInbox,
@@ -994,24 +1123,50 @@ internal fun HomeInboxWidget(
 }
 
 @Composable
-private fun HomeAllInContinueNote(
+private fun HomeActionNoteCardBody(
     message: String,
     actionLabel: String,
     onActionClick: () -> Unit,
+    stackVertically: Boolean = false,
+    actionTestTag: String? = null,
 ) {
     val colors = LocalRocheColors.current
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = message,
-            color = colors.textMuted,
-            fontSize = 12.5.sp,
-            modifier = Modifier.weight(1f).padding(end = 8.dp),
-        )
-        HeaderActionButton(label = actionLabel, onClick = onActionClick)
+    val buttonModifier = if (actionTestTag != null) Modifier.testTag(actionTestTag) else Modifier
+    if (stackVertically) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = message,
+                color = colors.textMuted,
+                fontSize = 12.sp,
+                lineHeight = 16.sp,
+            )
+            HeaderActionButton(
+                label = actionLabel,
+                onClick = onActionClick,
+                modifier = buttonModifier,
+            )
+        }
+    } else {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = message,
+                color = colors.textMuted,
+                fontSize = 12.5.sp,
+                modifier = Modifier.weight(1f).padding(end = 8.dp),
+            )
+            HeaderActionButton(
+                label = actionLabel,
+                onClick = onActionClick,
+                modifier = buttonModifier,
+            )
+        }
     }
 }
 
@@ -1148,6 +1303,7 @@ internal fun HomeWantQueueWidget(
     onOpenExternalUrl: (String) -> Unit,
     modifier: Modifier = Modifier,
     excludeEntryIds: Set<String> = emptySet(),
+    isCompactColumn: Boolean = false,
 ) {
     val previewItems =
         remember(state.catalog.wantToReadPreview, excludeEntryIds, maxItems) {
@@ -1172,10 +1328,15 @@ internal fun HomeWantQueueWidget(
         RocheSectionHeader(
             label = "Queue",
             badgeText = if (totalCount > 0) formatIntegerCount(totalCount) else null,
-            secondaryActionLabel = offlineLabel,
-            secondaryActionTestTag = "home_open_offline_btn",
-            onSecondaryActionClick = { onAction(MainAction.SelectTab(AppTab.OFFLINE)) },
-            actionLabel = "Queue →",
+            secondaryActionLabel = if (isCompactColumn) null else offlineLabel,
+            secondaryActionTestTag = if (isCompactColumn) null else "home_open_offline_btn",
+            onSecondaryActionClick =
+                if (isCompactColumn) {
+                    null
+                } else {
+                    { onAction(MainAction.SelectTab(AppTab.OFFLINE)) }
+                },
+            actionLabel = "All →",
             actionTestTag = "home_open_queue_btn",
             onActionClick = { onAction(MainAction.SelectTab(AppTab.QUEUE)) },
         )
@@ -1184,6 +1345,8 @@ internal fun HomeWantQueueWidget(
                 previewItems = previewItems,
                 totalCount = totalCount,
                 otherWantCount = otherWantCount,
+                offlineLabel = offlineLabel,
+                isCompactColumn = isCompactColumn,
                 state = state,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
@@ -1198,42 +1361,73 @@ private fun HomeWantQueueCardBody(
     previewItems: List<RankedCatalogEntry>,
     totalCount: Int,
     otherWantCount: Int,
+    offlineLabel: String,
+    isCompactColumn: Boolean,
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
+    val horizontalPadding = if (isCompactColumn) 10.dp else 12.dp
     if (previewItems.isEmpty() && otherWantCount == 0) {
         if (totalCount > 0) {
-            HomeAllInContinueNote(
+            HomeActionNoteCardBody(
                 message = "All saved items are currently in Continue above.",
                 actionLabel = "Open Queue",
                 onActionClick = { onAction(MainAction.SelectTab(AppTab.QUEUE)) },
+                stackVertically = isCompactColumn,
             )
         } else {
-            HomeWantQueueEmptyBody(onAction = onAction)
+            HomeActionNoteCardBody(
+                message =
+                    "Save URLs or add works to your synced Queue to read, watch, or listen next.",
+                actionLabel = "+ Save URL",
+                onActionClick = { onAction(MainAction.OpenAddSheet()) },
+                stackVertically = isCompactColumn,
+                actionTestTag = "home_queue_save_url_btn",
+            )
         }
-        return
+    } else {
+        HomeWantQueuePreviewList(
+            items = previewItems,
+            isCompactColumn = isCompactColumn,
+            state = state,
+            onAction = onAction,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+        if (otherWantCount > 0) {
+            val summaryLabel =
+                if (isCompactColumn) {
+                    "+${formatIntegerCount(otherWantCount)} more"
+                } else {
+                    "+${formatIntegerCount(otherWantCount)} in other Want queues"
+                }
+            HomeQueueFooterRow(
+                label = summaryLabel,
+                showTopDivider = previewItems.isNotEmpty(),
+                horizontalPadding = horizontalPadding,
+                testTag = "home_other_want_queues_row",
+                onClick = { onAction(MainAction.SelectTab(AppTab.QUEUE)) },
+            )
+        }
     }
-    HomeWantQueuePreviewList(
-        items = previewItems,
-        state = state,
-        onAction = onAction,
-        onOpenExternalUrl = onOpenExternalUrl,
-    )
-    if (otherWantCount > 0) {
-        HomeOtherWantQueuesFooter(
-            otherWantCount = otherWantCount,
-            showTopDivider = previewItems.isNotEmpty(),
-            onOpenQueue = { onAction(MainAction.SelectTab(AppTab.QUEUE)) },
+    if (isCompactColumn) {
+        HomeQueueFooterRow(
+            label = offlineLabel,
+            showTopDivider = true,
+            horizontalPadding = horizontalPadding,
+            testTag = "home_open_offline_btn",
+            onClick = { onAction(MainAction.SelectTab(AppTab.OFFLINE)) },
         )
     }
 }
 
 @Composable
-private fun HomeOtherWantQueuesFooter(
-    otherWantCount: Int,
+private fun HomeQueueFooterRow(
+    label: String,
     showTopDivider: Boolean,
-    onOpenQueue: () -> Unit,
+    horizontalPadding: Dp,
+    testTag: String,
+    onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
     if (showTopDivider) {
@@ -1242,46 +1436,29 @@ private fun HomeOtherWantQueuesFooter(
     Row(
         modifier =
             Modifier.fillMaxWidth()
-                .clickable(onClick = onOpenQueue)
-                .padding(horizontal = 12.dp, vertical = 10.dp)
-                .testTag("home_other_want_queues_row"),
+                .heightIn(min = 48.dp)
+                .clickable(role = Role.Button, onClick = onClick)
+                .padding(horizontal = horizontalPadding, vertical = 10.dp)
+                .testTag(testTag),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            text = "+${formatIntegerCount(otherWantCount)} in other Want queues",
+            text = label,
             color = colors.textSecondary,
             fontSize = 12.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f).padding(end = 6.dp),
         )
-        Text(text = "Open →", color = colors.accentBlue, fontSize = 12.sp)
-    }
-}
-
-@Composable
-private fun HomeWantQueueEmptyBody(onAction: (MainAction) -> Unit) {
-    val colors = LocalRocheColors.current
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = "Save URLs or add works to your synced Queue to read, watch, or listen next.",
-            color = colors.textMuted,
-            fontSize = 12.5.sp,
-            modifier = Modifier.weight(1f).padding(end = 8.dp),
-        )
-        HeaderActionButton(
-            label = "+ Save URL",
-            onClick = { onAction(MainAction.OpenAddSheet()) },
-            modifier = Modifier.testTag("home_queue_save_url_btn"),
-        )
+        Text(text = "Open →", color = colors.accentBlue, fontSize = 12.sp, maxLines = 1)
     }
 }
 
 @Composable
 private fun HomeWantQueuePreviewList(
     items: List<RankedCatalogEntry>,
+    isCompactColumn: Boolean,
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
@@ -1293,6 +1470,7 @@ private fun HomeWantQueuePreviewList(
         }
         HomeWantCatalogPreviewRow(
             item = item,
+            isCompactColumn = isCompactColumn,
             onClick = resolveHomeWantItemClick(item, state, onAction, onOpenExternalUrl),
         )
     }
@@ -1317,10 +1495,14 @@ private fun resolveHomeWantItemClick(
 @Composable
 private fun HomeWantCatalogPreviewRow(
     item: RankedCatalogEntry,
+    isCompactColumn: Boolean,
     onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val headlineFamily = currentHeadlineFontFamily()
+    val horizontalPadding = if (isCompactColumn) 10.dp else 12.dp
+    val titleFontSize = if (isCompactColumn) 13.5.sp else 14.sp
+    val titleLineHeight = if (isCompactColumn) 18.sp else 19.sp
     val meta =
         remember(item.entry) {
             buildList {
@@ -1337,7 +1519,7 @@ private fun HomeWantCatalogPreviewRow(
             Modifier.fillMaxWidth()
                 .heightIn(min = 48.dp)
                 .clickable(onClick = onClick)
-                .padding(horizontal = 12.dp, vertical = 9.dp)
+                .padding(horizontal = horizontalPadding, vertical = 9.dp)
                 .testTag("home_want_item_${item.entry.id}"),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -1347,8 +1529,8 @@ private fun HomeWantCatalogPreviewRow(
                 text = remember(item.entry.title) { formatInlineMathAnnotated(item.entry.title) },
                 color = colors.textPrimary,
                 fontFamily = headlineFamily,
-                fontSize = 14.sp,
-                lineHeight = 19.sp,
+                fontSize = titleFontSize,
+                lineHeight = titleLineHeight,
                 fontWeight = FontWeight.Normal,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
@@ -1366,180 +1548,80 @@ private fun HomeWantCatalogPreviewRow(
     }
 }
 
-@Composable
-internal fun HomeRecentDiaryWidget(
-    state: MainUiState,
-    maxItems: Int,
-    onAction: (MainAction) -> Unit,
-    onOpenExternalUrl: (String) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val diaryEntries =
-        remember(state.catalog.recentDiaryEntries, maxItems) {
-            state.catalog.recentDiaryEntries.take(maxItems)
-        }
-    val openDiary = { onAction(MainAction.OpenCompanionSection(CompanionSubTab.DIARY)) }
-
-    Column(
-        modifier = modifier.fillMaxWidth().testTag("home_widget_recent_diary"),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-    ) {
-        RocheSectionHeader(
-            label = "Recent Diary",
-            secondaryActionLabel = "+ Log",
-            secondaryActionTestTag = "home_diary_header_quick_log_btn",
-            onSecondaryActionClick = { onAction(MainAction.OpenQuickLogSheet(false)) },
-            actionLabel = "Diary →",
-            actionTestTag = "home_open_diary_btn",
-            onActionClick = openDiary,
-        )
-        RocheSurfaceCard {
-            if (diaryEntries.isEmpty()) {
-                HomeRecentDiaryEmptyBody(onAction = onAction)
-            } else {
-                HomeRecentDiaryList(
-                    diaryEntries = diaryEntries,
-                    readableIds = state.readableEntryIds,
-                    onOpenDiary = openDiary,
-                    onAction = onAction,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun HomeRecentDiaryList(
-    diaryEntries: List<DiaryEntryItem>,
-    readableIds: Set<String>,
-    onOpenDiary: () -> Unit,
-    onAction: (MainAction) -> Unit,
-    onOpenExternalUrl: (String) -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    diaryEntries.forEachIndexed { index, diary ->
-        if (index > 0) {
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
-        }
-        val onClick =
-            resolveCatalogEntryOpenAction(
-                entryId = diary.entryId,
-                externalUrl = diary.url,
-                readableIds = readableIds,
-                onOpenReader = { onAction(MainAction.OpenReader(it)) },
-                onOpenExternalUrl = onOpenExternalUrl,
-                entryKind = diary.kind,
-                onOpenCatalogDetail = { onAction(MainAction.OpenCatalogDetailSheet(it)) },
-            ) ?: onOpenDiary
-        HomeDiaryPreviewRow(diary = diary, onClick = onClick)
-    }
-}
-
-@Composable
-private fun HomeRecentDiaryEmptyBody(onAction: (MainAction) -> Unit) {
-    val colors = LocalRocheColors.current
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = "No diary entries logged yet.",
-            color = colors.textMuted,
-            fontSize = 12.5.sp,
-            modifier = Modifier.weight(1f).padding(end = 8.dp),
-        )
-        HeaderActionButton(
-            label = "+ Log",
-            onClick = { onAction(MainAction.OpenQuickLogSheet(false)) },
-            modifier = Modifier.testTag("home_quick_log_btn"),
-        )
-    }
-}
-
-@Composable
-private fun HomeDiaryPreviewRow(
-    diary: DiaryEntryItem,
-    onClick: () -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    val headlineFamily = currentHeadlineFontFamily()
-    val subtitle = remember(diary.creators, diary.releaseYear) { buildHomeDiarySubtitle(diary) }
-
-    Row(
-        modifier =
-            Modifier.fillMaxWidth()
-                .heightIn(min = 48.dp)
-                .clickable(onClick = onClick)
-                .padding(horizontal = 11.dp, vertical = 8.dp)
-                .testTag("home_diary_item_${diary.id}"),
-        horizontalArrangement = Arrangement.spacedBy(9.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = diary.dateLabel,
-            color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Normal,
-            maxLines = 1,
-            modifier = Modifier.widthIn(min = 38.dp),
-        )
-        CatalogCoverThumbnail(
-            thumbnailUrl = diary.thumbnailUrl,
-            kind = diary.kind,
-            size = 32.dp,
-            cornerRadius = 5.dp,
-        )
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-            Text(
-                text = diary.title,
-                color = colors.textPrimary,
-                fontFamily = headlineFamily,
-                fontSize = 13.5.sp,
-                fontWeight = FontWeight.Normal,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (subtitle.isNotBlank()) {
-                Text(
-                    text = subtitle,
-                    color = colors.textSecondary,
-                    fontSize = 11.5.sp,
-                    fontWeight = FontWeight.Normal,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-        if (diary.tier != null) {
-            TierBadgePill(tier = diary.tier)
-        }
-    }
-}
-
 internal fun buildCollectionDrawGenresLine(draw: CollectionDrawSnapshot): String =
     draw.tags.take(3).joinToString(", ")
 
-internal fun buildHomeDiarySubtitle(diary: DiaryEntryItem): String {
-    val creatorText = diary.creators.joinToString(", ")
-    val year = diary.releaseYear?.takeIf { it > 0 }
-    return when {
-        creatorText.isNotBlank() && year != null -> "$creatorText ($year)"
-        creatorText.isNotBlank() -> creatorText
-        year != null -> year.toString()
-        else -> ""
+internal data class HomeBottomLayout(
+    val useTwoColumns: Boolean,
+    val isCompactColumn: Boolean,
+    val columnGap: Dp,
+)
+
+internal fun resolveHomeBottomLayout(
+    viewportWidth: Dp,
+    hasActiveDraws: Boolean,
+    fontScale: Float = 1f,
+): HomeBottomLayout {
+    val safeFontScale = fontScale.coerceAtLeast(1f)
+    val safeWidth =
+        if (viewportWidth.isSpecified && viewportWidth.value.isFinite()) viewportWidth else 412.dp
+    val useTwoColumns = hasActiveDraws && safeWidth / safeFontScale >= TWO_COLUMN_BOTTOM_BREAKPOINT
+    val columnGap = if (safeWidth >= WIDE_HOME_BREAKPOINT) 14.dp else 12.dp
+    val columnWidth =
+        if (useTwoColumns) {
+            (safeWidth - HOME_HORIZONTAL_PADDING * 2 - columnGap) / 2
+        } else {
+            safeWidth - HOME_HORIZONTAL_PADDING * 2
+        }
+    return HomeBottomLayout(
+        useTwoColumns = useTwoColumns,
+        isCompactColumn = columnWidth / safeFontScale < COMPACT_COLUMN_BREAKPOINT,
+        columnGap = columnGap,
+    )
+}
+
+internal fun computeHomeInboxMaxItems(
+    viewportWidth: Dp,
+    viewportHeight: Dp,
+    fontScale: Float = 1f,
+): Int {
+    if (!viewportHeight.isSpecified || !viewportHeight.value.isFinite()) {
+        return DEFAULT_HOME_INBOX_ITEMS
     }
+    val safeFontScale = fontScale.coerceAtLeast(1f)
+    val isWideWidth =
+        viewportWidth.isSpecified &&
+            viewportWidth.value.isFinite() &&
+            viewportWidth >= WIDE_HOME_BREAKPOINT
+    val baseRowHeightDp =
+        if (isWideWidth) {
+            WIDE_INBOX_ROW_HEIGHT_DP
+        } else {
+            COMPACT_INBOX_ROW_HEIGHT_DP
+        }
+    val estimatedRowHeightDp = baseRowHeightDp * (1f + (safeFontScale - 1f) * 0.7f)
+    val targetCardHeightDp =
+        (viewportHeight.value * HOME_INBOX_TARGET_HEIGHT_FRACTION - HOME_INBOX_CHROME_HEIGHT_DP)
+            .coerceAtLeast(MIN_INBOX_CARD_HEIGHT_DP)
+    return (targetCardHeightDp / estimatedRowHeightDp)
+        .roundToInt()
+        .coerceIn(MIN_HOME_INBOX_ITEMS, MAX_HOME_INBOX_ITEMS)
 }
 
 private fun formatIntegerCount(value: Int): String =
     NumberFormat.getIntegerInstance(Locale.US).format(value)
 
-private val WIDE_DASHBOARD_BREAKPOINT = 540.dp
+private val HOME_HORIZONTAL_PADDING = 14.dp
+private val TWO_COLUMN_BOTTOM_BREAKPOINT = 340.dp
+private val COMPACT_COLUMN_BREAKPOINT = 250.dp
+private val WIDE_HOME_BREAKPOINT = 540.dp
+private const val HOME_INBOX_TARGET_HEIGHT_FRACTION = 2f / 3f
+private const val HOME_INBOX_CHROME_HEIGHT_DP = 78f
+private const val MIN_INBOX_CARD_HEIGHT_DP = 180f
+private const val WIDE_INBOX_ROW_HEIGHT_DP = 64f
+private const val COMPACT_INBOX_ROW_HEIGHT_DP = 70f
+private const val DEFAULT_HOME_INBOX_ITEMS = 6
+private const val MIN_HOME_INBOX_ITEMS = 3
+private const val MAX_HOME_INBOX_ITEMS = 12
 private const val HOME_CONTINUE_ITEMS = 4
-private const val WIDE_INBOX_ITEMS = 7
-private const val COMPACT_INBOX_ITEMS = 4
 private const val HOME_QUEUE_PREVIEW_ITEMS = 4
-private const val WIDE_DIARY_ITEMS = 6
-private const val COMPACT_DIARY_ITEMS = 3

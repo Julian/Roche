@@ -386,7 +386,9 @@ class UnifiedQueueAndInProgressTest {
                 assertTrue(env.repository.catalog.findWantCollectionsForEntry("art-prog").isEmpty())
 
                 vm.dispatch(MainAction.UndoLastArchive)
-                vm.uiState.first { "art-prog" in it.catalog.wantEntryIds }
+                vm.uiState.first {
+                    "art-prog" in it.catalog.wantEntryIds && it.statusBanner == "Restored to Queue"
+                }
                 assertEquals(
                     setOf(WANT_TO_READ_COLLECTION_ID, watchQueueId),
                     env.repository.catalog.findWantCollectionsForEntry("art-prog").toSet(),

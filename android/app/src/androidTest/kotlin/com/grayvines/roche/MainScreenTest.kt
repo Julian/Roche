@@ -2,10 +2,14 @@
 
 package com.grayvines.roche
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
@@ -15,6 +19,8 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToIndex
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.width
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.catalog.CatalogEntryItem
 import com.grayvines.roche.data.catalog.CatalogListSummary
@@ -308,12 +314,16 @@ class MainScreenTest {
         composeRule.onNodeWithTag("home_screen").assertExists()
         composeRule.onNodeWithTag("home_widget_pulse").assertDoesNotExist()
         composeRule.onNodeWithTag("home_widget_collection_draw").assertDoesNotExist()
+        composeRule.onNodeWithTag("home_bottom_two_column_row").assertDoesNotExist()
+        composeRule.onNodeWithTag("home_widget_recent_diary").assertDoesNotExist()
+        composeRule.onNodeWithTag("home_open_diary_btn").assertDoesNotExist()
         composeRule.onNodeWithTag("home_widget_inbox").assertExists()
         composeRule.onNodeWithTag("home_open_inbox_btn").assertExists()
         composeRule.onNodeWithTag("home_spare_settings_btn").assertExists()
         composeRule.onNodeWithTag("home_search_btn").assertExists()
-        composeRule.onNodeWithTag("home_widget_recent_diary").performScrollTo().assertExists()
-        composeRule.onNodeWithTag("home_open_diary_btn").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("home_widget_queue_want").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("home_open_queue_btn").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("home_open_offline_btn").performScrollTo().assertExists()
         composeRule.onNodeWithTag("save_fab").assertExists()
         composeRule.onNodeWithTag("search_fab").assertDoesNotExist()
         composeRule.onNodeWithTag("global_sync_indicator").assertDoesNotExist()
@@ -381,7 +391,24 @@ class MainScreenTest {
             }
         }
 
+        composeRule.onNodeWithTag("home_widget_inbox").assertExists()
+        composeRule.onNodeWithTag("home_bottom_two_column_row").assertExists()
+        composeRule.onNodeWithTag("home_widget_queue_want").assertExists()
         composeRule.onNodeWithTag("home_widget_collection_draw").assertExists()
+        composeRule.onNodeWithTag("home_widget_recent_diary").assertDoesNotExist()
+
+        val inboxBounds = composeRule.onNodeWithTag("home_widget_inbox").getUnclippedBoundsInRoot()
+        val queueBounds =
+            composeRule.onNodeWithTag("home_widget_queue_want").getUnclippedBoundsInRoot()
+        val drawBounds =
+            composeRule.onNodeWithTag("home_widget_collection_draw").getUnclippedBoundsInRoot()
+        org.junit.Assert.assertTrue(inboxBounds.width > queueBounds.width)
+        org.junit.Assert.assertTrue(inboxBounds.width > drawBounds.width)
+        org.junit.Assert.assertTrue(queueBounds.top >= inboxBounds.bottom)
+        org.junit.Assert.assertTrue(drawBounds.top >= inboxBounds.bottom)
+        org.junit.Assert.assertTrue(drawBounds.left >= queueBounds.right)
+
+        composeRule.onNodeWithTag("home_open_offline_btn").assertExists()
         composeRule.onNodeWithTag("collection_draw_cover").assertExists()
         composeRule.onNodeWithText("Sample Album  1972").assertExists()
         composeRule.onNodeWithText("Sample Artist").assertExists()
@@ -416,6 +443,87 @@ class MainScreenTest {
             ),
             actions,
         )
+    }
+
+    @Test
+    fun homeTabKeepsFullWidthInboxWithTwoBottomColumnsOnWideViewport() {
+        val entries =
+            (1..6).map { index ->
+                createSampleEntry()
+                    .copy(
+                        id = "wide-entry-$index",
+                        title = "Full-Width Headline #$index",
+                        readProgress = 0.0,
+                    )
+            }
+        val draw =
+            CollectionDrawSnapshot(
+                collectionId = "col-1001-albums",
+                collectionSlug = "1001_albums",
+                collectionTitle = "1001 Albums",
+                entryId = "album-wide-1",
+                title = "Kind of Blue",
+                creator = "Miles Davis",
+                releaseDate = "1959",
+                tags = listOf("jazz"),
+                drawNumber = 14,
+                totalCount = 1001,
+                remainingCount = 988,
+                wikipediaUrl = "https://en.wikipedia.org/wiki/Kind_of_Blue",
+            )
+        composeRule.setContent {
+            RocheTheme {
+                Box(modifier = Modifier.requiredSize(width = 720.dp, height = 640.dp)) {
+                    MainScreen(
+                        state =
+                            MainUiState(
+                                activeTab = AppTab.HOME,
+                                visibleEntries = entries,
+                                allEntries = entries,
+                                catalog =
+                                    CatalogSnapshot(
+                                        generators =
+                                            listOf(
+                                                CollectionGeneratorState(
+                                                    collectionId = "col-1001-albums",
+                                                    collectionSlug = "1001_albums",
+                                                    collectionTitle = "1001 Albums",
+                                                    enabled = true,
+                                                    currentDraw = draw,
+                                                    consumedCount = 13,
+                                                    abandonedCount = 0,
+                                                    totalCount = 1001,
+                                                )
+                                            )
+                                    ),
+                            ),
+                        onAction = {},
+                        onShareEntry = {},
+                        onOpenExternalUrl = {},
+                    )
+                }
+            }
+        }
+
+        composeRule.onNodeWithTag("home_widget_inbox").assertExists()
+        composeRule.onNodeWithTag("home_bottom_two_column_row").assertExists()
+        composeRule.onNodeWithTag("home_widget_queue_want").assertExists()
+        composeRule.onNodeWithTag("home_widget_collection_draw").assertExists()
+        composeRule.onNodeWithTag("home_open_offline_btn").assertExists()
+        composeRule.onNodeWithText("Daily Draw").assertExists()
+        composeRule.onNodeWithTag("home_widget_recent_diary").assertDoesNotExist()
+
+        val inboxBounds = composeRule.onNodeWithTag("home_widget_inbox").getUnclippedBoundsInRoot()
+        val queueBounds =
+            composeRule.onNodeWithTag("home_widget_queue_want").getUnclippedBoundsInRoot()
+        val drawBounds =
+            composeRule.onNodeWithTag("home_widget_collection_draw").getUnclippedBoundsInRoot()
+        org.junit.Assert.assertTrue(inboxBounds.width >= 600.dp)
+        org.junit.Assert.assertTrue(inboxBounds.width > queueBounds.width)
+        org.junit.Assert.assertTrue(inboxBounds.width > drawBounds.width)
+        org.junit.Assert.assertTrue(queueBounds.top >= inboxBounds.bottom)
+        org.junit.Assert.assertTrue(drawBounds.top >= inboxBounds.bottom)
+        org.junit.Assert.assertTrue(drawBounds.left >= queueBounds.right)
     }
 
     @Test
