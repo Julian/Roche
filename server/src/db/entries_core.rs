@@ -131,10 +131,22 @@ pub async fn upsert_entry_identifier_in_tx(
     scheme: &str,
     value: &str,
 ) -> std::result::Result<(), sqlx::Error> {
+    let _ = upsert_entry_identifier_changed_in_tx(tx, entry_id, scheme, value).await?;
+    Ok(())
+}
+
+/// Inserts an `entry_identifiers` mapping using `INSERT OR IGNORE`, returning `true` only when a
+/// new row was inserted.
+pub async fn upsert_entry_identifier_changed_in_tx(
+    tx: &mut SqliteConnection,
+    entry_id: &str,
+    scheme: &str,
+    value: &str,
+) -> std::result::Result<bool, sqlx::Error> {
     if scheme.is_empty() || value.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
-    sqlx::query(
+    let res = sqlx::query(
         "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
          VALUES (?, ?, ?)",
     )
@@ -143,7 +155,7 @@ pub async fn upsert_entry_identifier_in_tx(
     .bind(entry_id)
     .execute(&mut *tx)
     .await?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
 }
 
 /// Replaces an entry's sole identifier for `scheme` (for example when renaming a `'tag'`

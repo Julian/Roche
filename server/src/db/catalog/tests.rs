@@ -945,6 +945,7 @@ async fn test_collection_hex_color_validation_normalization_and_tolerant_read() 
                 summary: None,
                 color: Some("#10B981".to_owned()),
                 members: Vec::new(),
+                replace_members: false,
             },
             BatchCollectionInput {
                 ref_key: None,
@@ -955,6 +956,7 @@ async fn test_collection_hex_color_validation_normalization_and_tolerant_read() 
                 summary: None,
                 color: Some("  \t ".to_owned()),
                 members: Vec::new(),
+                replace_members: false,
             },
         ],
         ..CatalogBatchInput::default()
@@ -975,6 +977,7 @@ async fn test_collection_hex_color_validation_normalization_and_tolerant_read() 
             summary: None,
             color: Some("javascript:alert(1)".to_owned()),
             members: Vec::new(),
+            replace_members: false,
         }],
         ..CatalogBatchInput::default()
     };

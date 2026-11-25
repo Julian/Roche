@@ -10,6 +10,7 @@ use roche_core::identity_norm::{
 
 use super::{
     CatalogRepo,
+    batch::BatchTxCache,
     models::{
         CatalogEntry, CatalogError, CatalogResult, ConsumptionLogRow, EntryDetailView,
         EntryIdentifier, RawEntryRow, UpdateEntryInput, UpsertEntryInput,
@@ -845,12 +846,28 @@ impl CatalogRepo<'_> {
         title: &str,
         now: DateTime<Utc>,
     ) -> CatalogResult<String> {
-        let (id, _) =
-            Self::upsert_entry_with_created_in_tx(tx, input, kind, title, now, None, None).await?;
+        let (id, _) = Self::upsert_entry_with_created_cached_in_tx(
+            tx, input, kind, title, now, None, None, None,
+        )
+        .await?;
         Ok(id)
     }
 
-    #[allow(clippy::too_many_lines)]
+    pub(super) async fn upsert_entry_cached_in_tx(
+        tx: &mut WriteTx<'_>,
+        input: &UpsertEntryInput,
+        kind: EntryKind,
+        title: &str,
+        now: DateTime<Utc>,
+        cache: Option<&mut BatchTxCache>,
+    ) -> CatalogResult<String> {
+        let (id, _) = Self::upsert_entry_with_created_cached_in_tx(
+            tx, input, kind, title, now, None, None, cache,
+        )
+        .await?;
+        Ok(id)
+    }
+
     pub(crate) async fn upsert_entry_with_created_in_tx(
         tx: &mut WriteTx<'_>,
         input: &UpsertEntryInput,
@@ -859,6 +876,30 @@ impl CatalogRepo<'_> {
         now: DateTime<Utc>,
         explicit_created_at: Option<DateTime<Utc>>,
         explicit_hlc: Option<&str>,
+    ) -> CatalogResult<(String, bool)> {
+        Self::upsert_entry_with_created_cached_in_tx(
+            tx,
+            input,
+            kind,
+            title,
+            now,
+            explicit_created_at,
+            explicit_hlc,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    async fn upsert_entry_with_created_cached_in_tx(
+        tx: &mut WriteTx<'_>,
+        input: &UpsertEntryInput,
+        kind: EntryKind,
+        title: &str,
+        now: DateTime<Utc>,
+        explicit_created_at: Option<DateTime<Utc>>,
+        explicit_hlc: Option<&str>,
+        mut cache: Option<&mut BatchTxCache>,
     ) -> CatalogResult<(String, bool)> {
         if kind == EntryKind::Collection {
             return Err(CatalogError::InvalidInput(
@@ -989,18 +1030,36 @@ impl CatalogRepo<'_> {
         {
             let target_artist = primary_artist.to_lowercase();
             let target_stripped = strip_album_edition_suffix(title).to_lowercase();
-            let escaped_prefix = crate::db::escape_like_literal(&target_stripped);
-            let title_like = format!("{escaped_prefix}%");
-            let existing_albums: Vec<(String, String, String)> = sqlx::query_as(
-                "SELECT id, title, creators_json
-                 FROM entries
-                 WHERE kind = 'album'
-                   AND merged_into_id IS NULL
-                   AND LOWER(TRIM(title)) LIKE ? ESCAPE '\\'",
-            )
-            .bind(&title_like)
-            .fetch_all(tx.conn())
-            .await?;
+            let existing_albums: Vec<(String, String, String)> =
+                if let Some(upper) = ascii_prefix_upper_bound(&target_stripped) {
+                    // Uses `idx_entries_kind_lower_title_id` (`O(log N)` range seek instead of
+                    // scanning all albums on every insert).
+                    sqlx::query_as(
+                        "SELECT id, title, creators_json
+                         FROM entries
+                         WHERE kind = 'album'
+                           AND merged_into_id IS NULL
+                           AND LOWER(title) >= ?
+                           AND LOWER(title) < ?",
+                    )
+                    .bind(&target_stripped)
+                    .bind(&upper)
+                    .fetch_all(tx.conn())
+                    .await?
+                } else {
+                    let escaped_prefix = crate::db::escape_like_literal(&target_stripped);
+                    let title_like = format!("{escaped_prefix}%");
+                    sqlx::query_as(
+                        "SELECT id, title, creators_json
+                         FROM entries
+                         WHERE kind = 'album'
+                           AND merged_into_id IS NULL
+                           AND LOWER(TRIM(title)) LIKE ? ESCAPE '\\'",
+                    )
+                    .bind(&title_like)
+                    .fetch_all(tx.conn())
+                    .await?
+                };
             for (cand_id, cand_title, cand_creators_json) in existing_albums {
                 let cand_creators: Vec<String> =
                     serde_json::from_str(&cand_creators_json).unwrap_or_default();
@@ -1075,7 +1134,7 @@ impl CatalogRepo<'_> {
         let effective_release_year =
             input.release_year.or_else(|| input.published_at.map(|dt| dt.year()));
 
-        let (final_id, activity_action) = if let Some(existing_id) = matched_id {
+        let (final_id, activity_action, mut mutated) = if let Some(existing_id) = matched_id {
             let clean_existing_title = if kind == EntryKind::Album {
                 let current_title = sqlx::query_scalar!(
                     r#"SELECT title as "title!" FROM entries WHERE id = ?"#,
@@ -1099,7 +1158,7 @@ impl CatalogRepo<'_> {
                 _ => tx.next_hlc().await?,
             };
             let use_max_hlc = explicit_hlc.is_some_and(|h| !h.is_empty());
-            sqlx::query(
+            let upd_res = sqlx::query(
                 "UPDATE entries
                  SET title = COALESCE(?, title),
                      creators_json = CASE WHEN creators_json = '[]' AND ? != '[]' THEN ? ELSE creators_json END,
@@ -1112,18 +1171,20 @@ impl CatalogRepo<'_> {
                      updated_at = ?,
                      hlc = CASE
                          WHEN ? THEN CASE WHEN ? > hlc THEN ? ELSE hlc END
-                         WHEN ? IS NOT NULL
-                           OR (creators_json = '[]' AND ? != '[]')
-                           OR (url IS NULL AND ? IS NOT NULL)
-                           OR (published_at IS NULL AND ? IS NOT NULL)
-                           OR (release_year IS NULL AND ? IS NOT NULL)
-                           OR (summary IS NULL AND ? IS NOT NULL)
-                           OR (thumbnail_url IS NULL AND ? IS NOT NULL)
-                           OR (metadata_json = '{}' AND ? != '{}')
-                         THEN ?
-                         ELSE hlc
+                         ELSE ?
                      END
-                 WHERE id = ?",
+                 WHERE id = ?
+                   AND (
+                       (? AND ? > hlc)
+                       OR (? IS NOT NULL AND ? IS NOT title)
+                       OR (creators_json = '[]' AND ? != '[]')
+                       OR (url IS NULL AND ? IS NOT NULL)
+                       OR (published_at IS NULL AND ? IS NOT NULL)
+                       OR (release_year IS NULL AND ? IS NOT NULL)
+                       OR (summary IS NULL AND ? IS NOT NULL)
+                       OR (thumbnail_url IS NULL AND ? IS NOT NULL)
+                       OR (metadata_json = '{}' AND ? != '{}')
+                   )",
             )
             .bind(clean_existing_title)
             .bind(&creators_json)
@@ -1139,6 +1200,11 @@ impl CatalogRepo<'_> {
             .bind(use_max_hlc)
             .bind(&update_hlc)
             .bind(&update_hlc)
+            .bind(&update_hlc)
+            .bind(&existing_id)
+            .bind(use_max_hlc)
+            .bind(&update_hlc)
+            .bind(clean_existing_title)
             .bind(clean_existing_title)
             .bind(&creators_json)
             .bind(clean_url_ref)
@@ -1147,10 +1213,9 @@ impl CatalogRepo<'_> {
             .bind(clean_summary)
             .bind(clean_thumb)
             .bind(&metadata_json)
-            .bind(&update_hlc)
-            .bind(&existing_id)
             .execute(tx.conn())
             .await?;
+            let mut row_changed = upd_res.rows_affected() > 0;
 
             if let Some(serde_json::Value::Object(inc_map)) = &input.metadata
                 && !inc_map.is_empty()
@@ -1173,10 +1238,12 @@ impl CatalogRepo<'_> {
                     sqlx::query(
                         "UPDATE entries
                          SET metadata_json = ?,
+                             updated_at = ?,
                              hlc = CASE WHEN ? THEN CASE WHEN ? > hlc THEN ? ELSE hlc END ELSE ? END
                          WHERE id = ?",
                     )
                     .bind(&merged_json)
+                    .bind(now)
                     .bind(use_max_hlc)
                     .bind(&meta_hlc)
                     .bind(&meta_hlc)
@@ -1184,10 +1251,11 @@ impl CatalogRepo<'_> {
                     .bind(&existing_id)
                     .execute(tx.conn())
                     .await?;
+                    row_changed = true;
                 }
             }
 
-            (existing_id, ActivityAction::Update)
+            (existing_id, ActivityAction::Update, row_changed)
         } else {
             let det_id = choose_deterministic_entry_id(
                 input.id.as_deref(),
@@ -1197,17 +1265,18 @@ impl CatalogRepo<'_> {
                 &normalized_idents,
             );
             if let Some(found_det) = Self::follow_merged_id_in_tx(tx.conn(), &det_id).await? {
-                if let Some(h) = explicit_hlc.filter(|s| !s.is_empty()) {
-                    sqlx::query(
-                        "UPDATE entries SET hlc = CASE WHEN ? > hlc THEN ? ELSE hlc END WHERE id = ?",
-                    )
-                    .bind(h)
-                    .bind(h)
-                    .bind(&found_det)
-                    .execute(tx.conn())
-                    .await?;
-                }
-                (found_det, ActivityAction::Update)
+                let det_changed = if let Some(h) = explicit_hlc.filter(|s| !s.is_empty()) {
+                    let res = sqlx::query("UPDATE entries SET hlc = ? WHERE id = ? AND ? > hlc")
+                        .bind(h)
+                        .bind(&found_det)
+                        .bind(h)
+                        .execute(tx.conn())
+                        .await?;
+                    res.rows_affected() > 0
+                } else {
+                    false
+                };
+                (found_det, ActivityAction::Update, det_changed)
             } else {
                 entries_core::insert_entry_row_in_tx(
                     tx,
@@ -1230,18 +1299,21 @@ impl CatalogRepo<'_> {
                     },
                 )
                 .await?;
-                (det_id, ActivityAction::Create)
+                (det_id, ActivityAction::Create, true)
             }
         };
 
         for ident in &normalized_idents {
-            entries_core::upsert_entry_identifier_in_tx(
+            if entries_core::upsert_entry_identifier_changed_in_tx(
                 tx.conn(),
                 &final_id,
                 &ident.scheme,
                 &ident.value,
             )
-            .await?;
+            .await?
+            {
+                mutated = true;
+            }
         }
 
         if let Some(canon_parent) = resolved_parent_id {
@@ -1259,7 +1331,9 @@ impl CatalogRepo<'_> {
         // Synthesize `artist` entries for music `album` and `song` creators and link them
         if matches!(kind, EntryKind::Album | EntryKind::Song) {
             for creator in &clean_creators {
-                let artist_id = Self::ensure_artist_entry_in_tx(tx, creator, now).await?;
+                let artist_id =
+                    Self::ensure_artist_entry_cached_in_tx(tx, creator, now, cache.as_deref_mut())
+                        .await?;
                 let ce_hlc = tx.next_hlc().await?;
                 sqlx::query(
                     "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at, hlc)
@@ -1274,14 +1348,16 @@ impl CatalogRepo<'_> {
             }
         }
 
-        SyncRepo::record_activity(
-            tx.conn(),
-            ActivityEntityType::Entry,
-            &final_id,
-            activity_action,
-            now,
-        )
-        .await?;
+        if mutated {
+            SyncRepo::record_activity(
+                tx.conn(),
+                ActivityEntityType::Entry,
+                &final_id,
+                activity_action,
+                now,
+            )
+            .await?;
+        }
 
         Ok((final_id, activity_action == ActivityAction::Create))
     }
@@ -1291,33 +1367,63 @@ impl CatalogRepo<'_> {
         artist_name: &str,
         now: DateTime<Utc>,
     ) -> CatalogResult<String> {
+        Self::ensure_artist_entry_cached_in_tx(tx, artist_name, now, None).await
+    }
+
+    pub(super) async fn ensure_artist_entry_cached_in_tx(
+        tx: &mut WriteTx<'_>,
+        artist_name: &str,
+        now: DateTime<Utc>,
+        mut cache: Option<&mut BatchTxCache>,
+    ) -> CatalogResult<String> {
         let trimmed = artist_name.trim();
         let lower_name = trimmed.to_lowercase();
+        if let Some(cached) = cache.as_deref().and_then(|c| c.artist_ids.get(&lower_name)) {
+            return Ok(cached.clone());
+        }
         let det_artist_id = deterministic_title_entry_id("artist", &lower_name);
-        if let Some(existing) = sqlx::query_scalar!(
-            r#"SELECT id as "id!" FROM entries
-               WHERE kind = 'artist' AND merged_into_id IS NULL
-                 AND (id = ? OR LOWER(title) = LOWER(?))
-               LIMIT 1"#,
-            &det_artist_id,
-            trimmed,
+        if let Some(existing) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM entries
+             WHERE id = ? AND kind = 'artist' AND merged_into_id IS NULL
+             LIMIT 1",
         )
+        .bind(&det_artist_id)
         .fetch_optional(tx.conn())
         .await?
         {
+            if let Some(c) = cache.as_deref_mut() {
+                c.artist_ids.insert(lower_name, existing.clone());
+            }
+            return Ok(existing);
+        }
+        if let Some(existing) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM entries
+             WHERE kind = 'artist' AND merged_into_id IS NULL AND LOWER(title) = LOWER(?)
+             LIMIT 1",
+        )
+        .bind(trimmed)
+        .fetch_optional(tx.conn())
+        .await?
+        {
+            if let Some(c) = cache.as_deref_mut() {
+                c.artist_ids.insert(lower_name, existing.clone());
+            }
             return Ok(existing);
         }
         if !trimmed.is_ascii() {
-            let artist_rows = sqlx::query!(
-                r#"SELECT id as "id!", title as "title!" FROM entries
-                   WHERE kind = 'artist' AND merged_into_id IS NULL
-                   ORDER BY updated_at DESC"#,
+            let artist_rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT id, title FROM entries
+                 WHERE kind = 'artist' AND merged_into_id IS NULL AND title GLOB '*[^ -~]*'
+                 ORDER BY updated_at DESC",
             )
             .fetch_all(tx.conn())
             .await?;
-            for row in artist_rows {
-                if row.title.trim().to_lowercase() == lower_name {
-                    return Ok(row.id);
+            for (row_id, row_title) in artist_rows {
+                if row_title.trim().to_lowercase() == lower_name {
+                    if let Some(c) = cache.as_deref_mut() {
+                        c.artist_ids.insert(lower_name, row_id.clone());
+                    }
+                    return Ok(row_id);
                 }
             }
         }
@@ -1327,6 +1433,9 @@ impl CatalogRepo<'_> {
         if let Some(canon_artist_id) =
             Self::follow_merged_id_in_tx(tx.conn(), &det_artist_id).await?
         {
+            if let Some(c) = cache.as_deref_mut() {
+                c.artist_ids.insert(lower_name, canon_artist_id.clone());
+            }
             return Ok(canon_artist_id);
         }
 
@@ -1344,6 +1453,9 @@ impl CatalogRepo<'_> {
                 now,
             )
             .await?;
+        }
+        if let Some(c) = cache {
+            c.artist_ids.insert(lower_name, det_artist_id.clone());
         }
         Ok(det_artist_id)
     }
@@ -1457,6 +1569,20 @@ impl CatalogRepo<'_> {
         let hydrated = Self::hydrate_entries_in_tx(&mut *conn, raw_rows).await?;
         Ok(hydrated.into_iter().map(|e| (e.id.clone(), e)).collect())
     }
+}
+
+fn ascii_prefix_upper_bound(prefix: &str) -> Option<String> {
+    if prefix.is_empty() || !prefix.is_ascii() {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.pop() {
+        if last < 0x7f {
+            bytes.push(last + 1);
+            return String::from_utf8(bytes).ok();
+        }
+    }
+    None
 }
 
 fn validate_http_url(raw: &str, label: &str) -> CatalogResult<()> {

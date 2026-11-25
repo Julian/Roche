@@ -376,64 +376,224 @@ impl CatalogRepo<'_> {
         now: DateTime<Utc>,
         touch_parent_entry: bool,
     ) -> CatalogResult<()> {
+        let _ = Self::attach_collection_member_with_added_at_in_tx(
+            tx,
+            col_id,
+            member_id,
+            position,
+            None,
+            now,
+            touch_parent_entry,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn attach_collection_member_with_added_at_in_tx(
+        tx: &mut WriteTx<'_>,
+        col_id: &str,
+        member_id: &str,
+        position: Option<f64>,
+        explicit_added_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        touch_parent_entry: bool,
+    ) -> CatalogResult<bool> {
         if col_id == member_id {
             return Err(CatalogError::InvalidInput(
                 "A collection cannot contain itself".to_owned(),
             ));
         }
-        if Self::would_introduce_collection_cycle_in_tx(tx.conn(), col_id, member_id).await? {
-            return Err(CatalogError::InvalidInput(
-                "Adding entry to collection would create a cycle".to_owned(),
-            ));
-        }
+        let position = match position {
+            Some(p) if !p.is_finite() => {
+                return Err(CatalogError::InvalidInput(
+                    "Collection member position must be a finite number".to_owned(),
+                ));
+            }
+            Some(0.0) => Some(0.0),
+            other => other,
+        };
 
-        let nat_key = collection_entry_natural_key(col_id, member_id);
-        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::CollectionEntry, &nat_key).await?;
-
-        let ce_hlc = tx.next_hlc().await?;
-        sqlx::query(
-            "INSERT INTO collection_entries (collection_id, entry_id, position, added_at, hlc)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(collection_id, entry_id) DO UPDATE SET
-                position = COALESCE(excluded.position, collection_entries.position),
-                hlc = CASE
-                    WHEN excluded.position IS NOT NULL
-                      AND excluded.position IS NOT collection_entries.position
-                    THEN excluded.hlc
-                    ELSE collection_entries.hlc
-                END",
+        let existing: Option<(Option<f64>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT position, added_at
+             FROM collection_entries
+             WHERE collection_id = ? AND entry_id = ?",
         )
         .bind(col_id)
         .bind(member_id)
-        .bind(position)
-        .bind(now)
-        .bind(&ce_hlc)
-        .execute(tx.conn())
+        .fetch_optional(tx.conn())
         .await?;
 
-        SyncRepo::record_activity(
-            tx.conn(),
-            ActivityEntityType::CollectionEntry,
-            &nat_key,
-            ActivityAction::Create,
-            now,
-        )
-        .await?;
+        let nat_key = collection_entry_natural_key(col_id, member_id);
 
-        if touch_parent_entry {
-            sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, col_id,)
-                .execute(tx.conn())
+        if let Some((existing_pos, existing_added_at)) = existing {
+            let next_pos = position.or(existing_pos);
+            let next_added_at = explicit_added_at.unwrap_or(existing_added_at);
+            let pos_changed = match (existing_pos, next_pos) {
+                (Some(a), Some(b)) => a.to_bits() != b.to_bits(),
+                (None, None) => false,
+                _ => true,
+            };
+            let added_changed = next_added_at != existing_added_at;
+            if !pos_changed && !added_changed {
+                return Ok(false);
+            }
+            SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::CollectionEntry, &nat_key)
                 .await?;
+            let ce_hlc = tx.next_hlc().await?;
+            sqlx::query(
+                "UPDATE collection_entries
+                 SET position = ?, added_at = ?, hlc = ?
+                 WHERE collection_id = ? AND entry_id = ?",
+            )
+            .bind(next_pos)
+            .bind(next_added_at)
+            .bind(&ce_hlc)
+            .bind(col_id)
+            .bind(member_id)
+            .execute(tx.conn())
+            .await?;
             SyncRepo::record_activity(
                 tx.conn(),
-                ActivityEntityType::Entry,
-                col_id,
+                ActivityEntityType::CollectionEntry,
+                &nat_key,
                 ActivityAction::Update,
                 now,
             )
             .await?;
+        } else {
+            if Self::would_introduce_collection_cycle_in_tx(tx.conn(), col_id, member_id).await? {
+                return Err(CatalogError::InvalidInput(
+                    "Adding entry to collection would create a cycle".to_owned(),
+                ));
+            }
+            SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::CollectionEntry, &nat_key)
+                .await?;
+            let ce_hlc = tx.next_hlc().await?;
+            let insert_added_at = explicit_added_at.unwrap_or(now);
+            sqlx::query(
+                "INSERT INTO collection_entries (collection_id, entry_id, position, added_at, hlc)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(col_id)
+            .bind(member_id)
+            .bind(position)
+            .bind(insert_added_at)
+            .bind(&ce_hlc)
+            .execute(tx.conn())
+            .await?;
+            SyncRepo::record_activity(
+                tx.conn(),
+                ActivityEntityType::CollectionEntry,
+                &nat_key,
+                ActivityAction::Create,
+                now,
+            )
+            .await?;
         }
+
+        if touch_parent_entry {
+            Self::touch_collection_parent_in_tx(tx.conn(), col_id, now).await?;
+        }
+        Ok(true)
+    }
+
+    async fn touch_collection_parent_in_tx(
+        conn: &mut SqliteConnection,
+        col_id: &str,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<()> {
+        sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(col_id)
+            .execute(&mut *conn)
+            .await?;
+        SyncRepo::record_activity(
+            &mut *conn,
+            ActivityEntityType::Entry,
+            col_id,
+            ActivityAction::Update,
+            now,
+        )
+        .await?;
         Ok(())
+    }
+
+    pub(super) async fn remove_collection_member_by_id_in_tx(
+        tx: &mut WriteTx<'_>,
+        col_id: &str,
+        target_entry_id: &str,
+        now: DateTime<Utc>,
+        touch_parent_entry: bool,
+    ) -> CatalogResult<bool> {
+        Self::remove_collection_member_inner_in_tx(
+            tx,
+            col_id,
+            target_entry_id,
+            now,
+            touch_parent_entry,
+            true,
+        )
+        .await
+    }
+
+    pub(super) async fn remove_collection_member_defer_generator_in_tx(
+        tx: &mut WriteTx<'_>,
+        col_id: &str,
+        target_entry_id: &str,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<bool> {
+        Self::remove_collection_member_inner_in_tx(tx, col_id, target_entry_id, now, false, false)
+            .await
+    }
+
+    async fn remove_collection_member_inner_in_tx(
+        tx: &mut WriteTx<'_>,
+        col_id: &str,
+        target_entry_id: &str,
+        now: DateTime<Utc>,
+        touch_parent_entry: bool,
+        advance_generator: bool,
+    ) -> CatalogResult<bool> {
+        let res =
+            sqlx::query("DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?")
+                .bind(col_id)
+                .bind(target_entry_id)
+                .execute(tx.conn())
+                .await?;
+        let removed = res.rows_affected() > 0;
+        if removed {
+            if advance_generator {
+                Self::advance_generator_if_drawing_in_tx(tx, col_id, target_entry_id, now).await?;
+            }
+            let nat_key = collection_entry_natural_key(col_id, target_entry_id);
+            SyncRepo::record_tombstone(tx, ActivityEntityType::CollectionEntry, &nat_key, now)
+                .await?;
+            SyncRepo::record_activity(
+                tx.conn(),
+                ActivityEntityType::CollectionEntry,
+                &nat_key,
+                ActivityAction::Delete,
+                now,
+            )
+            .await?;
+            if touch_parent_entry {
+                sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(col_id)
+                    .execute(tx.conn())
+                    .await?;
+                SyncRepo::record_activity(
+                    tx.conn(),
+                    ActivityEntityType::Entry,
+                    col_id,
+                    ActivityAction::Update,
+                    now,
+                )
+                .await?;
+            }
+        }
+        Ok(removed)
     }
 
     /// Resolves a collection by slug or ID, verifies it is manually mutable, and attaches
@@ -492,40 +652,14 @@ impl CatalogRepo<'_> {
         let target_entry_id = Self::follow_merged_id_in_tx(tx.conn(), entry_id)
             .await?
             .unwrap_or_else(|| entry_id.trim().to_owned());
-        let res = sqlx::query!(
-            "DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
+        let removed = Self::remove_collection_member_by_id_in_tx(
+            &mut tx,
             &col.id,
             &target_entry_id,
+            now,
+            true,
         )
-        .execute(tx.conn())
         .await?;
-        let removed = res.rows_affected() > 0;
-        if removed {
-            Self::advance_generator_if_drawing_in_tx(&mut tx, &col.id, &target_entry_id, now)
-                .await?;
-            let nat_key = collection_entry_natural_key(&col.id, &target_entry_id);
-            SyncRepo::record_tombstone(&mut tx, ActivityEntityType::CollectionEntry, &nat_key, now)
-                .await?;
-            SyncRepo::record_activity(
-                tx.conn(),
-                ActivityEntityType::CollectionEntry,
-                &nat_key,
-                ActivityAction::Delete,
-                now,
-            )
-            .await?;
-            sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, &col.id,)
-                .execute(tx.conn())
-                .await?;
-            SyncRepo::record_activity(
-                tx.conn(),
-                ActivityEntityType::Entry,
-                &col.id,
-                ActivityAction::Update,
-                now,
-            )
-            .await?;
-        }
         tx.commit().await?;
         Ok(removed)
     }

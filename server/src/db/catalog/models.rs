@@ -459,6 +459,8 @@ pub struct BatchCollectionMemberInput {
     pub entry_ref: String,
     #[serde(default)]
     pub position: Option<f64>,
+    #[serde(default)]
+    pub added_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -467,6 +469,7 @@ pub struct BatchCollectionInput {
     pub ref_key: Option<String>,
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub slug: Option<String>,
@@ -478,6 +481,24 @@ pub struct BatchCollectionInput {
     pub color: Option<String>,
     #[serde(default)]
     pub members: Vec<BatchCollectionMemberInput>,
+    #[serde(default)]
+    pub replace_members: bool,
+}
+
+impl Default for BatchCollectionInput {
+    fn default() -> Self {
+        Self {
+            ref_key: None,
+            id: None,
+            title: String::new(),
+            slug: None,
+            role: default_batch_collection_role(),
+            summary: None,
+            color: None,
+            members: Vec::new(),
+            replace_members: false,
+        }
+    }
 }
 
 const fn default_batch_collection_role() -> CollectionRole {
@@ -519,6 +540,28 @@ pub struct CatalogBatchResult {
     pub comparisons_recorded: usize,
     pub generators_updated: usize,
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogBatchStreamResult {
+    pub batches_processed: usize,
+    pub collections_processed: usize,
+    pub entries_processed: usize,
+    pub logs_recorded: usize,
+    pub comparisons_recorded: usize,
+    pub generators_updated: usize,
+    pub dry_run: bool,
+}
+
+impl CatalogBatchStreamResult {
+    pub const fn accumulate(&mut self, batch: &CatalogBatchResult) {
+        self.batches_processed += 1;
+        self.collections_processed += batch.collections_processed;
+        self.entries_processed += batch.entries_processed;
+        self.logs_recorded += batch.logs_recorded;
+        self.comparisons_recorded += batch.comparisons_recorded;
+        self.generators_updated += batch.generators_updated;
+    }
 }
 
 /// Pure database snapshot of a collection and its rankable members, consumed by

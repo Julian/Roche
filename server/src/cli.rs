@@ -226,9 +226,9 @@ impl Cli {
                 run_draw_cmd(&db, action.unwrap_or(DrawCommand::Status { collection: None })).await
             }
             Some(Command::Catalog { action }) => match action {
-                CatalogCommand::Apply { file, dry_run, json } => {
+                CatalogCommand::Apply { file, ndjson, dry_run, json } => {
                     let db = crate::RocheServer::connect_db(&cfg).await?;
-                    run_catalog_apply_cmd(&db, &file, dry_run, json).await
+                    run_catalog_apply_cmd(&db, &file, ndjson, dry_run, json).await
                 }
             },
         }
@@ -450,9 +450,38 @@ fn format_bytes(bytes: u64) -> String {
 async fn run_catalog_apply_cmd(
     db: &Db,
     file: &std::path::Path,
+    ndjson: bool,
     dry_run_flag: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    if ndjson {
+        let mut on_batch = |batch_num: usize, _: &crate::db::CatalogBatchResult| {
+            if !json && batch_num.is_multiple_of(10) {
+                eprintln!("Processed {batch_num} catalog batches...");
+            }
+        };
+        let result = if file.as_os_str() == "-" {
+            let reader = tokio::io::BufReader::new(tokio::io::stdin());
+            db.catalog().apply_batch_ndjson(reader, dry_run_flag, &mut on_batch).await?
+        } else {
+            let opened = tokio::fs::File::open(file).await?;
+            let reader = tokio::io::BufReader::new(opened);
+            db.catalog().apply_batch_ndjson(reader, dry_run_flag, &mut on_batch).await?
+        };
+        if json {
+            println!("{}", serde_json::to_string(&result)?);
+        } else {
+            let suffix = if result.dry_run { " (dry run — rolled back)" } else { "" };
+            println!("Applied {} catalog batch(es){suffix}:", result.batches_processed);
+            println!("  Collections processed: {}", result.collections_processed);
+            println!("  Entries processed:     {}", result.entries_processed);
+            println!("  Consumption logs:      {}", result.logs_recorded);
+            println!("  Comparisons recorded:  {}", result.comparisons_recorded);
+            println!("  Generators updated:    {}", result.generators_updated);
+        }
+        return Ok(());
+    }
+
     let raw = if file.as_os_str() == "-" {
         use std::io::Read as _;
         let mut buf = String::new();
@@ -595,11 +624,14 @@ pub enum Command {
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum CatalogCommand {
-    /// Apply a JSON batch of catalog entries, logs, comparisons, and generator updates
+    /// Apply a JSON (or streaming NDJSON) batch of catalog entries, logs, comparisons, and generators
     Apply {
         /// Path to the JSON batch file (or `-` to read from stdin)
         #[arg(default_value = "-")]
         file: PathBuf,
+        /// Stream newline-delimited JSON (`CatalogBatchInput` per non-empty line)
+        #[arg(long)]
+        ndjson: bool,
         /// Validate and simulate inside a rolled-back transaction without modifying disk
         #[arg(long)]
         dry_run: bool,
@@ -1324,8 +1356,23 @@ mod tests {
             Some(Command::Catalog {
                 action: CatalogCommand::Apply {
                     file: PathBuf::from("/tmp/batch.json"),
+                    ndjson: false,
                     dry_run: true,
                     json: true,
+                },
+            })
+        );
+
+        let catalog_ndjson_cmd =
+            Cli::try_parse_from(["roche", "catalog", "apply", "--ndjson", "--dry-run"]).unwrap();
+        assert_eq!(
+            catalog_ndjson_cmd.command,
+            Some(Command::Catalog {
+                action: CatalogCommand::Apply {
+                    file: PathBuf::from("-"),
+                    ndjson: true,
+                    dry_run: true,
+                    json: false,
                 },
             })
         );

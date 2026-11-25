@@ -5,6 +5,7 @@ use sqlx::{QueryBuilder, Sqlite};
 
 use super::{
     CatalogRepo,
+    batch::BatchTxCache,
     models::{
         CatalogError, CatalogResult, ConsumptionLogRow, ConsumptionLogView, UpsertEntryInput,
     },
@@ -148,6 +149,18 @@ impl CatalogRepo<'_> {
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> CatalogResult<(String, String)> {
+        Self::log_consumption_cached_in_tx(tx, entry_id, status, notes, event_ts, now, None).await
+    }
+
+    pub(super) async fn log_consumption_cached_in_tx(
+        tx: &mut WriteTx<'_>,
+        entry_id: &str,
+        status: ConsumptionStatus,
+        notes: Option<&str>,
+        event_ts: DateTime<Utc>,
+        now: DateTime<Utc>,
+        cache: Option<&mut BatchTxCache>,
+    ) -> CatalogResult<(String, String)> {
         let canon_id = Self::follow_merged_id_in_tx(tx.conn(), entry_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Entry '{entry_id}'")))?;
@@ -157,7 +170,7 @@ impl CatalogRepo<'_> {
             event_ts.timestamp_millis(),
             status.as_str(),
         );
-        Self::insert_consumption_and_engage_in_tx(
+        Self::insert_consumption_and_engage_cached_in_tx(
             tx,
             &log_id,
             &canon_id,
@@ -167,6 +180,7 @@ impl CatalogRepo<'_> {
             now,
             true,
             None,
+            cache,
         )
         .await?;
         Ok((log_id, canon_id))
@@ -371,17 +385,67 @@ impl CatalogRepo<'_> {
         advance_generators: bool,
         explicit_hlc: Option<&str>,
     ) -> CatalogResult<bool> {
-        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::ConsumptionLog, log_id).await?;
+        Self::insert_consumption_and_engage_cached_in_tx(
+            tx,
+            log_id,
+            canon_id,
+            status,
+            clean_notes,
+            event_ts,
+            now,
+            advance_generators,
+            explicit_hlc,
+            None,
+        )
+        .await
+    }
 
-        let existed_before: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM consumption_log WHERE id = ?")
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_consumption_and_engage_cached_in_tx(
+        tx: &mut WriteTx<'_>,
+        log_id: &str,
+        canon_id: &str,
+        status: ConsumptionStatus,
+        clean_notes: Option<&str>,
+        event_ts: DateTime<Utc>,
+        now: DateTime<Utc>,
+        advance_generators: bool,
+        explicit_hlc: Option<&str>,
+        mut cache: Option<&mut BatchTxCache>,
+    ) -> CatalogResult<bool> {
+        let existing: Option<(Option<String>, ConsumptionStatus)> =
+            sqlx::query_as("SELECT notes, status FROM consumption_log WHERE id = ?")
                 .bind(log_id)
                 .fetch_optional(tx.conn())
                 .await?;
 
-        let log_hlc = match explicit_hlc {
-            Some(h) if !h.is_empty() => h.to_owned(),
-            _ => tx.next_hlc().await?,
+        let explicit_non_empty = explicit_hlc.filter(|s| !s.is_empty());
+        if let Some((ref existing_notes, existing_status)) = existing
+            && explicit_non_empty.is_none()
+        {
+            Self::handle_existing_local_consumption_in_tx(
+                tx,
+                log_id,
+                canon_id,
+                status,
+                existing_status,
+                existing_notes.as_deref(),
+                clean_notes,
+                event_ts,
+                now,
+                advance_generators,
+                cache,
+            )
+            .await?;
+            return Ok(false);
+        }
+
+        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::ConsumptionLog, log_id).await?;
+
+        let existed_before = existing.is_some();
+        let log_hlc = match explicit_non_empty {
+            Some(h) => h.to_owned(),
+            None => tx.next_hlc().await?,
         };
         sqlx::query(
             "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at, hlc)
@@ -413,15 +477,89 @@ impl CatalogRepo<'_> {
         .await?;
 
         if status == ConsumptionStatus::Consumed {
-            remove_from_want_queues_in_tx(tx, canon_id, now).await?;
-            Self::engage_consumed_parents_in_tx(tx, canon_id, event_ts, now).await?;
+            let already_engaged =
+                cache.as_deref().is_some_and(|c| c.engaged_consumed_entries.contains(canon_id));
+            if !already_engaged {
+                remove_from_want_queues_in_tx(tx, canon_id, now).await?;
+                Self::engage_consumed_parents_cached_in_tx(
+                    tx,
+                    canon_id,
+                    event_ts,
+                    now,
+                    cache.as_deref_mut(),
+                )
+                .await?;
+                if let Some(c) = cache {
+                    c.engaged_consumed_entries.insert(canon_id.to_owned());
+                }
+            }
         }
         if advance_generators
             && matches!(status, ConsumptionStatus::Consumed | ConsumptionStatus::Abandoned)
         {
             Self::advance_generators_for_entry_in_tx(tx, canon_id, now).await?;
         }
-        Ok(existed_before.is_none())
+        Ok(!existed_before)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_existing_local_consumption_in_tx(
+        tx: &mut WriteTx<'_>,
+        log_id: &str,
+        canon_id: &str,
+        status: ConsumptionStatus,
+        existing_status: ConsumptionStatus,
+        existing_notes: Option<&str>,
+        clean_notes: Option<&str>,
+        event_ts: DateTime<Utc>,
+        now: DateTime<Utc>,
+        advance_generators: bool,
+        mut cache: Option<&mut BatchTxCache>,
+    ) -> CatalogResult<()> {
+        if clean_notes.is_some() && existing_notes != clean_notes {
+            SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::ConsumptionLog, log_id)
+                .await?;
+            let log_hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE consumption_log SET notes = ?, hlc = ? WHERE id = ?")
+                .bind(clean_notes)
+                .bind(&log_hlc)
+                .bind(log_id)
+                .execute(tx.conn())
+                .await?;
+            SyncRepo::record_activity(
+                tx.conn(),
+                ActivityEntityType::ConsumptionLog,
+                log_id,
+                ActivityAction::Update,
+                now,
+            )
+            .await?;
+        }
+        let already_engaged = status == ConsumptionStatus::Consumed
+            && cache.as_deref().is_some_and(|c| c.engaged_consumed_entries.contains(canon_id));
+        if status == ConsumptionStatus::Consumed && !already_engaged {
+            remove_from_want_queues_in_tx(tx, canon_id, now).await?;
+            if existing_status != ConsumptionStatus::Consumed {
+                Self::engage_consumed_parents_cached_in_tx(
+                    tx,
+                    canon_id,
+                    event_ts,
+                    now,
+                    cache.as_deref_mut(),
+                )
+                .await?;
+            }
+            if let Some(c) = cache {
+                c.engaged_consumed_entries.insert(canon_id.to_owned());
+            }
+        }
+        if advance_generators
+            && !already_engaged
+            && matches!(status, ConsumptionStatus::Consumed | ConsumptionStatus::Abandoned)
+        {
+            Self::advance_generators_for_entry_in_tx(tx, canon_id, now).await?;
+        }
+        Ok(())
     }
 
     async fn engage_consumed_parents_in_tx(
@@ -429,6 +567,16 @@ impl CatalogRepo<'_> {
         canon_id: &str,
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
+    ) -> CatalogResult<()> {
+        Self::engage_consumed_parents_cached_in_tx(tx, canon_id, event_ts, now, None).await
+    }
+
+    async fn engage_consumed_parents_cached_in_tx(
+        tx: &mut WriteTx<'_>,
+        canon_id: &str,
+        event_ts: DateTime<Utc>,
+        now: DateTime<Utc>,
+        mut cache: Option<&mut BatchTxCache>,
     ) -> CatalogResult<()> {
         let row_meta = sqlx::query!(
             r#"SELECT kind as "kind!: EntryKind", creators_json as "creators_json!"
@@ -442,19 +590,21 @@ impl CatalogRepo<'_> {
 
         // Engage parent `podcast` / `publication` / `channel` when an episode/article/video is consumed.
         // Note: consuming a `song` intentionally NEVER auto-consumes its parent `album`!
-        let parent_feed_cols = sqlx::query_scalar!(
-            r#"SELECT ce.collection_id as "collection_id!"
-               FROM collection_entries ce
-               JOIN entries pe ON pe.id = ce.collection_id
-               WHERE ce.entry_id = ?
-                 AND pe.merged_into_id IS NULL
-                 AND pe.kind IN ('podcast', 'publication', 'channel')"#,
-            canon_id,
-        )
-        .fetch_all(tx.conn())
-        .await?;
-        for parent_id in parent_feed_cols {
-            Self::ensure_once_consumed_in_tx(tx, &parent_id, event_ts, now).await?;
+        if !matches!(entry_kind, EntryKind::Song | EntryKind::Album) {
+            let parent_feed_cols: Vec<String> = sqlx::query_scalar(
+                "SELECT ce.collection_id
+                 FROM collection_entries ce
+                 JOIN entries pe ON pe.id = ce.collection_id
+                 WHERE ce.entry_id = ?
+                   AND pe.merged_into_id IS NULL
+                   AND pe.kind IN ('podcast', 'publication', 'channel')",
+            )
+            .bind(canon_id)
+            .fetch_all(tx.conn())
+            .await?;
+            for parent_id in parent_feed_cols {
+                Self::ensure_once_consumed_in_tx(tx, &parent_id, event_ts, now).await?;
+            }
         }
 
         // Engage `artist` creators when an `album` or `song` is consumed
@@ -462,7 +612,13 @@ impl CatalogRepo<'_> {
             let creators: Vec<String> = serde_json::from_str(&creators_json).unwrap_or_default();
             for creator in creators {
                 if !creator.trim().is_empty() {
-                    let artist_id = Self::ensure_artist_entry_in_tx(tx, &creator, now).await?;
+                    let artist_id = Self::ensure_artist_entry_cached_in_tx(
+                        tx,
+                        &creator,
+                        now,
+                        cache.as_deref_mut(),
+                    )
+                    .await?;
                     let ce_hlc = tx.next_hlc().await?;
                     sqlx::query(
                         "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at, hlc)
@@ -474,7 +630,14 @@ impl CatalogRepo<'_> {
                     .bind(&ce_hlc)
                     .execute(tx.conn())
                     .await?;
-                    Self::ensure_once_consumed_in_tx(tx, &artist_id, event_ts, now).await?;
+                    let artist_already_consumed =
+                        cache.as_deref().is_some_and(|c| c.consumed_artists.contains(&artist_id));
+                    if !artist_already_consumed {
+                        Self::ensure_once_consumed_in_tx(tx, &artist_id, event_ts, now).await?;
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.consumed_artists.insert(artist_id);
+                        }
+                    }
                 }
             }
         }

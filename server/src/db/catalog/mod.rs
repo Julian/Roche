@@ -18,12 +18,13 @@ mod tests;
 pub use collections::derive_manual_collection_slug_and_id;
 pub use models::{
     BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
-    BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult, CatalogEntry,
-    CatalogError, CatalogExportSnapshot, CatalogResult, CollectionGeneratorState,
-    CollectionPageMeta, CollectionRankingInputs, CollectionSummary, ComparisonRecord,
-    ConsumptionLogRow, ConsumptionLogView, DiaryKindFilter, DynamicCollectionRule, EntryDetailView,
-    EntryIdentifier, ExportCatalogEntry, ExportCollectionEntry, ExportCollectionGenerator,
-    ExportComparison, ExportConsumptionLog, UpdateEntryInput, UpsertEntryInput, WantSearchMatch,
+    BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult,
+    CatalogBatchStreamResult, CatalogEntry, CatalogError, CatalogExportSnapshot, CatalogResult,
+    CollectionGeneratorState, CollectionPageMeta, CollectionRankingInputs, CollectionSummary,
+    ComparisonRecord, ConsumptionLogRow, ConsumptionLogView, DiaryKindFilter,
+    DynamicCollectionRule, EntryDetailView, EntryIdentifier, ExportCatalogEntry,
+    ExportCollectionEntry, ExportCollectionGenerator, ExportComparison, ExportConsumptionLog,
+    UpdateEntryInput, UpsertEntryInput, WantSearchMatch,
 };
 pub use roche_core::{
     domain::{matches_dynamic_collection_rule, parse_dynamic_collection_rule},
