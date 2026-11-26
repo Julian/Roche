@@ -5,7 +5,8 @@ use sqlx::SqliteConnection;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _};
 
 use roche_core::identity_norm::{
-    normalize_identifier_scheme, normalize_identifier_value, normalize_spotify_identifier,
+    choose_deterministic_entry_id, normalize_identifier_scheme, normalize_identifier_value,
+    normalize_spotify_identifier,
 };
 
 use super::{
@@ -13,14 +14,18 @@ use super::{
     collections::derive_manual_collection_slug_and_id,
     models::{
         BatchCollectionInput, BatchComparisonInput, BatchGeneratorInput, CatalogBatchInput,
-        CatalogBatchResult, CatalogBatchStreamResult, CatalogError, CatalogResult, is_dynamic_rule,
+        CatalogBatchResult, CatalogBatchStreamResult, CatalogError, CatalogResult,
+        LocalDocDbAppliedItem, LocalDocDbBatch, LocalDocDbBatchResult, LocalDocDbInput,
+        collection_immutable_reason, is_dynamic_rule,
     },
 };
 use crate::{
     db::{
-        WriteTx, entries_core,
-        sync::SyncRepo,
-        types::{ActivityAction, ActivityEntityType, CollectionRole, EntryKind, HexColor},
+        TagRepo, WANT_TO_READ_COLLECTION_ID, WANT_TO_READ_SLUG, WriteTx, entries_core,
+        sync::{SyncRepo, item_natural_key},
+        types::{
+            ActivityAction, ActivityEntityType, CollectionRole, EntryKind, HexColor, InboxState,
+        },
     },
     ranking::validate_ordering,
 };
@@ -95,6 +100,27 @@ fn validate_batch_limits(batch: &CatalogBatchInput) -> CatalogResult<()> {
     Ok(())
 }
 
+fn validate_local_doc_batch_limits(batch: &LocalDocDbBatch) -> CatalogResult<()> {
+    if batch.collections.len() > MAX_BATCH_COLLECTIONS {
+        return Err(CatalogError::InvalidInput(format!(
+            "Batch exceeds maximum of {MAX_BATCH_COLLECTIONS} collections"
+        )));
+    }
+    if batch.documents.len() > MAX_BATCH_ENTRIES {
+        return Err(CatalogError::InvalidInput(format!(
+            "Batch exceeds maximum of {MAX_BATCH_ENTRIES} documents"
+        )));
+    }
+    for doc in &batch.documents {
+        if doc.entry.identifiers.len() > MAX_BATCH_IDENTIFIERS_PER_ENTRY {
+            return Err(CatalogError::InvalidInput(format!(
+                "Document entry exceeds maximum of {MAX_BATCH_IDENTIFIERS_PER_ENTRY} identifiers"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl CatalogRepo<'_> {
     /// Applies a declarative batch of entries, manual collections, consumption logs, comparisons,
     /// and collection generator updates inside a single atomic SQLite transaction.
@@ -119,6 +145,387 @@ impl CatalogRepo<'_> {
         }
 
         Ok(result)
+    }
+
+    /// Atomically persists a batch of locally imported documents (PDFs/HTML), their target manual
+    /// collections, `entry_content`, `entry_state` (`inbox_state = 'none'`), optional Want-to-Read
+    /// queue membership (skipping entries already logged as `consumed`), and tags inside a single
+    /// SQLite write transaction.
+    ///
+    /// When `batch.dry_run` is `true`, all writes execute inside the transaction and roll back
+    /// cleanly before returning.
+    pub async fn apply_local_document_batch(
+        &self,
+        batch: &LocalDocDbBatch,
+    ) -> CatalogResult<LocalDocDbBatchResult> {
+        validate_local_doc_batch_limits(batch)?;
+        let now = crate::util::clock::now_utc();
+        let mut tx = crate::db::begin_write(self.pool, self.write_lock).await?;
+        let mut cache = BatchTxCache::default();
+        let mut ref_map: HashMap<String, String> = HashMap::with_capacity(batch.collections.len());
+
+        for col in &batch.collections {
+            let col_id = Self::upsert_batch_collection_spec_in_tx(&mut tx, col, now).await?;
+            if let Some(key) = col.ref_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                ref_map.insert(key.to_owned(), col_id.clone());
+            }
+            if let Some(slug) = col.slug.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                ref_map.insert(slug.to_owned(), col_id);
+            }
+        }
+
+        let want_to_read_id = if batch.documents.iter().any(|d| d.want_to_read) {
+            Some(Self::ensure_want_collection_in_tx(&mut tx, WANT_TO_READ_SLUG, now).await?.id)
+        } else {
+            None
+        };
+
+        let mut items = Vec::with_capacity(batch.documents.len());
+        let mut seen_entry_ids: HashMap<String, usize> =
+            HashMap::with_capacity(batch.documents.len());
+        for (idx, doc) in batch.documents.iter().enumerate() {
+            let applied = Self::apply_single_local_doc_in_tx(
+                &mut tx,
+                &ref_map,
+                &mut cache,
+                doc,
+                want_to_read_id.as_deref(),
+                now,
+            )
+            .await?;
+            if let Some(&prev_idx) = seen_entry_ids.get(&applied.entry_id) {
+                return Err(CatalogError::Conflict(format!(
+                    "Manifest documents #{prev_idx} and #{idx} ('{}') resolve to the same entry ID '{}'; deduplicate them before importing",
+                    doc.entry.title.trim(),
+                    applied.entry_id
+                )));
+            }
+            seen_entry_ids.insert(applied.entry_id.clone(), idx);
+            items.push(applied);
+        }
+
+        if batch.dry_run {
+            tx.rollback().await?;
+        } else {
+            tx.commit().await?;
+        }
+
+        Ok(LocalDocDbBatchResult {
+            collections_processed: batch.collections.len(),
+            items,
+            dry_run: batch.dry_run,
+        })
+    }
+
+    async fn apply_single_local_doc_in_tx(
+        tx: &mut WriteTx<'_>,
+        ref_map: &HashMap<String, String>,
+        cache: &mut BatchTxCache,
+        doc: &LocalDocDbInput,
+        want_to_read_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<LocalDocDbAppliedItem> {
+        let kind = doc.entry.kind.ok_or_else(|| {
+            CatalogError::InvalidInput("Document entry `kind` is required".into())
+        })?;
+        let title = doc.entry.title.trim();
+        if title.is_empty() {
+            return Err(CatalogError::InvalidInput(
+                "Document entry `title` cannot be empty".into(),
+            ));
+        }
+
+        if let Some(url) = doc.entry.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let nat_key = item_natural_key(None, url);
+            if !nat_key.is_empty() {
+                SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Item, &nat_key).await?;
+            }
+        }
+
+        // If an entry was previously imported offline (no DOI/arXiv/URL) and is now re-imported
+        // with enriched identifiers, upgrade the existing deterministic title entry in-place rather
+        // than creating a duplicate.
+        let upgraded_entry;
+        let effective_entry = if doc.entry.id.is_none()
+            && let Some(existing_title_id) =
+                Self::find_upgradeable_title_entry_in_tx(tx.conn(), &doc.entry, kind, title).await?
+        {
+            let mut cloned = doc.entry.clone();
+            cloned.id = Some(existing_title_id);
+            upgraded_entry = cloned;
+            &upgraded_entry
+        } else {
+            &doc.entry
+        };
+
+        let (entry_id, created) = Self::upsert_entry_with_created_cached_in_tx(
+            tx,
+            effective_entry,
+            kind,
+            title,
+            now,
+            None,
+            None,
+            Some(cache),
+        )
+        .await?;
+
+        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Entry, &entry_id).await?;
+
+        // If an existing non-user-edited entry had an `arxiv.org` URL and enrichment resolved a
+        // published `doi.org` canonical URL, upgrade `entries.url` cleanly in-place.
+        let persisted_url = Self::maybe_upgrade_arxiv_url_to_doi_in_tx(
+            tx,
+            &entry_id,
+            kind,
+            doc.entry.url.as_deref(),
+            now,
+        )
+        .await?;
+
+        let content_updated = entries_core::upsert_entry_content_in_tx(
+            tx.conn(),
+            &entry_id,
+            doc.content_html.as_deref(),
+            doc.content_type,
+            true,
+        )
+        .await?;
+        if content_updated && !created {
+            let hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET updated_at = ?, hlc = ? WHERE id = ?")
+                .bind(now)
+                .bind(&hlc)
+                .bind(&entry_id)
+                .execute(tx.conn())
+                .await?;
+        }
+
+        entries_core::ensure_entry_state_in_tx(tx, &entry_id, InboxState::None, now).await?;
+
+        let added_to_want_to_read = Self::attach_local_doc_collections_and_tags_in_tx(
+            tx,
+            ref_map,
+            &entry_id,
+            doc,
+            want_to_read_id,
+            now,
+        )
+        .await?;
+
+        Ok(LocalDocDbAppliedItem {
+            entry_id,
+            persisted_url,
+            created,
+            content_updated,
+            added_to_want_to_read,
+        })
+    }
+
+    async fn attach_local_doc_collections_and_tags_in_tx(
+        tx: &mut WriteTx<'_>,
+        ref_map: &HashMap<String, String>,
+        entry_id: &str,
+        doc: &LocalDocDbInput,
+        want_to_read_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<bool> {
+        let has_consumed: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM consumption_log WHERE entry_id = ? AND status = 'consumed')",
+        )
+        .bind(entry_id)
+        .fetch_one(tx.conn())
+        .await?;
+        let is_consumed = has_consumed != 0;
+
+        let mut added_to_want_to_read = false;
+        let mut attached_cols = HashSet::new();
+        for raw_col_ref in &doc.collections {
+            let trimmed_ref = raw_col_ref.trim();
+            if trimmed_ref.is_empty() {
+                continue;
+            }
+            let (col_id, col_title, col_role, rule_json) =
+                Self::resolve_batch_collection_ref_in_tx(tx.conn(), ref_map, trimmed_ref).await?;
+            if let Some(reason) = collection_immutable_reason(col_role, rule_json.as_deref()) {
+                return Err(CatalogError::ImmutableCollection { title: col_title, reason });
+            }
+            if matches!(col_role, CollectionRole::Tag | CollectionRole::System) {
+                return Err(CatalogError::Conflict(format!(
+                    "Collection '{col_title}' cannot be modified as a document collection target"
+                )));
+            }
+            if col_role == CollectionRole::Want && is_consumed {
+                continue;
+            }
+            if attached_cols.insert(col_id.clone()) {
+                let pos = (col_role == CollectionRole::List).then_some(doc.position).flatten();
+                let attached = Self::attach_collection_member_with_added_at_in_tx(
+                    tx, &col_id, entry_id, pos, None, now, false,
+                )
+                .await?;
+                if attached
+                    && (col_id == WANT_TO_READ_COLLECTION_ID
+                        || want_to_read_id == Some(col_id.as_str()))
+                {
+                    added_to_want_to_read = true;
+                }
+            }
+        }
+
+        if doc.want_to_read
+            && !is_consumed
+            && let Some(wtr_id) = want_to_read_id
+            && attached_cols.insert(wtr_id.to_owned())
+        {
+            added_to_want_to_read = Self::attach_collection_member_with_added_at_in_tx(
+                tx, wtr_id, entry_id, None, None, now, false,
+            )
+            .await?;
+        }
+
+        let mut seen_tags = HashSet::new();
+        for raw_tag in &doc.tags {
+            let clean_tag = raw_tag.trim();
+            if clean_tag.is_empty() || !seen_tags.insert(clean_tag.to_lowercase()) {
+                continue;
+            }
+            TagRepo::get_or_create_and_attach_in_tx(tx, entry_id, clean_tag, now).await?;
+        }
+
+        Ok(added_to_want_to_read)
+    }
+
+    async fn maybe_upgrade_arxiv_url_to_doi_in_tx(
+        tx: &mut WriteTx<'_>,
+        entry_id: &str,
+        kind: EntryKind,
+        incoming_url: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<Option<String>> {
+        let (cur_url, cur_meta_json): (Option<String>, String) =
+            sqlx::query_as("SELECT url, metadata_json FROM entries WHERE id = ?")
+                .bind(entry_id)
+                .fetch_one(tx.conn())
+                .await?;
+        let Some(next_url) = incoming_url.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(cur_url);
+        };
+        let is_cur_arxiv =
+            cur_url.as_deref().and_then(crate::util::media_urls::extract_arxiv_id).is_some();
+        let is_next_published_doi = roche_core::document_meta::normalize_doi(next_url)
+            .is_some_and(|d| roche_core::document_meta::extract_arxiv_id_from_doi(&d).is_none());
+        let user_edited = roche_core::crdt::extract_entry_edited_hlc(&cur_meta_json).is_some();
+
+        if is_cur_arxiv
+            && is_next_published_doi
+            && !user_edited
+            && cur_url.as_deref() != Some(next_url)
+        {
+            let hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET url = ?, updated_at = ?, hlc = ? WHERE id = ?")
+                .bind(next_url)
+                .bind(now)
+                .bind(&hlc)
+                .bind(entry_id)
+                .execute(tx.conn())
+                .await?;
+            let norm_url = normalize_identifier_value(kind, "url", next_url);
+            if !norm_url.is_empty() {
+                entries_core::upsert_entry_identifier_in_tx(tx.conn(), entry_id, "url", &norm_url)
+                    .await?;
+            }
+            return Ok(Some(next_url.to_owned()));
+        }
+        Ok(cur_url)
+    }
+
+    async fn find_upgradeable_title_entry_in_tx(
+        conn: &mut SqliteConnection,
+        entry: &crate::db::UpsertEntryInput,
+        kind: EntryKind,
+        title: &str,
+    ) -> CatalogResult<Option<String>> {
+        let mut incoming_idents: Vec<(String, String)> = Vec::new();
+        if let Some(u) = entry.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let norm_u = normalize_identifier_value(kind, "url", u);
+            if !norm_u.is_empty() {
+                incoming_idents.push(("url".to_owned(), norm_u));
+            }
+            if let Some(aid) = crate::util::media_urls::extract_arxiv_id(u) {
+                let norm_a = normalize_identifier_value(kind, "arxiv", &aid);
+                if !norm_a.is_empty() {
+                    incoming_idents.push(("arxiv".to_owned(), norm_a));
+                }
+            }
+        }
+        for ident in &entry.identifiers {
+            let scheme = normalize_identifier_scheme(&ident.scheme);
+            let val = normalize_identifier_value(kind, &scheme, &ident.value);
+            if !scheme.is_empty() && !val.is_empty() {
+                incoming_idents.push((scheme, val));
+            }
+        }
+        for (scheme, val) in &incoming_idents {
+            if entries_core::find_entry_id_by_identifier_in_tx(&mut *conn, scheme, val)
+                .await?
+                .is_some()
+            {
+                return Ok(None);
+            }
+        }
+
+        let clean_creators: Vec<String> = entry
+            .creators
+            .iter()
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        let primary_det_id = choose_deterministic_entry_id(None, kind, title, &clean_creators, &[]);
+        let mut candidate_ids = vec![(primary_det_id, false)];
+        if !clean_creators.is_empty() {
+            let creatorless_id = choose_deterministic_entry_id(None, kind, title, &[], &[]);
+            candidate_ids.push((creatorless_id, true));
+        }
+
+        for (det_id, require_empty_creators) in candidate_ids {
+            let Some(canon_id) = Self::follow_merged_id_in_tx(&mut *conn, &det_id).await? else {
+                continue;
+            };
+            if crate::db::is_protected_system_collection_id(&canon_id) {
+                continue;
+            }
+            let existing: Option<(EntryKind, String)> = sqlx::query_as(
+                "SELECT kind, creators_json FROM entries WHERE id = ? AND merged_into_id IS NULL",
+            )
+            .bind(&canon_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some((ex_kind, ex_creators_json)) = existing else {
+                continue;
+            };
+            if ex_kind != kind {
+                continue;
+            }
+            if require_empty_creators && ex_creators_json.trim() != "[]" {
+                continue;
+            }
+            let existing_idents: Vec<(String, String)> = sqlx::query_as(
+                "SELECT scheme, value FROM entry_identifiers
+                 WHERE entry_id = ? AND scheme IN ('doi', 'arxiv', 'isbn', 'url')",
+            )
+            .bind(&canon_id)
+            .fetch_all(&mut *conn)
+            .await?;
+            let conflicts = existing_idents.iter().any(|(ex_s, ex_v)| {
+                incoming_idents.iter().any(|(inc_s, inc_v)| inc_s == ex_s && inc_v != ex_v)
+            });
+            if !conflicts {
+                return Ok(Some(canon_id));
+            }
+        }
+        Ok(None)
     }
 
     /// Streams newline-delimited JSON (`CatalogBatchInput` per non-empty line) from `reader`.

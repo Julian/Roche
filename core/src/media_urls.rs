@@ -59,7 +59,14 @@ pub fn extract_arxiv_id(url_or_id: &str) -> Option<String> {
         .unwrap_or(stripped_oai);
 
     let cleaned = id_part.split(&['?', '#'][..]).next().unwrap_or(id_part);
-    let cleaned = cleaned.strip_suffix(".pdf").unwrap_or(cleaned).trim_matches('/');
+    let cleaned = if cleaned.len() > 4
+        && cleaned.as_bytes()[cleaned.len() - 4..].eq_ignore_ascii_case(b".pdf")
+    {
+        &cleaned[..cleaned.len() - 4]
+    } else {
+        cleaned
+    }
+    .trim_matches('/');
 
     is_valid_arxiv_id(cleaned).then(|| cleaned.to_string())
 }
@@ -69,7 +76,7 @@ pub fn extract_arxiv_id(url_or_id: &str) -> Option<String> {
 #[must_use]
 pub fn strip_arxiv_version(arxiv_id: &str) -> &str {
     let trimmed = arxiv_id.trim();
-    if let Some((base, suffix)) = trimmed.rsplit_once('v')
+    if let Some((base, suffix)) = trimmed.rsplit_once(['v', 'V'])
         && !base.is_empty()
         && !suffix.is_empty()
         && suffix.bytes().all(|b| b.is_ascii_digit())
@@ -252,9 +259,14 @@ mod tests {
     #[test]
     fn test_extract_arxiv_id_rejects_query_injection() {
         assert_eq!(extract_arxiv_id("2301.07041v2").as_deref(), Some("2301.07041v2"));
+        assert_eq!(extract_arxiv_id("2301.07041.PDF").as_deref(), Some("2301.07041"));
+        assert_eq!(strip_arxiv_version("2202.00002V3"), "2202.00002");
         assert_eq!(extract_arxiv_id("hep-th/9901001").as_deref(), Some("hep-th/9901001"));
         assert!(extract_arxiv_id("2301.07041&max_results=999").is_none());
         assert!(extract_arxiv_id("2301.07041%26search_query=all").is_none());
         assert!(extract_arxiv_id("../etc/passwd").is_none());
+        // Multi-byte UTF-8 inputs where `len - 4` falls inside a UTF-8 sequence must never panic
+        assert!(extract_arxiv_id("https://arxiv.org/abs/fo€ab").is_none());
+        assert!(extract_arxiv_id("2407.12ééa").is_none());
     }
 }

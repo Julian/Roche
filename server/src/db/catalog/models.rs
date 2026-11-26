@@ -6,7 +6,7 @@ use roche_core::external_links::EXTERNAL_ID_DISPLAY_ORDER;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::db::types::{CollectionRole, ConsumptionStatus, EntryKind, HexColor};
+use crate::db::types::{CollectionRole, ConsumptionStatus, ContentType, EntryKind, HexColor};
 
 #[must_use]
 pub fn is_dynamic_rule(rule_json: Option<&str>) -> bool {
@@ -641,4 +641,43 @@ pub struct CatalogExportSnapshot {
     pub consumption_log: Vec<ConsumptionLogRow>,
     pub comparisons: Vec<ComparisonRecord>,
     pub collection_generators: Vec<ExportCollectionGenerator>,
+}
+
+/// Database-ready payload for a single locally imported document (PDF or HTML).
+#[derive(Debug, Clone)]
+pub struct LocalDocDbInput {
+    pub entry: UpsertEntryInput,
+    pub content_type: ContentType,
+    pub content_html: Option<String>,
+    pub collections: Vec<String>,
+    pub position: Option<f64>,
+    pub want_to_read: bool,
+    pub tags: Vec<String>,
+}
+
+/// Atomic batch of collections and local documents to persist via
+/// [`super::CatalogRepo::apply_local_document_batch`].
+#[derive(Debug, Clone, Default)]
+pub struct LocalDocDbBatch {
+    pub collections: Vec<BatchCollectionInput>,
+    pub documents: Vec<LocalDocDbInput>,
+    pub dry_run: bool,
+}
+
+/// Per-document persistence outcome returned by [`super::CatalogRepo::apply_local_document_batch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDocDbAppliedItem {
+    pub entry_id: String,
+    pub persisted_url: Option<String>,
+    pub created: bool,
+    pub content_updated: bool,
+    pub added_to_want_to_read: bool,
+}
+
+/// Summary outcome returned by [`super::CatalogRepo::apply_local_document_batch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalDocDbBatchResult {
+    pub collections_processed: usize,
+    pub items: Vec<LocalDocDbAppliedItem>,
+    pub dry_run: bool,
 }

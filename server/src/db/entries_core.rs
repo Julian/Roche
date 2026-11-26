@@ -236,6 +236,84 @@ pub async fn insert_entry_content_in_tx(
     Ok(())
 }
 
+/// Resolves the appropriate `entry_content.content_type` for `entry_id`, preferring
+/// [`ContentType::Pdf`] whenever local PDF media is attached in `entry_media`.
+pub async fn resolve_entry_content_type_in_tx(
+    tx: &mut SqliteConnection,
+    entry_id: &str,
+    entry_kind: EntryKind,
+) -> std::result::Result<ContentType, sqlx::Error> {
+    let has_local_pdf: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM entry_media
+         WHERE entry_id = ? AND media_type = 'pdf' AND local_path IS NOT NULL
+         LIMIT 1",
+    )
+    .bind(entry_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(if has_local_pdf.is_some() { ContentType::Pdf } else { entry_kind.default_content_type() })
+}
+
+/// Inserts or updates an `entry_content` row, returning `true` when the row was inserted or
+/// modified.
+///
+/// When `overwrite_html` is `false`, existing non-empty `content_html` is preserved. When
+/// `content_type` is `ContentType::Pdf`, an existing `'paper'` or `'article'` row is upgraded to
+/// `'pdf'` so clients recognize cached local PDF media.
+pub async fn upsert_entry_content_in_tx(
+    tx: &mut SqliteConnection,
+    entry_id: &str,
+    content_html: Option<&str>,
+    content_type: ContentType,
+    overwrite_html: bool,
+) -> std::result::Result<bool, sqlx::Error> {
+    let clean_html = content_html.filter(|s| !s.trim().is_empty());
+    let existing: Option<(Option<String>, ContentType)> =
+        sqlx::query_as("SELECT content_html, content_type FROM entry_content WHERE entry_id = ?")
+            .bind(entry_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+    let Some((cur_html, cur_ct)) = existing else {
+        sqlx::query(
+            "INSERT INTO entry_content (entry_id, content_html, content_type)
+             VALUES (?, ?, ?)",
+        )
+        .bind(entry_id)
+        .bind(clean_html)
+        .bind(content_type)
+        .execute(&mut *tx)
+        .await?;
+        return Ok(true);
+    };
+
+    let has_cur_html = cur_html.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let next_html = clean_html.map_or(cur_html.as_deref(), |new_html| {
+        if overwrite_html || !has_cur_html { Some(new_html) } else { cur_html.as_deref() }
+    });
+    let next_ct = if content_type == ContentType::Pdf
+        && matches!(cur_ct, ContentType::Paper | ContentType::Article)
+    {
+        content_type
+    } else {
+        cur_ct
+    };
+
+    let html_changed = next_html != cur_html.as_deref();
+    let ct_changed = next_ct != cur_ct;
+    if !html_changed && !ct_changed {
+        return Ok(false);
+    }
+
+    sqlx::query("UPDATE entry_content SET content_html = ?, content_type = ? WHERE entry_id = ?")
+        .bind(next_html)
+        .bind(next_ct)
+        .bind(entry_id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(true)
+}
+
 /// Ensures an `entry_state` row exists with the given initial `inbox_state` and `progress = 0.0`
 /// without overwriting any existing state row.
 pub async fn ensure_entry_state_in_tx(

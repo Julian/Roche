@@ -24,6 +24,7 @@ pub use models::{
     CollectionSummary, ComparisonRecord, ConsumptionLogRow, ConsumptionLogView, DiaryKindFilter,
     DynamicCollectionRule, EntryDetailView, EntryIdentifier, ExportCatalogEntry,
     ExportCollectionEntry, ExportCollectionGenerator, ExportComparison, ExportConsumptionLog,
+    LocalDocDbAppliedItem, LocalDocDbBatch, LocalDocDbBatchResult, LocalDocDbInput,
     UpdateEntryInput, UpsertEntryInput, WantSearchMatch,
 };
 pub use roche_core::{

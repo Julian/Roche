@@ -15,7 +15,8 @@ use serde_json::Value;
 use url::Url;
 
 pub use self::document::{
-    FeedFetcherTextAdapter, can_refresh_document_metadata, discover_pdf_metadata_from_bytes,
+    DocumentIdentifierHint, FeedFetcherTextAdapter, can_refresh_document_metadata,
+    discover_pdf_metadata_from_bytes, discover_verified_pdf_metadata,
     enrich_document_detail_with_fetcher, extract_paper_reader_html, fetch_arxiv_html5,
     lookup_external_document_metadata, should_auto_enrich_document,
 };

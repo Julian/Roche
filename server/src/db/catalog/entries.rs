@@ -891,7 +891,7 @@ impl CatalogRepo<'_> {
     }
 
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-    async fn upsert_entry_with_created_cached_in_tx(
+    pub(super) async fn upsert_entry_with_created_cached_in_tx(
         tx: &mut WriteTx<'_>,
         input: &UpsertEntryInput,
         kind: EntryKind,

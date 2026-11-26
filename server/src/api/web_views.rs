@@ -107,13 +107,13 @@ where
 {
     let candidate_ids: Vec<String> = entries
         .into_iter()
-        .filter(|e| e.kind.is_reader_openable() && e.url.is_some())
+        .filter(|e| e.kind.is_reader_openable() || e.kind == EntryKind::Book)
         .map(|e| e.id.clone())
         .collect();
     if candidate_ids.is_empty() {
         return HashSet::new();
     }
-    service.items().existing_ids(&candidate_ids).await.unwrap_or_default()
+    service.items().reader_openable_ids(&candidate_ids).await.unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,7 +1148,7 @@ pub(super) async fn entry_detail_rich_get(
         load_artist_id_by_lower_name(&service, &relevant_creators),
         catalog.load_entry_ranked_appearances(&detail),
         catalog.list_collections(true, false),
-        items.existing_ids(std::slice::from_ref(&detail.entry.id)),
+        items.reader_openable_ids(std::slice::from_ref(&detail.entry.id)),
         catalog.load_tiers_for_entries(&detail.children),
     );
     let all_lists = collections_res.unwrap_or_default();

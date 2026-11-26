@@ -230,6 +230,27 @@ impl Cli {
                     let db = crate::RocheServer::connect_db(&cfg).await?;
                     run_catalog_apply_cmd(&db, &file, ndjson, dry_run, json).await
                 }
+                CatalogCommand::ImportDocs {
+                    file,
+                    base_dir,
+                    enrich,
+                    no_reflow,
+                    concurrency,
+                    dry_run,
+                    json,
+                } => {
+                    run_catalog_import_docs_cmd(
+                        &cfg,
+                        &file,
+                        base_dir,
+                        enrich,
+                        !no_reflow,
+                        concurrency,
+                        dry_run,
+                        json,
+                    )
+                    .await
+                }
             },
         }
     }
@@ -509,6 +530,74 @@ async fn run_catalog_apply_cmd(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+async fn run_catalog_import_docs_cmd(
+    cfg: &Config,
+    file: &std::path::Path,
+    base_dir: Option<PathBuf>,
+    enrich: bool,
+    reflow_pdfs: bool,
+    concurrency: usize,
+    dry_run: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let raw = if file.as_os_str() == "-" {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        tokio::fs::read_to_string(file).await?
+    };
+    let manifest: crate::import_docs::LocalDocsImportManifest = serde_json::from_str(&raw)?;
+    let resolved_base_dir = if let Some(explicit) = base_dir {
+        Some(explicit)
+    } else if file.as_os_str() != "-" {
+        let manifest_dir = file.parent().filter(|p| !p.as_os_str().is_empty());
+        match manifest.base_dir.as_deref() {
+            Some(base) if !base.as_os_str().is_empty() && base.is_relative() => {
+                Some(manifest_dir.map_or_else(|| base.to_path_buf(), |dir| dir.join(base)))
+            }
+            Some(base) if !base.as_os_str().is_empty() => None,
+            _ => manifest_dir.map(PathBuf::from),
+        }
+    } else {
+        None
+    };
+    let opts = crate::import_docs::LocalDocsImportOptions {
+        base_dir_override: resolved_base_dir,
+        enrich,
+        reflow_pdfs,
+        concurrency,
+        dry_run,
+    };
+
+    let report = crate::RocheServer::import_local_documents(cfg, &manifest, &opts).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        let suffix = if report.dry_run { " (dry run — rolled back)" } else { "" };
+        println!("Imported local documents{suffix}:");
+        println!("  Collections processed: {}", report.collections_processed);
+        println!(
+            "  Documents total:       {} ({} created, {} updated)",
+            report.documents_total, report.entries_created, report.entries_updated
+        );
+        println!(
+            "  PDFs stored/reused:    {} stored, {} reused",
+            report.pdf_media_stored, report.pdf_media_reused
+        );
+        println!("  Reader HTML populated: {}", report.reflowed_html_count);
+        let id_label = if enrich { "Identifiers verified:" } else { "Identifiers detected:" };
+        println!(
+            "  {id_label:<22} {} DOI, {} arXiv",
+            report.dois_detected, report.arxiv_ids_detected
+        );
+        println!("  Added to Want to Read: {}", report.added_to_want_to_read);
+    }
+    Ok(())
+}
+
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Run the HTTP server (default)
@@ -636,6 +725,30 @@ pub enum CatalogCommand {
         #[arg(long)]
         dry_run: bool,
         /// Emit machine-readable JSON result to stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import local PDF and HTML documents from a JSON manifest into the catalog, reader, and media store
+    ImportDocs {
+        /// Path to the JSON manifest file (or `-` to read from stdin)
+        #[arg(default_value = "-")]
+        file: PathBuf,
+        /// Override base directory for resolving relative document paths in the manifest
+        #[arg(long, value_name = "DIR")]
+        base_dir: Option<PathBuf>,
+        /// Query Crossref and arXiv APIs to verify DOIs/arXiv IDs and backfill bibliographic metadata
+        #[arg(long)]
+        enrich: bool,
+        /// Skip extracting reflowed HTML reader text from PDF files
+        #[arg(long)]
+        no_reflow: bool,
+        /// Maximum parallel document extraction/enrichment tasks (1..=16)
+        #[arg(short = 'j', long, default_value_t = 4)]
+        concurrency: usize,
+        /// Validate, extract, and simulate inside a rolled-back transaction without modifying DB or media
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit machine-readable JSON report to stdout
         #[arg(long)]
         json: bool,
     },
@@ -1373,6 +1486,39 @@ mod tests {
                     ndjson: true,
                     dry_run: true,
                     json: false,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn test_cli_parses_catalog_import_docs_command() {
+        let import_docs_cmd = Cli::try_parse_from([
+            "roche",
+            "catalog",
+            "import-docs",
+            "/tmp/docs.json",
+            "--base-dir",
+            "/tmp/corpus",
+            "--enrich",
+            "--no-reflow",
+            "-j",
+            "6",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(
+            import_docs_cmd.command,
+            Some(Command::Catalog {
+                action: CatalogCommand::ImportDocs {
+                    file: PathBuf::from("/tmp/docs.json"),
+                    base_dir: Some(PathBuf::from("/tmp/corpus")),
+                    enrich: true,
+                    no_reflow: true,
+                    concurrency: 6,
+                    dry_run: true,
+                    json: true,
                 },
             })
         );

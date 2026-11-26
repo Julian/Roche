@@ -1537,26 +1537,22 @@ impl ItemRepo<'_> {
         }
 
         if let Some(html) = clean_html {
-            let content_res = if force_refresh {
-                sqlx::query("UPDATE entry_content SET content_html = ? WHERE entry_id = ?")
-                    .bind(html)
-                    .bind(&canon_id)
-                    .execute(tx.conn())
-                    .await?
-            } else {
-                sqlx::query(
-                    "UPDATE entry_content
-                     SET content_html = ?
-                     WHERE entry_id = ? AND (content_html IS NULL OR content_html = '')",
-                )
-                .bind(html)
-                .bind(&canon_id)
-                .execute(tx.conn())
-                .await?
-            };
-            if content_res.rows_affected() > 0 {
-                sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
+            let default_ct =
+                entries_core::resolve_entry_content_type_in_tx(tx.conn(), &canon_id, entry_kind)
+                    .await?;
+            if entries_core::upsert_entry_content_in_tx(
+                tx.conn(),
+                &canon_id,
+                Some(html),
+                default_ct,
+                force_refresh,
+            )
+            .await?
+            {
+                let hlc = tx.next_hlc().await?;
+                sqlx::query("UPDATE entries SET updated_at = ?, hlc = ? WHERE id = ?")
                     .bind(now)
+                    .bind(&hlc)
                     .bind(&canon_id)
                     .execute(tx.conn())
                     .await?;
@@ -1589,19 +1585,29 @@ impl ItemRepo<'_> {
         let Some(canon_id) = CatalogRepo::follow_merged_id_in_tx(tx.conn(), id).await? else {
             return Ok(false);
         };
-        let res = sqlx::query(
-            "UPDATE entry_content
-             SET content_html = ?
-             WHERE entry_id = ? AND (content_html IS NULL OR content_html = '')",
+        let entry_kind: Option<EntryKind> =
+            sqlx::query_scalar("SELECT kind FROM entries WHERE id = ? AND merged_into_id IS NULL")
+                .bind(&canon_id)
+                .fetch_optional(tx.conn())
+                .await?;
+        let Some(kind) = entry_kind else {
+            return Ok(false);
+        };
+        let default_ct =
+            entries_core::resolve_entry_content_type_in_tx(tx.conn(), &canon_id, kind).await?;
+        let saved = entries_core::upsert_entry_content_in_tx(
+            tx.conn(),
+            &canon_id,
+            Some(html),
+            default_ct,
+            false,
         )
-        .bind(html)
-        .bind(&canon_id)
-        .execute(tx.conn())
         .await?;
-        let saved = res.rows_affected() > 0;
         if saved {
-            sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
+            let hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET updated_at = ?, hlc = ? WHERE id = ?")
                 .bind(now)
+                .bind(&hlc)
                 .bind(&canon_id)
                 .execute(tx.conn())
                 .await?;

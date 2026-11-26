@@ -26,6 +26,22 @@ impl ItemRepo<'_> {
 
     /// Returns the subset of `ids` that currently exist as live reader items (matching `get`).
     pub async fn existing_ids(&self, ids: &[String]) -> Result<HashSet<String>> {
+        self.filter_existing_live_ids(ids, false).await
+    }
+
+    /// Returns the subset of `ids` that are live reader items AND have readable content or a
+    /// canonical URL (i.e. `url IS NOT NULL`, `entry_content` exists, or local `entry_media`
+    /// exists), preventing title-only catalog entries without content from showing broken reader
+    /// links while allowing URL-less local PDFs/HTML documents to open in Reader.
+    pub async fn reader_openable_ids(&self, ids: &[String]) -> Result<HashSet<String>> {
+        self.filter_existing_live_ids(ids, true).await
+    }
+
+    async fn filter_existing_live_ids(
+        &self,
+        ids: &[String],
+        require_source_or_content: bool,
+    ) -> Result<HashSet<String>> {
         if ids.is_empty() {
             return Ok(HashSet::new());
         }
@@ -55,6 +71,11 @@ impl ItemRepo<'_> {
                 sep.push_bind(*id);
             }
             qb.push(") AND i.merged_into_id IS NULL AND ").push(IS_LIVE_ITEM_SQL);
+            if require_source_or_content {
+                qb.push(
+                    " AND (i.url IS NOT NULL OR NULLIF(TRIM(ec.content_html), '') IS NOT NULL OR EXISTS (SELECT 1 FROM entry_media em WHERE em.entry_id = i.id AND em.local_path IS NOT NULL))",
+                );
+            }
             let found: Vec<String> = qb.build_query_scalar().fetch_all(self.pool).await?;
             existing.extend(found);
         }

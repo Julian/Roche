@@ -980,13 +980,15 @@ private fun toSyncEntryRecordDto(
 ): SyncEntryRecordDto {
     val isUnsyncedFeed = entry.id in unsyncedFeedIds
     val belongsToUnsyncedFeed = entry.id in snap.entryIdsInUnsyncedFeeds
+    val state = snap.statesById[entry.id]
+    val hasUnsyncableUrl = !entry.url.isNullOrBlank() && !isSyncableItemUrl(entry.url)
+    val isUnsyncableBlankInbox =
+        entry.url.isNullOrBlank() && state != null && state.inboxState != "none"
     val stripInboxPayload =
-        isUnsyncedFeed ||
-            belongsToUnsyncedFeed ||
-            snap.statesById[entry.id] != null && !isSyncableItemUrl(entry.url.orEmpty())
+        isUnsyncedFeed || belongsToUnsyncedFeed || hasUnsyncableUrl || isUnsyncableBlankInbox
 
     val rawContent = if (stripInboxPayload) null else contentsById[entry.id]
-    val rawState = if (stripInboxPayload) null else snap.statesById[entry.id]
+    val rawState = if (stripInboxPayload) null else state
     val rawSpec = if (isUnsyncedFeed) null else snap.specsById[entry.id]
     val rawFeedSource = if (isUnsyncedFeed) null else snap.feedSourcesById[entry.id]
     val safeUrl = resolveSafeOutgoingEntryUrl(entry.url, stripInboxPayload)

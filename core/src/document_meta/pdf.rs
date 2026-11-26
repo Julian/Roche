@@ -4,8 +4,8 @@ use chrono::{DateTime, Datelike, Utc};
 use flate2::read::ZlibDecoder;
 
 use super::{
-    ExtractedDocumentMetadata, collapse_whitespace, extract_arxiv_id_from_text,
-    extract_doi_from_text,
+    ExtractedDocumentMetadata, collapse_whitespace, extract_all_arxiv_ids_from_text,
+    extract_all_dois_from_text, extract_doi_from_text,
     heuristics::{
         extract_metadata_from_layout_lines, is_junk_pdf_author, is_junk_pdf_title,
         split_author_names,
@@ -70,6 +70,41 @@ struct PdfInfoAndXmp {
     creation_date: Option<DateTime<Utc>>,
     doi: Option<String>,
     arxiv_id: Option<String>,
+    all_dois: Vec<String>,
+    all_arxiv_ids: Vec<String>,
+}
+
+impl PdfInfoAndXmp {
+    fn record_doi(&mut self, doi: String) {
+        if !self.all_dois.contains(&doi) {
+            self.all_dois.push(doi.clone());
+        }
+        if self.doi.is_none() {
+            self.doi = Some(doi);
+        }
+    }
+
+    fn record_arxiv_id(&mut self, id: String) {
+        if !self.all_arxiv_ids.contains(&id) {
+            self.all_arxiv_ids.push(id.clone());
+        }
+        if self.arxiv_id.is_none() {
+            self.arxiv_id = Some(id);
+        }
+    }
+}
+
+/// Full single-pass result of pure-Rust PDF metadata and front-matter extraction.
+#[derive(Debug, Default, Clone)]
+pub struct PdfMetadataExtraction {
+    pub metadata: ExtractedDocumentMetadata,
+    pub front_text: String,
+    pub info_dois: Vec<String>,
+    pub info_arxiv_ids: Vec<String>,
+    /// `true` when `metadata.release_year` was derived solely from PDF `/CreationDate` rather
+    /// than a publication date printed on page 1 (important so modern re-typeset/scanned copies
+    /// of classic papers are not rejected on publication year during Crossref verification).
+    pub year_is_creation_date_only: bool,
 }
 
 /// Extracts bibliographic metadata directly from raw PDF bytes using:
@@ -79,13 +114,28 @@ struct PdfInfoAndXmp {
 ///    OT1 Computer Modern ligatures) fed into academic header heuristics.
 #[must_use]
 pub fn extract_pdf_metadata(pdf_bytes: &[u8]) -> ExtractedDocumentMetadata {
+    extract_pdf_metadata_with_front_text(pdf_bytes).metadata
+}
+
+/// Single-pass variant of [`extract_pdf_metadata`] that also returns extracted text from pages
+/// 1–2, all candidate DOIs/arXiv IDs found in `/Info` + XMP, and whether `release_year` came only
+/// from `/CreationDate`.
+#[must_use]
+pub fn extract_pdf_metadata_with_front_text(pdf_bytes: &[u8]) -> PdfMetadataExtraction {
     if pdf_bytes.len() < 5 || !pdf_bytes.starts_with(b"%PDF-") {
-        return ExtractedDocumentMetadata::default();
+        return PdfMetadataExtraction::default();
     }
     let bounded = &pdf_bytes[..pdf_bytes.len().min(MAX_PDF_SCAN_BYTES)];
     let info_meta = extract_info_and_xmp(bounded);
-    let page1_lines = extract_page1_layout_lines(bounded);
-    let mut layout_meta = extract_metadata_from_layout_lines(&page1_lines);
+    let pages = extract_pdf_pages_lines(bounded, 2);
+    let page1_lines = pages.first().map_or(&[][..], Vec::as_slice);
+    let mut layout_meta = extract_metadata_from_layout_lines(page1_lines);
+    let front_text = pages
+        .into_iter()
+        .flat_map(IntoIterator::into_iter)
+        .map(|l| l.text)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Combine: prefer clean Info/XMP title/author when present, but fall back to page-1 layout
     // (critical for LaTeX/pdfTeX papers where `/Title()` and `/Author()` are empty).
@@ -96,21 +146,30 @@ pub fn extract_pdf_metadata(pdf_bytes: &[u8]) -> ExtractedDocumentMetadata {
     } else {
         info_meta.authors
     };
+    let year_is_creation_date_only = layout_meta.release_year.is_none()
+        && layout_meta.published_at.is_none()
+        && info_meta.creation_date.is_some();
     let published_at = layout_meta.published_at.or(info_meta.creation_date);
     let release_year = layout_meta.release_year.or_else(|| published_at.map(|dt| dt.year()));
     let summary = layout_meta.summary.or(info_meta.summary);
     let doi = info_meta.doi.or(layout_meta.doi);
     let arxiv_id = info_meta.arxiv_id.or(layout_meta.arxiv_id);
 
-    ExtractedDocumentMetadata {
-        title,
-        authors,
-        published_at,
-        release_year,
-        summary,
-        doi,
-        arxiv_id,
-        isbn: None,
+    PdfMetadataExtraction {
+        metadata: ExtractedDocumentMetadata {
+            title,
+            authors,
+            published_at,
+            release_year,
+            summary,
+            doi,
+            arxiv_id,
+            isbn: None,
+        },
+        front_text,
+        info_dois: info_meta.all_dois,
+        info_arxiv_ids: info_meta.all_arxiv_ids,
+        year_is_creation_date_only,
     }
 }
 
@@ -144,18 +203,25 @@ fn extract_info_and_xmp(bytes: &[u8]) -> PdfInfoAndXmp {
             }
         }
     }
-    if out.summary.is_none()
-        && let Some(raw_subj) = find_pdf_dict_string(bytes, b"/Subject")
-    {
+    if let Some(raw_subj) = find_pdf_dict_string(bytes, b"/Subject") {
         let clean = collapse_whitespace(&raw_subj);
-        if out.doi.is_none() {
-            out.doi = extract_doi_from_text(&clean);
+        for d in extract_all_dois_from_text(&clean) {
+            out.record_doi(d);
         }
-        if out.arxiv_id.is_none() {
-            out.arxiv_id = extract_arxiv_id_from_text(&clean);
+        for aid in extract_all_arxiv_ids_from_text(&clean) {
+            out.record_arxiv_id(aid);
         }
-        if clean.len() >= 25 {
+        if out.summary.is_none() && clean.len() >= 25 {
             out.summary = Some(clean);
+        }
+    }
+    if let Some(raw_kw) = find_pdf_dict_string(bytes, b"/Keywords") {
+        let clean = collapse_whitespace(&raw_kw);
+        for d in extract_all_dois_from_text(&clean) {
+            out.record_doi(d);
+        }
+        for aid in extract_all_arxiv_ids_from_text(&clean) {
+            out.record_arxiv_id(aid);
         }
     }
     if out.creation_date.is_none()
@@ -163,11 +229,12 @@ fn extract_info_and_xmp(bytes: &[u8]) -> PdfInfoAndXmp {
     {
         out.creation_date = parse_pdf_date(&raw_date);
     }
-    if out.doi.is_none()
-        && let Some(raw_doi) =
-            find_pdf_dict_string(bytes, b"/doi").or_else(|| find_pdf_dict_string(bytes, b"/DOI"))
+    if let Some(raw_doi) =
+        find_pdf_dict_string(bytes, b"/doi").or_else(|| find_pdf_dict_string(bytes, b"/DOI"))
     {
-        out.doi = extract_doi_from_text(&raw_doi);
+        for d in extract_all_dois_from_text(&raw_doi) {
+            out.record_doi(d);
+        }
     }
 
     out
@@ -216,23 +283,69 @@ fn parse_xmp_metadata(xmp: &str, out: &mut PdfInfoAndXmp) {
     {
         out.creation_date = parsed.published_at;
     }
-    if out.doi.is_none() {
-        out.doi = extract_xml_simple_text(xmp, "prism:doi")
-            .and_then(|s| extract_doi_from_text(&s))
-            .or_else(|| extract_doi_from_text(xmp));
+    if let Some(prism_doi) = extract_xml_simple_text(xmp, "prism:doi")
+        .or_else(|| extract_xml_attr_value(xmp, "prism:doi"))
+        && let Some(d) = extract_doi_from_text(&prism_doi)
+    {
+        out.record_doi(d);
     }
-    if out.arxiv_id.is_none() {
-        out.arxiv_id = extract_arxiv_id_from_text(xmp);
+    if let Some(dc_id) = extract_xml_simple_text(xmp, "dc:identifier")
+        .or_else(|| extract_xml_attr_value(xmp, "dc:identifier"))
+    {
+        for d in extract_all_dois_from_text(&dc_id) {
+            out.record_doi(d);
+        }
+        for aid in extract_all_arxiv_ids_from_text(&dc_id) {
+            out.record_arxiv_id(aid);
+        }
     }
+    for d in extract_all_dois_from_text(xmp) {
+        out.record_doi(d);
+    }
+    for aid in extract_all_arxiv_ids_from_text(xmp) {
+        out.record_arxiv_id(aid);
+    }
+}
+
+fn extract_xml_attr_value(xml: &str, attr_name: &str) -> Option<String> {
+    let needle = format!("{attr_name}=");
+    let pos = xml.find(&needle)?;
+    let rest = xml[pos + needle.len()..].trim_start();
+    let quote = rest.chars().next().filter(|&c| c == '"' || c == '\'')?;
+    let after_q = &rest[quote.len_utf8()..];
+    let end = after_q.find(quote)?;
+    let val = decode_basic_xml_entities(after_q[..end].trim());
+    (!val.is_empty()).then_some(val)
 }
 
 fn extract_xml_tag_block(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
-    let start = xml.find(&open)?;
-    let after_open = xml[start..].find('>')? + start + 1;
-    let end = xml[after_open..].find(&close)? + after_open;
-    Some(xml[after_open..end].to_owned())
+    let mut cursor = 0usize;
+    while let Some(rel_start) = xml[cursor..].find(&open) {
+        let start = cursor + rel_start;
+        let after_tag_name = start + open.len();
+        // Ensure we didn't match a longer tag name sharing a prefix
+        if xml
+            .as_bytes()
+            .get(after_tag_name)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':'))
+        {
+            cursor = after_tag_name;
+            continue;
+        }
+        let gt_rel = xml[after_tag_name..].find('>')?;
+        let gt_abs = after_tag_name + gt_rel;
+        // Skip self-closing `<tag .../>` and keep looking for a paired `<tag>...</tag>`
+        if xml[after_tag_name..gt_abs].trim_end().ends_with('/') {
+            cursor = gt_abs + 1;
+            continue;
+        }
+        let content_start = gt_abs + 1;
+        let end = xml[content_start..].find(&close)? + content_start;
+        return Some(xml[content_start..end].to_owned());
+    }
+    None
 }
 
 fn extract_xml_simple_text(xml: &str, tag: &str) -> Option<String> {
@@ -324,11 +437,6 @@ fn find_pdf_dict_string(bytes: &[u8], key: &[u8]) -> Option<String> {
         }
     }
     None
-}
-
-/// Extracts layout lines from the first page content stream of a PDF.
-fn extract_page1_layout_lines(bytes: &[u8]) -> Vec<LayoutLine> {
-    extract_pdf_pages_lines(bytes, 1).into_iter().next().unwrap_or_default()
 }
 
 /// Extracts layout lines from up to `max_pages` text-bearing content streams of a PDF.
@@ -1966,5 +2074,45 @@ ET";
         );
         // CMTI text italics (`important`) must NOT be wrapped in `$...$`
         assert_eq!(meta.summary.as_deref(), Some("We study $n$ important bounds."));
+    }
+
+    #[test]
+    fn test_extract_pdf_metadata_reads_doi_and_arxiv_from_subject_keywords_and_xmp() {
+        let mut pdf = build_minimal_pdf(
+            "/Title (Empirical Study of Types) /Author (Alice Smith) /Subject (ACM OOPSLA doi:10.1145/3133873) /Keywords (software engineering, arXiv:1707.01234)",
+            "",
+        );
+        // Append XMP with dc:description (>= 25 chars) so out.summary is already populated before /Subject runs
+        pdf.extend_from_slice(
+            b"<x:xmpmeta><dc:description><rdf:Alt><rdf:li>XMP abstract text describing empirical type studies.</rdf:li></rdf:Alt></dc:description></x:xmpmeta>\n",
+        );
+        let meta = extract_pdf_metadata(&pdf);
+        assert_eq!(
+            meta.summary.as_deref(),
+            Some("XMP abstract text describing empirical type studies.")
+        );
+        assert_eq!(meta.doi.as_deref(), Some("10.1145/3133873"));
+        assert_eq!(meta.arxiv_id.as_deref(), Some("1707.01234"));
+
+        let mut xmp_id_pdf = build_minimal_pdf("/Title (Preprint Study) /Author (Bob Jones)", "");
+        xmp_id_pdf.extend_from_slice(
+            b"<x:xmpmeta><dc:identifier rdf:resource=\"urn:skip\"/><dc:identifier>doi:10.1109/ICSE.2019.00042</dc:identifier></x:xmpmeta>\n",
+        );
+        let meta2 = extract_pdf_metadata(&xmp_id_pdf);
+        assert_eq!(meta2.doi.as_deref(), Some("10.1109/icse.2019.00042"));
+
+        // Attribute shorthand prism:doi + multiple DOIs across /Subject and /Keywords
+        let mut multi_doi_pdf = build_minimal_pdf(
+            "/Title (Multi DOI Paper) /Author (Carol Lin) /Subject (Proc 10.1145/2635868) /Keywords (doi:10.1145/2635868.2635922) /CreationDate (D:20250101000000Z)",
+            "",
+        );
+        multi_doi_pdf.extend_from_slice(
+            b"<x:xmpmeta><rdf:Description prism:doi=\"10.1145/2635868.9999999\"/></x:xmpmeta>\n",
+        );
+        let full = extract_pdf_metadata_with_front_text(&multi_doi_pdf);
+        assert!(full.year_is_creation_date_only);
+        assert!(full.info_dois.contains(&"10.1145/2635868.9999999".to_owned()));
+        assert!(full.info_dois.contains(&"10.1145/2635868".to_owned()));
+        assert!(full.info_dois.contains(&"10.1145/2635868.2635922".to_owned()));
     }
 }

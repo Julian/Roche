@@ -6,6 +6,7 @@ pub mod config;
 mod content;
 pub mod db;
 pub use roche_core::{boards, domain, feeds, ranking};
+pub mod import_docs;
 mod ingest;
 mod media;
 mod scheduler;
@@ -317,6 +318,16 @@ impl RocheServer {
     pub async fn export_opml(cfg: &config::Config) -> anyhow::Result<String> {
         let service = Self::connect_service(cfg).await?;
         Ok(service.feeds().export_opml().await?)
+    }
+
+    pub async fn import_local_documents(
+        cfg: &config::Config,
+        manifest: &import_docs::LocalDocsImportManifest,
+        opts: &import_docs::LocalDocsImportOptions,
+    ) -> anyhow::Result<import_docs::LocalDocsImportReport> {
+        let db = Self::connect_db(cfg).await?;
+        let media_store = media::MediaStore::new(&cfg.storage.media_dir);
+        import_docs::import_local_documents(&db, &media_store, manifest, opts).await
     }
 
     pub async fn discover_servers(
